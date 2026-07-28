@@ -1,0 +1,954 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Pengine Local API",
+    "version": "1.0.0",
+    "description": "Local-only API for persona selection, asynchronous short-drama creation, status/result retrieval, and one frozen revision."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8000",
+      "description": "Loopback-only local service"
+    }
+  ],
+  "security": [],
+  "paths": {
+    "/personas": {
+      "get": {
+        "operationId": "listPersonas",
+        "summary": "List valid selectable persona packages",
+        "responses": {
+          "200": {
+            "description": "Selectable personas",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaList"
+                },
+                "examples": {
+                  "nonProduction": {
+                    "value": {
+                      "items": [
+                        {
+                          "persona_id": "example-non-production",
+                          "display_name": "非生产示例人格",
+                          "version": "0.0.0-example",
+                          "snapshot_sha256": "c780dc82e9e2b47c8e5478f77a49696da3dea49ddcda7d1737eb2c560f46313e"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/creations": {
+      "post": {
+        "operationId": "createCreation",
+        "summary": "Queue an initial complete creation run",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCreationRequest"
+              },
+              "examples": {
+                "nonProduction": {
+                  "value": {
+                    "persona_id": "example-non-production",
+                    "story": "一个离开故乡多年的人回乡处理旧屋。",
+                    "requirements": "创作一部当代短剧；具体集数和单集标准从所选人格的 L4 获取。"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Initial run queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreationAccepted"
+                },
+                "examples": {
+                  "queued": {
+                    "value": {
+                      "creation_id": "018f6d49-2e10-7b21-8f40-5f5162b9d181",
+                      "initial_state": "queued",
+                      "resource_url": "/creations/018f6d49-2e10-7b21-8f40-5f5162b9d181"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/PersonaNotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/IdempotencyConflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/creations/{creation_id}": {
+      "get": {
+        "operationId": "getCreation",
+        "summary": "Get initial and revision states and complete results",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CreationId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Creation resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreationResource"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/CreationNotFound"
+          }
+        }
+      }
+    },
+    "/creations/{creation_id}/revision": {
+      "post": {
+        "operationId": "createOrRetryRevision",
+        "summary": "Freeze and queue the only revision, or requeue its identical feedback after failure",
+        "description": "The first accepted feedback is frozen. A failed revision may be requeued only with byte-for-byte identical feedback. Queued, running, or succeeded revisions reject this command.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CreationId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevisionRequest"
+              },
+              "examples": {
+                "nonProduction": {
+                  "value": {
+                    "feedback": "主角最后的选择太顺利，请让代价更明确，同时保留原有情绪底色。"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Revision run queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevisionAccepted"
+                },
+                "examples": {
+                  "queued": {
+                    "value": {
+                      "creation_id": "018f6d49-2e10-7b21-8f40-5f5162b9d181",
+                      "revision_state": "queued",
+                      "feedback_locked": true,
+                      "resource_url": "/creations/018f6d49-2e10-7b21-8f40-5f5162b9d181"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/CreationNotFound"
+          },
+          "409": {
+            "description": "Idempotency conflict, revision unavailable, or feedback differs from the frozen feedback",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "CreationId": {
+        "name": "creation_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "A caller-generated key. Reuse with the same request replays the original command response; reuse with a different request returns idempotency_conflict.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "responses": {
+      "InvalidRequest": {
+        "description": "Invalid command",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CommandError"
+            },
+            "example": {
+              "code": "invalid_request",
+              "message": "The request cannot be accepted."
+            }
+          }
+        }
+      },
+      "ValidationError": {
+        "description": "Request schema validation failed",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CommandError"
+            },
+            "example": {
+              "code": "invalid_request",
+              "message": "One or more request fields are invalid."
+            }
+          }
+        }
+      },
+      "PersonaNotFound": {
+        "description": "Persona not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CommandError"
+            },
+            "example": {
+              "code": "persona_not_found",
+              "message": "The requested persona is not selectable."
+            }
+          }
+        }
+      },
+      "CreationNotFound": {
+        "description": "Creation not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CommandError"
+            },
+            "example": {
+              "code": "creation_not_found",
+              "message": "The requested creation does not exist."
+            }
+          }
+        }
+      },
+      "IdempotencyConflict": {
+        "description": "Idempotency key reused with a different request",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CommandError"
+            },
+            "example": {
+              "code": "idempotency_conflict",
+              "message": "The idempotency key is already bound to a different request."
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "Local service cannot accept the command",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CommandError"
+            },
+            "example": {
+              "code": "service_unavailable",
+              "message": "The service is temporarily unavailable."
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "PersonaList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonaSummary"
+            }
+          }
+        }
+      },
+      "PersonaSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "persona_id",
+          "display_name",
+          "version",
+          "snapshot_sha256"
+        ],
+        "properties": {
+          "persona_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "snapshot_sha256": {
+            "$ref": "#/components/schemas/Sha256"
+          }
+        }
+      },
+      "CreateCreationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "persona_id",
+          "story",
+          "requirements"
+        ],
+        "properties": {
+          "persona_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "story": {
+            "type": "string",
+            "minLength": 1
+          },
+          "requirements": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "RevisionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "feedback"
+        ],
+        "properties": {
+          "feedback": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "CreationAccepted": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "creation_id",
+          "initial_state",
+          "resource_url"
+        ],
+        "properties": {
+          "creation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "initial_state": {
+            "const": "queued"
+          },
+          "resource_url": {
+            "type": "string",
+            "format": "uri-reference"
+          }
+        }
+      },
+      "RevisionAccepted": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "creation_id",
+          "revision_state",
+          "feedback_locked",
+          "resource_url"
+        ],
+        "properties": {
+          "creation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "revision_state": {
+            "const": "queued"
+          },
+          "feedback_locked": {
+            "const": true
+          },
+          "resource_url": {
+            "type": "string",
+            "format": "uri-reference"
+          }
+        }
+      },
+      "CreationResource": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "creation_id",
+          "persona",
+          "initial",
+          "revision",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "creation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "persona": {
+            "$ref": "#/components/schemas/PersonaSnapshot"
+          },
+          "initial": {
+            "$ref": "#/components/schemas/RunStatus"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/RevisionStatus"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "PersonaSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "persona_id",
+          "display_name",
+          "version",
+          "snapshot_sha256"
+        ],
+        "properties": {
+          "persona_id": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "snapshot_sha256": {
+            "$ref": "#/components/schemas/Sha256"
+          }
+        }
+      },
+      "RunStatus": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/QueuedRun"
+          },
+          {
+            "$ref": "#/components/schemas/RunningRun"
+          },
+          {
+            "$ref": "#/components/schemas/SucceededRun"
+          },
+          {
+            "$ref": "#/components/schemas/FailedRun"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "state"
+        }
+      },
+      "QueuedRun": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "const": "queued"
+          }
+        }
+      },
+      "RunningRun": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "const": "running"
+          }
+        }
+      },
+      "SucceededRun": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state",
+          "result"
+        ],
+        "properties": {
+          "state": {
+            "const": "succeeded"
+          },
+          "result": {
+            "$ref": "#/components/schemas/Delivery"
+          }
+        }
+      },
+      "FailedRun": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state",
+          "failure"
+        ],
+        "properties": {
+          "state": {
+            "const": "failed"
+          },
+          "failure": {
+            "$ref": "#/components/schemas/RunFailure"
+          }
+        }
+      },
+      "RevisionStatus": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/RevisionUnavailable"
+          },
+          {
+            "$ref": "#/components/schemas/RevisionAvailable"
+          },
+          {
+            "$ref": "#/components/schemas/RevisionQueued"
+          },
+          {
+            "$ref": "#/components/schemas/RevisionRunning"
+          },
+          {
+            "$ref": "#/components/schemas/RevisionFailed"
+          },
+          {
+            "$ref": "#/components/schemas/RevisionSucceeded"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "state"
+        }
+      },
+      "RevisionUnavailable": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state",
+          "feedback_locked",
+          "reason"
+        ],
+        "properties": {
+          "state": {
+            "const": "unavailable"
+          },
+          "feedback_locked": {
+            "const": false
+          },
+          "reason": {
+            "const": "initial_not_succeeded"
+          }
+        }
+      },
+      "RevisionAvailable": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state",
+          "feedback_locked"
+        ],
+        "properties": {
+          "state": {
+            "const": "available"
+          },
+          "feedback_locked": {
+            "const": false
+          }
+        }
+      },
+      "RevisionQueued": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state",
+          "feedback_locked"
+        ],
+        "properties": {
+          "state": {
+            "const": "queued"
+          },
+          "feedback_locked": {
+            "const": true
+          }
+        }
+      },
+      "RevisionRunning": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state",
+          "feedback_locked"
+        ],
+        "properties": {
+          "state": {
+            "const": "running"
+          },
+          "feedback_locked": {
+            "const": true
+          }
+        }
+      },
+      "RevisionFailed": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state",
+          "feedback_locked",
+          "retryable",
+          "failure"
+        ],
+        "properties": {
+          "state": {
+            "const": "failed"
+          },
+          "feedback_locked": {
+            "const": true
+          },
+          "retryable": {
+            "const": true
+          },
+          "failure": {
+            "$ref": "#/components/schemas/RunFailure"
+          }
+        }
+      },
+      "RevisionSucceeded": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state",
+          "feedback_locked",
+          "result"
+        ],
+        "properties": {
+          "state": {
+            "const": "succeeded"
+          },
+          "feedback_locked": {
+            "const": true
+          },
+          "result": {
+            "$ref": "#/components/schemas/Delivery"
+          }
+        }
+      },
+      "Delivery": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "content_package",
+          "delivery_report"
+        ],
+        "properties": {
+          "content_package": {
+            "$ref": "#/components/schemas/ContentPackage"
+          },
+          "delivery_report": {
+            "$ref": "#/components/schemas/DeliveryReport"
+          }
+        }
+      },
+      "ContentPackage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "story_outline",
+          "character_biographies",
+          "relationship_logic",
+          "episode_outline",
+          "episode_scripts"
+        ],
+        "properties": {
+          "story_outline": {
+            "type": "string",
+            "minLength": 1
+          },
+          "character_biographies": {
+            "type": "string",
+            "minLength": 1
+          },
+          "relationship_logic": {
+            "type": "string",
+            "minLength": 1
+          },
+          "episode_outline": {
+            "type": "string",
+            "minLength": 1
+          },
+          "episode_scripts": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "DeliveryReport": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "persona_id",
+          "persona_version",
+          "persona_snapshot_sha256",
+          "selected_l0_variant",
+          "selection_rationale",
+          "l0_gate",
+          "l4_gate",
+          "ownership_statement",
+          "feedback_handling"
+        ],
+        "properties": {
+          "persona_id": {
+            "type": "string"
+          },
+          "persona_version": {
+            "type": "string"
+          },
+          "persona_snapshot_sha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "selected_l0_variant": {
+            "type": "string",
+            "minLength": 1
+          },
+          "selection_rationale": {
+            "type": "string",
+            "minLength": 1
+          },
+          "l0_gate": {
+            "$ref": "#/components/schemas/GateResult"
+          },
+          "l4_gate": {
+            "$ref": "#/components/schemas/GateResult"
+          },
+          "ownership_statement": {
+            "type": "string",
+            "minLength": 1
+          },
+          "feedback_handling": {
+            "type": "array",
+            "description": "Empty for an initial delivery; itemized for a revised delivery.",
+            "items": {
+              "$ref": "#/components/schemas/FeedbackHandlingItem"
+            }
+          }
+        }
+      },
+      "GateResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "passed",
+          "evidence"
+        ],
+        "properties": {
+          "passed": {
+            "const": true
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "FeedbackHandlingItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "feedback_item",
+          "handling",
+          "result"
+        ],
+        "properties": {
+          "feedback_item": {
+            "type": "string",
+            "minLength": 1
+          },
+          "handling": {
+            "type": "string",
+            "minLength": 1
+          },
+          "result": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "RunFailure": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "message",
+          "failed_stage",
+          "attempt_count"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "persona_package_invalid",
+              "relay_unavailable",
+              "relay_incompatible",
+              "structured_output_invalid",
+              "stage_validation_failed",
+              "agent_execution_limit",
+              "checkpoint_unavailable",
+              "attempts_exhausted",
+              "internal_error"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "failed_stage": {
+            "$ref": "#/components/schemas/InternalStage"
+          },
+          "attempt_count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3
+          }
+        }
+      },
+      "InternalStage": {
+        "type": "string",
+        "enum": [
+          "loading_persona",
+          "selecting_l0_variant",
+          "generating_story_outline",
+          "generating_character_biographies",
+          "generating_relationship_logic",
+          "generating_episode_outline",
+          "generating_episode_scripts",
+          "accepting_l0",
+          "accepting_l4",
+          "assembling_delivery"
+        ]
+      },
+      "CommandError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "invalid_request",
+              "persona_not_found",
+              "persona_package_unavailable",
+              "creation_not_found",
+              "idempotency_conflict",
+              "revision_not_allowed",
+              "revision_feedback_locked",
+              "service_unavailable"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "Sha256": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      }
+    }
+  },
+  "x-pengine-loopback-only": true
+}

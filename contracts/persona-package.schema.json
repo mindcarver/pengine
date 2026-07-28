@@ -1,0 +1,245 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pengine Persona Package Manifest",
+  "description": "Manifest for one immutable, versioned nine-file persona package.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "persona_id",
+    "display_name",
+    "version",
+    "created_at",
+    "package_sha256",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "persona_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "package_sha256": {
+      "description": "SHA-256 of the canonical ordered concatenation of the paradigm, project, l0, l1, l2, l3, l4, l5, and l6 lowercase file SHA-256 values; the manifest is excluded.",
+      "$ref": "#/$defs/sha256"
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "paradigm",
+        "project",
+        "l0",
+        "l1",
+        "l2",
+        "l3",
+        "l4",
+        "l5",
+        "l6"
+      ],
+      "properties": {
+        "paradigm": {
+          "$ref": "#/$defs/paradigm"
+        },
+        "project": {
+          "$ref": "#/$defs/project"
+        },
+        "l0": {
+          "$ref": "#/$defs/l0"
+        },
+        "l1": {
+          "$ref": "#/$defs/l1"
+        },
+        "l2": {
+          "$ref": "#/$defs/l2"
+        },
+        "l3": {
+          "$ref": "#/$defs/l3"
+        },
+        "l4": {
+          "$ref": "#/$defs/l4"
+        },
+        "l5": {
+          "$ref": "#/$defs/l5"
+        },
+        "l6": {
+          "$ref": "#/$defs/l6"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "utf8_markdown_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "media_type",
+        "encoding",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "media_type": {
+          "const": "text/markdown"
+        },
+        "encoding": {
+          "const": "utf-8"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "paradigm": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/utf8_markdown_file"
+        },
+        {
+          "properties": {
+            "path": {
+              "const": "paradigm.md"
+            }
+          }
+        }
+      ]
+    },
+    "project": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/utf8_markdown_file"
+        },
+        {
+          "properties": {
+            "path": {
+              "const": "project.md"
+            }
+          }
+        }
+      ]
+    },
+    "l0": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/utf8_markdown_file"
+        },
+        {
+          "properties": {
+            "path": {
+              "const": "l0.md"
+            }
+          }
+        }
+      ]
+    },
+    "l1": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/utf8_markdown_file"
+        },
+        {
+          "properties": {
+            "path": {
+              "const": "l1.md"
+            }
+          }
+        }
+      ]
+    },
+    "l2": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/utf8_markdown_file"
+        },
+        {
+          "properties": {
+            "path": {
+              "const": "l2.md"
+            }
+          }
+        }
+      ]
+    },
+    "l3": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/utf8_markdown_file"
+        },
+        {
+          "properties": {
+            "path": {
+              "const": "l3.md"
+            }
+          }
+        }
+      ]
+    },
+    "l4": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/utf8_markdown_file"
+        },
+        {
+          "properties": {
+            "path": {
+              "const": "l4.md"
+            }
+          }
+        }
+      ]
+    },
+    "l5": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/utf8_markdown_file"
+        },
+        {
+          "properties": {
+            "path": {
+              "const": "l5.md"
+            }
+          }
+        }
+      ]
+    },
+    "l6": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/utf8_markdown_file"
+        },
+        {
+          "properties": {
+            "path": {
+              "const": "l6.md"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
