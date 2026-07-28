@@ -2,7 +2,7 @@
 managed_by: scd-architecture
 status: ready
 sources:
-  - .scd/tasks/current.md
+  - https://github.com/mindcarver/pengine/issues/1
   - /Users/carver/Downloads/Telegram Desktop/短剧线_九文件与调用逻辑说明_v1_2.docx
 contracts:
   - contracts/openapi.json
