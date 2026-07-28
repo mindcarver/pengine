@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pengine"
+version = "0.1.0"
+description = "Local short-drama creation agent backend"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "aiosqlite==0.22.1",
+  "deepagents==0.6.12",
+  "fastapi==0.140.8",
+  "jsonschema==4.26.0",
+  "langchain==1.3.14",
+  "langchain-anthropic==1.5.2",
+  "langgraph-checkpoint-sqlite==3.1.0",
+  "pydantic-settings==2.14.2",
+  "uvicorn==0.51.0",
+]
+
+[project.scripts]
+pengine = "pengine.main:run"
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.16.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pengine"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+

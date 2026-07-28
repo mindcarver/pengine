@@ -33,7 +33,7 @@
                           "persona_id": "example-non-production",
                           "display_name": "非生产示例人格",
                           "version": "0.0.0-example",
-                          "snapshot_sha256": "c780dc82e9e2b47c8e5478f77a49696da3dea49ddcda7d1737eb2c560f46313e"
+                          "snapshot_sha256": "3353503b56a85aaa0da1eb61b81e9e598ac200199610ef5bdfe8402f248126fd"
                         }
                       ]
                     }
@@ -365,6 +365,7 @@
             "minLength": 1
           },
           "snapshot_sha256": {
+            "description": "Domain-separated SHA-256 of the canonical full manifest and its declared package_sha256; identifies one immutable persona identity and content snapshot.",
             "$ref": "#/components/schemas/Sha256"
           }
         }
@@ -380,15 +381,18 @@
         "properties": {
           "persona_id": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "\\S"
           },
           "story": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "\\S"
           },
           "requirements": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "\\S"
           }
         }
       },
@@ -401,7 +405,9 @@
         "properties": {
           "feedback": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "\\S",
+            "description": "The accepted string is preserved exactly; failed retries must submit the same Unicode string, including leading and trailing whitespace."
           }
         }
       },
@@ -508,6 +514,7 @@
             "type": "string"
           },
           "snapshot_sha256": {
+            "description": "Domain-separated SHA-256 of the canonical full manifest and its declared package_sha256; identifies one immutable persona identity and content snapshot.",
             "$ref": "#/components/schemas/Sha256"
           }
         }
@@ -795,6 +802,7 @@
             "type": "string"
           },
           "persona_snapshot_sha256": {
+            "description": "The immutable identity-and-content snapshot selected when the creation was accepted.",
             "$ref": "#/components/schemas/Sha256"
           },
           "selected_l0_variant": {
