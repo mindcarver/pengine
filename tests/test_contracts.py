@@ -1,0 +1,43 @@
+import json
+from pathlib import Path
+
+from jsonschema import Draft202012Validator
+
+from pengine.personas import canonical_snapshot_sha256
+
+ROOT = Path(__file__).parents[1]
+
+
+def test_machine_contracts_parse_and_example_manifest_validates() -> None:
+    openapi = json.loads((ROOT / "contracts/openapi.json").read_text())
+    manifest_schema = json.loads((ROOT / "contracts/persona-package.schema.json").read_text())
+    manifest_example = json.loads((ROOT / "contracts/examples/persona-manifest.json").read_text())
+
+    assert openapi["openapi"] == "3.1.0"
+    Draft202012Validator.check_schema(manifest_schema)
+    Draft202012Validator(manifest_schema).validate(manifest_example)
+    documented_snapshot = openapi["paths"]["/personas"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["examples"]["nonProduction"]["value"]["items"][0]["snapshot_sha256"]
+    assert documented_snapshot == canonical_snapshot_sha256(
+        manifest_example,
+        manifest_example["package_sha256"],
+    )
+
+
+def test_openapi_exposes_only_the_four_v1_operations() -> None:
+    openapi = json.loads((ROOT / "contracts/openapi.json").read_text())
+
+    operations = {
+        (method.upper(), path)
+        for path, methods in openapi["paths"].items()
+        for method in methods
+        if method in {"get", "post", "put", "patch", "delete"}
+    }
+
+    assert operations == {
+        ("GET", "/personas"),
+        ("POST", "/creations"),
+        ("GET", "/creations/{creation_id}"),
+        ("POST", "/creations/{creation_id}/revision"),
+    }

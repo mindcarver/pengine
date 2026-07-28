@@ -235,8 +235,12 @@ manifest is metadata and is not one of the nine content files.
 `package_sha256` is the SHA-256 of the canonical ordered concatenation of the
 nine lowercase per-file SHA-256 values in this order:
 `paradigm`, `project`, `l0`, `l1`, `l2`, `l3`, `l4`, `l5`, `l6`. The manifest
-itself is excluded, avoiding a circular hash. API `snapshot_sha256` uses this
-same value.
+itself is excluded, avoiding a circular hash.
+
+API `snapshot_sha256` is the domain-separated SHA-256 of `package_sha256` plus
+the canonical complete manifest. It therefore addresses the immutable package
+identity as well as its Markdown content: two personas or versions may reuse
+identical Markdown without sharing or replacing a snapshot.
 
 | Logical file | Fixed name | Minimum required structure | Runtime use | V1 write policy |
 |---|---|---|---|---|
@@ -255,9 +259,10 @@ AI-structured pending item. Pending items cannot be compiled as confirmed
 persona rules. Exact heading and marker validation belongs to the persona
 loader; accepting arbitrary rich documents is outside V1.
 
-L5 and L6 are indexed as a derived local full-text-search projection. The
-Markdown snapshot remains authoritative. Retrieval is bounded by the relay
-context budget and never loads either file in full.
+L5 and L6 are split into a restart-scoped derived local chunk index. The
+Markdown snapshot remains authoritative. Only ranked excerpts bounded by the
+configured result count and character budgets enter the relay context; neither
+file is projected wholesale into Agent state.
 
 For each run, the loader seeds only the approved compiled context into the
 Deep Agents `StateBackend` virtual tree:
@@ -456,7 +461,8 @@ quality.
 ### Open items
 
 - No architecture decision remains open.
-- The governing GitHub Issue and repository remote do not exist yet.
+- The governing delivery source is
+  <https://github.com/mindcarver/pengine/issues/1>.
 - No real nine-file persona package is available; manifest and Markdown
   structural compatibility with production content remains unverified.
 - The configured relay's Anthropic tool-use and structured-output compatibility
