@@ -296,6 +296,55 @@ async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_out_of_order_stage_is_rejected_before_specialist_attempt(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call(
+                "task",
+                {
+                    "description": (
+                        "[stage=generating_episode_outline] skip required story stages"
+                    ),
+                    "subagent_type": "episode_planner",
+                },
+                0,
+            )
+        ]
+    )
+    attempted: list[InternalStage] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("No checkpoint may be approved")
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=model,
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+
+        with pytest.raises(AgentProtocolError, match="in order"):
+            await workflow.execute(
+                thread_id="out-of-order-thread",
+                story="故事",
+                requirements="要求",
+                persona_files={"/persona/project.md": "规则"},
+                before_stage=before_stage,
+                approve_stage=approve_stage,
+            )
+
+    assert attempted == []
+
+
+@pytest.mark.asyncio
 async def test_restart_reuses_thread_checkpoint_and_skips_approved_stage(
     tmp_path: Path,
 ) -> None:

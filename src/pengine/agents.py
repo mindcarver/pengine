@@ -53,6 +53,7 @@ _TASK_OWNER = {
     InternalStage.ACCEPTING_L0: "quality_reviewer",
     InternalStage.ACCEPTING_L4: "quality_reviewer",
 }
+_ORDERED_SPECIALIST_STAGES = tuple(_TASK_OWNER)
 
 VIRTUAL_FILE_PERMISSIONS = [
     FilesystemPermission(operations=["read"], paths=["/persona", "/persona/**"]),
@@ -174,9 +175,15 @@ def _validated_stage_payload(
 
 
 class StageGuardMiddleware(AgentMiddleware):
-    def __init__(self, before_stage: StageHook, approve_stage: CheckpointHook) -> None:
+    def __init__(
+        self,
+        before_stage: StageHook,
+        approve_stage: CheckpointHook,
+        approved_stages: set[InternalStage],
+    ) -> None:
         self.before_stage = before_stage
         self.approve_stage = approve_stage
+        self.approved_stages = approved_stages
 
     async def awrap_tool_call(
         self,
@@ -200,6 +207,19 @@ class StageGuardMiddleware(AgentMiddleware):
             raise AgentProtocolError("Subagent task declared an unknown stage") from exc
         if _TASK_OWNER.get(stage) != subagent_type:
             raise AgentProtocolError("Stage was delegated to the wrong subagent", stage=stage)
+        expected_stage = next(
+            (
+                candidate
+                for candidate in _ORDERED_SPECIALIST_STAGES
+                if candidate not in self.approved_stages
+            ),
+            None,
+        )
+        if stage != expected_stage:
+            raise AgentProtocolError(
+                "Specialist stages must be delegated in order",
+                stage=expected_stage or stage,
+            )
 
         await self.before_stage(stage)
         result = await handler(request)
@@ -208,6 +228,7 @@ class StageGuardMiddleware(AgentMiddleware):
             raise AgentProtocolError("Subagent result was not JSON text", stage=stage)
         payload = _validated_stage_payload(stage, message.content)
         await self.approve_stage(stage, payload)
+        self.approved_stages.add(stage)
         return result
 
 
@@ -349,7 +370,13 @@ class DeepAgentWorkflow:
                 approved_json=approved_json,
             ),
             tools=tools,
-            middleware=[StageGuardMiddleware(before_stage, approve_stage)],
+            middleware=[
+                StageGuardMiddleware(
+                    before_stage,
+                    approve_stage,
+                    set(approved_checkpoints or {}),
+                )
+            ],
             subagents=subagents,
             permissions=VIRTUAL_FILE_PERMISSIONS,
             backend=StateBackend(),
