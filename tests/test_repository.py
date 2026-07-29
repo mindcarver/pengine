@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -112,9 +113,8 @@ async def create_and_lease_initial(
 
 
 async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository) -> None:
-    async with aiosqlite.connect(repository.database_path) as connection:
+    async with repository._connection() as connection:
         journal = await (await connection.execute("PRAGMA journal_mode")).fetchone()
-        await connection.execute("PRAGMA foreign_keys = ON")
         foreign_keys = await (await connection.execute("PRAGMA foreign_keys")).fetchone()
         rows = await (
             await connection.execute(
@@ -125,8 +125,18 @@ async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository)
             )
         ).fetchall()
 
-    assert journal == ("wal",)
-    assert foreign_keys == (1,)
+    assert journal[0] == "wal"
+    assert foreign_keys[0] == 1
+    timestamp = NOW.isoformat()
+    with pytest.raises(sqlite3.IntegrityError):
+        async with repository._connection() as connection:
+            await connection.execute(
+                """
+                INSERT INTO jobs(id, run_id, state, available_at, created_at, updated_at)
+                VALUES ('dangling-job', 'missing-run', 'queued', ?, ?, ?)
+                """,
+                (timestamp, timestamp, timestamp),
+            )
     assert {
         "creations",
         "runs",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -18,6 +19,8 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError
 
 from pengine.schemas import InternalStage, PersonaSnapshot, PersonaSummary
+
+logger = logging.getLogger(__name__)
 
 MANIFEST_NAME = "manifest.json"
 LOGICAL_FILES: tuple[tuple[str, str], ...] = (
@@ -533,14 +536,25 @@ class PersonaCatalog:
                 continue
             try:
                 package = validate_persona_package(child, schema_path=self.schema_path)
-            except PersonaPackageError:
+            except PersonaPackageError as exc:
+                logger.warning(
+                    "persona package rejected path=%s code=%s",
+                    child.name,
+                    exc.code,
+                )
                 continue
             candidates[package.summary.persona_id].append(package)
-        return {
-            persona_id: packages[0]
-            for persona_id, packages in candidates.items()
-            if len(packages) == 1
-        }
+        selectable: dict[str, ValidatedPersonaPackage] = {}
+        for persona_id, packages in candidates.items():
+            if len(packages) == 1:
+                selectable[persona_id] = packages[0]
+                continue
+            for package in packages:
+                logger.warning(
+                    "persona package rejected path=%s code=duplicate_persona_id",
+                    package.path.name,
+                )
+        return selectable
 
 
 def _validate_package_directory(package_path: Path) -> None:

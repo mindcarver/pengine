@@ -1,4 +1,5 @@
 import shutil
+import threading
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,6 +19,43 @@ def _app(tmp_path: Path):
         data_dir=tmp_path / "data",
     )
     return create_app(settings=settings)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_creation_runs_outside_event_loop_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app(tmp_path)
+    event_loop_thread = threading.get_ident()
+    snapshot_threads: list[int] = []
+    create_snapshot = app.state.catalog.create_snapshot
+
+    def record_snapshot_thread(persona_id: str):
+        snapshot_threads.append(threading.get_ident())
+        return create_snapshot(persona_id)
+
+    monkeypatch.setattr(app.state.catalog, "create_snapshot", record_snapshot_thread)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client,
+    ):
+        accepted = await client.post(
+            "/creations",
+            headers={"Idempotency-Key": "threaded-snapshot"},
+            json={
+                "persona_id": "test-persona",
+                "story": "一个人回乡。",
+                "requirements": "生成完整短剧。",
+            },
+        )
+
+    assert accepted.status_code == 202
+    assert snapshot_threads
+    assert snapshot_threads[0] != event_loop_thread
 
 
 @pytest.mark.asyncio

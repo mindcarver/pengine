@@ -40,7 +40,8 @@ PENGINE_RELAY_MODEL_ID=your-model-id
 ```
 
 Only loopback hosts are accepted. The relay key is read at runtime and must not
-be committed.
+be committed. Relay URLs must use HTTPS; HTTP is accepted only for a relay on
+`localhost`, `127.0.0.1`, or `::1`.
 
 Each direct child of `PENGINE_PERSONA_ROOT` is one persona package containing
 exactly:
