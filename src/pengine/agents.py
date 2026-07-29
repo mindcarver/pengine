@@ -76,10 +76,27 @@ class StoryArchitectResult(StrictModel):
         "generating_story_outline",
         "generating_character_biographies",
         "generating_relationship_logic",
-    ]
-    content: NonEmptyText | None = None
-    selected_l0_variant: NonEmptyText | None = None
-    selection_rationale: NonEmptyText | None = None
+    ] = Field(description="The exact stage named in the delegated task.")
+    content: NonEmptyText | None = Field(
+        default=None,
+        description=(
+            "Required for generating_story_outline, "
+            "generating_character_biographies, and generating_relationship_logic. "
+            "Must be null for selecting_l0_variant."
+        ),
+    )
+    selected_l0_variant: NonEmptyText | None = Field(
+        default=None,
+        description=(
+            "Required only for selecting_l0_variant. Must be null for every generation stage."
+        ),
+    )
+    selection_rationale: NonEmptyText | None = Field(
+        default=None,
+        description=(
+            "Required only for selecting_l0_variant. Must be null for every generation stage."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_stage_payload(self) -> "StoryArchitectResult":
@@ -102,10 +119,29 @@ class ScriptWriterResult(StrictModel):
 
 
 class QualityReviewerResult(StrictModel):
-    stage: Literal["accepting_l0", "accepting_l4"]
-    passed: Literal[True]
-    evidence: NonEmptyText
-    feedback_handling: list[FeedbackHandlingItem] = Field(default_factory=list)
+    stage: Literal["accepting_l0", "accepting_l4"] = Field(
+        description="The exact gate stage named in the delegated task."
+    )
+    passed: bool = Field(
+        description=(
+            "Whether the approved artifacts satisfy the named gate. "
+            "Never report true without concrete evidence."
+        )
+    )
+    evidence: NonEmptyText = Field(description="Concrete evidence supporting the gate decision.")
+    feedback_handling: list[FeedbackHandlingItem] = Field(
+        default_factory=list,
+        description=(
+            "Empty for accepting_l0 and for an initial run. "
+            "For a revision's accepting_l4 gate, itemize every frozen feedback item."
+        ),
+    )
+
+
+class WorkflowCompletion(StrictModel):
+    completed: Literal[True] = Field(
+        description="Confirms that every required specialist stage and gate completed."
+    )
 
 
 class AgentProtocolError(RuntimeError):
@@ -171,7 +207,61 @@ def _validated_stage_payload(
         ) from exc
     if parsed.stage != stage.value:
         raise AgentProtocolError("Subagent returned a different stage", stage=stage)
+    if isinstance(parsed, QualityReviewerResult) and not parsed.passed:
+        raise AgentProtocolError("Quality gate did not pass", stage=stage)
     return parsed.model_dump(mode="json")
+
+
+def _workflow_result_from_checkpoints(
+    approved: Mapping[InternalStage, Any],
+) -> WorkflowResult:
+    missing = [stage for stage in _ORDERED_SPECIALIST_STAGES if stage not in approved]
+    if missing:
+        raise AgentProtocolError(
+            "Supervisor finished before every specialist stage was approved",
+            stage=missing[0],
+        )
+    try:
+        l0_selection = approved[InternalStage.SELECTING_L0_VARIANT]
+        l0_gate = approved[InternalStage.ACCEPTING_L0]
+        l4_gate = approved[InternalStage.ACCEPTING_L4]
+        return WorkflowResult.model_validate(
+            {
+                "content_package": {
+                    "story_outline": approved[InternalStage.GENERATING_STORY_OUTLINE]["content"],
+                    "character_biographies": approved[
+                        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES
+                    ]["content"],
+                    "relationship_logic": approved[InternalStage.GENERATING_RELATIONSHIP_LOGIC][
+                        "content"
+                    ],
+                    "episode_outline": approved[InternalStage.GENERATING_EPISODE_OUTLINE][
+                        "content"
+                    ],
+                    "episode_scripts": approved[InternalStage.GENERATING_EPISODE_SCRIPTS][
+                        "content"
+                    ],
+                },
+                "selected_l0_variant": l0_selection["selected_l0_variant"],
+                "selection_rationale": l0_selection["selection_rationale"],
+                "l0_gate": {
+                    "passed": l0_gate["passed"],
+                    "evidence": l0_gate["evidence"],
+                },
+                "l4_gate": {
+                    "passed": l4_gate["passed"],
+                    "evidence": l4_gate["evidence"],
+                },
+                "feedback_handling": l4_gate.get("feedback_handling", []),
+            }
+        )
+    except AgentProtocolError:
+        raise
+    except Exception as exc:
+        raise AgentProtocolError(
+            "Approved specialist checkpoints are invalid",
+            stage=InternalStage.ASSEMBLING_DELIVERY,
+        ) from exc
 
 
 class StageGuardMiddleware(AgentMiddleware):
@@ -216,9 +306,21 @@ class StageGuardMiddleware(AgentMiddleware):
             None,
         )
         if stage != expected_stage:
-            raise AgentProtocolError(
-                "Specialist stages must be delegated in order",
-                stage=expected_stage or stage,
+            return ToolMessage(
+                content=json.dumps(
+                    {
+                        "error": "stage_out_of_order",
+                        "expected_stage": expected_stage.value if expected_stage else None,
+                        "instruction": (
+                            "Delegate exactly one missing specialist stage per turn and "
+                            "wait for its tool result before delegating the next stage."
+                        ),
+                    },
+                    separators=(",", ":"),
+                ),
+                tool_call_id=request.tool_call["id"],
+                name="task",
+                status="error",
             )
 
         await self.before_stage(stage)
@@ -259,6 +361,17 @@ class DeepAgentWorkflow:
         feedback: str | None = None,
         retrieve_references: ReferenceRetriever | None = None,
     ) -> WorkflowResult:
+        approved_payloads: dict[InternalStage, Any] = {
+            stage: payload for stage, payload in (approved_checkpoints or {}).items()
+        }
+
+        async def approve_and_capture(
+            stage: InternalStage,
+            payload: Mapping[str, Any],
+        ) -> None:
+            await approve_stage(stage, payload)
+            approved_payloads[stage] = dict(payload)
+
         files = {
             path: {"content": content, "encoding": "utf-8"}
             for path, content in persona_files.items()
@@ -301,7 +414,10 @@ class DeepAgentWorkflow:
                 ),
                 "system_prompt": (
                     "Read the relevant /persona context. Return only the structured "
-                    "result for the stage named in the task."
+                    "result for the stage named in the task. For "
+                    "selecting_l0_variant, set selected_l0_variant and "
+                    "selection_rationale, and leave content null. For each generation "
+                    "stage, set content and leave both L0 selection fields null."
                 ),
                 "model": self.model,
                 "tools": tools,
@@ -347,8 +463,12 @@ class DeepAgentWorkflow:
                     "Reviews the L0 and L4 gates and itemizes revision-feedback coverage."
                 ),
                 "system_prompt": (
-                    "Review only the named gate. A passing result requires concrete "
-                    "evidence. For a revision, itemize feedback handling during L4 review."
+                    "Read the relevant /persona context and review only the named gate "
+                    "against the approved artifacts supplied in the task. Always return "
+                    "the structured stage, passed decision, and concrete evidence; never "
+                    "return prose instead. Keep feedback_handling empty for accepting_l0 "
+                    "and for an initial run. For a revision's accepting_l4 gate, itemize "
+                    "every frozen feedback item."
                 ),
                 "model": self.model,
                 "tools": tools,
@@ -373,14 +493,14 @@ class DeepAgentWorkflow:
             middleware=[
                 StageGuardMiddleware(
                     before_stage,
-                    approve_stage,
+                    approve_and_capture,
                     set(approved_checkpoints or {}),
                 )
             ],
             subagents=subagents,
             permissions=VIRTUAL_FILE_PERMISSIONS,
             backend=StateBackend(),
-            response_format=ToolStrategy(schema=WorkflowResult, handle_errors=False),
+            response_format=ToolStrategy(schema=WorkflowCompletion, handle_errors=False),
             checkpointer=self.checkpointer,
             store=None,
         )
@@ -405,7 +525,11 @@ class DeepAgentWorkflow:
         structured = result.get("structured_response")
         if structured is None:
             raise AgentProtocolError("Supervisor did not return structured output")
-        return WorkflowResult.model_validate(structured)
+        try:
+            WorkflowCompletion.model_validate(structured)
+        except Exception as exc:
+            raise AgentProtocolError("Supervisor returned invalid completion output") from exc
+        return _workflow_result_from_checkpoints(approved_payloads)
 
 
 def _supervisor_prompt(
@@ -442,9 +566,11 @@ Delegate every missing specialist stage exactly once, in this order:
 8. accepting_l4 -> quality_reviewer
 
 Every task description MUST begin with the exact token
-`[stage=<stage_name>]`. Do not delegate an already approved stage. Do not use
-any subagent other than the four listed above. Treat /persona as read-only and
-/workspace as temporary thread scratch. Never claim a gate passed without the
-quality_reviewer evidence. After all stages are complete, return WorkflowResult
-using the approved artifacts. Do not return partial content.
+`[stage=<stage_name>]`. Issue exactly one task tool call per model turn and wait
+for its tool result before delegating the next stage. Do not delegate an already
+approved stage. Do not use any subagent other than the four listed above. Treat
+/persona as read-only and /workspace as temporary thread scratch. Never claim a
+gate passed without the quality_reviewer evidence. After all stages are
+complete, return WorkflowCompletion only. Do not repeat the approved artifacts
+or return partial content.
 """

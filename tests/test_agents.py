@@ -14,6 +14,9 @@ from pengine.agents import (
     VIRTUAL_FILE_PERMISSIONS,
     AgentProtocolError,
     DeepAgentWorkflow,
+    QualityReviewerResult,
+    StoryArchitectResult,
+    WorkflowCompletion,
 )
 from pengine.config import Settings
 from pengine.personas import PersonaCatalog
@@ -158,25 +161,40 @@ def _successful_responses() -> list[AIMessage]:
         index += 2
     responses.append(
         _tool_call(
-            "WorkflowResult",
-            {
-                "content_package": {
-                    "story_outline": "故事大纲",
-                    "character_biographies": "人物小传",
-                    "relationship_logic": "关系逻辑",
-                    "episode_outline": "分集大纲",
-                    "episode_scripts": "分集剧本",
-                },
-                "selected_l0_variant": "主动选择",
-                "selection_rationale": "契合故事",
-                "l0_gate": {"passed": True, "evidence": "符合 L0"},
-                "l4_gate": {"passed": True, "evidence": "符合 L4"},
-                "feedback_handling": [],
-            },
+            "WorkflowCompletion",
+            {"completed": True},
             index,
         )
     )
     return responses
+
+
+def test_story_architect_schema_exposes_stage_specific_field_contract() -> None:
+    properties = StoryArchitectResult.model_json_schema()["properties"]
+
+    assert "selecting_l0_variant" in properties["content"]["description"]
+    assert "Must be null" in properties["content"]["description"]
+    assert "selecting_l0_variant" in properties["selected_l0_variant"]["description"]
+    assert "Must be null" in properties["selected_l0_variant"]["description"]
+    assert "selecting_l0_variant" in properties["selection_rationale"]["description"]
+    assert "Must be null" in properties["selection_rationale"]["description"]
+
+
+def test_quality_reviewer_schema_exposes_gate_decision_contract() -> None:
+    properties = QualityReviewerResult.model_json_schema()["properties"]
+
+    assert properties["passed"]["type"] == "boolean"
+    assert "concrete evidence" in properties["passed"]["description"]
+    assert "accepting_l0" in properties["feedback_handling"]["description"]
+    assert "initial run" in properties["feedback_handling"]["description"]
+    assert "revision" in properties["feedback_handling"]["description"]
+
+
+def test_workflow_completion_does_not_repeat_approved_content() -> None:
+    schema = WorkflowCompletion.model_json_schema()
+
+    assert set(schema["properties"]) == {"completed"}
+    assert schema["properties"]["completed"]["const"] is True
 
 
 @pytest.mark.asyncio
@@ -296,7 +314,57 @@ async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_out_of_order_stage_is_rejected_before_specialist_attempt(
+async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    responses[13] = _tool_call(
+        "QualityReviewerResult",
+        {
+            "stage": "accepting_l0",
+            "passed": False,
+            "evidence": "成品没有通过 L0 闸门。",
+            "feedback_handling": [],
+        },
+        13,
+    )
+    approved: list[InternalStage] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+
+        with pytest.raises(AgentProtocolError, match="Quality gate did not pass"):
+            await workflow.execute(
+                thread_id="failed-gate-thread",
+                story="故事",
+                requirements="要求",
+                persona_files={"/persona/project.md": "规则"},
+                before_stage=before_stage,
+                approve_stage=approve_stage,
+            )
+
+    assert approved == [
+        InternalStage.SELECTING_L0_VARIANT,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_out_of_order_stage_is_rejected_without_attempt_and_can_recover(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "checkpoints.sqlite3"
@@ -311,17 +379,19 @@ async def test_out_of_order_stage_is_rejected_before_specialist_attempt(
                     "subagent_type": "episode_planner",
                 },
                 0,
-            )
+            ),
+            *_successful_responses(),
         ]
     )
     attempted: list[InternalStage] = []
+    approved: list[InternalStage] = []
 
     async def before_stage(stage: InternalStage) -> int:
         attempted.append(stage)
         return 1
 
-    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
-        raise AssertionError("No checkpoint may be approved")
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
@@ -331,17 +401,28 @@ async def test_out_of_order_stage_is_rejected_before_specialist_attempt(
             provider_profile_key="toolcallingfakemodel",
         )
 
-        with pytest.raises(AgentProtocolError, match="in order"):
-            await workflow.execute(
-                thread_id="out-of-order-thread",
-                story="故事",
-                requirements="要求",
-                persona_files={"/persona/project.md": "规则"},
-                before_stage=before_stage,
-                approve_stage=approve_stage,
-            )
+        result = await workflow.execute(
+            thread_id="out-of-order-thread",
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+        )
 
-    assert attempted == []
+    expected = [
+        InternalStage.SELECTING_L0_VARIANT,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+        InternalStage.ACCEPTING_L0,
+        InternalStage.ACCEPTING_L4,
+    ]
+    assert result.content_package.episode_scripts == "分集剧本"
+    assert attempted == expected
+    assert approved == expected
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr
 
 from pengine.config import Settings
 from pengine.relay import RelayError, build_chat_model, classify_relay_exception
@@ -21,8 +21,23 @@ def test_build_chat_model_uses_only_operator_connection_fields() -> None:
     assert "secret-value" not in repr(model)
 
 
+def test_build_chat_model_disables_parallel_tool_calls() -> None:
+    class ProbeTool(BaseModel):
+        value: str
+
+    settings = Settings(
+        relay_base_url="https://relay.example/anthropic",
+        relay_api_key="secret-value",
+        relay_model_id="model-id",
+    )
+
+    bound = build_chat_model(settings).bind_tools([ProbeTool])
+
+    assert bound.kwargs["tool_choice"]["disable_parallel_tool_use"] is True
+
+
 def test_missing_relay_configuration_is_safe() -> None:
-    settings = Settings()
+    settings = Settings(_env_file=None)
 
     try:
         build_chat_model(settings)
