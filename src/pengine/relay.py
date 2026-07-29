@@ -1,9 +1,16 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_anthropic import ChatAnthropic
 
 from pengine.config import Settings
+
+
+class _SerialChatAnthropic(ChatAnthropic):
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
+        kwargs["parallel_tool_calls"] = False
+        return super().bind_tools(tools, **kwargs)
 
 
 @dataclass(slots=True)
@@ -22,7 +29,7 @@ def build_chat_model(settings: Settings) -> ChatAnthropic:
             safe_message="The model relay is not configured.",
         )
 
-    return ChatAnthropic(
+    return _SerialChatAnthropic(
         model=settings.relay_model_id,
         base_url=settings.relay_base_url,
         api_key=settings.relay_api_key,
