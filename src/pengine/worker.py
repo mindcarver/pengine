@@ -121,7 +121,17 @@ class Worker:
 
     async def _run_loop(self) -> None:
         while not self._stop_event.is_set():
-            worked = await self.run_once()
+            try:
+                worked = await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "worker iteration failed worker_id=%s error_type=%s",
+                    self.worker_id,
+                    type(exc).__name__,
+                )
+                worked = False
             if worked:
                 continue
             with suppress(TimeoutError):

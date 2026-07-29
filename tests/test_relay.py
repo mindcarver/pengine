@@ -36,8 +36,16 @@ def test_build_chat_model_disables_parallel_tool_calls() -> None:
     assert bound.kwargs["tool_choice"]["disable_parallel_tool_use"] is True
 
 
-def test_missing_relay_configuration_is_safe() -> None:
-    settings = Settings(_env_file=None)
+def test_missing_relay_configuration_is_safe(monkeypatch) -> None:
+    monkeypatch.setenv("PENGINE_RELAY_BASE_URL", "https://ambient.example/anthropic")
+    monkeypatch.setenv("PENGINE_RELAY_API_KEY", "ambient-secret")
+    monkeypatch.setenv("PENGINE_RELAY_MODEL_ID", "ambient-model")
+    settings = Settings(
+        _env_file=None,
+        relay_base_url=None,
+        relay_api_key=None,
+        relay_model_id=None,
+    )
 
     try:
         build_chat_model(settings)

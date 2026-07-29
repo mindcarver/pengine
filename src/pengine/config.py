@@ -1,6 +1,7 @@
 from functools import lru_cache
 from ipaddress import ip_address
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -50,6 +51,34 @@ class Settings(BaseSettings):
         except ValueError:
             pass
         raise ValueError("Pengine V1 may bind only to a loopback address")
+
+    @field_validator("relay_base_url")
+    @classmethod
+    def relay_base_url_must_be_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if any(character.isspace() for character in value):
+            raise ValueError("relay_base_url must be a valid HTTP URL")
+        try:
+            parsed = urlsplit(value)
+            hostname = parsed.hostname
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("relay_base_url must be a valid HTTP URL") from exc
+        if parsed.scheme not in {"http", "https"} or not hostname:
+            raise ValueError("relay_base_url must be a valid HTTP URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("relay_base_url must not contain credentials")
+        if parsed.scheme == "https":
+            return value
+        if hostname == "localhost":
+            return value
+        try:
+            if ip_address(hostname).is_loopback:
+                return value
+        except ValueError:
+            pass
+        raise ValueError("relay_base_url must use HTTPS unless the host is loopback")
 
 
 @lru_cache

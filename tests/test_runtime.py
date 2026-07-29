@@ -19,7 +19,8 @@ async def _wait_for_state(
     field: str,
     expected: str,
 ) -> dict:
-    for _ in range(100):
+    deadline = asyncio.get_running_loop().time() + 10.0
+    while asyncio.get_running_loop().time() < deadline:
         response = await client.get(f"/creations/{creation_id}")
         assert response.status_code == 200
         body = response.json()

@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Protocol
@@ -120,7 +121,10 @@ def create_app(
         )
         if replay is not None:
             return replay
-        snapshot = resolved_catalog.create_snapshot(request.persona_id)
+        snapshot = await asyncio.to_thread(
+            resolved_catalog.create_snapshot,
+            request.persona_id,
+        )
         return await resolved_repository.create_creation(
             idempotency_key=idempotency_key,
             request=request,

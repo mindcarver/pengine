@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -200,10 +202,72 @@ async def test_worker_completes_initial_and_one_revision(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_background_worker_recovers_after_transient_iteration_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    settings = settings.model_copy(update={"worker_poll_seconds": 0.01})
+    accepted = await repository.create_creation(
+        "transient-failure",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    requeue_expired_jobs = repository.requeue_expired_jobs
+    calls = 0
+
+    async def no_startup_reconciliation():
+        return []
+
+    async def fail_once_then_requeue(*, now=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("SECRET-ITERATION-DETAIL")
+        return await requeue_expired_jobs(now=now)
+
+    monkeypatch.setattr(repository, "reconcile_startup", no_startup_reconciliation)
+    monkeypatch.setattr(repository, "requeue_expired_jobs", fail_once_then_requeue)
+    caplog.set_level(logging.ERROR, logger="pengine.worker")
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=DeterministicWorkflow(),
+        worker_id="resilient-worker",
+    )
+
+    await worker.start()
+    deadline = asyncio.get_running_loop().time() + 2.0
+    try:
+        while asyncio.get_running_loop().time() < deadline:
+            resource = await repository.get_creation(accepted.creation_id)
+            assert resource is not None
+            if resource.initial.state == "succeeded":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("worker did not recover after transient failure")
+    finally:
+        await worker.stop()
+
+    assert calls >= 2
+    assert "worker iteration failed worker_id=resilient-worker" in caplog.text
+    assert "OperationalError" in caplog.text
+    assert "SECRET-ITERATION-DETAIL" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_missing_relay_fails_safely_without_leaking_content(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="pengine")
     settings, catalog, repository, snapshot = await _services(tmp_path)
     accepted = await repository.create_creation(
         "missing-relay",
@@ -268,6 +332,7 @@ async def test_provider_failure_is_safe_and_never_logged(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="pengine")
     settings, catalog, repository, snapshot = await _services(tmp_path)
     accepted = await repository.create_creation(
         "provider-failure",

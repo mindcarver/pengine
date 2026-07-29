@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -143,6 +144,26 @@ def test_duplicate_persona_ids_are_not_selectable(tmp_path: Path) -> None:
 
     assert catalog.discover() == []
     assert catalog.get("duplicate") is None
+
+
+def test_discovery_logs_only_safe_rejection_metadata(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source_root = tmp_path / "personas"
+    invalid = create_persona_package(source_root / "invalid-secret")
+    (invalid / "l6.md").unlink()
+    create_persona_package(source_root / "duplicate-one", persona_id="duplicate", version="1")
+    create_persona_package(source_root / "duplicate-two", persona_id="duplicate", version="2")
+    catalog = PersonaCatalog(source_root, tmp_path / "snapshots")
+    caplog.set_level(logging.WARNING, logger="pengine.personas")
+
+    assert catalog.discover() == []
+
+    assert "path=invalid-secret code=invalid_package_entries" in caplog.text
+    assert "path=duplicate-one code=duplicate_persona_id" in caplog.text
+    assert "path=duplicate-two code=duplicate_persona_id" in caplog.text
+    assert "NON-PRODUCTION TEST FIXTURE" not in caplog.text
 
 
 def test_snapshot_is_idempotent_and_source_is_never_mutated(tmp_path: Path) -> None:
