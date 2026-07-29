@@ -1,17 +1,22 @@
-<div align="center">
+<p align="center">
+  <img src="docs/assets/pengine-retro-workbench.jpg" alt="Pengine 复古创作工作台：人格档案、创作终端、四个专业 Agent 与成片胶卷" width="100%">
+</p>
 
-```text
-╔══════════════════════════════════════════════════════════╗
-║                      P E N G I N E                       ║
-║          LOCAL SHORT-DRAMA ENGINE // VERSION 01          ║
-╚══════════════════════════════════════════════════════════╝
-```
+<h1 align="center">PENGINE</h1>
 
-**把一套可验证的编剧人格、一个故事和创作要求，变成完整短剧交付。**
+<p align="center">
+  <strong>本地短剧创作引擎 · 第一版</strong><br>
+  把一套可验证的编剧人格、一个故事和创作要求，变成完整短剧交付。
+</p>
 
-</div>
-
-> `LOCAL ONLY` · 单操作员 · 回环 API · 不可变人格快照 · 一次冻结修订
+<table align="center">
+  <tr>
+    <td align="center"><strong>运行</strong><br>本地单操作员</td>
+    <td align="center"><strong>接口</strong><br>仅限回环地址</td>
+    <td align="center"><strong>人格</strong><br>不可变快照</td>
+    <td align="center"><strong>修订</strong><br>一次提交后冻结</td>
+  </tr>
+</table>
 
 Pengine V1 是一个本地短剧创作 Agent 后端。它通过
 [Deep Agents](https://github.com/langchain-ai/deepagents) 与 LangGraph，
@@ -20,46 +25,46 @@ SQLite，模型请求则通过 Anthropic Messages 兼容 relay 发出。
 
 V1 没有前端、身份认证、公共部署、多用户隔离或跨项目可写记忆。
 
-## 01 / 系统架构
+<h2 align="center">01 · 系统架构</h2>
 
 ```text
 ┌──────────────┐     HTTP / 127.0.0.1      ┌─────────────────┐
-│   Operator   │ ─────────────────────────▶│   FastAPI API   │
+│    操作员     │ ─────────────────────────▶│  FastAPI 接口   │
 └──────────────┘                           └────────┬────────┘
-                                                  │ command / query
+                                                  │ 命令 / 查询
                     ┌─────────────────────────────▼──────────────┐
-                    │          SQLite Domain Store               │
-                    │ creation · run · job · gate · delivery     │
-                    │ business checkpoint · LangGraph checkpoint │
+                    │             SQLite 状态库                   │
+                    │ 创作 · 运行 · 任务 · 闸门 · 交付            │
+                    │ 业务检查点 · LangGraph 检查点               │
                     └───────────────┬─────────────────────────────┘
-                                    │ durable job lease
-┌──────────────┐   validate   ┌─────▼──────────┐   invoke   ┌──────────────┐
-│ Persona Root │ ────────────▶│ Embedded Worker│ ──────────▶│ Deep Agents  │
-└──────────────┘   snapshot   └─────┬──────────┘            │ Supervisor   │
+                                    │ 持久任务租约
+┌──────────────┐   校验 / 快照  ┌─────▼──────────┐   调用    ┌──────────────┐
+│   人格目录    │ ────────────▶│   内嵌 Worker  │ ─────────▶│ Deep Agents  │
+└──────────────┘               └─────┬──────────┘           │ 监督 Agent   │
                                     │                       └──────┬───────┘
-                                    │ read-only context            │
+                                    │ 只读上下文                    │
                               ┌─────▼──────┐              ┌───────▼────────┐
-                              │ L0–L6 Files│              │ 4 Specialists  │
+                              │ L0–L6 文件 │              │ 4 个专业 Agent │
                               └────────────┘              └───────┬────────┘
                                                                   │
                                                            ┌──────▼──────┐
-                                                           │ Model Relay │
+                                                           │  模型中继   │
                                                            └─────────────┘
 ```
 
 | 组件 | 负责什么 |
 |---|---|
-| FastAPI API | 参数校验、幂等命令、状态与结果查询、稳定错误 |
-| Persona Loader | 校验九文件人格包，生成内容寻址的不可变快照 |
-| Repository | 管理创作、运行、任务、反馈、检查点与交付物 |
-| Embedded Worker | 租约、重启恢复、阶段尝试预算、工作流调度 |
-| Deep Agents | Supervisor 编排四个同步专业 Agent |
-| Relay Client | 以固定超时和安全错误映射调用模型 |
+| 接口服务（FastAPI） | 参数校验、幂等命令、状态与结果查询、稳定错误 |
+| 人格加载器 | 校验九文件人格包，生成内容寻址的不可变快照 |
+| 状态仓库 | 管理创作、运行、任务、反馈、检查点与交付物 |
+| 内嵌任务器 | 租约、重启恢复、阶段尝试预算、工作流调度 |
+| Agent 编排层 | 由监督 Agent 编排四个同步专业 Agent |
+| 模型中继客户端 | 以固定超时和安全错误映射调用模型 |
 
 系统采用模块化单体：一个进程、一个 Worker、一次处理一个创作任务，不依赖外部
 消息队列或远程 Agent。
 
-## 02 / 九文件人格
+<h2 align="center">02 · 九文件人格</h2>
 
 每个人格目录必须包含一个 `manifest.json` 和九个 UTF-8 Markdown 文件：
 
@@ -87,19 +92,19 @@ persona/
 规范见
 [`persona-package.schema.json`](contracts/persona-package.schema.json)。
 
-## 03 / 创作流水线
+<h2 align="center">03 · 创作流水线</h2>
 
 ```text
-LOAD PERSONA
-  └─▶ SELECT L0
-       └─▶ STORY OUTLINE
-            └─▶ CHARACTER BIOGRAPHIES
-                 └─▶ RELATIONSHIP LOGIC
-                      └─▶ EPISODE OUTLINE
-                           └─▶ EPISODE SCRIPTS
-                                └─▶ L0 GATE
-                                     └─▶ L4 GATE
-                                          └─▶ ASSEMBLE DELIVERY
+载入人格
+  └─▶ 选择 L0
+       └─▶ 故事大纲
+            └─▶ 人物小传
+                 └─▶ 关系逻辑
+                      └─▶ 分集大纲
+                           └─▶ 分集剧本
+                                └─▶ L0 闸门
+                                     └─▶ L4 闸门
+                                          └─▶ 组装交付
 ```
 
 四个 Agent 分工明确：
@@ -116,7 +121,7 @@ LOAD PERSONA
 
 每阶段最多尝试三次。只有通过结构校验和 L0/L4 闸门的完整内容包才会公开。
 
-## 04 / 一次创作，一次修订
+<h2 align="center">04 · 一次创作，一次修订</h2>
 
 1. 创建请求使用调用方生成的 `Idempotency-Key`，返回异步资源地址；
 2. 初稿成功后，系统开放一次修订机会；
@@ -126,7 +131,7 @@ LOAD PERSONA
 
 机器接口以 [`openapi.json`](contracts/openapi.json) 为准。
 
-## 05 / 快速启动
+<h2 align="center">05 · 快速启动</h2>
 
 要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)、一个兼容 Anthropic
 Messages 的 relay，以及至少一个人格包。
@@ -161,7 +166,7 @@ uv run pengine
 
 交互文档：`http://127.0.0.1:8000/docs`
 
-## 06 / 最短 API 路径
+<h2 align="center">06 · 最短接口路径</h2>
 
 ```bash
 # 1. 查看可用人格
@@ -188,7 +193,7 @@ curl --fail-with-body -X POST \
 轮询同一个 creation 资源，直到 `initial.state` 或 `revision.state` 进入
 `succeeded` / `failed`。
 
-## 07 / 数据与恢复
+<h2 align="center">07 · 数据与恢复</h2>
 
 ```text
 PENGINE_DATA_DIR/
@@ -201,7 +206,7 @@ PENGINE_DATA_DIR/
 
 数据不会自动过期。故事、反馈、生成内容和备份都应按敏感内容保护。
 
-## 08 / 验证与边界
+<h2 align="center">08 · 验证与边界</h2>
 
 ```bash
 uv run ruff check .
