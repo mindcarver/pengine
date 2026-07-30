@@ -1,12 +1,14 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Protocol
 from uuid import UUID
 
 from fastapi import FastAPI, Header
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from pengine.config import Settings, get_settings
 from pengine.errors import DomainError
@@ -26,6 +28,7 @@ IdempotencyKey = Annotated[
     str,
     Header(alias="Idempotency-Key", min_length=1, max_length=128),
 ]
+_WEB_ROOT = Path(__file__).with_name("web")
 
 
 class WorkerControl(Protocol):
@@ -74,6 +77,11 @@ def create_app(
     app.state.repository = resolved_repository
     app.state.catalog = resolved_catalog
     app.state.worker = worker
+    app.mount("/static", StaticFiles(directory=_WEB_ROOT), name="static")
+
+    @app.get("/", include_in_schema=False)
+    async def frontend() -> FileResponse:
+        return FileResponse(_WEB_ROOT / "index.html", media_type="text/html")
 
     @app.exception_handler(DomainError)
     async def handle_domain_error(_, exc: DomainError) -> JSONResponse:

@@ -22,6 +22,44 @@ def _app(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_frontend_and_assets_are_served_without_expanding_business_openapi(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client,
+    ):
+        page = await client.get("/")
+        stylesheet = await client.get("/static/styles.css")
+        script = await client.get("/static/app.js")
+
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert "<!doctype html>" in page.text.lower()
+    assert stylesheet.status_code == 200
+    assert stylesheet.headers["content-type"].startswith("text/css")
+    assert script.status_code == 200
+    assert "javascript" in script.headers["content-type"]
+
+    operations = {
+        (method.upper(), path)
+        for path, methods in app.openapi()["paths"].items()
+        for method in methods
+        if method in {"get", "post", "put", "patch", "delete"}
+    }
+    assert operations == {
+        ("GET", "/personas"),
+        ("POST", "/creations"),
+        ("GET", "/creations/{creation_id}"),
+        ("POST", "/creations/{creation_id}/revision"),
+    }
+
+
+@pytest.mark.asyncio
 async def test_snapshot_creation_runs_outside_event_loop_thread(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

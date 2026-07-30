@@ -18,12 +18,13 @@
   </tr>
 </table>
 
-Pengine V1 是一个本地短剧创作 Agent 后端。它通过
+Pengine V1 是一个带同源 Web 原型的本地短剧创作 Agent。它通过
 [Deep Agents](https://github.com/langchain-ai/deepagents) 与 LangGraph，
 让四个专业 Agent 按固定阶段协作；业务状态、检查点和交付物全部落在本地
 SQLite，模型请求则通过 Anthropic Messages 兼容 relay 发出。
 
-V1 没有前端、身份认证、公共部署、多用户隔离或跨项目可写记忆。
+Web 原型只服务本机单操作员；V1 没有身份认证、公共部署、多用户隔离或跨项目
+可写记忆。
 
 <h2 align="center">01 · 系统架构</h2>
 
@@ -133,8 +134,9 @@ persona/
 
 <h2 align="center">05 · 快速启动</h2>
 
-要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)、一个兼容 Anthropic
-Messages 的 relay，以及至少一个人格包。
+要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及一个兼容
+Anthropic Messages 的 relay。仓库已内置四套临时原型人格包。
+这四套人格当前统一采用 6 集原型基线，不代表创作者人格定稿。
 
 ```bash
 uv sync --locked --all-groups
@@ -156,13 +158,13 @@ PENGINE_RELAY_MODEL_ID=your-model-id
 API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localhost`、
 `127.0.0.1` 和 `::1` 可使用 HTTP。密钥不得提交到仓库。
 
-把人格包放入 `PENGINE_PERSONA_ROOT` 的直接子目录，然后启动：
+确认 `PENGINE_PERSONA_ROOT=./personas` 后启动：
 
 ```bash
 uv run pengine
 ```
 
-默认地址：`http://127.0.0.1:8000`
+原型界面：`http://127.0.0.1:8000`
 
 交互文档：`http://127.0.0.1:8000/docs`
 
@@ -218,5 +220,6 @@ uv build --no-sources
 自动化测试使用非生产人格与确定性假模型，只证明工程行为。真实 relay 的工具调用、
 结构化输出，以及不同真实人格是否产生可辨识差异，仍需单独 UAT。
 
-更完整的设计依据见 [`.scd/architecture.md`](.scd/architecture.md)；产品边界见
-[Issue #1](https://github.com/mindcarver/pengine/issues/1)。
+更完整的设计依据见 [`.scd/architecture.md`](.scd/architecture.md)；后端边界见
+[Issue #1](https://github.com/mindcarver/pengine/issues/1)，可运行前端原型见
+[Issue #9](https://github.com/mindcarver/pengine/issues/9)。

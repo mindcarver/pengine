@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0.0",
+  "persona_id": "xinggui",
+  "display_name": "星轨 · 科幻",
+  "version": "0.1.0-prototype",
+  "created_at": "2026-07-30T00:00:00Z",
+  "package_sha256": "19ae2de21f8eaa3a013516b9db46c9a075312bbc86e18bdf805b71742616d4ce",
+  "files": {
+    "paradigm": {
+      "path": "paradigm.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "bf0654e322f02d532ba9858d83765a175c903b04b6b7440e19837c6175c2ab00"
+    },
+    "project": {
+      "path": "project.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "d7921e6be869658e2d55a372313fa427d204cb617acc67cf225da85b1d0cc0c3"
+    },
+    "l0": {
+      "path": "l0.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "07bf17a2e9fafab7e82a31628a8bcdc85f79985b1304fad7d6776cbeda34d3b1"
+    },
+    "l1": {
+      "path": "l1.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "8c5a55d4cdbd8994c1a45c2f9e30176ed230f2250cb11c08b55771cb4d0f0dc2"
+    },
+    "l2": {
+      "path": "l2.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "1739c838d94aae72108c32f2be42ffbc5c18987b69f0818e44034ba0806bffa6"
+    },
+    "l3": {
+      "path": "l3.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "66ef1fb9de8153c1130c181b452226b18929eb63e835820f37f971796146e683"
+    },
+    "l4": {
+      "path": "l4.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "ce896f9666a75ae9c95070fb100e71548d51cea9a9fcb56cd015dd1faeb2c11f"
+    },
+    "l5": {
+      "path": "l5.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "09618ae036be6825d05d8e926c10515c5a81e16c1b30591ec06a7454918fdfd7"
+    },
+    "l6": {
+      "path": "l6.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "43e1bd2e79037a70e2274be66552072cecc0335ad2e223f0dff56af158c51440"
+    }
+  }
+}
