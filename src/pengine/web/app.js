@@ -531,8 +531,13 @@ function renderRevision() {
   let buttonLabel = "提交全量重写";
   let message = "";
 
-  if (revision.state === "available") {
+  if (revision.state === "available" && !state.pendingFeedback) {
     disabled = false;
+  } else if (revision.state === "available") {
+    feedbackState = "意见已冻结";
+    buttonLabel = "等待状态同步";
+    description = "修改意见已被服务端接收；本页正在重新读取修订状态。";
+    message = "修改意见已提交，等待状态同步。";
   } else if (revision.state === "queued") {
     feedbackState = "意见已冻结";
     description = "修订任务已排队。初稿仍可浏览；本页会继续查询真实状态。";
@@ -755,13 +760,21 @@ function setCreationBusy(busy) {
 
 function setRevisionBusy(busy) {
   if (busy) {
+    elements.feedback.disabled = true;
     elements["revision-button"].disabled = true;
     elements["revision-button"].textContent = "正在提交";
   } else {
     const revisionState = state.creation?.revision.state;
-    elements["revision-button"].disabled = revisionState !== "available";
+    const canSubmit =
+      revisionState === "available" && !state.pendingFeedback;
+    elements.feedback.disabled = !canSubmit;
+    elements["revision-button"].disabled = !canSubmit;
     elements["revision-button"].textContent =
-      revisionState === "failed" ? "修订失败" : "提交全量重写";
+      state.pendingFeedback
+        ? "意见已冻结"
+        : revisionState === "failed"
+          ? "修订失败"
+          : "提交全量重写";
   }
   elements["revision-form"].setAttribute("aria-busy", String(busy));
 }
