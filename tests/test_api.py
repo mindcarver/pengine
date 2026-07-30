@@ -44,6 +44,8 @@ async def test_frontend_and_assets_are_served_without_expanding_business_openapi
     assert stylesheet.headers["content-type"].startswith("text/css")
     assert script.status_code == 200
     assert "javascript" in script.headers["content-type"]
+    assert "重试本次修订" not in script.text
+    assert 'revisionState !== "available"' in script.text
 
     operations = {
         (method.upper(), path)

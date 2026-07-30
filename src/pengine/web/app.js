@@ -759,10 +759,9 @@ function setRevisionBusy(busy) {
     elements["revision-button"].textContent = "正在提交";
   } else {
     const revisionState = state.creation?.revision.state;
-    elements["revision-button"].disabled =
-      !["available", "failed"].includes(revisionState);
+    elements["revision-button"].disabled = revisionState !== "available";
     elements["revision-button"].textContent =
-      revisionState === "failed" ? "重试本次修订" : "提交全量重写";
+      revisionState === "failed" ? "修订失败" : "提交全量重写";
   }
   elements["revision-form"].setAttribute("aria-busy", String(busy));
 }
