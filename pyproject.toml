@@ -12,6 +12,7 @@ dependencies = [
   "aiosqlite==0.22.1",
   "deepagents==0.6.12",
   "fastapi==0.140.8",
+  "httpx[socks]==0.28.1",
   "jsonschema==4.26.0",
   "langchain==1.3.14",
   "langchain-anthropic==1.5.2",
@@ -25,7 +26,6 @@ pengine = "pengine.main:run"
 
 [dependency-groups]
 dev = [
-  "httpx==0.28.1",
   "pytest==9.1.1",
   "pytest-asyncio==1.4.0",
   "ruff==0.16.0",
