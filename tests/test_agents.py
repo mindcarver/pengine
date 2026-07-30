@@ -11,6 +11,9 @@ from persona_factory import create_persona_package
 from pydantic import Field
 
 from pengine.agents import (
+    _EPISODE_PLANNER_PROMPT,
+    _SCRIPT_WRITER_PROMPT,
+    _STORY_ARCHITECT_PROMPT,
     VIRTUAL_FILE_PERMISSIONS,
     AgentProtocolError,
     DeepAgentWorkflow,
@@ -209,6 +212,14 @@ def test_supervisor_preserves_persona_episode_baseline_when_request_omits_count(
     normalized = " ".join(prompt.split())
     assert "active persona L4 baseline is authoritative" in normalized
     assert "Do not invent a different episode count" in normalized
+
+
+def test_generation_prompts_require_cross_artifact_consistency() -> None:
+    assert "future dialogue counts" in _STORY_ARCHITECT_PROMPT
+    assert "episode-specific action" in _EPISODE_PLANNER_PROMPT
+    assert "dates, countdowns, amounts, counts, and arithmetic" in _EPISODE_PLANNER_PROMPT
+    assert "exact dialogue-count claims" in _SCRIPT_WRITER_PROMPT
+    assert "Every upstream commitment must appear" in _SCRIPT_WRITER_PROMPT
 
 
 @pytest.mark.asyncio

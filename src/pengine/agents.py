@@ -55,6 +55,38 @@ _TASK_OWNER = {
 }
 _ORDERED_SPECIALIST_STAGES = tuple(_TASK_OWNER)
 
+_STORY_ARCHITECT_PROMPT = (
+    "Read the relevant /persona context. Return only the structured result for "
+    "the stage named in the task. For selecting_l0_variant, set "
+    "selected_l0_variant and selection_rationale, and leave content null. For "
+    "each generation stage, set content and leave both L0 selection fields null. "
+    "Treat every prior approved artifact as binding. Reconcile dates, amounts, "
+    "counts, and episode-specific actions before returning. Avoid unnecessary "
+    "exact claims about future dialogue counts or scene placement; when such a "
+    "claim is required, make it an explicit downstream commitment."
+)
+
+_EPISODE_PLANNER_PROMPT = (
+    "Use approved upstream artifacts and persona rules. Return only the "
+    "structured episode-outline result. Preserve every explicit numeric "
+    "constraint from the script requirements. When the requirements do not "
+    "specify an episode count, read the stage-specific persona L4 file and use "
+    "its baseline; never invent a different count. Before returning, verify "
+    "that every episode-specific action promised by the character biographies "
+    "or relationship logic appears in the matching episode, and that dates, "
+    "countdowns, amounts, counts, and arithmetic agree across artifacts."
+)
+
+_SCRIPT_WRITER_PROMPT = (
+    "Use the approved episode outline and persona rules without changing its "
+    "episode count or numeric constraints. Before returning, reread every "
+    "approved upstream artifact and audit the complete scripts against them. "
+    "Correct contradictions in dates or countdowns, amounts or arithmetic, "
+    "exact dialogue-count claims, and episode-specific promised actions. Every "
+    "upstream commitment must appear in the scripts. Return only the structured "
+    "episode-script result."
+)
+
 VIRTUAL_FILE_PERMISSIONS = [
     FilesystemPermission(operations=["read"], paths=["/persona", "/persona/**"]),
     FilesystemPermission(
@@ -415,13 +447,7 @@ class DeepAgentWorkflow:
                     "Selects L0 and creates story outline, character biographies, "
                     "and relationship logic as separate structured tasks."
                 ),
-                "system_prompt": (
-                    "Read the relevant /persona context. Return only the structured "
-                    "result for the stage named in the task. For "
-                    "selecting_l0_variant, set selected_l0_variant and "
-                    "selection_rationale, and leave content null. For each generation "
-                    "stage, set content and leave both L0 selection fields null."
-                ),
+                "system_prompt": _STORY_ARCHITECT_PROMPT,
                 "model": self.model,
                 "tools": tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
@@ -433,14 +459,7 @@ class DeepAgentWorkflow:
             {
                 "name": "episode_planner",
                 "description": "Creates the complete episode outline.",
-                "system_prompt": (
-                    "Use approved upstream artifacts and persona rules. Return only "
-                    "the structured episode-outline result. Preserve every explicit "
-                    "numeric constraint from the script requirements. When the "
-                    "requirements do not specify an episode count, read the "
-                    "stage-specific persona L4 file and use its baseline; never invent "
-                    "a different count."
-                ),
+                "system_prompt": _EPISODE_PLANNER_PROMPT,
                 "model": self.model,
                 "tools": tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
@@ -452,11 +471,7 @@ class DeepAgentWorkflow:
             {
                 "name": "script_writer",
                 "description": "Creates the complete episode scripts.",
-                "system_prompt": (
-                    "Use the approved episode outline and persona rules without "
-                    "changing its episode count or numeric constraints. Return only "
-                    "the structured episode-script result."
-                ),
+                "system_prompt": _SCRIPT_WRITER_PROMPT,
                 "model": self.model,
                 "tools": tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
