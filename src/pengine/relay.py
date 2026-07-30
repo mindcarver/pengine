@@ -10,7 +10,7 @@ from pengine.config import Settings
 class _SerialChatAnthropic(ChatAnthropic):
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
         kwargs["parallel_tool_calls"] = False
-        kwargs.setdefault("tool_choice", "any")
+        kwargs["tool_choice"] = "any"
         return super().bind_tools(tools, **kwargs)
 
 
