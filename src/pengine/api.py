@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Protocol
+from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
 from fastapi import FastAPI, Header
@@ -22,6 +22,7 @@ from pengine.schemas import (
     PersonaList,
     RevisionAccepted,
     RevisionRequest,
+    RunControlAccepted,
 )
 
 IdempotencyKey = Annotated[
@@ -165,6 +166,40 @@ def create_app(
             creation_id=creation_id,
             idempotency_key=idempotency_key,
             request=request,
+        )
+
+    @app.post(
+        "/creations/{creation_id}/runs/{run_kind}/continue",
+        operation_id="continueRun",
+        status_code=202,
+        response_model=RunControlAccepted,
+    )
+    async def continue_run(
+        creation_id: UUID,
+        run_kind: Literal["initial", "revision"],
+        idempotency_key: IdempotencyKey,
+    ) -> RunControlAccepted:
+        return await resolved_repository.continue_run(
+            creation_id=creation_id,
+            run_kind=run_kind,
+            idempotency_key=idempotency_key,
+        )
+
+    @app.post(
+        "/creations/{creation_id}/runs/{run_kind}/end",
+        operation_id="endRun",
+        status_code=202,
+        response_model=RunControlAccepted,
+    )
+    async def end_run(
+        creation_id: UUID,
+        run_kind: Literal["initial", "revision"],
+        idempotency_key: IdempotencyKey,
+    ) -> RunControlAccepted:
+        return await resolved_repository.end_run(
+            creation_id=creation_id,
+            run_kind=run_kind,
+            idempotency_key=idempotency_key,
         )
 
     return app

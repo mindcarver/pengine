@@ -3,11 +3,14 @@ import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import httpx
 import pytest
+from langgraph.errors import GraphRecursionError
 from persona_factory import create_persona_package
 
+from pengine.agents import QualityGateRejectedError
 from pengine.config import Settings
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
@@ -145,6 +148,39 @@ class CheckpointMismatchWorkflow(DeterministicWorkflow):
         )
 
 
+class TimeoutOnceWorkflow(DeterministicWorkflow):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        self.calls += 1
+        if self.calls > 1:
+            return await super().execute(**kwargs)
+
+        approved = dict(kwargs["approved_checkpoints"] or {})
+        if InternalStage.SELECTING_L0_VARIANT not in approved:
+            await kwargs["before_stage"](InternalStage.SELECTING_L0_VARIANT)
+            await kwargs["approve_stage"](
+                InternalStage.SELECTING_L0_VARIANT,
+                {
+                    "stage": "selecting_l0_variant",
+                    "selected_l0_variant": "主动选择",
+                    "selection_rationale": "符合测试故事",
+                },
+            )
+        await kwargs["before_stage"](InternalStage.GENERATING_STORY_OUTLINE)
+        await asyncio.sleep(0.1)
+        raise AssertionError("the workflow timeout did not cancel execution")
+
+
+class RaisingWorkflow:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def execute(self, **_: Any) -> WorkflowResult:
+        raise self.error
+
+
 async def _services(tmp_path: Path):
     persona_root = tmp_path / "personas"
     create_persona_package(persona_root / "active")
@@ -199,6 +235,106 @@ async def test_worker_completes_initial_and_one_revision(tmp_path: Path) -> None
     )
     assert revised_resource.persona.snapshot_sha256 == initial_resource.persona.snapshot_sha256
     assert await worker.run_once() is False
+
+
+@pytest.mark.asyncio
+async def test_worker_auto_resumes_first_wall_clock_timeout_from_approved_checkpoint(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    settings = settings.model_copy(update={"run_timeout_seconds": 0.02})
+    accepted = await repository.create_creation(
+        "timeout-recovery",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = TimeoutOnceWorkflow()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="timeout-recovery-worker",
+    )
+
+    assert await worker.run_once() is True
+    recovering = await repository.get_creation(accepted.creation_id)
+    assert recovering is not None
+    assert recovering.initial.state == "auto_resuming"
+    assert recovering.initial.progress.current_stage == "generating_story_outline"
+    assert recovering.initial.progress.completed_stages == ["determining_direction"]
+    assert not hasattr(recovering.initial, "result")
+
+    worker.settings = settings.model_copy(update={"run_timeout_seconds": 1.0})
+    assert await worker.run_once() is True
+    succeeded = await repository.get_creation(accepted.creation_id)
+    assert succeeded is not None
+    assert succeeded.initial.state == "succeeded"
+    assert succeeded.initial.progress.completed_stages == [
+        "determining_direction",
+        "generating_story_outline",
+        "generating_character_biographies",
+        "generating_relationships",
+        "generating_episode_outline",
+        "generating_episode_scripts",
+        "final_review",
+    ]
+    async with repository._connection() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+                (str(accepted.creation_id),),
+            )
+        ).fetchone()
+    assert row is not None
+    counts = await repository.get_stage_attempt_counts(UUID(row["id"]))
+    assert counts[InternalStage.SELECTING_L0_VARIANT] == 1
+    assert counts[InternalStage.GENERATING_STORY_OUTLINE] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (GraphRecursionError("recursion exhausted"), "graph_recursion_limit"),
+        (
+            QualityGateRejectedError(stage=InternalStage.ACCEPTING_L0),
+            "quality_gate_rejected",
+        ),
+    ],
+)
+async def test_worker_reports_graph_and_quality_failures_separately(
+    tmp_path: Path,
+    error: Exception,
+    expected_code: str,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        f"failure-{expected_code}",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=RaisingWorkflow(error),
+        worker_id="failure-classification-worker",
+    )
+
+    assert await worker.run_once() is True
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "failed"
+    assert resource.initial.failure.code == expected_code
 
 
 @pytest.mark.asyncio

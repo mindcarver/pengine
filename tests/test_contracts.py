@@ -25,7 +25,7 @@ def test_machine_contracts_parse_and_example_manifest_validates() -> None:
     )
 
 
-def test_openapi_exposes_only_the_four_v1_operations() -> None:
+def test_openapi_exposes_creation_and_run_control_operations() -> None:
     openapi = json.loads((ROOT / "contracts/openapi.json").read_text())
 
     operations = {
@@ -40,4 +40,6 @@ def test_openapi_exposes_only_the_four_v1_operations() -> None:
         ("POST", "/creations"),
         ("GET", "/creations/{creation_id}"),
         ("POST", "/creations/{creation_id}/revision"),
+        ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
+        ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
     }

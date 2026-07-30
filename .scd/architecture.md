@@ -3,6 +3,7 @@ managed_by: scd-architecture
 status: ready
 sources:
   - https://github.com/mindcarver/pengine/issues/1
+  - https://github.com/mindcarver/pengine/issues/10
   - /Users/carver/Downloads/Telegram Desktop/短剧线_九文件与调用逻辑说明_v1_2.docx
 contracts:
   - contracts/openapi.json
@@ -16,16 +17,17 @@ package plus free-form story and script requirements into a complete short-drama
 delivery. It permits one frozen revision request and reruns the full workflow
 against the same immutable persona snapshot.
 
-The system is a modular monolith. It binds only to loopback, exposes a JSON HTTP
-API, persists durable state in SQLite, and runs one embedded background worker.
-The worker drives a Deep Agents/LangGraph creative runtime through one
-Anthropic Messages API-compatible relay.
+The system is a modular monolith. It binds only to loopback, serves one
+same-origin single-page workbench plus a JSON HTTP API, persists durable state
+in SQLite, and runs one embedded background worker. The worker drives a Deep
+Agents/LangGraph creative runtime through one Anthropic Messages
+API-compatible relay.
 
-V1 does not include a frontend, authentication, multi-user isolation, public
-deployment, multiple model protocols, production persona authoring, automatic
-persona learning, cross-creation writable memory, asynchronous or remote
-subagents, host filesystem or shell access, task listing/export/deletion, or
-deployment automation.
+V1 does not include authentication, multi-user isolation, public deployment,
+multiple model protocols, production persona authoring, automatic persona
+learning, cross-creation writable memory, asynchronous or remote subagents,
+host filesystem or shell access, task listing/export/deletion, streaming
+transport, partial-result preview, or deployment automation.
 
 ## Domain model
 
@@ -55,6 +57,9 @@ A `WorkflowRun` is either `initial` or `revision`. Public run states are:
 
 - `queued`
 - `running`
+- `auto_resuming`
+- `paused`
+- `ended`
 - `succeeded`
 - `failed`
 
@@ -67,7 +72,8 @@ The revision resource separately exposes:
 
 - `unavailable` until the initial run succeeds;
 - `available` before feedback is frozen;
-- `queued`, `running`, `failed`, or `succeeded` after feedback is frozen.
+- `queued`, `running`, `auto_resuming`, `paused`, `ended`, `failed`, or
+  `succeeded` after feedback is frozen.
 
 Internal stages are:
 
@@ -81,6 +87,19 @@ Internal stages are:
 8. `accepting_l0`
 9. `accepting_l4`
 10. `assembling_delivery`
+
+The workbench groups those internal stages into seven stable user stages:
+
+1. determine the creative direction;
+2. generate the story outline;
+3. generate character biographies;
+4. generate character relationships;
+5. generate the episode outline;
+6. generate episode scripts;
+7. review the finished work.
+
+The final user stage exposes L0 creative-core alignment and L4 craft/value
+review as separate sub-statuses without collapsing their internal gates.
 
 The persona-bound `workflow_supervisor` advances these stages by delegating to
 four named synchronous subagents:
@@ -123,15 +142,17 @@ the sole authority that approves a stage or marks a run succeeded.
 - ownership statement;
 - revision-feedback handling items for a revised delivery only.
 
-No partial content package is exposed for a run that is queued, running, or
-failed. A succeeded initial package remains readable while a revision is queued,
-running, or failed.
+No partial content package is exposed for a run that is queued, running,
+auto-resuming, paused, ended, or failed. A succeeded initial package remains
+readable while a revision is queued, running, auto-resuming, paused, ended, or
+failed.
 
 ### Revision invariants
 
 - A revision is allowed only after the initial run succeeds.
 - The first accepted feedback payload is frozen.
 - A queued or running revision rejects duplicate submissions.
+- An ended revision is terminal and cannot be requeued.
 - A failed revision may be requeued only with the exact frozen feedback.
 - Requeuing a failed revision creates a new revision-attempt run and preserves
   the failed run for audit.
@@ -144,7 +165,8 @@ running, or failed.
 
 | Component | Owns | Does not own |
 |---|---|---|
-| Local HTTP API | Runtime validation, idempotent commands, resource queries, stable errors | Workflow execution, model retries, persona parsing |
+| Local workbench | Persona selection, creation/revision commands, 1.8-second status polling, one shared progress display, paused-run controls | Stage inference, partial-result access, workflow execution |
+| Local HTTP API | Runtime validation, idempotent commands, resource queries, paused-run continue/end commands, stable errors | Workflow execution, model retries, persona parsing |
 | Creation service | Domain invariants and state-transition authority | HTTP serialization, vendor requests |
 | Embedded worker | Durable job leases, stage-attempt guards, invocation/resume of Deep Agents threads, restart reconciliation | Creative planning, public request semantics |
 | Deep Agents supervisor | Run-local planning, ordered specialist delegation, correction loops, structured candidate assembly | Domain state transitions, retry entitlement, final gate authority |
@@ -196,6 +218,9 @@ immutable snapshots already referenced by creations.
    the pass/fail state transition.
 8. The complete content package and delivery report commit atomically with the
    run's `succeeded` state.
+9. Each guarded attempt records the current internal stage in SQLite. Resource
+   queries map it and approved checkpoints to the seven user stages, completed
+   stages, elapsed active time, final-review sub-status, and available actions.
 
 ### Revision
 
@@ -209,6 +234,9 @@ immutable snapshots already referenced by creations.
    feedback conversation.
 4. A successful revision commits a new complete delivery and permanently closes
    revision.
+5. Revision progress and timeout control use the same persisted contract and
+   workbench component as the initial run; the successful initial delivery
+   remains visible throughout.
 
 ### Restart recovery
 
@@ -226,6 +254,17 @@ immutable snapshots already referenced by creations.
   never cause the worker to treat unverified agent state as approved output.
 - Exhausting three attempts for a stage fails that run with a stable stage and
   error identifier.
+- The first worker wall-clock timeout in a user stage parks the active clock,
+  requeues the same run and `thread_id`, and automatically resumes from approved
+  business checkpoints. The unapproved in-flight stage is invoked again.
+- A second wall-clock timeout in the same user stage parks the job in `paused`.
+  Idempotent operator commands may requeue that same run or mark it `ended`.
+  Graph recursion exhaustion, invalid structured output, quality-gate
+  rejection, and relay/provider failures remain terminal and are never routed
+  through timeout recovery.
+- A paused or ended job is excluded from lease-expiry reconciliation. Refresh
+  reconstructs its stage, completed checkpoints, frozen elapsed time, and
+  available actions from SQLite.
 
 ## Persona-package loading contract
 
@@ -355,9 +394,9 @@ duplicate the full field contract.
 - `ChatAnthropic.max_retries` is zero and no Deep Agents retry middleware is
   installed. The worker is the sole owner of the three-attempt budget.
 - A finite LangGraph recursion limit and a worker-enforced wall-clock deadline
-  bound each run. Hitting either limit consumes the current guarded stage
-  attempt or fails the run with a stable safe error; it never starts an
-  unrecorded model call.
+  bound each run attempt. Graph recursion exhaustion fails with its own stable
+  error. A wall-clock timeout follows the one-auto-resume/then-pause policy and
+  never starts an unrecorded model call.
 - Provider-specific prompt caching and beta-only Anthropic features remain
   disabled until the configured relay smoke test proves compatibility.
 - Each POST command requires an `Idempotency-Key`.
@@ -371,8 +410,9 @@ duplicate the full field contract.
   approved business checkpoints.
 - A single worker avoids concurrent mutation of one creation and keeps V1's
   queue semantics deterministic.
-- There is no cancellation, priority, streaming, partial result, or manual
-  stage-resume operation in V1.
+- There is no ordinary-running cancellation, priority, SSE/WebSocket streaming,
+  token streaming, partial result, percentage, ETA, or budget display in V1.
+  Manual continue/end is available only after the second timeout pauses a run.
 
 ## Compatibility, migration, and rollback
 
@@ -385,13 +425,15 @@ any of them is a deliberate compatibility change requiring the supervisor,
 subagent structured-output, permissions, checkpoint-resume, and relay contract
 tests to pass again. V1 does not track prerelease dependency versions.
 
-Compatible additive HTTP changes may stay within V1. Breaking HTTP or persona
-format changes require a new contract version. Persona source packages remain
-outside the database so application rollback does not rewrite operator content.
+Compatible additive HTTP changes may stay within V1. The progress fields and
+run-control commands are additive. Breaking HTTP or persona format changes
+require a new contract version. Persona source packages remain outside the
+database so application rollback does not rewrite operator content.
 
-SQLite schema migrations must be forward, transactional where SQLite permits,
-and preceded by a local database backup. Migration execution and production
-rollback automation are outside this architecture-delivery slice.
+SQLite schema version 2 adds `run_progress` and backfills existing runs without
+rewriting creations, checkpoints, deliveries, or frozen revisions. Migrations
+must remain forward and transactional where SQLite permits; production rollback
+automation is outside this architecture-delivery slice.
 
 Technology feasibility is grounded in the current official contracts:
 
@@ -415,7 +457,7 @@ Implementation evidence must include:
 - JSON Schema validation of the representative persona manifest;
 - unit tests for every domain invariant and stable error;
 - state-machine tests for initial, revision, failed-revision retry, duplicate
-  commands, and service restart;
+  commands, timeout auto-resume, pause/continue/end, and service restart;
 - isolated SQLite tests for transactions, leases, checkpoints, and attempt
   exhaustion;
 - Deep Agents integration tests proving the persona-bound supervisor invokes
@@ -454,8 +496,12 @@ quality.
   in-progress agent execution state only.
 - Immutable content-addressed persona snapshots.
 - Public initial and revision run states remain separate.
+- Initial and revision run resources share the same progress schema and
+  workbench progress component.
 - Checkpoint recovery resumes the existing Deep Agents thread while approved
   business checkpoints remain authoritative.
+- Wall-clock timeout recovery is distinct from recursion, structured-output,
+  quality-gate, and relay/provider failure handling.
 - `ContentPackage` and `DeliveryReport` are separate contract objects.
 
 ### Open items
@@ -463,7 +509,8 @@ quality.
 - No architecture decision remains open.
 - The governing delivery source is
   <https://github.com/mindcarver/pengine/issues/1>.
-- No real nine-file persona package is available; manifest and Markdown
-  structural compatibility with production content remains unverified.
-- The configured relay's Anthropic tool-use and structured-output compatibility
-  remains unverified until a real relay smoke test is available.
+- Four bundled nine-file persona packages are explicitly non-production
+  prototypes; creator-confirmed production persona quality remains unverified.
+- The configured relay has exercised real tool-use and structured-output paths,
+  but a complete workbench initial-plus-revision acceptance run for Issue #10
+  remains required.

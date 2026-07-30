@@ -23,8 +23,9 @@ Pengine V1 是一个带同源 Web 原型的本地短剧创作 Agent。它通过
 让四个专业 Agent 按固定阶段协作；业务状态、检查点和交付物全部落在本地
 SQLite，模型请求则通过 Anthropic Messages 兼容 relay 发出。
 
-Web 原型只服务本机单操作员；V1 没有身份认证、公共部署、多用户隔离或跨项目
-可写记忆。
+Web 原型只服务本机单操作员，并以约 1.8 秒轮询展示后端确认的七阶段进度、
+已运行时长和超时恢复操作；V1 没有身份认证、公共部署、多用户隔离、SSE /
+WebSocket 或跨项目可写记忆。
 
 <h2 align="center">01 · 系统架构</h2>
 
@@ -55,7 +56,8 @@ Web 原型只服务本机单操作员；V1 没有身份认证、公共部署、�
 
 | 组件 | 负责什么 |
 |---|---|
-| 接口服务（FastAPI） | 参数校验、幂等命令、状态与结果查询、稳定错误 |
+| 同源 Web 工作台 | 七阶段进度、初稿/修订结果和暂停任务操作 |
+| 接口服务（FastAPI） | 参数校验、幂等命令、状态、恢复操作与结果查询 |
 | 人格加载器 | 校验九文件人格包，生成内容寻址的不可变快照 |
 | 状态仓库 | 管理创作、运行、任务、反馈、检查点与交付物 |
 | 内嵌任务器 | 租约、重启恢复、阶段尝试预算、工作流调度 |
@@ -192,8 +194,22 @@ curl --fail-with-body -X POST \
   -d '{"feedback":"让结尾的代价更明确，同时保留原有情绪底色。"}'
 ```
 
-轮询同一个 creation 资源，直到 `initial.state` 或 `revision.state` 进入
-`succeeded` / `failed`。
+轮询同一个 creation 资源。运行状态会依次使用 `queued`、`running`，首次整体
+超时进入 `auto_resuming`；同一阶段第二次超时进入 `paused`。终态为
+`succeeded`、`failed` 或用户主动选择的 `ended`。
+
+暂停后可用同一套幂等命令继续或结束初稿／修订（把 `initial` 换成 `revision`
+即可操作修订）：
+
+```bash
+curl --fail-with-body -X POST \
+  http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/continue \
+  -H 'Idempotency-Key: continue-001'
+
+curl --fail-with-body -X POST \
+  http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/end \
+  -H 'Idempotency-Key: end-001'
+```
 
 <h2 align="center">07 · 数据与恢复</h2>
 
@@ -204,7 +220,9 @@ PENGINE_DATA_DIR/
 ```
 
 进程中断后，使用同一数据目录重启即可。过期租约会重新入队；已批准的业务检查点
-不会重新生成；现有 LangGraph `thread_id` 会继续用于恢复。
+不会重新生成；现有 LangGraph `thread_id` 会继续用于恢复。首次整体墙钟超时
+也会按同一原则自动继续；同一用户阶段再次超时时，SQLite 会冻结时长并等待
+操作员继续或结束。图递归、结构化输出、质量门和 relay 故障不会伪装成可恢复超时。
 
 数据不会自动过期。故事、反馈、生成内容和备份都应按敏感内容保护。
 
@@ -222,4 +240,5 @@ uv build --no-sources
 
 更完整的设计依据见 [`.scd/architecture.md`](.scd/architecture.md)；后端边界见
 [Issue #1](https://github.com/mindcarver/pengine/issues/1)，可运行前端原型见
-[Issue #9](https://github.com/mindcarver/pengine/issues/9)。
+[Issue #9](https://github.com/mindcarver/pengine/issues/9)，长任务进度与恢复见
+[Issue #10](https://github.com/mindcarver/pengine/issues/10)。

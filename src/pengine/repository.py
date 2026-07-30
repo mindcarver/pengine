@@ -15,28 +15,39 @@ from pydantic import BaseModel
 
 from pengine.errors import DomainError
 from pengine.schemas import (
+    AutoResumingRun,
     CreateCreationRequest,
     CreationAccepted,
     CreationResource,
     Delivery,
+    EndedRun,
     FailedRun,
+    FinalReviewProgress,
     InternalStage,
+    PausedRun,
     PersonaSnapshot,
     QueuedRun,
     RevisionAccepted,
+    RevisionAutoResuming,
     RevisionAvailable,
+    RevisionEnded,
     RevisionFailed,
+    RevisionPaused,
     RevisionQueued,
     RevisionRequest,
     RevisionRunning,
     RevisionSucceeded,
     RevisionUnavailable,
+    RunControlAccepted,
     RunFailure,
     RunningRun,
+    RunPause,
+    RunProgress,
     SucceededRun,
+    UserStage,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_STAGE_ATTEMPTS = 3
 
 _SCHEMA_SQL = """
@@ -163,7 +174,104 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
 );
 """
 
+_SCHEMA_V2_SQL = """
+CREATE TABLE IF NOT EXISTS run_progress (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    current_stage TEXT NOT NULL,
+    execution_state TEXT NOT NULL CHECK (
+        execution_state IN (
+            'queued', 'running', 'auto_resuming', 'paused',
+            'ended', 'succeeded', 'failed'
+        )
+    ),
+    elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (elapsed_seconds >= 0),
+    active_started_at TEXT,
+    timeout_stage TEXT,
+    timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+    updated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO run_progress(
+    run_id, current_stage, execution_state, elapsed_seconds,
+    active_started_at, timeout_stage, timeout_count, updated_at
+)
+SELECT
+    runs.id,
+    COALESCE(
+        runs.failed_stage,
+        (
+            SELECT stage_attempts.stage
+            FROM stage_attempts
+            WHERE stage_attempts.run_id = runs.id
+            ORDER BY stage_attempts.recorded_at DESC, stage_attempts.attempt_number DESC
+            LIMIT 1
+        ),
+        'loading_persona'
+    ),
+    runs.state,
+    CASE
+        WHEN runs.state IN ('succeeded', 'failed') AND runs.started_at IS NOT NULL
+        THEN MAX(
+            0,
+            (julianday(COALESCE(runs.completed_at, runs.updated_at))
+             - julianday(runs.started_at)) * 86400
+        )
+        ELSE 0
+    END,
+    CASE
+        WHEN runs.state = 'running' THEN COALESCE(runs.started_at, runs.updated_at)
+        ELSE NULL
+    END,
+    NULL,
+    0,
+    runs.updated_at
+FROM runs;
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (2);
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+RunKind = Literal["initial", "revision"]
+ControlState = Literal["queued", "running", "auto_resuming", "ended"]
+
+_USER_STAGE_BY_INTERNAL = {
+    InternalStage.LOADING_PERSONA: UserStage.DETERMINING_DIRECTION,
+    InternalStage.SELECTING_L0_VARIANT: UserStage.DETERMINING_DIRECTION,
+    InternalStage.GENERATING_STORY_OUTLINE: UserStage.GENERATING_STORY_OUTLINE,
+    InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: (UserStage.GENERATING_CHARACTER_BIOGRAPHIES),
+    InternalStage.GENERATING_RELATIONSHIP_LOGIC: UserStage.GENERATING_RELATIONSHIPS,
+    InternalStage.GENERATING_EPISODE_OUTLINE: UserStage.GENERATING_EPISODE_OUTLINE,
+    InternalStage.GENERATING_EPISODE_SCRIPTS: UserStage.GENERATING_EPISODE_SCRIPTS,
+    InternalStage.ACCEPTING_L0: UserStage.FINAL_REVIEW,
+    InternalStage.ACCEPTING_L4: UserStage.FINAL_REVIEW,
+    InternalStage.ASSEMBLING_DELIVERY: UserStage.FINAL_REVIEW,
+}
+
+_COMPLETED_STAGE_CHECKPOINTS = (
+    (UserStage.DETERMINING_DIRECTION, InternalStage.SELECTING_L0_VARIANT),
+    (UserStage.GENERATING_STORY_OUTLINE, InternalStage.GENERATING_STORY_OUTLINE),
+    (
+        UserStage.GENERATING_CHARACTER_BIOGRAPHIES,
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+    ),
+    (UserStage.GENERATING_RELATIONSHIPS, InternalStage.GENERATING_RELATIONSHIP_LOGIC),
+    (UserStage.GENERATING_EPISODE_OUTLINE, InternalStage.GENERATING_EPISODE_OUTLINE),
+    (UserStage.GENERATING_EPISODE_SCRIPTS, InternalStage.GENERATING_EPISODE_SCRIPTS),
+)
+
+_INTERNAL_STAGE_ORDER = (
+    InternalStage.LOADING_PERSONA,
+    InternalStage.SELECTING_L0_VARIANT,
+    InternalStage.GENERATING_STORY_OUTLINE,
+    InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+    InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+    InternalStage.GENERATING_EPISODE_OUTLINE,
+    InternalStage.GENERATING_EPISODE_SCRIPTS,
+    InternalStage.ACCEPTING_L0,
+    InternalStage.ACCEPTING_L4,
+    InternalStage.ASSEMBLING_DELIVERY,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,8 +387,11 @@ class Repository:
 
             cursor = await connection.execute("SELECT MAX(version) FROM pengine_schema")
             row = await cursor.fetchone()
-            if row is None or row[0] != SCHEMA_VERSION:
+            if row is None or row[0] not in {1, SCHEMA_VERSION}:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
+            if row[0] == 1:
+                await connection.executescript(_SCHEMA_V2_SQL)
+                await connection.commit()
 
     async def setup(self) -> None:
         await self.initialize()
@@ -370,6 +481,14 @@ class Repository:
             )
             await connection.execute(
                 """
+                INSERT INTO run_progress(
+                    run_id, current_stage, execution_state, updated_at
+                ) VALUES (?, ?, 'queued', ?)
+                """,
+                (str(run_id), InternalStage.LOADING_PERSONA.value, timestamp),
+            )
+            await connection.execute(
+                """
                 INSERT INTO jobs(
                     id, run_id, state, available_at, created_at, updated_at
                 ) VALUES (?, ?, 'queued', ?, ?, ?)
@@ -451,6 +570,15 @@ class Repository:
                 (str(creation_id),),
             )
             latest = await self._fetch_latest_revision_run(connection, creation_id)
+            latest_progress = (
+                await self._fetchone(
+                    connection,
+                    "SELECT execution_state FROM run_progress WHERE run_id = ?",
+                    (latest["id"],),
+                )
+                if latest is not None
+                else None
+            )
 
             if frozen is None:
                 await connection.execute(
@@ -469,6 +597,12 @@ class Repository:
                     raise DomainError(
                         "revision_not_allowed",
                         "The revision entitlement has already been consumed.",
+                        409,
+                    )
+                if latest_progress is not None and latest_progress["execution_state"] == "ended":
+                    raise DomainError(
+                        "revision_not_allowed",
+                        "The ended revision cannot be restarted.",
                         409,
                     )
                 if frozen["feedback"] != request.feedback or frozen[
@@ -509,6 +643,14 @@ class Repository:
                     timestamp,
                     timestamp,
                 ),
+            )
+            await connection.execute(
+                """
+                INSERT INTO run_progress(
+                    run_id, current_stage, execution_state, updated_at
+                ) VALUES (?, ?, 'queued', ?)
+                """,
+                (str(run_id), InternalStage.LOADING_PERSONA.value, timestamp),
             )
             await connection.execute(
                 """
@@ -557,9 +699,13 @@ class Repository:
                     runs.thread_id
                 FROM jobs
                 JOIN runs ON runs.id = jobs.run_id
+                JOIN run_progress ON run_progress.run_id = runs.id
                 WHERE jobs.state = 'queued'
                   AND jobs.available_at <= ?
                   AND runs.state IN ('queued', 'running')
+                  AND run_progress.execution_state IN (
+                      'queued', 'running', 'auto_resuming'
+                  )
                 ORDER BY jobs.created_at, jobs.id
                 LIMIT 1
                 """,
@@ -587,6 +733,16 @@ class Repository:
                     started_at = COALESCE(started_at, ?),
                     updated_at = ?
                 WHERE id = ? AND state = 'queued'
+                """,
+                (timestamp, timestamp, row["run_id"]),
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET execution_state = 'running',
+                    active_started_at = COALESCE(active_started_at, ?),
+                    updated_at = ?
+                WHERE run_id = ?
                 """,
                 (timestamp, timestamp, row["run_id"]),
             )
@@ -621,6 +777,17 @@ class Repository:
             if run is None:
                 raise DomainError("run_not_found", "Workflow run not found.", 404)
             if run["state"] == "running":
+                await connection.execute(
+                    """
+                    UPDATE run_progress
+                    SET execution_state = 'running',
+                        active_started_at = COALESCE(active_started_at, ?),
+                        updated_at = ?
+                    WHERE run_id = ?
+                      AND execution_state IN ('queued', 'running', 'auto_resuming')
+                    """,
+                    (timestamp, timestamp, str(run_id)),
+                )
                 return
             if run["state"] != "queued":
                 raise DomainError("run_already_completed", "Workflow run is already terminal.", 409)
@@ -631,6 +798,16 @@ class Repository:
                     started_at = COALESCE(started_at, ?),
                     updated_at = ?
                 WHERE id = ?
+                """,
+                (timestamp, timestamp, str(run_id)),
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET execution_state = 'running',
+                    active_started_at = COALESCE(active_started_at, ?),
+                    updated_at = ?
+                WHERE run_id = ?
                 """,
                 (timestamp, timestamp, str(run_id)),
             )
@@ -679,6 +856,13 @@ class Repository:
                     lease_expires_at = NULL,
                     updated_at = ?
                 WHERE state = 'leased' AND lease_expires_at <= ?
+                  AND EXISTS (
+                      SELECT 1 FROM run_progress
+                      WHERE run_progress.run_id = jobs.run_id
+                        AND run_progress.execution_state IN (
+                            'queued', 'running', 'auto_resuming'
+                        )
+                  )
                 """,
                 (timestamp, timestamp, timestamp),
             )
@@ -742,6 +926,14 @@ class Repository:
                 """,
                 (str(run_id), stage.value, attempt_number, timestamp),
             )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?, execution_state = 'running', updated_at = ?
+                WHERE run_id = ?
+                """,
+                (stage.value, timestamp, str(run_id)),
+            )
             return attempt_number
 
     async def approve_business_checkpoint(
@@ -792,6 +984,16 @@ class Repository:
                 """,
                 (str(run_id), stage.value, payload_json, payload_hash, timestamp),
             )
+            stage_index = _INTERNAL_STAGE_ORDER.index(stage)
+            next_stage = _INTERNAL_STAGE_ORDER[min(stage_index + 1, len(_INTERNAL_STAGE_ORDER) - 1)]
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (next_stage.value, timestamp, str(run_id)),
+            )
             return json.loads(payload_json)
 
     async def approve_checkpoint(
@@ -837,6 +1039,272 @@ class Repository:
             )
             rows = await cursor.fetchall()
         return {InternalStage(row["stage"]): int(row["attempt_count"]) for row in rows}
+
+    async def handle_run_timeout(
+        self,
+        run_id: UUID,
+        stage: InternalStage,
+        *,
+        now: datetime | None = None,
+    ) -> Literal["auto_resuming", "paused"]:
+        current = now or _utc_now()
+        timestamp = _timestamp(current)
+        user_stage = _USER_STAGE_BY_INTERNAL[stage]
+
+        async with self._transaction() as connection:
+            progress = await self._fetchone(
+                connection,
+                """
+                SELECT run_progress.*, runs.state AS run_state, runs.creation_id
+                FROM run_progress
+                JOIN runs ON runs.id = run_progress.run_id
+                WHERE run_progress.run_id = ?
+                """,
+                (str(run_id),),
+            )
+            if progress is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if progress["run_state"] != "running" or progress["execution_state"] != "running":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Workflow run is not actively running.",
+                    409,
+                )
+
+            timeout_count = (
+                int(progress["timeout_count"]) + 1
+                if progress["timeout_stage"] == user_stage.value
+                else 1
+            )
+            next_state = "auto_resuming" if timeout_count == 1 else "paused"
+            elapsed_seconds = self._elapsed_seconds(progress, current)
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    execution_state = ?,
+                    elapsed_seconds = ?,
+                    active_started_at = NULL,
+                    timeout_stage = ?,
+                    timeout_count = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    stage.value,
+                    next_state,
+                    elapsed_seconds,
+                    user_stage.value,
+                    timeout_count,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = ?,
+                    available_at = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    "queued" if next_state == "auto_resuming" else "failed",
+                    timestamp,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, progress["creation_id"]),
+            )
+            return next_state
+
+    async def continue_run(
+        self,
+        *,
+        creation_id: UUID,
+        run_kind: RunKind,
+        idempotency_key: str,
+        now: datetime | None = None,
+    ) -> RunControlAccepted:
+        timestamp = _timestamp(now or _utc_now())
+        scope = f"run-control:{creation_id}:{run_kind}:continue"
+        payload_hash = canonical_payload_hash({"action": "continue"})
+
+        async with self._transaction() as connection:
+            replay = await self._idempotency_replay(
+                connection,
+                idempotency_key,
+                scope,
+                payload_hash,
+                RunControlAccepted,
+            )
+            if replay is not None:
+                return replay
+
+            run = await self._fetch_control_run(connection, creation_id, run_kind)
+            state = run["execution_state"]
+            if state == "paused":
+                await connection.execute(
+                    """
+                    UPDATE run_progress
+                    SET execution_state = 'queued', updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (timestamp, run["id"]),
+                )
+                await connection.execute(
+                    """
+                    UPDATE jobs
+                    SET state = 'queued',
+                        available_at = ?,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (timestamp, timestamp, run["id"]),
+                )
+                state = "queued"
+            elif state not in {"queued", "running", "auto_resuming"}:
+                raise DomainError(
+                    "run_not_controllable",
+                    "Only a paused workflow run can continue.",
+                    409,
+                )
+
+            response = RunControlAccepted(
+                creation_id=creation_id,
+                run_kind=run_kind,
+                run_state=state,
+                resource_url=f"/creations/{creation_id}",
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, str(creation_id)),
+            )
+            await self._store_idempotency(
+                connection,
+                idempotency_key,
+                scope,
+                payload_hash,
+                response,
+                timestamp,
+            )
+            return response
+
+    async def end_run(
+        self,
+        *,
+        creation_id: UUID,
+        run_kind: RunKind,
+        idempotency_key: str,
+        now: datetime | None = None,
+    ) -> RunControlAccepted:
+        timestamp = _timestamp(now or _utc_now())
+        scope = f"run-control:{creation_id}:{run_kind}:end"
+        payload_hash = canonical_payload_hash({"action": "end"})
+
+        async with self._transaction() as connection:
+            replay = await self._idempotency_replay(
+                connection,
+                idempotency_key,
+                scope,
+                payload_hash,
+                RunControlAccepted,
+            )
+            if replay is not None:
+                return replay
+
+            run = await self._fetch_control_run(connection, creation_id, run_kind)
+            state = run["execution_state"]
+            if state == "ended":
+                response = RunControlAccepted(
+                    creation_id=creation_id,
+                    run_kind=run_kind,
+                    run_state="ended",
+                    resource_url=f"/creations/{creation_id}",
+                )
+            elif state == "paused":
+                current_stage = InternalStage(run["current_stage"])
+                cursor = await connection.execute(
+                    """
+                    SELECT COUNT(*) FROM stage_attempts
+                    WHERE run_id = ? AND stage = ?
+                    """,
+                    (run["id"], current_stage.value),
+                )
+                attempt_row = await cursor.fetchone()
+                attempt_count = max(1, min(MAX_STAGE_ATTEMPTS, int(attempt_row[0])))
+                await connection.execute(
+                    """
+                    UPDATE runs
+                    SET state = 'failed',
+                        failure_code = 'ended_by_user',
+                        failure_message = 'The operator ended the paused workflow run.',
+                        failed_stage = ?,
+                        failure_attempt_count = ?,
+                        completed_at = ?,
+                        updated_at = ?
+                    WHERE id = ? AND state = 'running'
+                    """,
+                    (
+                        current_stage.value,
+                        attempt_count,
+                        timestamp,
+                        timestamp,
+                        run["id"],
+                    ),
+                )
+                await connection.execute(
+                    """
+                    UPDATE run_progress
+                    SET execution_state = 'ended', updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (timestamp, run["id"]),
+                )
+                await connection.execute(
+                    """
+                    UPDATE jobs
+                    SET state = 'failed',
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (timestamp, run["id"]),
+                )
+                response = RunControlAccepted(
+                    creation_id=creation_id,
+                    run_kind=run_kind,
+                    run_state="ended",
+                    resource_url=f"/creations/{creation_id}",
+                )
+            else:
+                raise DomainError(
+                    "run_not_controllable",
+                    "Only a paused workflow run can end.",
+                    409,
+                )
+
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, str(creation_id)),
+            )
+            await self._store_idempotency(
+                connection,
+                idempotency_key,
+                scope,
+                payload_hash,
+                response,
+                timestamp,
+            )
+            return response
 
     async def succeed_run(
         self,
@@ -907,6 +1375,24 @@ class Repository:
                 WHERE id = ?
                 """,
                 (timestamp, timestamp, str(run_id)),
+            )
+            progress = await self._fetchone(
+                connection,
+                "SELECT * FROM run_progress WHERE run_id = ?",
+                (str(run_id),),
+            )
+            if progress is None:
+                raise RuntimeError("Workflow run is missing progress state")
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET execution_state = 'succeeded',
+                    elapsed_seconds = ?,
+                    active_started_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (self._elapsed_seconds(progress, _datetime(timestamp)), timestamp, str(run_id)),
             )
             await connection.execute(
                 """
@@ -986,6 +1472,30 @@ class Repository:
                     str(run_id),
                 ),
             )
+            progress = await self._fetchone(
+                connection,
+                "SELECT * FROM run_progress WHERE run_id = ?",
+                (str(run_id),),
+            )
+            if progress is None:
+                raise RuntimeError("Workflow run is missing progress state")
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    execution_state = 'failed',
+                    elapsed_seconds = ?,
+                    active_started_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    failure.failed_stage.value,
+                    self._elapsed_seconds(progress, _datetime(timestamp)),
+                    timestamp,
+                    str(run_id),
+                ),
+            )
             await connection.execute(
                 """
                 UPDATE jobs
@@ -1002,7 +1512,13 @@ class Repository:
                 (timestamp, run["creation_id"]),
             )
 
-    async def get_creation(self, creation_id: UUID) -> CreationResource | None:
+    async def get_creation(
+        self,
+        creation_id: UUID,
+        *,
+        now: datetime | None = None,
+    ) -> CreationResource | None:
+        current = now or _utc_now()
         async with self._connection() as connection:
             creation = await self._fetchone(
                 connection,
@@ -1015,9 +1531,9 @@ class Repository:
             initial = await self._fetch_initial_run(connection, creation_id)
             if initial is None:
                 raise RuntimeError("Creation is missing its initial run")
-            initial_status = await self._run_status(connection, initial)
+            initial_status = await self._run_status(connection, initial, current)
 
-            if initial["state"] != "succeeded":
+            if initial_status.state != "succeeded":
                 revision_status = RevisionUnavailable()
             else:
                 frozen = await self._fetchone(
@@ -1034,7 +1550,11 @@ class Repository:
                     )
                     if revision_run is None:
                         raise RuntimeError("Frozen revision is missing its workflow run")
-                    revision_status = await self._revision_status(connection, revision_run)
+                    revision_status = await self._revision_status(
+                        connection,
+                        revision_run,
+                        current,
+                    )
 
             return CreationResource(
                 creation_id=creation_id,
@@ -1102,7 +1622,15 @@ class Repository:
                 """
                 SELECT id, creation_id, thread_id, state
                 FROM runs
-                WHERE id = ? AND state IN ('queued', 'running')
+                WHERE id = ?
+                  AND state IN ('queued', 'running')
+                  AND EXISTS (
+                      SELECT 1 FROM run_progress
+                      WHERE run_progress.run_id = runs.id
+                        AND run_progress.execution_state IN (
+                            'queued', 'running', 'auto_resuming'
+                        )
+                  )
                 """,
                 (str(run_id),),
             )
@@ -1134,9 +1662,13 @@ class Repository:
                 SELECT runs.id
                 FROM jobs
                 JOIN runs ON runs.id = jobs.run_id
+                JOIN run_progress ON run_progress.run_id = runs.id
                 WHERE jobs.state = 'queued'
                   AND jobs.available_at <= ?
                   AND runs.state IN ('queued', 'running')
+                  AND run_progress.execution_state IN (
+                      'queued', 'running', 'auto_resuming'
+                  )
                 ORDER BY jobs.created_at, jobs.id
                 """,
                 (timestamp,),
@@ -1194,41 +1726,170 @@ class Repository:
         self,
         connection: aiosqlite.Connection,
         run: aiosqlite.Row,
-    ) -> QueuedRun | RunningRun | SucceededRun | FailedRun:
-        match run["state"]:
+        now: datetime,
+    ) -> QueuedRun | RunningRun | AutoResumingRun | PausedRun | EndedRun | SucceededRun | FailedRun:
+        progress_row, progress = await self._run_progress(connection, run, now)
+        match progress_row["execution_state"]:
             case "queued":
-                return QueuedRun()
+                return QueuedRun(progress=progress)
             case "running":
-                return RunningRun()
+                return RunningRun(progress=progress)
+            case "auto_resuming":
+                return AutoResumingRun(progress=progress)
+            case "paused":
+                return PausedRun(
+                    progress=progress,
+                    pause=self._pause_from_progress(progress_row),
+                )
+            case "ended":
+                return EndedRun(progress=progress)
             case "succeeded":
                 delivery = await self._load_delivery(connection, UUID(run["id"]))
                 if delivery is None:
                     raise RuntimeError("Successful run is missing its delivery")
-                return SucceededRun(result=delivery)
+                return SucceededRun(progress=progress, result=delivery)
             case "failed":
-                return FailedRun(failure=self._failure_from_row(run))
+                return FailedRun(
+                    progress=progress,
+                    failure=self._failure_from_row(run),
+                )
             case _:
-                raise RuntimeError("Unknown workflow run state")
+                raise RuntimeError("Unknown workflow progress state")
 
     async def _revision_status(
         self,
         connection: aiosqlite.Connection,
         run: aiosqlite.Row,
-    ) -> RevisionQueued | RevisionRunning | RevisionSucceeded | RevisionFailed:
-        match run["state"]:
+        now: datetime,
+    ) -> (
+        RevisionQueued
+        | RevisionRunning
+        | RevisionAutoResuming
+        | RevisionPaused
+        | RevisionEnded
+        | RevisionSucceeded
+        | RevisionFailed
+    ):
+        progress_row, progress = await self._run_progress(connection, run, now)
+        match progress_row["execution_state"]:
             case "queued":
-                return RevisionQueued()
+                return RevisionQueued(progress=progress)
             case "running":
-                return RevisionRunning()
+                return RevisionRunning(progress=progress)
+            case "auto_resuming":
+                return RevisionAutoResuming(progress=progress)
+            case "paused":
+                return RevisionPaused(
+                    progress=progress,
+                    pause=self._pause_from_progress(progress_row),
+                )
+            case "ended":
+                return RevisionEnded(progress=progress)
             case "succeeded":
                 delivery = await self._load_delivery(connection, UUID(run["id"]))
                 if delivery is None:
                     raise RuntimeError("Successful revision is missing its delivery")
-                return RevisionSucceeded(result=delivery)
+                return RevisionSucceeded(progress=progress, result=delivery)
             case "failed":
-                return RevisionFailed(failure=self._failure_from_row(run))
+                return RevisionFailed(
+                    progress=progress,
+                    failure=self._failure_from_row(run),
+                )
             case _:
-                raise RuntimeError("Unknown revision run state")
+                raise RuntimeError("Unknown revision progress state")
+
+    async def _run_progress(
+        self,
+        connection: aiosqlite.Connection,
+        run: aiosqlite.Row,
+        now: datetime,
+    ) -> tuple[aiosqlite.Row, RunProgress]:
+        progress = await self._fetchone(
+            connection,
+            "SELECT * FROM run_progress WHERE run_id = ?",
+            (run["id"],),
+        )
+        if progress is None:
+            raise RuntimeError("Workflow run is missing progress state")
+        cursor = await connection.execute(
+            "SELECT stage FROM business_checkpoints WHERE run_id = ?",
+            (run["id"],),
+        )
+        checkpoints = {InternalStage(row["stage"]) for row in await cursor.fetchall()}
+        current_internal = InternalStage(progress["current_stage"])
+        completed = [
+            user_stage
+            for user_stage, checkpoint in _COMPLETED_STAGE_CHECKPOINTS
+            if checkpoint in checkpoints
+        ]
+        if progress["execution_state"] == "succeeded":
+            completed.append(UserStage.FINAL_REVIEW)
+
+        execution_state = progress["execution_state"]
+        return progress, RunProgress(
+            current_stage=_USER_STAGE_BY_INTERNAL[current_internal],
+            completed_stages=completed,
+            elapsed_seconds=int(self._elapsed_seconds(progress, now)),
+            recovery_state=(
+                execution_state if execution_state in {"auto_resuming", "paused"} else "none"
+            ),
+            final_review=FinalReviewProgress(
+                l0=self._gate_progress(
+                    InternalStage.ACCEPTING_L0,
+                    current_internal,
+                    checkpoints,
+                    execution_state,
+                ),
+                l4=self._gate_progress(
+                    InternalStage.ACCEPTING_L4,
+                    current_internal,
+                    checkpoints,
+                    execution_state,
+                ),
+            ),
+            can_continue=execution_state == "paused",
+            can_end=execution_state == "paused",
+        )
+
+    @staticmethod
+    def _gate_progress(
+        gate: InternalStage,
+        current_stage: InternalStage,
+        checkpoints: set[InternalStage],
+        execution_state: str,
+    ) -> Literal["pending", "running", "passed", "paused", "failed"]:
+        if gate in checkpoints:
+            return "passed"
+        if current_stage is not gate:
+            return "pending"
+        if execution_state == "paused":
+            return "paused"
+        if execution_state in {"failed", "ended"}:
+            return "failed"
+        return "running"
+
+    @staticmethod
+    def _pause_from_progress(progress: aiosqlite.Row) -> RunPause:
+        timeout_stage = progress["timeout_stage"]
+        if timeout_stage is None:
+            raise RuntimeError("Paused workflow run is missing its timeout stage")
+        return RunPause(
+            message="The workflow exceeded its wall-clock limit twice in this stage.",
+            stage=UserStage(timeout_stage),
+            timeout_count=int(progress["timeout_count"]),
+        )
+
+    @staticmethod
+    def _elapsed_seconds(progress: aiosqlite.Row, now: datetime) -> float:
+        elapsed = float(progress["elapsed_seconds"])
+        active_started_at = progress["active_started_at"]
+        if active_started_at is None:
+            return max(0, elapsed)
+        active_since = _datetime(active_started_at)
+        if active_since.tzinfo is None:
+            active_since = active_since.replace(tzinfo=UTC)
+        current = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+        return max(0, elapsed + (current.astimezone(UTC) - active_since).total_seconds())
 
     async def _load_delivery(
         self,
@@ -1284,6 +1945,44 @@ class Repository:
     ) -> aiosqlite.Row | None:
         cursor = await connection.execute(query, parameters)
         return await cursor.fetchone()
+
+    async def _fetch_control_run(
+        self,
+        connection: aiosqlite.Connection,
+        creation_id: UUID,
+        run_kind: RunKind,
+    ) -> aiosqlite.Row:
+        creation = await self._fetchone(
+            connection,
+            "SELECT 1 FROM creations WHERE id = ?",
+            (str(creation_id),),
+        )
+        if creation is None:
+            raise DomainError("creation_not_found", "Creation not found.", 404)
+        order = "ASC" if run_kind == "initial" else "DESC"
+        run = await self._fetchone(
+            connection,
+            f"""
+            SELECT
+                runs.id,
+                runs.state AS run_state,
+                run_progress.current_stage,
+                run_progress.execution_state
+            FROM runs
+            JOIN run_progress ON run_progress.run_id = runs.id
+            WHERE runs.creation_id = ? AND runs.kind = ?
+            ORDER BY runs.sequence {order}
+            LIMIT 1
+            """,
+            (str(creation_id), run_kind),
+        )
+        if run is None:
+            raise DomainError(
+                "run_not_controllable",
+                "The requested workflow run does not exist.",
+                409,
+            )
+        return run
 
     async def _fetch_initial_run(
         self,

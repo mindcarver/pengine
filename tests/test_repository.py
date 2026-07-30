@@ -146,6 +146,7 @@ async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository)
         "deliveries",
         "frozen_revisions",
         "idempotency_records",
+        "run_progress",
     } <= {row[0] for row in rows}
 
 
@@ -330,6 +331,37 @@ async def test_revision_rules_and_initial_delivery_remains_visible(
     assert failed.revision.state == "failed"
 
 
+async def test_revision_becomes_available_from_authoritative_initial_status(
+    repository,
+    persona,
+    creation_request,
+    monkeypatch,
+) -> None:
+    accepted, initial_lease = await create_and_lease_initial(
+        repository,
+        persona,
+        creation_request,
+    )
+    async with repository._connection() as connection:
+        stale_initial = await repository._fetch_initial_run(
+            connection,
+            accepted.creation_id,
+        )
+    assert stale_initial is not None
+    assert stale_initial["state"] == "running"
+
+    await repository.succeed_run(initial_lease.run_id, make_delivery())
+
+    async def fetch_stale_initial(connection, creation_id):
+        return stale_initial
+
+    monkeypatch.setattr(repository, "_fetch_initial_run", fetch_stale_initial)
+    aggregate = await repository.get_creation(accepted.creation_id)
+
+    assert aggregate.initial.state == "succeeded"
+    assert aggregate.revision.state == "available"
+
+
 async def test_successful_revision_consumes_entitlement(
     repository,
     persona,
@@ -398,3 +430,186 @@ async def test_expired_lease_requeues_same_thread_with_durable_business_state(
     assert resumed is not None
     assert resumed.run_id == lease.run_id
     assert resumed.thread_id == lease.thread_id
+
+
+async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempotent(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(
+        repository,
+        persona,
+        creation_request,
+    )
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        now=NOW + timedelta(seconds=1),
+    )
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        {"selected_l0_variant": "归返", "selection_rationale": "匹配母题"},
+        now=NOW + timedelta(seconds=2),
+    )
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        now=NOW + timedelta(seconds=3),
+    )
+
+    running = await repository.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=20),
+    )
+    assert running is not None
+    assert running.initial.state == "running"
+    assert running.initial.progress.current_stage == "generating_story_outline"
+    assert running.initial.progress.completed_stages == ["determining_direction"]
+    assert running.initial.progress.elapsed_seconds == 20
+    assert not hasattr(running.initial, "result")
+
+    first_timeout = await repository.handle_run_timeout(
+        lease.run_id,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        now=NOW + timedelta(seconds=30),
+    )
+    assert first_timeout == "auto_resuming"
+    recovering = await repository.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=40),
+    )
+    assert recovering is not None
+    assert recovering.initial.state == "auto_resuming"
+    assert recovering.initial.progress.elapsed_seconds == 30
+    assert recovering.initial.progress.recovery_state == "auto_resuming"
+
+    resumed = await repository.lease_next_job(
+        "worker-2",
+        30,
+        now=NOW + timedelta(seconds=40),
+    )
+    assert resumed is not None
+    await repository.record_stage_attempt(
+        resumed.run_id,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        now=NOW + timedelta(seconds=41),
+    )
+    second_timeout = await repository.handle_run_timeout(
+        resumed.run_id,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        now=NOW + timedelta(seconds=55),
+    )
+    assert second_timeout == "paused"
+
+    paused = await repository.get_creation(accepted.creation_id)
+    assert paused is not None
+    assert paused.initial.state == "paused"
+    assert paused.initial.pause.code == "run_timeout"
+    assert paused.initial.pause.timeout_count == 2
+    assert paused.initial.progress.can_continue is True
+    assert paused.initial.progress.can_end is True
+
+    first_continue = await repository.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-paused",
+        now=NOW + timedelta(seconds=60),
+    )
+    replay_continue = await repository.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-paused",
+        now=NOW + timedelta(seconds=61),
+    )
+    duplicate_continue = await repository.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-paused-again",
+        now=NOW + timedelta(seconds=61),
+    )
+    assert replay_continue == first_continue == duplicate_continue
+    assert first_continue.run_state == "queued"
+
+    resumed_again = await repository.lease_next_job(
+        "worker-3",
+        30,
+        now=NOW + timedelta(seconds=62),
+    )
+    assert resumed_again is not None
+    await repository.record_stage_attempt(
+        resumed_again.run_id,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        now=NOW + timedelta(seconds=63),
+    )
+    assert (
+        await repository.handle_run_timeout(
+            resumed_again.run_id,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            now=NOW + timedelta(seconds=70),
+        )
+        == "paused"
+    )
+
+    first_end = await repository.end_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="end-paused",
+        now=NOW + timedelta(seconds=71),
+    )
+    replay_end = await repository.end_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="end-paused",
+        now=NOW + timedelta(seconds=72),
+    )
+    duplicate_end = await repository.end_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="end-paused-again",
+        now=NOW + timedelta(seconds=72),
+    )
+    assert replay_end == first_end == duplicate_end
+    assert first_end.run_state == "ended"
+
+    ended = await repository.get_creation(accepted.creation_id)
+    assert ended is not None
+    assert ended.initial.state == "ended"
+    assert await repository.reconcile_startup(now=NOW + timedelta(minutes=5)) == []
+    with pytest.raises(DomainError) as cannot_continue:
+        await repository.continue_run(
+            creation_id=accepted.creation_id,
+            run_kind="initial",
+            idempotency_key="continue-ended",
+        )
+    assert cannot_continue.value.code == "run_not_controllable"
+
+
+async def test_schema_v1_database_is_backfilled_without_losing_creation(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted = await repository.create_creation(
+        idempotency_key="migration-create",
+        request=creation_request,
+        persona_snapshot=persona,
+        now=NOW,
+    )
+    async with repository._connection() as connection:
+        await connection.execute("DROP TABLE run_progress")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 2")
+        await connection.commit()
+
+    await repository.initialize()
+
+    migrated = await repository.get_creation(accepted.creation_id, now=NOW)
+    assert migrated is not None
+    assert migrated.initial.state == "queued"
+    assert migrated.initial.progress.current_stage == "determining_direction"
+    async with repository._connection() as connection:
+        version = await (
+            await connection.execute("SELECT MAX(version) FROM pengine_schema")
+        ).fetchone()
+    assert version[0] == 2

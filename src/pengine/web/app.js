@@ -48,6 +48,24 @@ const ARTIFACTS = [
   { key: "episode_scripts", title: "分集剧本", overline: "DELIVERABLE 05" },
 ];
 
+const USER_STAGES = [
+  ["determining_direction", "确定创作方向"],
+  ["generating_story_outline", "生成故事大纲"],
+  ["generating_character_biographies", "生成人物小传"],
+  ["generating_relationships", "生成人物关系"],
+  ["generating_episode_outline", "生成分集大纲"],
+  ["generating_episode_scripts", "生成分集剧本"],
+  ["final_review", "成品审核"],
+];
+const USER_STAGE_LABELS = new Map(USER_STAGES);
+const REVIEW_STATUS_LABELS = {
+  pending: "等待",
+  running: "审核中",
+  passed: "已通过",
+  paused: "已暂停",
+  failed: "未通过",
+};
+
 const STORAGE_KEY = "pengine.currentCreationId";
 const POLL_INTERVAL_MS = 1800;
 const DEFAULT_REQUIREMENTS = "按所选人格完成一部完整短剧。";
@@ -62,6 +80,8 @@ const state = {
   pollTimer: null,
   loadingCreation: false,
   pendingFeedback: "",
+  progressRunKind: "",
+  runControlBusy: false,
 };
 
 const elements = {};
@@ -105,11 +125,24 @@ function cacheElements() {
     "delivery-section",
     "delivery-subtitle",
     "folio-stamp",
+    "run-progress",
+    "progress-kind",
+    "progress-title",
+    "progress-elapsed",
+    "progress-stages",
+    "review-progress",
+    "review-l0",
+    "review-l4",
+    "run-controls",
+    "continue-run",
+    "end-run",
+    "run-control-message",
     "task-waiting",
     "wait-kicker",
     "wait-title",
     "wait-description",
     "failure-panel",
+    "failure-label",
     "failure-title",
     "failure-message",
     "failure-code",
@@ -143,6 +176,8 @@ function bindEvents() {
   elements["reload-personas"].addEventListener("click", () => void loadPersonas());
   elements["creation-form"].addEventListener("submit", handleCreate);
   elements["revision-form"].addEventListener("submit", handleRevision);
+  elements["continue-run"].addEventListener("click", () => void handleRunControl("continue"));
+  elements["end-run"].addEventListener("click", () => void handleRunControl("end"));
   elements["series-card"].addEventListener("click", focusDelivery);
 
   elements["version-tabs"].addEventListener("click", handleVersionClick);
@@ -385,6 +420,41 @@ async function handleRevision(event) {
   }
 }
 
+async function handleRunControl(action) {
+  const runKind = state.progressRunKind;
+  if (!runKind || state.runControlBusy) {
+    return;
+  }
+  if (
+    action === "end" &&
+    !window.confirm("结束后，本次任务将不能继续。确定结束吗？")
+  ) {
+    return;
+  }
+
+  state.runControlBusy = true;
+  renderProgress();
+  elements["run-control-message"].textContent =
+    action === "continue" ? "正在恢复当前阶段……" : "正在结束本次任务……";
+  try {
+    await apiRequest(
+      `/creations/${encodeURIComponent(state.creationId)}/runs/${runKind}/${action}`,
+      {
+        method: "POST",
+        headers: {
+          "Idempotency-Key": createIdempotencyKey(`run-${runKind}-${action}`),
+        },
+      },
+    );
+    await refreshCreation();
+  } catch (error) {
+    elements["run-control-message"].textContent = formatError(error);
+  } finally {
+    state.runControlBusy = false;
+    renderProgress();
+  }
+}
+
 async function refreshCreation(options = {}) {
   if (!state.creationId || state.loadingCreation) {
     return false;
@@ -431,6 +501,7 @@ async function refreshCreation(options = {}) {
 function renderCreation() {
   if (!state.creationId) {
     elements["delivery-section"].hidden = true;
+    elements["run-progress"].hidden = true;
     return;
   }
 
@@ -438,6 +509,7 @@ function renderCreation() {
   elements["folio-stamp"].textContent = `卷宗 ${shortId(state.creationId)}`;
 
   if (!state.creation) {
+    renderProgress();
     showWaiting(
       "任务已接收",
       "正在读取编辑部状态",
@@ -449,6 +521,7 @@ function renderCreation() {
   const initial = state.creation.initial;
   elements["delivery-subtitle"].textContent =
     `${state.creation.persona.display_name} · 人格版本 ${state.creation.persona.version}`;
+  renderProgress();
 
   if (initial.state === "queued") {
     showWaiting(
@@ -462,9 +535,32 @@ function renderCreation() {
   if (initial.state === "running") {
     showWaiting(
       "任务创作中",
-      "真实创作仍在进行",
-      "本页只知道任务正在运行，不推测内部阶段。完成后会读取服务端交付的五类文稿。",
+      "编辑部正在处理当前阶段",
+      "上方阶段与已运行时长均来自本地服务；最终审核通过前不会展示中间文稿。",
     );
+    return;
+  }
+
+  if (initial.state === "auto_resuming") {
+    showWaiting(
+      "首次超时 · 自动恢复",
+      "正在从已批准检查点继续",
+      "已完成阶段不会重新生成；当前未批准阶段将重新执行。",
+    );
+    return;
+  }
+
+  if (initial.state === "paused") {
+    showWaiting(
+      "任务已暂停",
+      "当前阶段再次超过整体运行时限",
+      "请在上方选择继续当前阶段，或结束本次任务。",
+    );
+    return;
+  }
+
+  if (initial.state === "ended") {
+    showEnded("初稿任务已结束");
     return;
   }
 
@@ -481,6 +577,74 @@ function renderCreation() {
   renderRevision();
 }
 
+function activeProgressRun() {
+  if (!state.creation) {
+    return null;
+  }
+  if (state.creation.initial.state !== "succeeded") {
+    return state.creation.initial.progress
+      ? { kind: "initial", run: state.creation.initial }
+      : null;
+  }
+  const revision = state.creation.revision;
+  if (revision.progress && revision.state !== "succeeded") {
+    return { kind: "revision", run: revision };
+  }
+  return null;
+}
+
+function renderProgress() {
+  const active = activeProgressRun();
+  if (!active) {
+    state.progressRunKind = "";
+    elements["run-progress"].hidden = true;
+    return;
+  }
+
+  const { kind, run } = active;
+  const progress = run.progress;
+  state.progressRunKind = kind;
+  elements["run-progress"].hidden = false;
+  elements["progress-kind"].textContent = kind === "initial" ? "初稿进度" : "修订进度";
+  elements["progress-title"].textContent =
+    USER_STAGE_LABELS.get(progress.current_stage) || "正在读取阶段";
+  elements["progress-elapsed"].textContent = formatElapsed(progress.elapsed_seconds);
+
+  const completed = new Set(progress.completed_stages);
+  for (const item of elements["progress-stages"].querySelectorAll("[data-stage]")) {
+    const stage = item.dataset.stage;
+    const status = completed.has(stage)
+      ? "completed"
+      : stage === progress.current_stage
+        ? "current"
+        : "pending";
+    item.dataset.status = status;
+    if (status === "current") {
+      item.setAttribute("aria-current", "step");
+    } else {
+      item.removeAttribute("aria-current");
+    }
+  }
+
+  const showReview =
+    progress.current_stage === "final_review" ||
+    progress.final_review.l0 !== "pending" ||
+    progress.final_review.l4 !== "pending";
+  elements["review-progress"].hidden = !showReview;
+  elements["review-l0"].textContent =
+    `L0 创作内核 · ${REVIEW_STATUS_LABELS[progress.final_review.l0]}`;
+  elements["review-l4"].textContent =
+    `L4 技法与价值观 · ${REVIEW_STATUS_LABELS[progress.final_review.l4]}`;
+
+  const controllable = progress.can_continue && progress.can_end;
+  elements["run-controls"].hidden = !controllable;
+  elements["continue-run"].disabled = state.runControlBusy;
+  elements["end-run"].disabled = state.runControlBusy;
+  if (!controllable) {
+    elements["run-control-message"].textContent = "";
+  }
+}
+
 function showWaiting(kicker, title, description) {
   elements["task-waiting"].hidden = false;
   elements["failure-panel"].hidden = true;
@@ -494,11 +658,23 @@ function showFailure(failure, title) {
   elements["task-waiting"].hidden = true;
   elements["failure-panel"].hidden = false;
   elements["result-workspace"].hidden = true;
+  elements["failure-label"].textContent = "任务未完成";
   elements["failure-title"].textContent = title;
   elements["failure-message"].textContent = failure?.message || "本地服务未提供失败说明。";
   elements["failure-code"].textContent = failure?.code
     ? `错误代码：${failure.code}`
     : "错误代码：未提供";
+}
+
+function showEnded(title) {
+  elements["task-waiting"].hidden = true;
+  elements["failure-panel"].hidden = false;
+  elements["result-workspace"].hidden = true;
+  elements["failure-label"].textContent = "任务已结束";
+  elements["failure-title"].textContent = title;
+  elements["failure-message"].textContent =
+    "你已结束暂停中的任务；已批准检查点保留，但本次任务不能再次继续。";
+  elements["failure-code"].textContent = "状态：ended";
 }
 
 function renderVersionControls() {
@@ -561,12 +737,29 @@ function renderRevision() {
     message = "修改意见已提交，等待状态同步。";
   } else if (revision.state === "queued") {
     feedbackState = "意见已冻结";
+    buttonLabel = "修订已排队";
     description = "修订任务已排队。初稿仍可浏览；本页会继续查询真实状态。";
     message = "修订任务已排队。";
   } else if (revision.state === "running") {
     feedbackState = "意见已冻结";
+    buttonLabel = "修订创作中";
     description = "修订正在真实运行。初稿仍可浏览；完成前不会展示假修订稿。";
     message = "修订创作中。";
+  } else if (revision.state === "auto_resuming") {
+    feedbackState = "自动恢复中";
+    buttonLabel = "自动恢复中";
+    description = "首次整体超时后，修订正在从已批准检查点自动继续；初稿仍可浏览。";
+    message = "修订正在自动恢复。";
+  } else if (revision.state === "paused") {
+    feedbackState = "修订已暂停";
+    buttonLabel = "修订已暂停";
+    description = "当前阶段再次超时。请使用上方进度卡继续或结束；初稿仍可浏览。";
+    message = "修订等待你的决定。";
+  } else if (revision.state === "ended") {
+    feedbackState = "修订已结束";
+    buttonLabel = "修订已结束";
+    description = "暂停中的修订已由你结束，不能再次继续；初稿仍可浏览。";
+    message = "本次修订已结束。";
   } else if (revision.state === "failed") {
     feedbackState = "修订失败";
     buttonLabel = "修订失败";
@@ -575,10 +768,12 @@ function renderRevision() {
     message = `${revision.failure.message}（${revision.failure.code}）`;
   } else if (revision.state === "succeeded") {
     feedbackState = "修订已完成";
+    buttonLabel = "修订已完成";
     description = "一次修订额度已使用；可用上方版本按钮在初稿与修订稿之间切换。";
     message = "修订稿已交付。";
   } else {
     feedbackState = "初稿尚未完成";
+    buttonLabel = "等待初稿";
     description = "初稿成功交付后，才可提交一次全量重写。";
   }
 
@@ -623,18 +818,40 @@ function currentSeriesStatus() {
   if (state.creation.initial.state === "failed") {
     return { label: "初稿失败", tone: "failed" };
   }
-  if (["queued", "running"].includes(state.creation.initial.state)) {
+  if (state.creation.initial.state === "ended") {
+    return { label: "初稿已结束", tone: "failed" };
+  }
+  if (state.creation.initial.state === "paused") {
+    return { label: "初稿待决定", tone: "waiting" };
+  }
+  if (["queued", "running", "auto_resuming"].includes(state.creation.initial.state)) {
     return {
-      label: state.creation.initial.state === "queued" ? "初稿排队" : "初稿创作中",
+      label:
+        state.creation.initial.state === "queued"
+          ? "初稿排队"
+          : state.creation.initial.state === "auto_resuming"
+            ? "初稿恢复中"
+            : "初稿创作中",
       tone: "waiting",
     };
   }
   if (state.creation.revision.state === "failed") {
     return { label: "修订失败", tone: "failed" };
   }
-  if (["queued", "running"].includes(state.creation.revision.state)) {
+  if (state.creation.revision.state === "ended") {
+    return { label: "修订已结束", tone: "failed" };
+  }
+  if (state.creation.revision.state === "paused") {
+    return { label: "修订待决定", tone: "waiting" };
+  }
+  if (["queued", "running", "auto_resuming"].includes(state.creation.revision.state)) {
     return {
-      label: state.creation.revision.state === "queued" ? "修订排队" : "修订创作中",
+      label:
+        state.creation.revision.state === "queued"
+          ? "修订排队"
+          : state.creation.revision.state === "auto_resuming"
+            ? "修订恢复中"
+            : "修订创作中",
       tone: "waiting",
     };
   }
@@ -706,8 +923,8 @@ function shouldPoll() {
     return Boolean(state.creationId);
   }
   return (
-    ["queued", "running"].includes(state.creation.initial.state) ||
-    ["queued", "running"].includes(state.creation.revision.state)
+    ["queued", "running", "auto_resuming"].includes(state.creation.initial.state) ||
+    ["queued", "running", "auto_resuming"].includes(state.creation.revision.state)
   );
 }
 
@@ -788,14 +1005,22 @@ function setRevisionBusy(busy) {
     const revisionState = state.creation?.revision.state;
     const canSubmit =
       revisionState === "available" && !state.pendingFeedback;
+    const lockedLabels = {
+      unavailable: "等待初稿",
+      queued: "修订已排队",
+      running: "修订创作中",
+      auto_resuming: "自动恢复中",
+      paused: "修订已暂停",
+      ended: "修订已结束",
+      failed: "修订失败",
+      succeeded: "修订已完成",
+    };
     elements.feedback.disabled = !canSubmit;
     elements["revision-button"].disabled = !canSubmit;
     elements["revision-button"].textContent =
       state.pendingFeedback
         ? "意见已冻结"
-        : revisionState === "failed"
-          ? "修订失败"
-          : "提交全量重写";
+        : lockedLabels[revisionState] || "提交全量重写";
   }
   elements["revision-form"].setAttribute("aria-busy", String(busy));
 }
@@ -849,6 +1074,21 @@ function clearCurrentCreationId() {
 
 function shortId(value) {
   return value ? value.slice(0, 8).toUpperCase() : "—";
+}
+
+function formatElapsed(value) {
+  const total = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const parts = [
+    String(minutes).padStart(2, "0"),
+    String(seconds).padStart(2, "0"),
+  ];
+  if (hours > 0) {
+    parts.unshift(String(hours).padStart(2, "0"));
+  }
+  return parts.join(":");
 }
 
 function formatDate(value) {
