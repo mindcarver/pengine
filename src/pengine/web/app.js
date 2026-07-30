@@ -340,14 +340,13 @@ async function handleRevision(event) {
     elements.feedback.focus();
     return;
   }
-  if (!revision || !["available", "failed"].includes(revision.state)) {
+  if (!revision || revision.state !== "available") {
     elements["revision-message"].textContent = "当前作品不能提交修订。";
     return;
   }
 
   setRevisionBusy(true);
-  elements["revision-message"].textContent =
-    revision.state === "failed" ? "正在使用修改意见重试修订……" : "正在提交一次全量重写……";
+  elements["revision-message"].textContent = "正在提交一次全量重写……";
 
   try {
     await apiRequest(`/creations/${encodeURIComponent(state.creationId)}/revision`, {
@@ -543,11 +542,10 @@ function renderRevision() {
     description = "修订正在真实运行。初稿仍可浏览；完成前不会展示假修订稿。";
     message = "修订创作中。";
   } else if (revision.state === "failed") {
-    disabled = false;
-    feedbackState = "意见已锁定";
-    buttonLabel = "重试本次修订";
+    feedbackState = "修订失败";
+    buttonLabel = "修订失败";
     description =
-      "修订失败且原意见已锁定。重试时必须提交与首次完全相同的文字；页面不会把意见写入浏览器存储。";
+      "原意见已被服务端锁定；本地原型不保存意见，因此不提供可能改变原文的重试。初稿仍可浏览。";
     message = `${revision.failure.message}（${revision.failure.code}）`;
   } else if (revision.state === "succeeded") {
     feedbackState = "修订已完成";
