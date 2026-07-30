@@ -15,7 +15,7 @@ def test_build_chat_model_uses_only_operator_connection_fields() -> None:
 
     assert model.model == "model-id"
     assert model.anthropic_api_url == "https://relay.example/anthropic"
-    assert model.max_retries == 0
+    assert model.max_retries == 1
     assert isinstance(model.anthropic_api_key, SecretStr)
     assert model.anthropic_api_key.get_secret_value() == "secret-value"
     assert "secret-value" not in repr(model)
