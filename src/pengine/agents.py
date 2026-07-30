@@ -199,6 +199,12 @@ class AgentProtocolError(RuntimeError):
         self.stage = stage
 
 
+class QualityGateRejectedError(RuntimeError):
+    def __init__(self, *, stage: InternalStage) -> None:
+        super().__init__("Quality gate did not pass")
+        self.stage = stage
+
+
 class CheckpointUnavailableError(RuntimeError):
     """The durable thread state required for a resumed run is missing."""
 
@@ -340,7 +346,7 @@ def _validated_stage_payload(
     if parsed.stage != stage.value:
         raise AgentProtocolError("Subagent returned a different stage", stage=stage)
     if isinstance(parsed, QualityReviewerResult) and not parsed.passed:
-        raise AgentProtocolError("Quality gate did not pass", stage=stage)
+        raise QualityGateRejectedError(stage=stage)
     return parsed.model_dump(mode="json")
 
 

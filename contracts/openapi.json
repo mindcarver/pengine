@@ -3,7 +3,7 @@
   "info": {
     "title": "Pengine Local API",
     "version": "1.0.0",
-    "description": "Local-only API for persona selection, asynchronous short-drama creation, status/result retrieval, and one frozen revision."
+    "description": "Local-only API for persona selection, observable asynchronous short-drama creation, timeout recovery, complete result retrieval, and one frozen revision."
   },
   "servers": [
     {
@@ -215,6 +215,146 @@
           }
         }
       }
+    },
+    "/creations/{creation_id}/runs/{run_kind}/continue": {
+      "post": {
+        "summary": "Continue a paused initial or revision run",
+        "operationId": "continueRun",
+        "parameters": [
+          {
+            "name": "creation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Creation Id"
+            }
+          },
+          {
+            "name": "run_kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "initial",
+                "revision"
+              ],
+              "type": "string",
+              "title": "Run Kind"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Run queued or an identical continue command replayed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunControlAccepted"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/CreationNotFound"
+          },
+          "409": {
+            "description": "The requested run cannot continue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/creations/{creation_id}/runs/{run_kind}/end": {
+      "post": {
+        "summary": "End a paused initial or revision run permanently",
+        "operationId": "endRun",
+        "parameters": [
+          {
+            "name": "creation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Creation Id"
+            }
+          },
+          {
+            "name": "run_kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "initial",
+                "revision"
+              ],
+              "type": "string",
+              "title": "Run Kind"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Run ended or an identical end command replayed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunControlAccepted"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/CreationNotFound"
+          },
+          "409": {
+            "description": "The requested run cannot end",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -327,141 +467,232 @@
       }
     },
     "schemas": {
-      "PersonaList": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "items"
-        ],
+      "AutoResumingRun": {
         "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PersonaSummary"
-            }
+          "state": {
+            "type": "string",
+            "const": "auto_resuming",
+            "title": "State",
+            "default": "auto_resuming"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
           }
-        }
-      },
-      "PersonaSummary": {
-        "type": "object",
+        },
         "additionalProperties": false,
+        "type": "object",
         "required": [
-          "persona_id",
-          "display_name",
-          "version",
-          "snapshot_sha256"
+          "progress"
         ],
+        "title": "AutoResumingRun"
+      },
+      "ContentPackage": {
+        "properties": {
+          "story_outline": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Story Outline"
+          },
+          "character_biographies": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Character Biographies"
+          },
+          "relationship_logic": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Relationship Logic"
+          },
+          "episode_outline": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Episode Outline"
+          },
+          "episode_scripts": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Episode Scripts"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "story_outline",
+          "character_biographies",
+          "relationship_logic",
+          "episode_outline",
+          "episode_scripts"
+        ],
+        "title": "ContentPackage"
+      },
+      "CreateCreationRequest": {
         "properties": {
           "persona_id": {
             "type": "string",
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Persona Id"
           },
-          "display_name": {
+          "story": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Story"
           },
-          "version": {
+          "requirements": {
             "type": "string",
-            "minLength": 1
-          },
-          "snapshot_sha256": {
-            "description": "Domain-separated SHA-256 of the canonical full manifest and its declared package_sha256; identifies one immutable persona identity and content snapshot.",
-            "$ref": "#/components/schemas/Sha256"
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Requirements"
           }
-        }
-      },
-      "CreateCreationRequest": {
-        "type": "object",
+        },
         "additionalProperties": false,
+        "type": "object",
         "required": [
           "persona_id",
           "story",
           "requirements"
         ],
-        "properties": {
-          "persona_id": {
-            "type": "string",
-            "minLength": 1,
-            "pattern": "\\S"
-          },
-          "story": {
-            "type": "string",
-            "minLength": 1,
-            "pattern": "\\S"
-          },
-          "requirements": {
-            "type": "string",
-            "minLength": 1,
-            "pattern": "\\S"
-          }
-        }
-      },
-      "RevisionRequest": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "feedback"
-        ],
-        "properties": {
-          "feedback": {
-            "type": "string",
-            "minLength": 1,
-            "pattern": "\\S",
-            "description": "The accepted string is preserved exactly; failed retries must submit the same Unicode string, including leading and trailing whitespace."
-          }
-        }
+        "title": "CreateCreationRequest"
       },
       "CreationAccepted": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "creation_id",
-          "initial_state",
-          "resource_url"
-        ],
         "properties": {
           "creation_id": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "title": "Creation Id"
           },
           "initial_state": {
-            "const": "queued"
+            "type": "string",
+            "const": "queued",
+            "title": "Initial State",
+            "default": "queued"
           },
           "resource_url": {
             "type": "string",
-            "format": "uri-reference"
+            "title": "Resource Url"
           }
-        }
-      },
-      "RevisionAccepted": {
-        "type": "object",
+        },
         "additionalProperties": false,
+        "type": "object",
         "required": [
           "creation_id",
-          "revision_state",
-          "feedback_locked",
           "resource_url"
         ],
+        "title": "CreationAccepted"
+      },
+      "CreationResource": {
         "properties": {
           "creation_id": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "title": "Creation Id"
           },
-          "revision_state": {
-            "const": "queued"
+          "persona": {
+            "$ref": "#/components/schemas/PersonaSnapshot"
           },
-          "feedback_locked": {
-            "const": true
+          "initial": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/QueuedRun"
+              },
+              {
+                "$ref": "#/components/schemas/RunningRun"
+              },
+              {
+                "$ref": "#/components/schemas/AutoResumingRun"
+              },
+              {
+                "$ref": "#/components/schemas/PausedRun"
+              },
+              {
+                "$ref": "#/components/schemas/EndedRun"
+              },
+              {
+                "$ref": "#/components/schemas/SucceededRun"
+              },
+              {
+                "$ref": "#/components/schemas/FailedRun"
+              }
+            ],
+            "title": "Initial",
+            "discriminator": {
+              "propertyName": "state",
+              "mapping": {
+                "auto_resuming": "#/components/schemas/AutoResumingRun",
+                "ended": "#/components/schemas/EndedRun",
+                "failed": "#/components/schemas/FailedRun",
+                "paused": "#/components/schemas/PausedRun",
+                "queued": "#/components/schemas/QueuedRun",
+                "running": "#/components/schemas/RunningRun",
+                "succeeded": "#/components/schemas/SucceededRun"
+              }
+            }
           },
-          "resource_url": {
+          "revision": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RevisionUnavailable"
+              },
+              {
+                "$ref": "#/components/schemas/RevisionAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/RevisionQueued"
+              },
+              {
+                "$ref": "#/components/schemas/RevisionRunning"
+              },
+              {
+                "$ref": "#/components/schemas/RevisionAutoResuming"
+              },
+              {
+                "$ref": "#/components/schemas/RevisionPaused"
+              },
+              {
+                "$ref": "#/components/schemas/RevisionEnded"
+              },
+              {
+                "$ref": "#/components/schemas/RevisionFailed"
+              },
+              {
+                "$ref": "#/components/schemas/RevisionSucceeded"
+              }
+            ],
+            "title": "Revision",
+            "discriminator": {
+              "propertyName": "state",
+              "mapping": {
+                "auto_resuming": "#/components/schemas/RevisionAutoResuming",
+                "available": "#/components/schemas/RevisionAvailable",
+                "ended": "#/components/schemas/RevisionEnded",
+                "failed": "#/components/schemas/RevisionFailed",
+                "paused": "#/components/schemas/RevisionPaused",
+                "queued": "#/components/schemas/RevisionQueued",
+                "running": "#/components/schemas/RevisionRunning",
+                "succeeded": "#/components/schemas/RevisionSucceeded",
+                "unavailable": "#/components/schemas/RevisionUnavailable"
+              }
+            }
+          },
+          "created_at": {
             "type": "string",
-            "format": "uri-reference"
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
           }
-        }
-      },
-      "CreationResource": {
-        "type": "object",
+        },
         "additionalProperties": false,
+        "type": "object",
         "required": [
           "creation_id",
           "persona",
@@ -470,274 +701,9 @@
           "created_at",
           "updated_at"
         ],
-        "properties": {
-          "creation_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "persona": {
-            "$ref": "#/components/schemas/PersonaSnapshot"
-          },
-          "initial": {
-            "$ref": "#/components/schemas/RunStatus"
-          },
-          "revision": {
-            "$ref": "#/components/schemas/RevisionStatus"
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "updated_at": {
-            "type": "string",
-            "format": "date-time"
-          }
-        }
-      },
-      "PersonaSnapshot": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "persona_id",
-          "display_name",
-          "version",
-          "snapshot_sha256"
-        ],
-        "properties": {
-          "persona_id": {
-            "type": "string"
-          },
-          "display_name": {
-            "type": "string"
-          },
-          "version": {
-            "type": "string"
-          },
-          "snapshot_sha256": {
-            "description": "Domain-separated SHA-256 of the canonical full manifest and its declared package_sha256; identifies one immutable persona identity and content snapshot.",
-            "$ref": "#/components/schemas/Sha256"
-          }
-        }
-      },
-      "RunStatus": {
-        "oneOf": [
-          {
-            "$ref": "#/components/schemas/QueuedRun"
-          },
-          {
-            "$ref": "#/components/schemas/RunningRun"
-          },
-          {
-            "$ref": "#/components/schemas/SucceededRun"
-          },
-          {
-            "$ref": "#/components/schemas/FailedRun"
-          }
-        ],
-        "discriminator": {
-          "propertyName": "state"
-        }
-      },
-      "QueuedRun": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "state"
-        ],
-        "properties": {
-          "state": {
-            "const": "queued"
-          }
-        }
-      },
-      "RunningRun": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "state"
-        ],
-        "properties": {
-          "state": {
-            "const": "running"
-          }
-        }
-      },
-      "SucceededRun": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "state",
-          "result"
-        ],
-        "properties": {
-          "state": {
-            "const": "succeeded"
-          },
-          "result": {
-            "$ref": "#/components/schemas/Delivery"
-          }
-        }
-      },
-      "FailedRun": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "state",
-          "failure"
-        ],
-        "properties": {
-          "state": {
-            "const": "failed"
-          },
-          "failure": {
-            "$ref": "#/components/schemas/RunFailure"
-          }
-        }
-      },
-      "RevisionStatus": {
-        "oneOf": [
-          {
-            "$ref": "#/components/schemas/RevisionUnavailable"
-          },
-          {
-            "$ref": "#/components/schemas/RevisionAvailable"
-          },
-          {
-            "$ref": "#/components/schemas/RevisionQueued"
-          },
-          {
-            "$ref": "#/components/schemas/RevisionRunning"
-          },
-          {
-            "$ref": "#/components/schemas/RevisionFailed"
-          },
-          {
-            "$ref": "#/components/schemas/RevisionSucceeded"
-          }
-        ],
-        "discriminator": {
-          "propertyName": "state"
-        }
-      },
-      "RevisionUnavailable": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "state",
-          "feedback_locked",
-          "reason"
-        ],
-        "properties": {
-          "state": {
-            "const": "unavailable"
-          },
-          "feedback_locked": {
-            "const": false
-          },
-          "reason": {
-            "const": "initial_not_succeeded"
-          }
-        }
-      },
-      "RevisionAvailable": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "state",
-          "feedback_locked"
-        ],
-        "properties": {
-          "state": {
-            "const": "available"
-          },
-          "feedback_locked": {
-            "const": false
-          }
-        }
-      },
-      "RevisionQueued": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "state",
-          "feedback_locked"
-        ],
-        "properties": {
-          "state": {
-            "const": "queued"
-          },
-          "feedback_locked": {
-            "const": true
-          }
-        }
-      },
-      "RevisionRunning": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "state",
-          "feedback_locked"
-        ],
-        "properties": {
-          "state": {
-            "const": "running"
-          },
-          "feedback_locked": {
-            "const": true
-          }
-        }
-      },
-      "RevisionFailed": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "state",
-          "feedback_locked",
-          "retryable",
-          "failure"
-        ],
-        "properties": {
-          "state": {
-            "const": "failed"
-          },
-          "feedback_locked": {
-            "const": true
-          },
-          "retryable": {
-            "const": true
-          },
-          "failure": {
-            "$ref": "#/components/schemas/RunFailure"
-          }
-        }
-      },
-      "RevisionSucceeded": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "state",
-          "feedback_locked",
-          "result"
-        ],
-        "properties": {
-          "state": {
-            "const": "succeeded"
-          },
-          "feedback_locked": {
-            "const": true
-          },
-          "result": {
-            "$ref": "#/components/schemas/Delivery"
-          }
-        }
+        "title": "CreationResource"
       },
       "Delivery": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "content_package",
-          "delivery_report"
-        ],
         "properties": {
           "content_package": {
             "$ref": "#/components/schemas/ContentPackage"
@@ -745,44 +711,64 @@
           "delivery_report": {
             "$ref": "#/components/schemas/DeliveryReport"
           }
-        }
-      },
-      "ContentPackage": {
-        "type": "object",
+        },
         "additionalProperties": false,
+        "type": "object",
         "required": [
-          "story_outline",
-          "character_biographies",
-          "relationship_logic",
-          "episode_outline",
-          "episode_scripts"
+          "content_package",
+          "delivery_report"
         ],
-        "properties": {
-          "story_outline": {
-            "type": "string",
-            "minLength": 1
-          },
-          "character_biographies": {
-            "type": "string",
-            "minLength": 1
-          },
-          "relationship_logic": {
-            "type": "string",
-            "minLength": 1
-          },
-          "episode_outline": {
-            "type": "string",
-            "minLength": 1
-          },
-          "episode_scripts": {
-            "type": "string",
-            "minLength": 1
-          }
-        }
+        "title": "Delivery"
       },
       "DeliveryReport": {
-        "type": "object",
+        "properties": {
+          "persona_id": {
+            "type": "string",
+            "title": "Persona Id"
+          },
+          "persona_version": {
+            "type": "string",
+            "title": "Persona Version"
+          },
+          "persona_snapshot_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Persona Snapshot Sha256"
+          },
+          "selected_l0_variant": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Selected L0 Variant"
+          },
+          "selection_rationale": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Selection Rationale"
+          },
+          "l0_gate": {
+            "$ref": "#/components/schemas/GateResult"
+          },
+          "l4_gate": {
+            "$ref": "#/components/schemas/GateResult"
+          },
+          "ownership_statement": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Ownership Statement"
+          },
+          "feedback_handling": {
+            "items": {
+              "$ref": "#/components/schemas/FeedbackHandlingItem"
+            },
+            "type": "array",
+            "title": "Feedback Handling"
+          }
+        },
         "additionalProperties": false,
+        "type": "object",
         "required": [
           "persona_id",
           "persona_version",
@@ -794,121 +780,147 @@
           "ownership_statement",
           "feedback_handling"
         ],
-        "properties": {
-          "persona_id": {
-            "type": "string"
-          },
-          "persona_version": {
-            "type": "string"
-          },
-          "persona_snapshot_sha256": {
-            "description": "The immutable identity-and-content snapshot selected when the creation was accepted.",
-            "$ref": "#/components/schemas/Sha256"
-          },
-          "selected_l0_variant": {
-            "type": "string",
-            "minLength": 1
-          },
-          "selection_rationale": {
-            "type": "string",
-            "minLength": 1
-          },
-          "l0_gate": {
-            "$ref": "#/components/schemas/GateResult"
-          },
-          "l4_gate": {
-            "$ref": "#/components/schemas/GateResult"
-          },
-          "ownership_statement": {
-            "type": "string",
-            "minLength": 1
-          },
-          "feedback_handling": {
-            "type": "array",
-            "description": "Empty for an initial delivery; itemized for a revised delivery.",
-            "items": {
-              "$ref": "#/components/schemas/FeedbackHandlingItem"
-            }
-          }
-        }
+        "title": "DeliveryReport"
       },
-      "GateResult": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "passed",
-          "evidence"
-        ],
+      "EndedRun": {
         "properties": {
-          "passed": {
-            "const": true
-          },
-          "evidence": {
+          "state": {
             "type": "string",
-            "minLength": 1
+            "const": "ended",
+            "title": "State",
+            "default": "ended"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
           }
-        }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress"
+        ],
+        "title": "EndedRun"
+      },
+      "FailedRun": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "failed",
+            "title": "State",
+            "default": "failed"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          },
+          "failure": {
+            "$ref": "#/components/schemas/RunFailure"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress",
+          "failure"
+        ],
+        "title": "FailedRun"
       },
       "FeedbackHandlingItem": {
-        "type": "object",
+        "properties": {
+          "feedback_item": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Feedback Item"
+          },
+          "handling": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Handling"
+          },
+          "result": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Result"
+          }
+        },
         "additionalProperties": false,
+        "type": "object",
         "required": [
           "feedback_item",
           "handling",
           "result"
         ],
-        "properties": {
-          "feedback_item": {
-            "type": "string",
-            "minLength": 1
-          },
-          "handling": {
-            "type": "string",
-            "minLength": 1
-          },
-          "result": {
-            "type": "string",
-            "minLength": 1
-          }
-        }
+        "title": "FeedbackHandlingItem"
       },
-      "RunFailure": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "code",
-          "message",
-          "failed_stage",
-          "attempt_count"
-        ],
+      "FinalReviewProgress": {
         "properties": {
-          "code": {
+          "l0": {
             "type": "string",
             "enum": [
-              "persona_package_invalid",
-              "relay_unavailable",
-              "relay_incompatible",
-              "structured_output_invalid",
-              "stage_validation_failed",
-              "agent_execution_limit",
-              "checkpoint_unavailable",
-              "attempts_exhausted",
-              "internal_error"
-            ]
+              "pending",
+              "running",
+              "passed",
+              "paused",
+              "failed"
+            ],
+            "title": "L0"
           },
-          "message": {
+          "l4": {
             "type": "string",
-            "minLength": 1
-          },
-          "failed_stage": {
-            "$ref": "#/components/schemas/InternalStage"
-          },
-          "attempt_count": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 3
+            "enum": [
+              "pending",
+              "running",
+              "passed",
+              "paused",
+              "failed"
+            ],
+            "title": "L4"
           }
-        }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "l0",
+          "l4"
+        ],
+        "title": "FinalReviewProgress"
+      },
+      "GateResult": {
+        "properties": {
+          "passed": {
+            "type": "boolean",
+            "const": true,
+            "title": "Passed"
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Evidence"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "passed",
+          "evidence"
+        ],
+        "title": "GateResult"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
       },
       "InternalStage": {
         "type": "string",
@@ -923,7 +935,686 @@
           "accepting_l0",
           "accepting_l4",
           "assembling_delivery"
-        ]
+        ],
+        "title": "InternalStage"
+      },
+      "PausedRun": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "paused",
+            "title": "State",
+            "default": "paused"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          },
+          "pause": {
+            "$ref": "#/components/schemas/RunPause"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress",
+          "pause"
+        ],
+        "title": "PausedRun"
+      },
+      "PersonaList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PersonaSummary"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "PersonaList"
+      },
+      "PersonaSnapshot": {
+        "properties": {
+          "persona_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+            "title": "Persona Id"
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Display Name"
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Version"
+          },
+          "snapshot_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Snapshot Sha256"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "persona_id",
+          "display_name",
+          "version",
+          "snapshot_sha256"
+        ],
+        "title": "PersonaSnapshot"
+      },
+      "PersonaSummary": {
+        "properties": {
+          "persona_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+            "title": "Persona Id"
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Display Name"
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Version"
+          },
+          "snapshot_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Snapshot Sha256"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "persona_id",
+          "display_name",
+          "version",
+          "snapshot_sha256"
+        ],
+        "title": "PersonaSummary"
+      },
+      "QueuedRun": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "queued",
+            "title": "State",
+            "default": "queued"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress"
+        ],
+        "title": "QueuedRun"
+      },
+      "RevisionAccepted": {
+        "properties": {
+          "creation_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Creation Id"
+          },
+          "revision_state": {
+            "type": "string",
+            "const": "queued",
+            "title": "Revision State",
+            "default": "queued"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": true,
+            "title": "Feedback Locked",
+            "default": true
+          },
+          "resource_url": {
+            "type": "string",
+            "title": "Resource Url"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "creation_id",
+          "resource_url"
+        ],
+        "title": "RevisionAccepted"
+      },
+      "RevisionAutoResuming": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "auto_resuming",
+            "title": "State",
+            "default": "auto_resuming"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": true,
+            "title": "Feedback Locked",
+            "default": true
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress"
+        ],
+        "title": "RevisionAutoResuming"
+      },
+      "RevisionAvailable": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "available",
+            "title": "State",
+            "default": "available"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": false,
+            "title": "Feedback Locked",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "RevisionAvailable"
+      },
+      "RevisionEnded": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "ended",
+            "title": "State",
+            "default": "ended"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": true,
+            "title": "Feedback Locked",
+            "default": true
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress"
+        ],
+        "title": "RevisionEnded"
+      },
+      "RevisionFailed": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "failed",
+            "title": "State",
+            "default": "failed"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": true,
+            "title": "Feedback Locked",
+            "default": true
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": true,
+            "title": "Retryable",
+            "default": true
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          },
+          "failure": {
+            "$ref": "#/components/schemas/RunFailure"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress",
+          "failure"
+        ],
+        "title": "RevisionFailed"
+      },
+      "RevisionPaused": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "paused",
+            "title": "State",
+            "default": "paused"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": true,
+            "title": "Feedback Locked",
+            "default": true
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          },
+          "pause": {
+            "$ref": "#/components/schemas/RunPause"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress",
+          "pause"
+        ],
+        "title": "RevisionPaused"
+      },
+      "RevisionQueued": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "queued",
+            "title": "State",
+            "default": "queued"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": true,
+            "title": "Feedback Locked",
+            "default": true
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress"
+        ],
+        "title": "RevisionQueued"
+      },
+      "RevisionRequest": {
+        "properties": {
+          "feedback": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Feedback"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "feedback"
+        ],
+        "title": "RevisionRequest"
+      },
+      "RevisionRunning": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "running",
+            "title": "State",
+            "default": "running"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": true,
+            "title": "Feedback Locked",
+            "default": true
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress"
+        ],
+        "title": "RevisionRunning"
+      },
+      "RevisionSucceeded": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "succeeded",
+            "title": "State",
+            "default": "succeeded"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": true,
+            "title": "Feedback Locked",
+            "default": true
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          },
+          "result": {
+            "$ref": "#/components/schemas/Delivery"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress",
+          "result"
+        ],
+        "title": "RevisionSucceeded"
+      },
+      "RevisionUnavailable": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "unavailable",
+            "title": "State",
+            "default": "unavailable"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": false,
+            "title": "Feedback Locked",
+            "default": false
+          },
+          "reason": {
+            "type": "string",
+            "const": "initial_not_succeeded",
+            "title": "Reason",
+            "default": "initial_not_succeeded"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "RevisionUnavailable"
+      },
+      "RunControlAccepted": {
+        "properties": {
+          "creation_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Creation Id"
+          },
+          "run_kind": {
+            "type": "string",
+            "enum": [
+              "initial",
+              "revision"
+            ],
+            "title": "Run Kind"
+          },
+          "run_state": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "auto_resuming",
+              "ended"
+            ],
+            "title": "Run State"
+          },
+          "resource_url": {
+            "type": "string",
+            "title": "Resource Url"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "creation_id",
+          "run_kind",
+          "run_state",
+          "resource_url"
+        ],
+        "title": "RunControlAccepted"
+      },
+      "RunFailure": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "persona_package_invalid",
+              "relay_unavailable",
+              "relay_incompatible",
+              "structured_output_invalid",
+              "stage_validation_failed",
+              "agent_execution_limit",
+              "graph_recursion_limit",
+              "quality_gate_rejected",
+              "checkpoint_unavailable",
+              "attempts_exhausted",
+              "ended_by_user",
+              "internal_error"
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Message"
+          },
+          "failed_stage": {
+            "$ref": "#/components/schemas/InternalStage"
+          },
+          "attempt_count": {
+            "type": "integer",
+            "maximum": 3.0,
+            "minimum": 1.0,
+            "title": "Attempt Count"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "failed_stage",
+          "attempt_count"
+        ],
+        "title": "RunFailure"
+      },
+      "RunPause": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "run_timeout",
+            "title": "Code",
+            "default": "run_timeout"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Message"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/UserStage"
+          },
+          "timeout_count": {
+            "type": "integer",
+            "minimum": 2.0,
+            "title": "Timeout Count"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "message",
+          "stage",
+          "timeout_count"
+        ],
+        "title": "RunPause"
+      },
+      "RunProgress": {
+        "properties": {
+          "current_stage": {
+            "$ref": "#/components/schemas/UserStage"
+          },
+          "completed_stages": {
+            "items": {
+              "$ref": "#/components/schemas/UserStage"
+            },
+            "type": "array",
+            "title": "Completed Stages"
+          },
+          "elapsed_seconds": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Elapsed Seconds"
+          },
+          "recovery_state": {
+            "type": "string",
+            "enum": [
+              "none",
+              "auto_resuming",
+              "paused"
+            ],
+            "title": "Recovery State"
+          },
+          "final_review": {
+            "$ref": "#/components/schemas/FinalReviewProgress"
+          },
+          "can_continue": {
+            "type": "boolean",
+            "title": "Can Continue"
+          },
+          "can_end": {
+            "type": "boolean",
+            "title": "Can End"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "current_stage",
+          "completed_stages",
+          "elapsed_seconds",
+          "recovery_state",
+          "final_review",
+          "can_continue",
+          "can_end"
+        ],
+        "title": "RunProgress"
+      },
+      "RunningRun": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "running",
+            "title": "State",
+            "default": "running"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress"
+        ],
+        "title": "RunningRun"
+      },
+      "SucceededRun": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "succeeded",
+            "title": "State",
+            "default": "succeeded"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          },
+          "result": {
+            "$ref": "#/components/schemas/Delivery"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress",
+          "result"
+        ],
+        "title": "SucceededRun"
+      },
+      "UserStage": {
+        "type": "string",
+        "enum": [
+          "determining_direction",
+          "generating_story_outline",
+          "generating_character_biographies",
+          "generating_relationships",
+          "generating_episode_outline",
+          "generating_episode_scripts",
+          "final_review"
+        ],
+        "title": "UserStage"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
       },
       "CommandError": {
         "type": "object",
@@ -943,7 +1634,8 @@
               "idempotency_conflict",
               "revision_not_allowed",
               "revision_feedback_locked",
-              "service_unavailable"
+              "service_unavailable",
+              "run_not_controllable"
             ]
           },
           "message": {

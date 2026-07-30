@@ -15,6 +15,7 @@ from pengine.agents import (
     AgentProtocolError,
     CheckpointUnavailableError,
     DeepAgentWorkflow,
+    QualityGateRejectedError,
 )
 from pengine.config import Settings
 from pengine.errors import DomainError
@@ -156,6 +157,7 @@ class Worker:
         work = await self.repository.get_run_work_item(job.run_id)
         approved: dict[InternalStage, Any] = dict(work.business_checkpoints)
         current_stage = InternalStage.LOADING_PERSONA
+        run_timeout_scope: asyncio.Timeout | None = None
         logger.info(
             "workflow run started run_id=%s creation_id=%s kind=%s",
             work.run_id,
@@ -219,8 +221,9 @@ class Worker:
                     separators=(",", ":"),
                 )
 
-            result = await asyncio.wait_for(
-                self.workflow.execute(
+            run_timeout_scope = asyncio.timeout(self.settings.run_timeout_seconds)
+            async with run_timeout_scope:
+                result = await self.workflow.execute(
                     thread_id=work.thread_id,
                     story=work.story,
                     requirements=work.requirements,
@@ -230,9 +233,7 @@ class Worker:
                     approved_checkpoints=approved,
                     feedback=work.frozen_feedback,
                     retrieve_references=retrieve_references,
-                ),
-                timeout=self.settings.run_timeout_seconds,
-            )
+                )
             if work.run_kind == "revision" and not result.feedback_handling:
                 raise AgentProtocolError(
                     "Revision result omitted feedback handling",
@@ -260,6 +261,31 @@ class Worker:
             )
         except asyncio.CancelledError:
             raise
+        except TimeoutError as exc:
+            if run_timeout_scope is not None and run_timeout_scope.expired():
+                timeout_stage = self._failure_stage(exc, current_stage, approved)
+                recovery_state = await self.repository.handle_run_timeout(
+                    work.run_id,
+                    timeout_stage,
+                )
+                logger.warning(
+                    "workflow run timed out run_id=%s creation_id=%s stage=%s state=%s",
+                    work.run_id,
+                    work.creation_id,
+                    timeout_stage.value,
+                    recovery_state,
+                )
+                return
+            failure_stage = self._failure_stage(exc, current_stage, approved)
+            failure = await self._safe_failure(work.run_id, failure_stage, exc)
+            await self.repository.fail_run(work.run_id, failure)
+            logger.warning(
+                "workflow run failed run_id=%s creation_id=%s stage=%s code=%s",
+                work.run_id,
+                work.creation_id,
+                failure.failed_stage.value,
+                failure.code,
+            )
         except Exception as exc:
             failure_stage = self._failure_stage(exc, current_stage, approved)
             failure = await self._safe_failure(work.run_id, failure_stage, exc)
@@ -415,12 +441,16 @@ def _classify_failure(exc: Exception) -> tuple[str, str]:
         return exc.code, exc.safe_message
     if isinstance(exc, AgentProtocolError):
         return "structured_output_invalid", "The agent returned invalid structured output."
+    if isinstance(exc, QualityGateRejectedError):
+        return "quality_gate_rejected", "The final quality gate rejected the generated work."
     if isinstance(exc, PersonaPackageError):
         return "persona_package_invalid", "The persona snapshot could not be loaded."
     if isinstance(exc, CheckpointUnavailableError):
         return "checkpoint_unavailable", "The workflow checkpoint is unavailable."
-    if isinstance(exc, GraphRecursionError | TimeoutError):
-        return "agent_execution_limit", "The agent execution budget was exhausted."
+    if isinstance(exc, GraphRecursionError):
+        return "graph_recursion_limit", "The workflow graph recursion limit was exhausted."
+    if isinstance(exc, TimeoutError):
+        return "relay_unavailable", "The model relay timed out."
     if isinstance(exc, DomainError) and exc.code == "attempts_exhausted":
         return "attempts_exhausted", "The stage attempt limit was exhausted."
     if isinstance(exc, sqlite3.Error) or type(exc).__module__.startswith("langgraph.checkpoint"):

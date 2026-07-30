@@ -901,6 +901,166 @@ textarea:disabled {
   transform: rotate(2deg);
 }
 
+.run-progress {
+  position: relative;
+  z-index: 1;
+  margin: 0 0 1rem 2rem;
+  padding: clamp(1rem, 2.4vw, 1.5rem);
+  border: 1px solid rgba(90, 69, 45, 0.28);
+  background:
+    linear-gradient(90deg, rgba(159, 63, 45, 0.06), transparent 36%),
+    rgba(255, 250, 235, 0.62);
+}
+
+.progress-header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.progress-header h3 {
+  margin: 0;
+  font-family: var(--display);
+  font-size: clamp(1.25rem, 2.5vw, 1.7rem);
+}
+
+.elapsed-clock {
+  margin: 0;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.elapsed-clock time {
+  display: block;
+  margin-top: 0.15rem;
+  color: var(--ink);
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.stage-list {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stage-list li {
+  min-width: 0;
+  padding: 0.55rem 0.45rem;
+  border-top: 3px solid rgba(90, 69, 45, 0.18);
+  color: var(--ink-faint);
+  font-size: 0.67rem;
+  line-height: 1.35;
+}
+
+.stage-list li span {
+  display: block;
+  margin-bottom: 0.22rem;
+  font-family: var(--mono);
+  font-size: 0.58rem;
+}
+
+.stage-list li[data-status="completed"] {
+  border-color: #496759;
+  color: #2f4c3e;
+}
+
+.stage-list li[data-status="completed"] span::after {
+  margin-left: 0.2rem;
+  content: "✓";
+}
+
+.stage-list li[data-status="current"] {
+  border-color: var(--rust);
+  color: var(--rust-deep);
+  background: rgba(159, 63, 45, 0.06);
+  font-weight: 700;
+}
+
+.review-progress {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.85rem;
+  padding-top: 0.8rem;
+  border-top: 1px dashed rgba(90, 69, 45, 0.28);
+}
+
+.review-progress p {
+  width: 100%;
+  margin: 0;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+}
+
+.review-progress span {
+  padding: 0.28rem 0.48rem;
+  border: 1px solid rgba(90, 69, 45, 0.24);
+  background: rgba(255, 255, 255, 0.35);
+  font-size: 0.7rem;
+}
+
+.run-controls {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.8rem 1rem;
+  align-items: center;
+  margin-top: 1rem;
+  padding: 0.9rem;
+  border: 1px solid rgba(115, 48, 36, 0.36);
+  background: rgba(159, 63, 45, 0.07);
+}
+
+.run-controls strong {
+  font-family: var(--display);
+}
+
+.run-controls p {
+  margin: 0.25rem 0 0;
+  color: var(--ink-soft);
+  font-size: 0.74rem;
+}
+
+.run-control-actions {
+  display: flex;
+  gap: 0.55rem;
+}
+
+.run-control-actions .secondary-button,
+.end-run-button {
+  min-width: 6.4rem;
+  padding: 0.65rem 0.85rem;
+}
+
+.end-run-button {
+  border: 1px solid var(--rust-deep);
+  color: var(--rust-deep);
+  background: transparent;
+  font-family: var(--display);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.end-run-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.run-controls .form-message {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
 .task-waiting,
 .failure-panel {
   position: relative;
@@ -1291,6 +1451,14 @@ textarea:disabled {
   .revision-desk {
     grid-template-columns: 1fr;
   }
+
+  .stage-list {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .run-controls {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 620px) {
@@ -1372,6 +1540,7 @@ textarea:disabled {
   }
 
   .delivery-heading,
+  .run-progress,
   .task-waiting,
   .failure-panel,
   #result-workspace {
@@ -1380,6 +1549,31 @@ textarea:disabled {
 
   .task-waiting {
     grid-template-columns: 1fr;
+  }
+
+  .progress-header,
+  .run-control-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .stage-list {
+    grid-template-columns: 1fr;
+  }
+
+  .stage-list li {
+    display: grid;
+    grid-template-columns: 2.2rem 1fr;
+    align-items: center;
+  }
+
+  .stage-list li span {
+    margin: 0;
+  }
+
+  .run-control-actions .secondary-button,
+  .end-run-button {
+    width: 100%;
   }
 
   .typewriter {

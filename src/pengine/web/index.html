@@ -52,7 +52,7 @@
         <aside class="desk-note" aria-label="工作台说明">
           <span class="pin" aria-hidden="true"></span>
           <p class="note-label">编务提示</p>
-          <p>任务耗时取决于本地模型服务。等待期间，本页只报告后端返回的真实状态。</p>
+          <p>任务耗时取决于本地模型服务。等待期间，本页会显示后端确认的阶段与已运行时长。</p>
           <p class="hand-sign">— 值班编辑</p>
         </aside>
       </section>
@@ -183,6 +183,56 @@
               <span class="folio-stamp" id="folio-stamp">卷宗 —</span>
             </div>
 
+            <section
+              class="run-progress"
+              id="run-progress"
+              aria-labelledby="progress-title"
+              hidden
+            >
+              <header class="progress-header">
+                <div aria-live="polite">
+                  <p class="wait-kicker" id="progress-kind">初稿进度</p>
+                  <h3 id="progress-title">确定创作方向</h3>
+                </div>
+                <p class="elapsed-clock">
+                  已运行
+                  <time id="progress-elapsed">00:00</time>
+                </p>
+              </header>
+
+              <ol class="stage-list" id="progress-stages">
+                <li data-stage="determining_direction"><span>01</span>确定创作方向</li>
+                <li data-stage="generating_story_outline"><span>02</span>生成故事大纲</li>
+                <li data-stage="generating_character_biographies"><span>03</span>生成人物小传</li>
+                <li data-stage="generating_relationships"><span>04</span>生成人物关系</li>
+                <li data-stage="generating_episode_outline"><span>05</span>生成分集大纲</li>
+                <li data-stage="generating_episode_scripts"><span>06</span>生成分集剧本</li>
+                <li data-stage="final_review"><span>07</span>成品审核</li>
+              </ol>
+
+              <div class="review-progress" id="review-progress" hidden>
+                <p>成品审核</p>
+                <span id="review-l0">L0 创作内核 · 等待</span>
+                <span id="review-l4">L4 技法与价值观 · 等待</span>
+              </div>
+
+              <div class="run-controls" id="run-controls" hidden>
+                <div>
+                  <strong>本阶段已两次超过整体运行时限</strong>
+                  <p>可从当前未批准阶段继续，已完成阶段不会重新生成；也可以结束本次任务。</p>
+                </div>
+                <div class="run-control-actions">
+                  <button class="secondary-button" id="continue-run" type="button">
+                    继续创作
+                  </button>
+                  <button class="end-run-button" id="end-run" type="button">
+                    结束任务
+                  </button>
+                </div>
+                <p class="form-message" id="run-control-message" aria-live="assertive"></p>
+              </div>
+            </section>
+
             <div class="task-waiting" id="task-waiting" role="status" hidden>
               <div class="typewriter" aria-hidden="true">
                 <span></span><span></span><span></span><span></span>
@@ -197,7 +247,7 @@
             </div>
 
             <div class="failure-panel" id="failure-panel" role="alert" hidden>
-              <p class="failure-label">任务未完成</p>
+              <p class="failure-label" id="failure-label">任务未完成</p>
               <h3 id="failure-title">编辑部返回失败</h3>
               <p id="failure-message"></p>
               <code id="failure-code"></code>

@@ -9,6 +9,7 @@ from persona_factory import create_persona_package
 
 from pengine.api import create_app
 from pengine.config import Settings
+from pengine.schemas import InternalStage
 
 
 def _app(tmp_path: Path):
@@ -22,7 +23,7 @@ def _app(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_frontend_and_assets_are_served_without_expanding_business_openapi(
+async def test_frontend_and_assets_are_served_with_run_control_openapi(
     tmp_path: Path,
 ) -> None:
     app = _app(tmp_path)
@@ -58,6 +59,8 @@ async def test_frontend_and_assets_are_served_without_expanding_business_openapi
         ("POST", "/creations"),
         ("GET", "/creations/{creation_id}"),
         ("POST", "/creations/{creation_id}/revision"),
+        ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
+        ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
     }
 
 
@@ -136,13 +139,125 @@ async def test_persona_creation_and_query_contract(tmp_path: Path) -> None:
         resource = await client.get(f"/creations/{creation_id}")
         assert resource.status_code == 200
         body = resource.json()
-        assert body["initial"] == {"state": "queued"}
+        assert body["initial"] == {
+            "state": "queued",
+            "progress": {
+                "current_stage": "determining_direction",
+                "completed_stages": [],
+                "elapsed_seconds": 0,
+                "recovery_state": "none",
+                "final_review": {"l0": "pending", "l4": "pending"},
+                "can_continue": False,
+                "can_end": False,
+            },
+        }
         assert body["revision"] == {
             "state": "unavailable",
             "feedback_locked": False,
             "reason": "initial_not_succeeded",
         }
         assert "result" not in body["initial"]
+
+
+@pytest.mark.asyncio
+async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client,
+    ):
+        accepted = await client.post(
+            "/creations",
+            headers={"Idempotency-Key": "control-create"},
+            json={
+                "persona_id": "test-persona",
+                "story": "一个人回乡面对旧事。",
+                "requirements": "生成完整短剧。",
+            },
+        )
+        creation_id = accepted.json()["creation_id"]
+        repository = app.state.repository
+        lease = await repository.lease_next_job("control-worker-1", 30)
+        assert lease is not None
+        await repository.record_stage_attempt(
+            lease.run_id,
+            InternalStage.GENERATING_STORY_OUTLINE,
+        )
+        assert (
+            await repository.handle_run_timeout(
+                lease.run_id,
+                InternalStage.GENERATING_STORY_OUTLINE,
+            )
+            == "auto_resuming"
+        )
+        resumed = await repository.lease_next_job("control-worker-2", 30)
+        assert resumed is not None
+        await repository.record_stage_attempt(
+            resumed.run_id,
+            InternalStage.GENERATING_STORY_OUTLINE,
+        )
+        assert (
+            await repository.handle_run_timeout(
+                resumed.run_id,
+                InternalStage.GENERATING_STORY_OUTLINE,
+            )
+            == "paused"
+        )
+
+        paused = await client.get(f"/creations/{creation_id}")
+        assert paused.json()["initial"]["state"] == "paused"
+        assert paused.json()["initial"]["progress"]["can_continue"] is True
+        assert "result" not in paused.json()["initial"]
+
+        first_continue = await client.post(
+            f"/creations/{creation_id}/runs/initial/continue",
+            headers={"Idempotency-Key": "control-continue"},
+        )
+        replay_continue = await client.post(
+            f"/creations/{creation_id}/runs/initial/continue",
+            headers={"Idempotency-Key": "control-continue"},
+        )
+        assert first_continue.status_code == 202
+        assert replay_continue.json() == first_continue.json()
+        assert first_continue.json()["run_state"] == "queued"
+
+        resumed_again = await repository.lease_next_job("control-worker-3", 30)
+        assert resumed_again is not None
+        await repository.record_stage_attempt(
+            resumed_again.run_id,
+            InternalStage.GENERATING_STORY_OUTLINE,
+        )
+        assert (
+            await repository.handle_run_timeout(
+                resumed_again.run_id,
+                InternalStage.GENERATING_STORY_OUTLINE,
+            )
+            == "paused"
+        )
+
+        first_end = await client.post(
+            f"/creations/{creation_id}/runs/initial/end",
+            headers={"Idempotency-Key": "control-end"},
+        )
+        replay_end = await client.post(
+            f"/creations/{creation_id}/runs/initial/end",
+            headers={"Idempotency-Key": "control-end"},
+        )
+        assert first_end.status_code == 202
+        assert replay_end.json() == first_end.json()
+        assert first_end.json()["run_state"] == "ended"
+
+        ended = await client.get(f"/creations/{creation_id}")
+        assert ended.json()["initial"]["state"] == "ended"
+        cannot_continue = await client.post(
+            f"/creations/{creation_id}/runs/initial/continue",
+            headers={"Idempotency-Key": "control-continue-ended"},
+        )
+        assert cannot_continue.status_code == 409
+        assert cannot_continue.json()["code"] == "run_not_controllable"
 
 
 @pytest.mark.asyncio

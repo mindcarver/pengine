@@ -18,6 +18,7 @@ from pengine.agents import (
     VIRTUAL_FILE_PERMISSIONS,
     AgentProtocolError,
     DeepAgentWorkflow,
+    QualityGateRejectedError,
     QualityReviewerResult,
     StageGuardMiddleware,
     StoryArchitectResult,
@@ -574,7 +575,7 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
             provider_profile_key="toolcallingfakemodel",
         )
 
-        with pytest.raises(AgentProtocolError, match="Quality gate did not pass"):
+        with pytest.raises(QualityGateRejectedError, match="Quality gate did not pass"):
             await workflow.execute(
                 thread_id="failed-gate-thread",
                 story="故事",

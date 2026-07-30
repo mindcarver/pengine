@@ -42,6 +42,16 @@ class InternalStage(StrEnum):
     ASSEMBLING_DELIVERY = "assembling_delivery"
 
 
+class UserStage(StrEnum):
+    DETERMINING_DIRECTION = "determining_direction"
+    GENERATING_STORY_OUTLINE = "generating_story_outline"
+    GENERATING_CHARACTER_BIOGRAPHIES = "generating_character_biographies"
+    GENERATING_RELATIONSHIPS = "generating_relationships"
+    GENERATING_EPISODE_OUTLINE = "generating_episode_outline"
+    GENERATING_EPISODE_SCRIPTS = "generating_episode_scripts"
+    FINAL_REVIEW = "final_review"
+
+
 class CreateCreationRequest(StrictModel):
     persona_id: NonEmptyText
     story: NonEmptyText
@@ -111,8 +121,11 @@ class RunFailure(StrictModel):
         "structured_output_invalid",
         "stage_validation_failed",
         "agent_execution_limit",
+        "graph_recursion_limit",
+        "quality_gate_rejected",
         "checkpoint_unavailable",
         "attempts_exhausted",
+        "ended_by_user",
         "internal_error",
     ]
     message: NonEmptyText
@@ -120,26 +133,68 @@ class RunFailure(StrictModel):
     attempt_count: int = Field(ge=1, le=3)
 
 
+class FinalReviewProgress(StrictModel):
+    l0: Literal["pending", "running", "passed", "paused", "failed"]
+    l4: Literal["pending", "running", "passed", "paused", "failed"]
+
+
+class RunProgress(StrictModel):
+    current_stage: UserStage
+    completed_stages: list[UserStage]
+    elapsed_seconds: int = Field(ge=0)
+    recovery_state: Literal["none", "auto_resuming", "paused"]
+    final_review: FinalReviewProgress
+    can_continue: bool
+    can_end: bool
+
+
+class RunPause(StrictModel):
+    code: Literal["run_timeout"] = "run_timeout"
+    message: NonEmptyText
+    stage: UserStage
+    timeout_count: int = Field(ge=2)
+
+
 class QueuedRun(StrictModel):
     state: Literal["queued"] = "queued"
+    progress: RunProgress
 
 
 class RunningRun(StrictModel):
     state: Literal["running"] = "running"
+    progress: RunProgress
+
+
+class AutoResumingRun(StrictModel):
+    state: Literal["auto_resuming"] = "auto_resuming"
+    progress: RunProgress
+
+
+class PausedRun(StrictModel):
+    state: Literal["paused"] = "paused"
+    progress: RunProgress
+    pause: RunPause
+
+
+class EndedRun(StrictModel):
+    state: Literal["ended"] = "ended"
+    progress: RunProgress
 
 
 class SucceededRun(StrictModel):
     state: Literal["succeeded"] = "succeeded"
+    progress: RunProgress
     result: Delivery
 
 
 class FailedRun(StrictModel):
     state: Literal["failed"] = "failed"
+    progress: RunProgress
     failure: RunFailure
 
 
 RunStatus = Annotated[
-    QueuedRun | RunningRun | SucceededRun | FailedRun,
+    QueuedRun | RunningRun | AutoResumingRun | PausedRun | EndedRun | SucceededRun | FailedRun,
     Field(discriminator="state"),
 ]
 
@@ -158,23 +213,46 @@ class RevisionAvailable(StrictModel):
 class RevisionQueued(StrictModel):
     state: Literal["queued"] = "queued"
     feedback_locked: Literal[True] = True
+    progress: RunProgress
 
 
 class RevisionRunning(StrictModel):
     state: Literal["running"] = "running"
     feedback_locked: Literal[True] = True
+    progress: RunProgress
+
+
+class RevisionAutoResuming(StrictModel):
+    state: Literal["auto_resuming"] = "auto_resuming"
+    feedback_locked: Literal[True] = True
+    progress: RunProgress
+
+
+class RevisionPaused(StrictModel):
+    state: Literal["paused"] = "paused"
+    feedback_locked: Literal[True] = True
+    progress: RunProgress
+    pause: RunPause
+
+
+class RevisionEnded(StrictModel):
+    state: Literal["ended"] = "ended"
+    feedback_locked: Literal[True] = True
+    progress: RunProgress
 
 
 class RevisionFailed(StrictModel):
     state: Literal["failed"] = "failed"
     feedback_locked: Literal[True] = True
     retryable: Literal[True] = True
+    progress: RunProgress
     failure: RunFailure
 
 
 class RevisionSucceeded(StrictModel):
     state: Literal["succeeded"] = "succeeded"
     feedback_locked: Literal[True] = True
+    progress: RunProgress
     result: Delivery
 
 
@@ -183,6 +261,9 @@ RevisionStatus = Annotated[
     | RevisionAvailable
     | RevisionQueued
     | RevisionRunning
+    | RevisionAutoResuming
+    | RevisionPaused
+    | RevisionEnded
     | RevisionFailed
     | RevisionSucceeded,
     Field(discriminator="state"),
@@ -199,6 +280,13 @@ class RevisionAccepted(StrictModel):
     creation_id: UUID
     revision_state: Literal["queued"] = "queued"
     feedback_locked: Literal[True] = True
+    resource_url: str
+
+
+class RunControlAccepted(StrictModel):
+    creation_id: UUID
+    run_kind: Literal["initial", "revision"]
+    run_state: Literal["queued", "running", "auto_resuming", "ended"]
     resource_url: str
 
 
@@ -220,6 +308,7 @@ class CommandError(StrictModel):
         "idempotency_conflict",
         "revision_not_allowed",
         "revision_feedback_locked",
+        "run_not_controllable",
         "service_unavailable",
     ]
     message: NonEmptyText
