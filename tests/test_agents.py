@@ -22,6 +22,7 @@ from pengine.agents import (
     StageGuardMiddleware,
     StoryArchitectResult,
     WorkflowCompletion,
+    _calculate_arithmetic,
     _supervisor_prompt,
 )
 from pengine.config import Settings
@@ -222,6 +223,12 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "dates, countdowns, amounts, counts, and arithmetic" in _EPISODE_PLANNER_PROMPT
     assert "exact dialogue-count claims" in _SCRIPT_WRITER_PROMPT
     assert "Every upstream commitment must appear" in _SCRIPT_WRITER_PROMPT
+    assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
+
+
+def test_calculate_arithmetic_preserves_exact_decimal_result() -> None:
+    assert _calculate_arithmetic("190", "divide", "8") == "23.75"
+    assert _calculate_arithmetic("12", "multiply", "16") == "192"
 
 
 @pytest.mark.asyncio
@@ -274,6 +281,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         all_tool_names = {name for snapshot in model.bound_tool_names for name in snapshot}
         assert "execute" not in all_tool_names
         assert "task" in all_tool_names
+        assert "calculate_arithmetic" in all_tool_names
         task_descriptions = [
             description
             for names, descriptions in zip(

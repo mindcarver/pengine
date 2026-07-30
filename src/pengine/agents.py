@@ -2,6 +2,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 from deepagents import (
@@ -73,7 +74,8 @@ _STORY_ARCHITECT_PROMPT = (
     "Treat every prior approved artifact as binding. Reconcile dates, amounts, "
     "counts, and episode-specific actions before returning. Avoid unnecessary "
     "exact claims about future dialogue counts or scene placement; when such a "
-    "claim is required, make it an explicit downstream commitment."
+    "claim is required, make it an explicit downstream commitment. Use "
+    "calculate_arithmetic for every derived numeric claim and copy its exact result."
 )
 
 _EPISODE_PLANNER_PROMPT = (
@@ -84,7 +86,9 @@ _EPISODE_PLANNER_PROMPT = (
     "its baseline; never invent a different count. Before returning, verify "
     "that every episode-specific action promised by the character biographies "
     "or relationship logic appears in the matching episode, and that dates, "
-    "countdowns, amounts, counts, and arithmetic agree across artifacts."
+    "countdowns, amounts, counts, and arithmetic agree across artifacts. Use "
+    "calculate_arithmetic for every derived numeric claim. Never round a "
+    "non-integral division unless the story states the rounding rule."
 )
 
 _SCRIPT_WRITER_PROMPT = (
@@ -93,8 +97,10 @@ _SCRIPT_WRITER_PROMPT = (
     "approved upstream artifact and audit the complete scripts against them. "
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
     "exact dialogue-count claims, and episode-specific promised actions. Every "
-    "upstream commitment must appear in the scripts. Return only the structured "
-    "episode-script result."
+    "upstream commitment must appear in the scripts. Use calculate_arithmetic "
+    "for every derived numeric claim and copy its exact result. Never round a "
+    "non-integral division unless the script states the rounding rule. Return "
+    "only the structured episode-script result."
 )
 
 VIRTUAL_FILE_PERMISSIONS = [
@@ -194,6 +200,29 @@ class AgentProtocolError(RuntimeError):
 
 class CheckpointUnavailableError(RuntimeError):
     """The durable thread state required for a resumed run is missing."""
+
+
+def _calculate_arithmetic(
+    left: str,
+    operation: Literal["add", "subtract", "multiply", "divide"],
+    right: str,
+) -> str:
+    try:
+        lhs = Decimal(left)
+        rhs = Decimal(right)
+    except InvalidOperation as exc:
+        raise ValueError("Operands must be decimal numbers") from exc
+    if operation == "add":
+        result = lhs + rhs
+    elif operation == "subtract":
+        result = lhs - rhs
+    elif operation == "multiply":
+        result = lhs * rhs
+    else:
+        if rhs == 0:
+            raise ValueError("Cannot divide by zero")
+        result = lhs / rhs
+    return format(result.normalize(), "f")
 
 
 def register_pengine_harness_profile(provider_key: str = "anthropic") -> None:
@@ -471,7 +500,16 @@ class DeepAgentWorkflow:
             "encoding": "utf-8",
         }
 
-        tools = []
+        tools = [
+            StructuredTool.from_function(
+                func=_calculate_arithmetic,
+                name="calculate_arithmetic",
+                description=(
+                    "Calculate one exact decimal add, subtract, multiply, or divide "
+                    "operation. Use it before writing any derived numeric claim."
+                ),
+            )
+        ]
         if retrieve_references is not None:
 
             async def retrieve_persona_references(query: str) -> str:
