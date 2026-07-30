@@ -4,8 +4,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from persona_factory import create_persona_package
 from pydantic import Field
@@ -18,6 +19,7 @@ from pengine.agents import (
     AgentProtocolError,
     DeepAgentWorkflow,
     QualityReviewerResult,
+    StageGuardMiddleware,
     StoryArchitectResult,
     WorkflowCompletion,
     _supervisor_prompt,
@@ -424,6 +426,58 @@ async def test_missing_structured_result_fails_after_one_correction(
             )
 
     assert attempted == [InternalStage.SELECTING_L0_VARIANT]
+
+
+@pytest.mark.asyncio
+async def test_wrong_stage_result_is_not_corrected() -> None:
+    attempted: list[InternalStage] = []
+    handler_calls = 0
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The wrong stage must not be approved")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages={
+            InternalStage.SELECTING_L0_VARIANT,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+            InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        },
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] create the outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-wrong-stage",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(_: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(
+            content='{"stage":"generating_episode_scripts","content":"wrong stage"}',
+            tool_call_id="call-wrong-stage",
+        )
+
+    with pytest.raises(AgentProtocolError, match="different stage"):
+        await middleware.awrap_tool_call(request, handler)
+
+    assert attempted == [InternalStage.GENERATING_EPISODE_OUTLINE]
+    assert handler_calls == 1
 
 
 @pytest.mark.asyncio

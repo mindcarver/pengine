@@ -241,6 +241,12 @@ def _validated_stage_payload(
 ) -> Mapping[str, Any]:
     try:
         raw = json.loads(content)
+        if (
+            isinstance(raw, Mapping)
+            and isinstance(raw.get("stage"), str)
+            and raw["stage"] != stage.value
+        ):
+            raise AgentProtocolError("Subagent returned a different stage", stage=stage)
         if stage in _STORY_STAGES:
             parsed = StoryArchitectResult.model_validate(raw)
         elif stage is InternalStage.GENERATING_EPISODE_OUTLINE:
