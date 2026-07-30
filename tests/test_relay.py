@@ -21,7 +21,7 @@ def test_build_chat_model_uses_only_operator_connection_fields() -> None:
     assert "secret-value" not in repr(model)
 
 
-def test_build_chat_model_disables_parallel_tool_calls() -> None:
+def test_build_chat_model_requires_serial_tool_calls() -> None:
     class ProbeTool(BaseModel):
         value: str
 
@@ -33,6 +33,7 @@ def test_build_chat_model_disables_parallel_tool_calls() -> None:
 
     bound = build_chat_model(settings).bind_tools([ProbeTool])
 
+    assert bound.kwargs["tool_choice"]["type"] == "any"
     assert bound.kwargs["tool_choice"]["disable_parallel_tool_use"] is True
 
 

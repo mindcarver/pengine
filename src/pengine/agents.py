@@ -404,7 +404,10 @@ class DeepAgentWorkflow:
                 )
             )
 
-        no_retry = {"handle_errors": False}
+        structured_output_retry = (
+            "Return exactly one valid structured result tool call for the requested "
+            "stage. Do not return the result as prose."
+        )
         subagents = [
             {
                 "name": "story_architect",
@@ -424,7 +427,7 @@ class DeepAgentWorkflow:
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
                 "response_format": ToolStrategy(
                     schema=StoryArchitectResult,
-                    **no_retry,
+                    handle_errors=structured_output_retry,
                 ),
             },
             {
@@ -432,21 +435,26 @@ class DeepAgentWorkflow:
                 "description": "Creates the complete episode outline.",
                 "system_prompt": (
                     "Use approved upstream artifacts and persona rules. Return only "
-                    "the structured episode-outline result."
+                    "the structured episode-outline result. Preserve every explicit "
+                    "numeric constraint from the script requirements. When the "
+                    "requirements do not specify an episode count, read the "
+                    "stage-specific persona L4 file and use its baseline; never invent "
+                    "a different count."
                 ),
                 "model": self.model,
                 "tools": tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
                 "response_format": ToolStrategy(
                     schema=EpisodePlannerResult,
-                    **no_retry,
+                    handle_errors=structured_output_retry,
                 ),
             },
             {
                 "name": "script_writer",
                 "description": "Creates the complete episode scripts.",
                 "system_prompt": (
-                    "Use the approved episode outline and persona rules. Return only "
+                    "Use the approved episode outline and persona rules without "
+                    "changing its episode count or numeric constraints. Return only "
                     "the structured episode-script result."
                 ),
                 "model": self.model,
@@ -454,7 +462,7 @@ class DeepAgentWorkflow:
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
                 "response_format": ToolStrategy(
                     schema=ScriptWriterResult,
-                    **no_retry,
+                    handle_errors=structured_output_retry,
                 ),
             },
             {
@@ -475,7 +483,7 @@ class DeepAgentWorkflow:
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
                 "response_format": ToolStrategy(
                     schema=QualityReviewerResult,
-                    **no_retry,
+                    handle_errors=structured_output_retry,
                 ),
             },
         ]
@@ -500,7 +508,10 @@ class DeepAgentWorkflow:
             subagents=subagents,
             permissions=VIRTUAL_FILE_PERMISSIONS,
             backend=StateBackend(),
-            response_format=ToolStrategy(schema=WorkflowCompletion, handle_errors=False),
+            response_format=ToolStrategy(
+                schema=WorkflowCompletion,
+                handle_errors=structured_output_retry,
+            ),
             checkpointer=self.checkpointer,
             store=None,
         )
@@ -573,4 +584,9 @@ approved stage. Do not use any subagent other than the four listed above. Treat
 gate passed without the quality_reviewer evidence. After all stages are
 complete, return WorkflowCompletion only. Do not repeat the approved artifacts
 or return partial content.
+
+Preserve explicit numeric constraints from Script requirements. When Script
+requirements do not specify an episode count, the active persona L4 baseline is
+authoritative. Do not invent a different episode count or override any persona
+numeric constraint in a delegated task.
 """

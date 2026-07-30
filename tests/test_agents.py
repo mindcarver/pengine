@@ -17,6 +17,7 @@ from pengine.agents import (
     QualityReviewerResult,
     StoryArchitectResult,
     WorkflowCompletion,
+    _supervisor_prompt,
 )
 from pengine.config import Settings
 from pengine.personas import PersonaCatalog
@@ -197,6 +198,19 @@ def test_workflow_completion_does_not_repeat_approved_content() -> None:
     assert schema["properties"]["completed"]["const"] is True
 
 
+def test_supervisor_preserves_persona_episode_baseline_when_request_omits_count() -> None:
+    prompt = _supervisor_prompt(
+        story="故事",
+        requirements="按人格设定完成完整交付。",
+        feedback=None,
+        approved_json="{}",
+    )
+
+    normalized = " ".join(prompt.split())
+    assert "active persona L4 baseline is authoritative" in normalized
+    assert "Do not invent a different episode count" in normalized
+
+
 @pytest.mark.asyncio
 async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
@@ -266,6 +280,58 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         ):
             assert any(name in description for description in task_descriptions)
         assert all("\n- general-purpose:" not in description for description in task_descriptions)
+
+
+@pytest.mark.asyncio
+async def test_structured_output_validation_error_is_corrected_within_stage(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    responses.insert(
+        1,
+        _tool_call(
+            "StoryArchitectResult",
+            {
+                "stage": "selecting_l0_variant",
+                "content": "invalid for the selection stage",
+                "selected_l0_variant": None,
+                "selection_rationale": None,
+            },
+            99,
+        ),
+    )
+    attempted: list[InternalStage] = []
+    approved: list[InternalStage] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            recursion_limit=40,
+            provider_profile_key="toolcallingfakemodel",
+        )
+
+        result = await workflow.execute(
+            thread_id="structured-retry-thread",
+            story="故事",
+            requirements="按人格设定完成完整交付。",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+        )
+
+    assert result.content_package.episode_scripts == "分集剧本"
+    assert attempted.count(InternalStage.SELECTING_L0_VARIANT) == 1
+    assert approved[0] is InternalStage.SELECTING_L0_VARIANT
 
 
 @pytest.mark.asyncio
