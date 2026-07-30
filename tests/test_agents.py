@@ -229,6 +229,17 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
 def test_calculate_arithmetic_preserves_exact_decimal_result() -> None:
     assert _calculate_arithmetic("190", "divide", "8") == "23.75"
     assert _calculate_arithmetic("12", "multiply", "16") == "192"
+    assert _calculate_arithmetic("1", "divide", "3") == (
+        "1/3 (non-terminating decimal; do not round without an explicit rule)"
+    )
+
+
+@pytest.mark.parametrize("operand", ["NaN", "Infinity", "1e1000000"])
+def test_calculate_arithmetic_rejects_non_finite_or_unbounded_operands(
+    operand: str,
+) -> None:
+    with pytest.raises(ValueError, match="finite bounded decimal"):
+        _calculate_arithmetic(operand, "add", "1")
 
 
 @pytest.mark.asyncio

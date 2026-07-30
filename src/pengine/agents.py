@@ -2,7 +2,8 @@ import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException
+from fractions import Fraction
 from typing import Any, Literal
 
 from deepagents import (
@@ -207,22 +208,65 @@ def _calculate_arithmetic(
     operation: Literal["add", "subtract", "multiply", "divide"],
     right: str,
 ) -> str:
-    try:
-        lhs = Decimal(left)
-        rhs = Decimal(right)
-    except InvalidOperation as exc:
-        raise ValueError("Operands must be decimal numbers") from exc
+    lhs = _bounded_decimal(left)
+    rhs = _bounded_decimal(right)
+    left_fraction = Fraction(lhs)
+    right_fraction = Fraction(rhs)
     if operation == "add":
-        result = lhs + rhs
+        result = left_fraction + right_fraction
     elif operation == "subtract":
-        result = lhs - rhs
+        result = left_fraction - right_fraction
     elif operation == "multiply":
-        result = lhs * rhs
+        result = left_fraction * right_fraction
     else:
-        if rhs == 0:
+        if right_fraction == 0:
             raise ValueError("Cannot divide by zero")
-        result = lhs / rhs
-    return format(result.normalize(), "f")
+        result = left_fraction / right_fraction
+    decimal_result = _exact_decimal(result)
+    if decimal_result is not None:
+        return decimal_result
+    return (
+        f"{result.numerator}/{result.denominator} "
+        "(non-terminating decimal; do not round without an explicit rule)"
+    )
+
+
+def _bounded_decimal(value: str) -> Decimal:
+    stripped = value.strip()
+    if not stripped or len(stripped) > 64:
+        raise ValueError("Operand is empty or too long")
+    try:
+        parsed = Decimal(stripped)
+    except DecimalException as exc:
+        raise ValueError("Operands must be decimal numbers") from exc
+    sign, digits, exponent = parsed.as_tuple()
+    del sign
+    if not parsed.is_finite() or len(digits) > 64 or abs(exponent) > 100:
+        raise ValueError("Operand must be a finite bounded decimal")
+    return parsed
+
+
+def _exact_decimal(value: Fraction) -> str | None:
+    denominator = value.denominator
+    twos = 0
+    fives = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator != 1:
+        return None
+    scale = max(twos, fives)
+    scaled = value.numerator * (2 ** (scale - twos)) * (5 ** (scale - fives))
+    if scale == 0:
+        return str(scaled)
+    sign = "-" if scaled < 0 else ""
+    digits = str(abs(scaled)).zfill(scale + 1)
+    whole = digits[:-scale]
+    fraction = digits[-scale:].rstrip("0")
+    return f"{sign}{whole}.{fraction}" if fraction else f"{sign}{whole}"
 
 
 def register_pengine_harness_profile(provider_key: str = "anthropic") -> None:
