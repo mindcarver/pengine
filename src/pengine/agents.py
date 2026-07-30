@@ -54,6 +54,16 @@ _TASK_OWNER = {
     InternalStage.ACCEPTING_L4: "quality_reviewer",
 }
 _ORDERED_SPECIALIST_STAGES = tuple(_TASK_OWNER)
+_RESULT_TOOL = {
+    InternalStage.SELECTING_L0_VARIANT: "StoryArchitectResult",
+    InternalStage.GENERATING_STORY_OUTLINE: "StoryArchitectResult",
+    InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: "StoryArchitectResult",
+    InternalStage.GENERATING_RELATIONSHIP_LOGIC: "StoryArchitectResult",
+    InternalStage.GENERATING_EPISODE_OUTLINE: "EpisodePlannerResult",
+    InternalStage.GENERATING_EPISODE_SCRIPTS: "ScriptWriterResult",
+    InternalStage.ACCEPTING_L0: "QualityReviewerResult",
+    InternalStage.ACCEPTING_L4: "QualityReviewerResult",
+}
 
 _STORY_ARCHITECT_PROMPT = (
     "Read the relevant /persona context. Return only the structured result for "
@@ -214,6 +224,17 @@ def _tool_message(result: ToolMessage | Command[Any]) -> ToolMessage:
     return message
 
 
+def _request_state_after_result(
+    request: ToolCallRequest,
+    result: ToolMessage | Command[Any],
+) -> Any:
+    if not isinstance(result, Command):
+        return request.state
+    if not isinstance(request.state, Mapping) or not isinstance(result.update, Mapping):
+        return request.state
+    return {**request.state, **result.update}
+
+
 def _validated_stage_payload(
     stage: InternalStage,
     content: str,
@@ -360,7 +381,33 @@ class StageGuardMiddleware(AgentMiddleware):
         message = _tool_message(result)
         if not isinstance(message.content, str):
             raise AgentProtocolError("Subagent result was not JSON text", stage=stage)
-        payload = _validated_stage_payload(stage, message.content)
+        try:
+            payload = _validated_stage_payload(stage, message.content)
+        except AgentProtocolError as exc:
+            if str(exc) != "Subagent returned invalid structured output":
+                raise
+            retry_args = {
+                **args,
+                "description": (
+                    f"{description}\n"
+                    "The previous attempt ended without the required structured "
+                    f"result. Reuse its completed workspace artifacts and return "
+                    f"exactly one {_RESULT_TOOL[stage]} tool call now. Do not return "
+                    "a prose summary."
+                ),
+            }
+            retry_request = request.override(
+                tool_call={**request.tool_call, "args": retry_args},
+                state=_request_state_after_result(request, result),
+            )
+            result = await handler(retry_request)
+            message = _tool_message(result)
+            if not isinstance(message.content, str):
+                raise AgentProtocolError(
+                    "Subagent result was not JSON text",
+                    stage=stage,
+                ) from exc
+            payload = _validated_stage_payload(stage, message.content)
         await self.approve_stage(stage, payload)
         self.approved_stages.add(stage)
         return result

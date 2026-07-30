@@ -346,6 +346,87 @@ async def test_structured_output_validation_error_is_corrected_within_stage(
 
 
 @pytest.mark.asyncio
+async def test_missing_structured_result_is_corrected_once_within_stage(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    responses.insert(1, AIMessage(content="The workspace artifact is complete."))
+    attempted: list[InternalStage] = []
+    approved: list[InternalStage] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            recursion_limit=40,
+            provider_profile_key="toolcallingfakemodel",
+        )
+
+        result = await workflow.execute(
+            thread_id="missing-structured-result-thread",
+            story="故事",
+            requirements="按人格设定完成完整交付。",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+        )
+
+    assert result.content_package.story_outline == "故事大纲"
+    assert attempted.count(InternalStage.SELECTING_L0_VARIANT) == 1
+    assert approved[0] is InternalStage.SELECTING_L0_VARIANT
+
+
+@pytest.mark.asyncio
+async def test_missing_structured_result_fails_after_one_correction(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    responses[1:1] = [
+        AIMessage(content="The workspace artifact is complete."),
+        AIMessage(content="Still returning prose."),
+    ]
+    attempted: list[InternalStage] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The invalid stage must not be approved")
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            recursion_limit=40,
+            provider_profile_key="toolcallingfakemodel",
+        )
+
+        with pytest.raises(AgentProtocolError, match="invalid structured output"):
+            await workflow.execute(
+                thread_id="missing-structured-result-fail-thread",
+                story="故事",
+                requirements="按人格设定完成完整交付。",
+                persona_files={"/persona/project.md": "规则"},
+                before_stage=before_stage,
+                approve_stage=approve_stage,
+            )
+
+    assert attempted == [InternalStage.SELECTING_L0_VARIANT]
+
+
+@pytest.mark.asyncio
 async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     model = ToolCallingFakeModel(
