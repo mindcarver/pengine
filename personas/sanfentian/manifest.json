@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0.0",
+  "persona_id": "sanfentian",
+  "display_name": "三分甜 · 言情",
+  "version": "0.1.0-prototype",
+  "created_at": "2026-07-30T00:00:00Z",
+  "package_sha256": "ff1871f629be5bd4d1612d2d9629e7fc2c995ba4c992cf6a9db7dbae65dfde7d",
+  "files": {
+    "paradigm": {
+      "path": "paradigm.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "bf0654e322f02d532ba9858d83765a175c903b04b6b7440e19837c6175c2ab00"
+    },
+    "project": {
+      "path": "project.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "d45a1f6005ce609f0b58ef9d3ac96f321da67de74776d741c138a9cd9a90172f"
+    },
+    "l0": {
+      "path": "l0.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "59780216e49e4d270f8e0b6fbf2018e8fc06762dd0f5998a21a209944bdf7d37"
+    },
+    "l1": {
+      "path": "l1.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "39e81253b7e300f82be2e9ef0d2111bab3b4379dfe9b8153796cc9ea3b3f178f"
+    },
+    "l2": {
+      "path": "l2.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "42f1ebf921f93d741fd2a5157ce9ecd4679751321e3fb2e540b535f44d20bdd3"
+    },
+    "l3": {
+      "path": "l3.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "f2ae33d4d4ddf0e3d81e9d3c92c47d1c5459220c4d608c63f4b6f66c89b9a68b"
+    },
+    "l4": {
+      "path": "l4.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "024eccd3658b7cb94c9efdba1f755ef1fb0e889c54b7047b82dd20702aa237a3"
+    },
+    "l5": {
+      "path": "l5.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "289e53a53d7bb3946131b5179b7a737ed70672f7aef89941519f36a5b4ac642b"
+    },
+    "l6": {
+      "path": "l6.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "a2e46db0056f9a6a03ac73b1c5df0a2bc5907666cc3eca829e5c466f94754034"
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0.0",
+  "persona_id": "wuzhen",
+  "display_name": "雾枕 · 悬疑",
+  "version": "0.1.0-prototype",
+  "created_at": "2026-07-30T00:00:00Z",
+  "package_sha256": "d42d6693f66d69bd7b9b8426dab9576b51a8cb2239de32c826a076dd91dd584c",
+  "files": {
+    "paradigm": {
+      "path": "paradigm.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "bf0654e322f02d532ba9858d83765a175c903b04b6b7440e19837c6175c2ab00"
+    },
+    "project": {
+      "path": "project.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "830c7f2621aca1b3334997d58b1c10441f617aa5fcbbef17fdcdd32a80476c60"
+    },
+    "l0": {
+      "path": "l0.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "43775ed37caa6fe39515d7230f03cf35f1ce2031593019d88add31310e62e30f"
+    },
+    "l1": {
+      "path": "l1.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "5654983eeddae9ad68f3ba550f7da38ea8cf29eae516c40e61623de1284ae0ea"
+    },
+    "l2": {
+      "path": "l2.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "2a278af6c1439a072b3fe4a9eff28d071e4b33d0838e8f80fa26f8dd1ea3f6b9"
+    },
+    "l3": {
+      "path": "l3.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "3c1f911a1c4a1e6da0c270163e9af1d4ed3fe5756ac4d99ee88f9bc6478ad1b9"
+    },
+    "l4": {
+      "path": "l4.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "d89c7d5fbb5ec4d0cd616ec24d3a0183a04de8e2393da1a8b6b8fb8612e2da31"
+    },
+    "l5": {
+      "path": "l5.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "bf2b23c75a131cfb535799ba22592693e98ee830f2b4958282cdf3f1b1deb012"
+    },
+    "l6": {
+      "path": "l6.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "aae8d1acc413114b13d3fbc40fcf62018b889f07acf1fb5df92e639032ab5c1e"
+    }
+  }
+}

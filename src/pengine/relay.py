@@ -10,6 +10,7 @@ from pengine.config import Settings
 class _SerialChatAnthropic(ChatAnthropic):
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
         kwargs["parallel_tool_calls"] = False
+        kwargs["tool_choice"] = "any"
         return super().bind_tools(tools, **kwargs)
 
 
@@ -33,7 +34,7 @@ def build_chat_model(settings: Settings) -> ChatAnthropic:
         model=settings.relay_model_id,
         base_url=settings.relay_base_url,
         api_key=settings.relay_api_key,
-        max_retries=0,
+        max_retries=1,
         timeout=settings.model_timeout_seconds,
         max_tokens=8192,
         temperature=0,

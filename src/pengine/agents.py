@@ -2,6 +2,8 @@ import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal, DecimalException
+from fractions import Fraction
 from typing import Any, Literal
 
 from deepagents import (
@@ -54,6 +56,53 @@ _TASK_OWNER = {
     InternalStage.ACCEPTING_L4: "quality_reviewer",
 }
 _ORDERED_SPECIALIST_STAGES = tuple(_TASK_OWNER)
+_RESULT_TOOL = {
+    InternalStage.SELECTING_L0_VARIANT: "StoryArchitectResult",
+    InternalStage.GENERATING_STORY_OUTLINE: "StoryArchitectResult",
+    InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: "StoryArchitectResult",
+    InternalStage.GENERATING_RELATIONSHIP_LOGIC: "StoryArchitectResult",
+    InternalStage.GENERATING_EPISODE_OUTLINE: "EpisodePlannerResult",
+    InternalStage.GENERATING_EPISODE_SCRIPTS: "ScriptWriterResult",
+    InternalStage.ACCEPTING_L0: "QualityReviewerResult",
+    InternalStage.ACCEPTING_L4: "QualityReviewerResult",
+}
+
+_STORY_ARCHITECT_PROMPT = (
+    "Read the relevant /persona context. Return only the structured result for "
+    "the stage named in the task. For selecting_l0_variant, set "
+    "selected_l0_variant and selection_rationale, and leave content null. For "
+    "each generation stage, set content and leave both L0 selection fields null. "
+    "Treat every prior approved artifact as binding. Reconcile dates, amounts, "
+    "counts, and episode-specific actions before returning. Avoid unnecessary "
+    "exact claims about future dialogue counts or scene placement; when such a "
+    "claim is required, make it an explicit downstream commitment. Use "
+    "calculate_arithmetic for every derived numeric claim and copy its exact result."
+)
+
+_EPISODE_PLANNER_PROMPT = (
+    "Use approved upstream artifacts and persona rules. Return only the "
+    "structured episode-outline result. Preserve every explicit numeric "
+    "constraint from the script requirements. When the requirements do not "
+    "specify an episode count, read the stage-specific persona L4 file and use "
+    "its baseline; never invent a different count. Before returning, verify "
+    "that every episode-specific action promised by the character biographies "
+    "or relationship logic appears in the matching episode, and that dates, "
+    "countdowns, amounts, counts, and arithmetic agree across artifacts. Use "
+    "calculate_arithmetic for every derived numeric claim. Never round a "
+    "non-integral division unless the story states the rounding rule."
+)
+
+_SCRIPT_WRITER_PROMPT = (
+    "Use the approved episode outline and persona rules without changing its "
+    "episode count or numeric constraints. Before returning, reread every "
+    "approved upstream artifact and audit the complete scripts against them. "
+    "Correct contradictions in dates or countdowns, amounts or arithmetic, "
+    "exact dialogue-count claims, and episode-specific promised actions. Every "
+    "upstream commitment must appear in the scripts. Use calculate_arithmetic "
+    "for every derived numeric claim and copy its exact result. Never round a "
+    "non-integral division unless the script states the rounding rule. Return "
+    "only the structured episode-script result."
+)
 
 VIRTUAL_FILE_PERMISSIONS = [
     FilesystemPermission(operations=["read"], paths=["/persona", "/persona/**"]),
@@ -154,6 +203,72 @@ class CheckpointUnavailableError(RuntimeError):
     """The durable thread state required for a resumed run is missing."""
 
 
+def _calculate_arithmetic(
+    left: str,
+    operation: Literal["add", "subtract", "multiply", "divide"],
+    right: str,
+) -> str:
+    lhs = _bounded_decimal(left)
+    rhs = _bounded_decimal(right)
+    left_fraction = Fraction(lhs)
+    right_fraction = Fraction(rhs)
+    if operation == "add":
+        result = left_fraction + right_fraction
+    elif operation == "subtract":
+        result = left_fraction - right_fraction
+    elif operation == "multiply":
+        result = left_fraction * right_fraction
+    else:
+        if right_fraction == 0:
+            raise ValueError("Cannot divide by zero")
+        result = left_fraction / right_fraction
+    decimal_result = _exact_decimal(result)
+    if decimal_result is not None:
+        return decimal_result
+    return (
+        f"{result.numerator}/{result.denominator} "
+        "(non-terminating decimal; do not round without an explicit rule)"
+    )
+
+
+def _bounded_decimal(value: str) -> Decimal:
+    stripped = value.strip()
+    if not stripped or len(stripped) > 64:
+        raise ValueError("Operand is empty or too long")
+    try:
+        parsed = Decimal(stripped)
+    except DecimalException as exc:
+        raise ValueError("Operands must be decimal numbers") from exc
+    sign, digits, exponent = parsed.as_tuple()
+    del sign
+    if not parsed.is_finite() or len(digits) > 64 or abs(exponent) > 100:
+        raise ValueError("Operand must be a finite bounded decimal")
+    return parsed
+
+
+def _exact_decimal(value: Fraction) -> str | None:
+    denominator = value.denominator
+    twos = 0
+    fives = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator != 1:
+        return None
+    scale = max(twos, fives)
+    scaled = value.numerator * (2 ** (scale - twos)) * (5 ** (scale - fives))
+    if scale == 0:
+        return str(scaled)
+    sign = "-" if scaled < 0 else ""
+    digits = str(abs(scaled)).zfill(scale + 1)
+    whole = digits[:-scale]
+    fraction = digits[-scale:].rstrip("0")
+    return f"{sign}{whole}.{fraction}" if fraction else f"{sign}{whole}"
+
+
 def register_pengine_harness_profile(provider_key: str = "anthropic") -> None:
     if provider_key in _REGISTERED_PROFILE_KEYS:
         return
@@ -182,12 +297,29 @@ def _tool_message(result: ToolMessage | Command[Any]) -> ToolMessage:
     return message
 
 
+def _request_state_after_result(
+    request: ToolCallRequest,
+    result: ToolMessage | Command[Any],
+) -> Any:
+    if not isinstance(result, Command):
+        return request.state
+    if not isinstance(request.state, Mapping) or not isinstance(result.update, Mapping):
+        return request.state
+    return {**request.state, **result.update}
+
+
 def _validated_stage_payload(
     stage: InternalStage,
     content: str,
 ) -> Mapping[str, Any]:
     try:
         raw = json.loads(content)
+        if (
+            isinstance(raw, Mapping)
+            and isinstance(raw.get("stage"), str)
+            and raw["stage"] != stage.value
+        ):
+            raise AgentProtocolError("Subagent returned a different stage", stage=stage)
         if stage in _STORY_STAGES:
             parsed = StoryArchitectResult.model_validate(raw)
         elif stage is InternalStage.GENERATING_EPISODE_OUTLINE:
@@ -328,7 +460,33 @@ class StageGuardMiddleware(AgentMiddleware):
         message = _tool_message(result)
         if not isinstance(message.content, str):
             raise AgentProtocolError("Subagent result was not JSON text", stage=stage)
-        payload = _validated_stage_payload(stage, message.content)
+        try:
+            payload = _validated_stage_payload(stage, message.content)
+        except AgentProtocolError as exc:
+            if str(exc) != "Subagent returned invalid structured output":
+                raise
+            retry_args = {
+                **args,
+                "description": (
+                    f"{description}\n"
+                    "The previous attempt ended without the required structured "
+                    f"result. Reuse its completed workspace artifacts and return "
+                    f"exactly one {_RESULT_TOOL[stage]} tool call now. Do not return "
+                    "a prose summary."
+                ),
+            }
+            retry_request = request.override(
+                tool_call={**request.tool_call, "args": retry_args},
+                state=_request_state_after_result(request, result),
+            )
+            result = await handler(retry_request)
+            message = _tool_message(result)
+            if not isinstance(message.content, str):
+                raise AgentProtocolError(
+                    "Subagent result was not JSON text",
+                    stage=stage,
+                ) from exc
+            payload = _validated_stage_payload(stage, message.content)
         await self.approve_stage(stage, payload)
         self.approved_stages.add(stage)
         return result
@@ -386,7 +544,16 @@ class DeepAgentWorkflow:
             "encoding": "utf-8",
         }
 
-        tools = []
+        tools = [
+            StructuredTool.from_function(
+                func=_calculate_arithmetic,
+                name="calculate_arithmetic",
+                description=(
+                    "Calculate one exact decimal add, subtract, multiply, or divide "
+                    "operation. Use it before writing any derived numeric claim."
+                ),
+            )
+        ]
         if retrieve_references is not None:
 
             async def retrieve_persona_references(query: str) -> str:
@@ -404,7 +571,10 @@ class DeepAgentWorkflow:
                 )
             )
 
-        no_retry = {"handle_errors": False}
+        structured_output_retry = (
+            "Return exactly one valid structured result tool call for the requested "
+            "stage. Do not return the result as prose."
+        )
         subagents = [
             {
                 "name": "story_architect",
@@ -412,49 +582,37 @@ class DeepAgentWorkflow:
                     "Selects L0 and creates story outline, character biographies, "
                     "and relationship logic as separate structured tasks."
                 ),
-                "system_prompt": (
-                    "Read the relevant /persona context. Return only the structured "
-                    "result for the stage named in the task. For "
-                    "selecting_l0_variant, set selected_l0_variant and "
-                    "selection_rationale, and leave content null. For each generation "
-                    "stage, set content and leave both L0 selection fields null."
-                ),
+                "system_prompt": _STORY_ARCHITECT_PROMPT,
                 "model": self.model,
                 "tools": tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
                 "response_format": ToolStrategy(
                     schema=StoryArchitectResult,
-                    **no_retry,
+                    handle_errors=structured_output_retry,
                 ),
             },
             {
                 "name": "episode_planner",
                 "description": "Creates the complete episode outline.",
-                "system_prompt": (
-                    "Use approved upstream artifacts and persona rules. Return only "
-                    "the structured episode-outline result."
-                ),
+                "system_prompt": _EPISODE_PLANNER_PROMPT,
                 "model": self.model,
                 "tools": tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
                 "response_format": ToolStrategy(
                     schema=EpisodePlannerResult,
-                    **no_retry,
+                    handle_errors=structured_output_retry,
                 ),
             },
             {
                 "name": "script_writer",
                 "description": "Creates the complete episode scripts.",
-                "system_prompt": (
-                    "Use the approved episode outline and persona rules. Return only "
-                    "the structured episode-script result."
-                ),
+                "system_prompt": _SCRIPT_WRITER_PROMPT,
                 "model": self.model,
                 "tools": tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
                 "response_format": ToolStrategy(
                     schema=ScriptWriterResult,
-                    **no_retry,
+                    handle_errors=structured_output_retry,
                 ),
             },
             {
@@ -475,7 +633,7 @@ class DeepAgentWorkflow:
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
                 "response_format": ToolStrategy(
                     schema=QualityReviewerResult,
-                    **no_retry,
+                    handle_errors=structured_output_retry,
                 ),
             },
         ]
@@ -500,7 +658,10 @@ class DeepAgentWorkflow:
             subagents=subagents,
             permissions=VIRTUAL_FILE_PERMISSIONS,
             backend=StateBackend(),
-            response_format=ToolStrategy(schema=WorkflowCompletion, handle_errors=False),
+            response_format=ToolStrategy(
+                schema=WorkflowCompletion,
+                handle_errors=structured_output_retry,
+            ),
             checkpointer=self.checkpointer,
             store=None,
         )
@@ -573,4 +734,9 @@ approved stage. Do not use any subagent other than the four listed above. Treat
 gate passed without the quality_reviewer evidence. After all stages are
 complete, return WorkflowCompletion only. Do not repeat the approved artifacts
 or return partial content.
+
+Preserve explicit numeric constraints from Script requirements. When Script
+requirements do not specify an episode count, the active persona L4 baseline is
+authoritative. Do not invent a different episode count or override any persona
+numeric constraint in a delegated task.
 """

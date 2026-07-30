@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0.0",
+  "persona_id": "shouzhuo",
+  "display_name": "守拙 · 正剧",
+  "version": "0.1.0-prototype",
+  "created_at": "2026-07-30T00:00:00Z",
+  "package_sha256": "80cc48f3e4a3e66dbf6d97f249b27ab354f47d16b7248b0ad983a5fedbbdd09f",
+  "files": {
+    "paradigm": {
+      "path": "paradigm.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "bf0654e322f02d532ba9858d83765a175c903b04b6b7440e19837c6175c2ab00"
+    },
+    "project": {
+      "path": "project.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "9df9c871d538d57a37d1e328f7e4b0d2d65dd1c44ae6f5dec6c3334b884ea3af"
+    },
+    "l0": {
+      "path": "l0.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "b2e0d749f652db24b675749a92f49783598838516b705076fbbcdcded81a09b8"
+    },
+    "l1": {
+      "path": "l1.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "2a9bdb43ccc0f8e2d0c9c858db8ff210e06b1656d81a825e603dd2c3ac4fc4be"
+    },
+    "l2": {
+      "path": "l2.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "1040ce959a9bb1861d6e47a7e67378a3ebb00786f7893f33f3ba148d8d95df61"
+    },
+    "l3": {
+      "path": "l3.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "aed858149bdeab7fb066d1e0fd4d8d880e42822da037bb534988474a273cb3a0"
+    },
+    "l4": {
+      "path": "l4.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "b4b224cf7f8e4002fc64554766708c11736fe8dee080c5df936eef62db99acb0"
+    },
+    "l5": {
+      "path": "l5.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "a0848a3b81571be4dad82ca5ebb01206a833e91ca82f526436968ae921342559"
+    },
+    "l6": {
+      "path": "l6.md",
+      "media_type": "text/markdown",
+      "encoding": "utf-8",
+      "sha256": "2738b95e10cdae289dcd62e681be8058f250e55a55ef6d8f1f53f37a3cbb333b"
+    }
+  }
+}

@@ -4,19 +4,26 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from persona_factory import create_persona_package
 from pydantic import Field
 
 from pengine.agents import (
+    _EPISODE_PLANNER_PROMPT,
+    _SCRIPT_WRITER_PROMPT,
+    _STORY_ARCHITECT_PROMPT,
     VIRTUAL_FILE_PERMISSIONS,
     AgentProtocolError,
     DeepAgentWorkflow,
     QualityReviewerResult,
+    StageGuardMiddleware,
     StoryArchitectResult,
     WorkflowCompletion,
+    _calculate_arithmetic,
+    _supervisor_prompt,
 )
 from pengine.config import Settings
 from pengine.personas import PersonaCatalog
@@ -197,6 +204,44 @@ def test_workflow_completion_does_not_repeat_approved_content() -> None:
     assert schema["properties"]["completed"]["const"] is True
 
 
+def test_supervisor_preserves_persona_episode_baseline_when_request_omits_count() -> None:
+    prompt = _supervisor_prompt(
+        story="故事",
+        requirements="按人格设定完成完整交付。",
+        feedback=None,
+        approved_json="{}",
+    )
+
+    normalized = " ".join(prompt.split())
+    assert "active persona L4 baseline is authoritative" in normalized
+    assert "Do not invent a different episode count" in normalized
+
+
+def test_generation_prompts_require_cross_artifact_consistency() -> None:
+    assert "future dialogue counts" in _STORY_ARCHITECT_PROMPT
+    assert "episode-specific action" in _EPISODE_PLANNER_PROMPT
+    assert "dates, countdowns, amounts, counts, and arithmetic" in _EPISODE_PLANNER_PROMPT
+    assert "exact dialogue-count claims" in _SCRIPT_WRITER_PROMPT
+    assert "Every upstream commitment must appear" in _SCRIPT_WRITER_PROMPT
+    assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
+
+
+def test_calculate_arithmetic_preserves_exact_decimal_result() -> None:
+    assert _calculate_arithmetic("190", "divide", "8") == "23.75"
+    assert _calculate_arithmetic("12", "multiply", "16") == "192"
+    assert _calculate_arithmetic("1", "divide", "3") == (
+        "1/3 (non-terminating decimal; do not round without an explicit rule)"
+    )
+
+
+@pytest.mark.parametrize("operand", ["NaN", "Infinity", "1e1000000"])
+def test_calculate_arithmetic_rejects_non_finite_or_unbounded_operands(
+    operand: str,
+) -> None:
+    with pytest.raises(ValueError, match="finite bounded decimal"):
+        _calculate_arithmetic(operand, "add", "1")
+
+
 @pytest.mark.asyncio
 async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
@@ -247,6 +292,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         all_tool_names = {name for snapshot in model.bound_tool_names for name in snapshot}
         assert "execute" not in all_tool_names
         assert "task" in all_tool_names
+        assert "calculate_arithmetic" in all_tool_names
         task_descriptions = [
             description
             for names, descriptions in zip(
@@ -266,6 +312,191 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         ):
             assert any(name in description for description in task_descriptions)
         assert all("\n- general-purpose:" not in description for description in task_descriptions)
+
+
+@pytest.mark.asyncio
+async def test_structured_output_validation_error_is_corrected_within_stage(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    responses.insert(
+        1,
+        _tool_call(
+            "StoryArchitectResult",
+            {
+                "stage": "selecting_l0_variant",
+                "content": "invalid for the selection stage",
+                "selected_l0_variant": None,
+                "selection_rationale": None,
+            },
+            99,
+        ),
+    )
+    attempted: list[InternalStage] = []
+    approved: list[InternalStage] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            recursion_limit=40,
+            provider_profile_key="toolcallingfakemodel",
+        )
+
+        result = await workflow.execute(
+            thread_id="structured-retry-thread",
+            story="故事",
+            requirements="按人格设定完成完整交付。",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+        )
+
+    assert result.content_package.episode_scripts == "分集剧本"
+    assert attempted.count(InternalStage.SELECTING_L0_VARIANT) == 1
+    assert approved[0] is InternalStage.SELECTING_L0_VARIANT
+
+
+@pytest.mark.asyncio
+async def test_missing_structured_result_is_corrected_once_within_stage(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    responses.insert(1, AIMessage(content="The workspace artifact is complete."))
+    attempted: list[InternalStage] = []
+    approved: list[InternalStage] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            recursion_limit=40,
+            provider_profile_key="toolcallingfakemodel",
+        )
+
+        result = await workflow.execute(
+            thread_id="missing-structured-result-thread",
+            story="故事",
+            requirements="按人格设定完成完整交付。",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+        )
+
+    assert result.content_package.story_outline == "故事大纲"
+    assert attempted.count(InternalStage.SELECTING_L0_VARIANT) == 1
+    assert approved[0] is InternalStage.SELECTING_L0_VARIANT
+
+
+@pytest.mark.asyncio
+async def test_missing_structured_result_fails_after_one_correction(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    responses[1:1] = [
+        AIMessage(content="The workspace artifact is complete."),
+        AIMessage(content="Still returning prose."),
+    ]
+    attempted: list[InternalStage] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The invalid stage must not be approved")
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            recursion_limit=40,
+            provider_profile_key="toolcallingfakemodel",
+        )
+
+        with pytest.raises(AgentProtocolError, match="invalid structured output"):
+            await workflow.execute(
+                thread_id="missing-structured-result-fail-thread",
+                story="故事",
+                requirements="按人格设定完成完整交付。",
+                persona_files={"/persona/project.md": "规则"},
+                before_stage=before_stage,
+                approve_stage=approve_stage,
+            )
+
+    assert attempted == [InternalStage.SELECTING_L0_VARIANT]
+
+
+@pytest.mark.asyncio
+async def test_wrong_stage_result_is_not_corrected() -> None:
+    attempted: list[InternalStage] = []
+    handler_calls = 0
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The wrong stage must not be approved")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages={
+            InternalStage.SELECTING_L0_VARIANT,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+            InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        },
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] create the outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-wrong-stage",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(_: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(
+            content='{"stage":"generating_episode_scripts","content":"wrong stage"}',
+            tool_call_id="call-wrong-stage",
+        )
+
+    with pytest.raises(AgentProtocolError, match="different stage"):
+        await middleware.awrap_tool_call(request, handler)
+
+    assert attempted == [InternalStage.GENERATING_EPISODE_OUTLINE]
+    assert handler_calls == 1
 
 
 @pytest.mark.asyncio

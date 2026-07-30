@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'"
+    >
+    <meta name="theme-color" content="#231f1a">
+    <link rel="icon" href="data:,">
+    <meta
+      name="description"
+      content="Pengine 本地短剧创作工作台：选择编剧人格，提交故事，并查看真实生成与修订结果。"
+    >
+    <title>Pengine · 短剧编辑部</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+
+    <header class="masthead">
+      <a class="brand" href="#main-content" aria-label="Pengine 短剧编辑部首页">
+        <span class="brand-mark" aria-hidden="true">P</span>
+        <span>
+          <strong>PENGINE</strong>
+          <small>短剧编辑部 · 本地创作台</small>
+        </span>
+      </a>
+
+      <div class="service-stamp" id="service-stamp" data-tone="idle" role="status">
+        <span class="service-light" aria-hidden="true"></span>
+        <span id="service-label">正在联络编辑部</span>
+      </div>
+    </header>
+
+    <main id="main-content">
+      <section class="hero" aria-labelledby="page-title">
+        <div class="hero-kicker">
+          <span>NO. 01</span>
+          <span>LOCAL EDITION</span>
+        </div>
+        <div class="hero-copy">
+          <p class="eyebrow">一张故事便笺，四种编剧目光</p>
+          <h1 id="page-title">把故事送进<br><em>真正运转</em>的编辑部</h1>
+          <p class="hero-summary">
+            选择一位编剧人格，写下故事与创作要求。Pengine 会在本地启动真实任务，
+            完成后交付五类完整文稿，并接受一次全量修订。
+          </p>
+        </div>
+        <aside class="desk-note" aria-label="工作台说明">
+          <span class="pin" aria-hidden="true"></span>
+          <p class="note-label">编务提示</p>
+          <p>任务耗时取决于本地模型服务。等待期间，本页只报告后端返回的真实状态。</p>
+          <p class="hand-sign">— 值班编辑</p>
+        </aside>
+      </section>
+
+      <div class="workbench">
+        <aside class="series-drawer" aria-labelledby="series-title">
+          <div class="drawer-heading">
+            <p class="section-number">卷宗</p>
+            <h2 id="series-title">我的剧集</h2>
+          </div>
+          <p class="drawer-explainer">浏览器只记住当前作品编号；作品正文始终从本地服务读取。</p>
+
+          <div id="series-empty" class="empty-file">
+            <span aria-hidden="true">＋</span>
+            <p>完成第一次投递后，当前剧集会出现在这里。</p>
+          </div>
+
+          <button class="series-card" id="series-card" type="button" hidden>
+            <span class="series-card-top">
+              <span class="series-status-dot" aria-hidden="true"></span>
+              <span id="series-status">等待中</span>
+            </span>
+            <strong id="series-persona">未载入人格</strong>
+            <span id="series-id">卷宗编号 —</span>
+            <time id="series-date"></time>
+          </button>
+
+          <div class="drawer-legend" aria-label="任务状态说明">
+            <p><span class="legend-dot queued" aria-hidden="true"></span>排队 / 创作中</p>
+            <p><span class="legend-dot ready" aria-hidden="true"></span>文稿已交付</p>
+            <p><span class="legend-dot failed" aria-hidden="true"></span>任务失败</p>
+          </div>
+        </aside>
+
+        <div class="editorial-stack">
+          <section class="paper-sheet persona-sheet" aria-labelledby="persona-title">
+            <div class="paper-index" aria-hidden="true">01</div>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">CASTING DESK</p>
+                <h2 id="persona-title">选择编剧人格</h2>
+                <p>人格决定创作视角与题材方法。只有本地服务确认可用的人格才能投递。</p>
+              </div>
+              <button class="text-button" id="reload-personas" type="button">
+                重新读取
+              </button>
+            </div>
+
+            <div
+              class="persona-grid"
+              id="persona-grid"
+              role="radiogroup"
+              aria-labelledby="persona-title"
+              aria-describedby="persona-status"
+            ></div>
+            <p class="inline-status" id="persona-status" aria-live="polite">
+              正在读取人格档案……
+            </p>
+          </section>
+
+          <section class="paper-sheet brief-sheet" aria-labelledby="brief-title">
+            <div class="paper-index" aria-hidden="true">02</div>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">STORY BRIEF</p>
+                <h2 id="brief-title">填写创作便笺</h2>
+                <p>故事讲“发生什么”，创作要求可补充“希望怎样完成”。</p>
+              </div>
+            </div>
+
+            <form id="creation-form" novalidate>
+              <div class="field-group">
+                <label for="story">
+                  <span>故事</span>
+                  <small>必填</small>
+                </label>
+                <textarea
+                  id="story"
+                  name="story"
+                  rows="7"
+                  required
+                  placeholder="例如：一个离家十年的女儿回到海边小城，发现父亲留下的旧照里藏着全家一直回避的秘密……"
+                  aria-describedby="story-hint"
+                ></textarea>
+                <p class="field-hint" id="story-hint">写清主要人物、处境与想讲的核心冲突。</p>
+              </div>
+
+              <div class="field-group">
+                <label for="requirements">
+                  <span>创作要求</span>
+                  <small>选填</small>
+                </label>
+                <textarea
+                  id="requirements"
+                  name="requirements"
+                  rows="4"
+                  placeholder="例如：当代背景；人物选择要有明确代价；节奏紧凑；具体集数与单集标准遵循所选人格设定。"
+                  aria-describedby="requirements-hint"
+                ></textarea>
+                <p class="field-hint" id="requirements-hint">
+                  可写时代、基调、受众或限制；留空时按所选人格完成一部完整短剧。
+                </p>
+              </div>
+
+              <div class="form-footer">
+                <p class="form-message" id="creation-message" aria-live="assertive"></p>
+                <button class="primary-button" id="create-button" type="submit">
+                  <span>送入编辑部</span>
+                  <span aria-hidden="true">→</span>
+                </button>
+              </div>
+            </form>
+          </section>
+
+          <section
+            class="paper-sheet delivery-sheet"
+            id="delivery-section"
+            aria-labelledby="delivery-title"
+            hidden
+          >
+            <div class="paper-index" aria-hidden="true">03</div>
+            <div class="section-heading delivery-heading">
+              <div>
+                <p class="eyebrow">DELIVERY ROOM</p>
+                <h2 id="delivery-title">成品阅览室</h2>
+                <p id="delivery-subtitle">当前剧集的实际任务状态与交付文稿。</p>
+              </div>
+              <span class="folio-stamp" id="folio-stamp">卷宗 —</span>
+            </div>
+
+            <div class="task-waiting" id="task-waiting" role="status" hidden>
+              <div class="typewriter" aria-hidden="true">
+                <span></span><span></span><span></span><span></span>
+              </div>
+              <div>
+                <p class="wait-kicker" id="wait-kicker">任务已排队</p>
+                <h3 id="wait-title">编辑部已收到你的故事</h3>
+                <p id="wait-description">
+                  本页会持续查询本地服务；后端返回成功或失败前，不会展示假成品。
+                </p>
+              </div>
+            </div>
+
+            <div class="failure-panel" id="failure-panel" role="alert" hidden>
+              <p class="failure-label">任务未完成</p>
+              <h3 id="failure-title">编辑部返回失败</h3>
+              <p id="failure-message"></p>
+              <code id="failure-code"></code>
+            </div>
+
+            <div id="result-workspace" hidden>
+              <div class="version-bar">
+                <div>
+                  <p class="toolbar-label">稿件版本</p>
+                  <div class="segmented-control" id="version-tabs" role="tablist" aria-label="选择稿件版本">
+                    <button
+                      id="version-initial"
+                      type="button"
+                      role="tab"
+                      aria-selected="true"
+                      aria-controls="artifact-panel"
+                      data-version="initial"
+                    >
+                      初稿
+                    </button>
+                    <button
+                      id="version-revision"
+                      type="button"
+                      role="tab"
+                      aria-selected="false"
+                      aria-controls="artifact-panel"
+                      data-version="revision"
+                      disabled
+                    >
+                      修订稿
+                    </button>
+                  </div>
+                </div>
+                <p class="version-note" id="version-note">正在查看首次交付</p>
+              </div>
+
+              <div class="artifact-layout">
+                <div class="artifact-tabs" id="artifact-tabs" role="tablist" aria-label="选择成品类别">
+                  <button
+                    id="artifact-tab-story"
+                    type="button"
+                    role="tab"
+                    aria-selected="true"
+                    aria-controls="artifact-panel"
+                    data-artifact="story_outline"
+                  >
+                    <span>01</span>故事大纲
+                  </button>
+                  <button
+                    id="artifact-tab-character"
+                    type="button"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="artifact-panel"
+                    data-artifact="character_biographies"
+                    tabindex="-1"
+                  >
+                    <span>02</span>人物小传
+                  </button>
+                  <button
+                    id="artifact-tab-relationship"
+                    type="button"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="artifact-panel"
+                    data-artifact="relationship_logic"
+                    tabindex="-1"
+                  >
+                    <span>03</span>关系逻辑
+                  </button>
+                  <button
+                    id="artifact-tab-episode-outline"
+                    type="button"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="artifact-panel"
+                    data-artifact="episode_outline"
+                    tabindex="-1"
+                  >
+                    <span>04</span>分集大纲
+                  </button>
+                  <button
+                    id="artifact-tab-scripts"
+                    type="button"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="artifact-panel"
+                    data-artifact="episode_scripts"
+                    tabindex="-1"
+                  >
+                    <span>05</span>分集剧本
+                  </button>
+                </div>
+
+                <article
+                  class="artifact-paper"
+                  id="artifact-panel"
+                  role="tabpanel"
+                  tabindex="0"
+                  aria-labelledby="artifact-tab-story"
+                >
+                  <header class="artifact-header">
+                    <div>
+                      <p class="artifact-overline" id="artifact-overline">DELIVERABLE 01</p>
+                      <h3 id="artifact-title">故事大纲</h3>
+                    </div>
+                    <span id="artifact-version-mark">初稿</span>
+                  </header>
+                  <pre id="artifact-content"></pre>
+                </article>
+              </div>
+
+              <section class="revision-desk" id="revision-desk" aria-labelledby="revision-title">
+                <div class="revision-intro">
+                  <p class="eyebrow">ONE REVISION</p>
+                  <h3 id="revision-title">一次全量重写</h3>
+                  <p id="revision-description">
+                    修改意见会冻结，并使用同一人格快照完整重跑五类文稿；初稿不会被覆盖。
+                  </p>
+                </div>
+
+                <form id="revision-form" novalidate>
+                  <label for="feedback">
+                    修改意见
+                    <small id="feedback-state">尚未提交</small>
+                  </label>
+                  <textarea
+                    id="feedback"
+                    name="feedback"
+                    rows="5"
+                    required
+                    placeholder="例如：让主角在结尾付出更明确的代价；保留海边旧照这一核心意象。"
+                    aria-describedby="revision-description revision-message"
+                  ></textarea>
+                  <div class="revision-actions">
+                    <p class="form-message" id="revision-message" aria-live="assertive"></p>
+                    <button class="secondary-button" id="revision-button" type="submit">
+                      提交全量重写
+                    </button>
+                  </div>
+                </form>
+              </section>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <p>PENGINE · LOCAL EDITORIAL WORKBENCH</p>
+      <p>所有文稿来自当前本地服务；本页不提供登录、云同步或导出。</p>
+    </footer>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>
