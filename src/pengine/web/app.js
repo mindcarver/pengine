@@ -340,11 +340,16 @@ async function handleRevision(event) {
     elements.feedback.focus();
     return;
   }
+  if (state.pendingFeedback) {
+    elements["revision-message"].textContent = "修改意见已经提交，正在读取真实修订状态。";
+    return;
+  }
   if (!revision || revision.state !== "available") {
     elements["revision-message"].textContent = "当前作品不能提交修订。";
     return;
   }
 
+  state.pendingFeedback = feedback;
   setRevisionBusy(true);
   elements["revision-message"].textContent = "正在提交一次全量重写……";
 
@@ -357,11 +362,24 @@ async function handleRevision(event) {
       },
       body: JSON.stringify({ feedback }),
     });
-    state.pendingFeedback = feedback;
     elements["revision-message"].textContent = "修改意见已冻结，正在读取真实修订状态。";
     await refreshCreation();
   } catch (error) {
-    elements["revision-message"].textContent = formatError(error);
+    const refreshed = await refreshCreation();
+    const definitivelyRejected =
+      error instanceof ApiError &&
+      error.status >= 400 &&
+      refreshed &&
+      state.creation?.revision.state === "available";
+
+    if (definitivelyRejected) {
+      state.pendingFeedback = "";
+      renderRevision();
+      elements["revision-message"].textContent = formatError(error);
+    } else {
+      elements["revision-message"].textContent =
+        `${formatError(error)} 提交结果尚未确认；请刷新页面读取服务端状态，勿重复提交。`;
+    }
   } finally {
     setRevisionBusy(false);
   }
@@ -369,17 +387,19 @@ async function handleRevision(event) {
 
 async function refreshCreation(options = {}) {
   if (!state.creationId || state.loadingCreation) {
-    return;
+    return false;
   }
 
   state.loadingCreation = true;
   stopPolling();
+  let refreshed = false;
 
   try {
     const resource = await apiRequest(
       `/creations/${encodeURIComponent(state.creationId)}`,
     );
     state.creation = resource;
+    refreshed = true;
     setServiceState("ready", "本地服务已连接");
     renderSeries();
     renderCreation();
@@ -405,6 +425,7 @@ async function refreshCreation(options = {}) {
   } finally {
     state.loadingCreation = false;
   }
+  return refreshed;
 }
 
 function renderCreation() {
