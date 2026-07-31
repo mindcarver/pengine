@@ -124,7 +124,7 @@ const state = {
   pendingFeedback: "",
   progressRunKind: "",
   runControlBusy: false,
-  workspaceView: "creation",
+  workspaceView: "selection",
 };
 
 const elements = {};
@@ -165,12 +165,20 @@ function cacheElements() {
     "series-persona",
     "series-id",
     "series-date",
-    "workspace-new-creation",
-    "workspace-current-work",
-    "new-creation-view",
+    "flow-select-writer",
+    "flow-tell-story",
+    "flow-create",
+    "flow-read-deliverables",
+    "selection-view",
+    "brief-view",
     "current-work-view",
     "current-work-placeholder",
+    "progress-scene",
+    "back-to-selection",
+    "brief-persona",
+    "delivery-index",
     "delivery-section",
+    "delivery-title",
     "delivery-subtitle",
     "folio-stamp",
     "run-progress",
@@ -251,11 +259,16 @@ function bindEvents() {
     void handleQualityRejectionControl("end"),
   );
   elements["series-card"].addEventListener("click", focusDelivery);
-  elements["workspace-new-creation"].addEventListener("click", () =>
-    setWorkspaceView("creation"),
-  );
-  elements["workspace-current-work"].addEventListener("click", () =>
-    setWorkspaceView("current"),
+  for (const [id, view] of [
+    ["flow-select-writer", "selection"],
+    ["flow-tell-story", "brief"],
+    ["flow-create", "progress"],
+    ["flow-read-deliverables", "reading"],
+  ]) {
+    elements[id].addEventListener("click", () => setWorkspaceView(view));
+  }
+  elements["back-to-selection"].addEventListener("click", () =>
+    setWorkspaceView("selection"),
   );
 
   elements["version-tabs"].addEventListener("click", handleVersionClick);
@@ -276,7 +289,7 @@ function bindEvents() {
 async function initialize() {
   const currentId = readCurrentCreationId();
   state.creationId = currentId;
-  state.workspaceView = currentId ? "current" : "creation";
+  state.workspaceView = currentId ? "progress" : "selection";
   renderWorkspaceViews();
   renderSeries();
 
@@ -343,6 +356,8 @@ function renderPersonaCards() {
       state.selectedPersonaId = personaId;
       renderPersonaCards();
       elements["creation-message"].textContent = "";
+      setWorkspaceView("brief");
+      elements.story.focus({ preventScroll: true });
     });
 
     const inner = document.createElement("span");
@@ -436,7 +451,7 @@ async function handleCreate(event) {
     state.activeEpisode = null;
     state.pendingFeedback = "";
     writeCurrentCreationId(state.creationId);
-    setWorkspaceView("current");
+    setWorkspaceView("progress");
     elements["creation-message"].textContent = "投递成功，正在读取真实任务状态。";
     renderSeries();
     renderCreation();
@@ -482,6 +497,7 @@ async function handleRevision(event) {
       },
       body: JSON.stringify({ feedback }),
     });
+    setWorkspaceView("progress");
     elements["revision-message"].textContent = "修改意见已冻结，正在读取真实修订状态。";
     await refreshCreation();
   } catch (error) {
@@ -578,6 +594,9 @@ async function refreshCreation(options = {}) {
     );
     state.creation = resource;
     refreshed = true;
+    if (options.isRestore) {
+      state.workspaceView = hasReadableDelivery() ? "reading" : "progress";
+    }
     setServiceState("ready", "本地服务已连接");
     renderSeries();
     renderCreation();
@@ -630,6 +649,11 @@ function renderCreation() {
   const initial = state.creation.initial;
   elements["delivery-subtitle"].textContent =
     `${state.creation.persona.display_name} · 人格版本 ${state.creation.persona.version}`;
+  if (requiresAttentionScene()) {
+    setWorkspaceView("progress");
+  } else if (shouldOpenReader()) {
+    setWorkspaceView("reading");
+  }
   renderProgress();
 
   const activeDraft = activeDraftRun();
@@ -652,7 +676,7 @@ function renderCreation() {
     showWaiting(
       "任务已排队",
       "编辑部已收到你的故事",
-      "本页会持续查询本地服务；已提交的阶段草稿会在这里显示，尚未提交的内容不会展示。",
+      "本页会持续查询本地服务；成品通过审核前，不会开启文稿阅览。",
       { showWorkspace },
     );
     return;
@@ -663,7 +687,7 @@ function renderCreation() {
     showWaiting(
       "任务创作中",
       "编辑部正在处理当前阶段",
-      "上方阶段与已运行时长均来自本地服务；已提交草稿尚未通过成品审核。",
+      "上方阶段与已运行时长均来自本地服务；成品审核通过前不会展示文稿。",
       { showWorkspace },
     );
     return;
@@ -676,8 +700,8 @@ function renderCreation() {
       relayInterrupted ? "网络 / Relay 暂时中断 · 自动恢复" : "首次超时 · 自动恢复",
       relayInterrupted ? "正在等待后从已批准检查点继续" : "正在从已批准检查点继续",
       relayInterrupted
-        ? "当前阶段、已运行时长和已提交草稿均已保留；未批准阶段将在短暂等待后重新执行。"
-        : "已完成阶段不会重新生成；已提交草稿仍可查看，当前未批准阶段将重新执行。",
+        ? "当前阶段与已运行时长均已保留；未批准阶段将在短暂等待后重新执行。"
+        : "已完成阶段不会重新生成；当前未批准阶段将重新执行。",
       { showWorkspace },
     );
     return;
@@ -689,7 +713,7 @@ function renderCreation() {
     showWaiting(
       "任务已暂停",
       relayInterrupted ? "当前阶段再次发生网络 / Relay 中断" : "当前阶段再次超过整体运行时限",
-      "请在上方选择继续当前阶段，或结束本次任务；当前阶段、时长和已提交草稿仍可查看。",
+      "请在上方选择继续当前阶段，或结束本次任务；当前阶段与已运行时长均已保留。",
       { showWorkspace },
     );
     return;
@@ -855,7 +879,7 @@ function showQualityRejection(rejected, options = {}) {
   elements["failure-label"].textContent = "成品审核未通过";
   elements["failure-title"].textContent = `${runLabel} ${stageLabel}未通过`;
   elements["failure-message"].textContent =
-    `${runLabel}在${stageLabel}未通过。已提交的工作区保留在下方，可继续查看。`;
+    `${runLabel}在${stageLabel}未通过。审核证据已保留；成品阅览会继续保持关闭。`;
   elements["failure-guidance"].hidden = false;
   elements["failure-guidance"].textContent =
     canRetry
@@ -941,7 +965,7 @@ function startNewCreation() {
   state.activeDraftRunKind = "";
   state.activeEpisode = null;
   state.pendingFeedback = "";
-  setWorkspaceView("creation");
+  setWorkspaceView("selection");
   renderSeries();
   renderCreation();
   elements["creation-message"].textContent =
@@ -1018,8 +1042,16 @@ function draftArtifactContent(draft) {
 }
 
 function renderWorkspace() {
-  const initialArtifacts = artifactViewsForRun(state.creation.initial);
-  const revisionArtifacts = artifactViewsForRun(state.creation.revision);
+  if (state.workspaceView !== "reading" || !hasReadableDelivery()) {
+    elements["result-workspace"].hidden = true;
+    return false;
+  }
+  const initialArtifacts = isFormalRun(state.creation.initial)
+    ? artifactViewsForRun(state.creation.initial)
+    : [];
+  const revisionArtifacts = isFormalRun(state.creation.revision)
+    ? artifactViewsForRun(state.creation.revision)
+    : [];
   if (!initialArtifacts.length && !revisionArtifacts.length) {
     elements["result-workspace"].hidden = true;
     return false;
@@ -1036,8 +1068,8 @@ function renderWorkspace() {
 }
 
 function renderVersionControls() {
-  const initialAvailable = artifactViewsForRun(state.creation.initial).length > 0;
-  const revisionAvailable = artifactViewsForRun(state.creation.revision).length > 0;
+  const initialAvailable = isFormalRun(state.creation.initial);
+  const revisionAvailable = isFormalRun(state.creation.revision);
   if (state.activeVersion === "initial" && !initialAvailable) {
     state.activeVersion = "revision";
   }
@@ -1069,6 +1101,9 @@ function renderArtifact() {
   const run = state.activeVersion === "revision"
     ? state.creation.revision
     : state.creation.initial;
+  if (!isFormalRun(run)) {
+    return;
+  }
   const artifacts = artifactViewsForRun(run);
   if (!artifacts.length) {
     return;
@@ -1414,7 +1449,8 @@ function focusFirstAvailablePersona() {
 }
 
 function focusDelivery() {
-  if (!setWorkspaceView("current")) {
+  const targetView = hasReadableDelivery() ? "reading" : "progress";
+  if (!setWorkspaceView(targetView)) {
     return;
   }
   if (elements["delivery-section"].hidden) {
@@ -1425,37 +1461,100 @@ function focusDelivery() {
 }
 
 function setWorkspaceView(view) {
-  if (view === "current" && !state.creationId) {
+  if (view === "brief" && !state.selectedPersonaId) {
     return false;
   }
-  state.workspaceView = view === "current" ? "current" : "creation";
+  if (view === "progress" && !state.creationId) {
+    return false;
+  }
+  if (view === "reading" && !hasReadableDelivery()) {
+    return false;
+  }
+  state.workspaceView = view;
   renderWorkspaceViews();
   return true;
 }
 
 function renderWorkspaceViews() {
-  const creationView = elements["new-creation-view"];
+  const selectionView = elements["selection-view"];
+  const briefView = elements["brief-view"];
   const currentView = elements["current-work-view"];
-  const creationButton = elements["workspace-new-creation"];
-  const currentButton = elements["workspace-current-work"];
-  if (!creationView || !currentView || !creationButton || !currentButton) {
+  const progressScene = elements["progress-scene"];
+  const flowButtons = [
+    ["flow-select-writer", "selection", true],
+    ["flow-tell-story", "brief", Boolean(state.selectedPersonaId)],
+    ["flow-create", "progress", Boolean(state.creationId)],
+    ["flow-read-deliverables", "reading", hasReadableDelivery()],
+  ];
+  if (!selectionView || !briefView || !currentView || !progressScene) {
     return;
   }
 
-  if (state.workspaceView === "current" && !state.creationId) {
-    state.workspaceView = "creation";
+  if (state.workspaceView === "brief" && !state.selectedPersonaId) {
+    state.workspaceView = "selection";
   }
-  const showingCurrent = state.workspaceView === "current";
-  creationView.hidden = showingCurrent;
+  if (state.workspaceView === "progress" && !state.creationId) {
+    state.workspaceView = "selection";
+  }
+  if (state.workspaceView === "reading" && !hasReadableDelivery()) {
+    state.workspaceView = state.creationId ? "progress" : "selection";
+  }
+  const showingCurrent = ["progress", "reading"].includes(state.workspaceView);
+  selectionView.hidden = state.workspaceView !== "selection";
+  briefView.hidden = state.workspaceView !== "brief";
   currentView.hidden = !showingCurrent;
-  creationButton.setAttribute("aria-current", showingCurrent ? "false" : "page");
-  currentButton.setAttribute("aria-current", showingCurrent ? "page" : "false");
-  currentButton.disabled = !state.creationId;
+  currentView.dataset.scene = state.workspaceView;
+  progressScene.hidden = state.workspaceView === "reading";
+  if (elements["delivery-title"]) {
+    elements["delivery-title"].textContent =
+      state.workspaceView === "reading" ? "成品阅览室" : "创作进行中";
+  }
+  if (elements["delivery-index"]) {
+    elements["delivery-index"].textContent = state.workspaceView === "reading" ? "04" : "03";
+  }
+  for (const [id, view, available] of flowButtons) {
+    const button = elements[id];
+    if (!button) {
+      continue;
+    }
+    button.disabled = !available;
+    button.setAttribute("aria-current", state.workspaceView === view ? "page" : "false");
+  }
 
   const placeholder = elements["current-work-placeholder"];
   if (placeholder) {
     placeholder.hidden = Boolean(state.creation);
   }
+  const briefPersona = elements["brief-persona"];
+  if (briefPersona) {
+    const profile = PERSONA_PROFILES[state.selectedPersonaId];
+    const persona = state.personas.get(state.selectedPersonaId);
+    briefPersona.textContent = profile
+      ? `你选择了 —— ${persona?.display_name || profile.name} · ${profile.tag}`
+      : "先选择一位当前可用的编剧人格。";
+  }
+}
+
+function hasReadableDelivery() {
+  return isFormalRun(state.creation?.initial) || isFormalRun(state.creation?.revision);
+}
+
+function shouldOpenReader() {
+  if (state.workspaceView !== "progress" || !isFormalRun(state.creation?.initial)) {
+    return false;
+  }
+  const revisionState = state.creation?.revision?.state;
+  return ["available", "unavailable", "succeeded"].includes(revisionState);
+}
+
+function requiresAttentionScene() {
+  const initialState = state.creation?.initial?.state;
+  if (initialState && initialState !== "succeeded") {
+    return true;
+  }
+  return ["paused", "quality_rejected", "ended", "failed"].includes(
+    state.creation?.revision?.state,
+  );
 }
 
 function shouldPoll() {

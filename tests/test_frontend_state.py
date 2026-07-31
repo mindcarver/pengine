@@ -181,7 +181,7 @@ if (!elements["failure-guidance"].hidden || !elements["failure-actions"].hidden)
 }
 
 renderProgress = () => {};
-renderWorkspace = () => true;
+renderWorkspace = () => false;
 state.activeDraftRunKind = "";
 state.creationId = "terminal-creation";
 state.creation = {
@@ -193,13 +193,13 @@ state.creation = {
   revision: { state: "unavailable" },
 };
 renderCreation();
-if (elements["result-workspace"].hidden) {
-  throw new Error("failed initial run hid durable workspace");
+if (!elements["result-workspace"].hidden) {
+  throw new Error("failed initial run exposed unapproved drafts");
 }
 state.creation.initial = { state: "ended" };
 renderCreation();
-if (elements["result-workspace"].hidden) {
-  throw new Error("ended initial run hid durable workspace");
+if (!elements["result-workspace"].hidden) {
+  throw new Error("ended initial run exposed unapproved drafts");
 }
 """
     harness = f"""
@@ -230,70 +230,99 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
-def test_workbench_separates_new_creation_from_current_work() -> None:
+def test_workbench_uses_four_gated_creation_scenes() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"
     page = (root / "src" / "pengine" / "web" / "index.html").read_text()
-    assert 'id="workspace-new-creation"' in page
-    assert 'id="workspace-current-work"' in page
-    assert 'id="new-creation-view"' in page
+    assert 'id="flow-select-writer"' in page
+    assert 'id="flow-tell-story"' in page
+    assert 'id="flow-create"' in page
+    assert 'id="flow-read-deliverables"' in page
+    assert 'id="selection-view"' in page
+    assert 'id="brief-view"' in page
     assert 'id="current-work-view"' in page
-    assert page.index('id="new-creation-view"') < page.index('id="current-work-view"')
+    assert page.index('id="selection-view"') < page.index('id="brief-view"')
+    assert page.index('id="brief-view"') < page.index('id="current-work-view"')
 
     assertions = """
-function viewElement() {
+function sceneElement() {
   return {
     hidden: false,
     disabled: false,
+    dataset: {},
     attrs: {},
     setAttribute(name, value) { this.attrs[name] = value; },
   };
 }
-const newView = viewElement();
-const currentView = viewElement();
-const newButton = viewElement();
-const currentButton = viewElement();
-const placeholder = viewElement();
+const selectionView = sceneElement();
+const briefView = sceneElement();
+const currentView = sceneElement();
+const progressScene = sceneElement();
+const selectButton = sceneElement();
+const briefButton = sceneElement();
+const progressButton = sceneElement();
+const readingButton = sceneElement();
+const placeholder = sceneElement();
 Object.assign(elements, {
-  "new-creation-view": newView,
+  "selection-view": selectionView,
+  "brief-view": briefView,
   "current-work-view": currentView,
-  "workspace-new-creation": newButton,
-  "workspace-current-work": currentButton,
+  "progress-scene": progressScene,
+  "flow-select-writer": selectButton,
+  "flow-tell-story": briefButton,
+  "flow-create": progressButton,
+  "flow-read-deliverables": readingButton,
   "current-work-placeholder": placeholder,
+  "brief-persona": { textContent: "" },
+  "delivery-title": { textContent: "" },
+  "delivery-index": { textContent: "" },
 });
 
 state.creationId = "";
 state.creation = null;
-state.workspaceView = "current";
+state.selectedPersonaId = "";
+state.workspaceView = "reading";
 renderWorkspaceViews();
-if (state.workspaceView !== "creation") throw new Error("empty workbench kept current-work view");
-if (newView.hidden || !currentView.hidden) {
-  throw new Error("empty workbench exposed the wrong view");
+if (state.workspaceView !== "selection") {
+  throw new Error("empty workbench skipped writer selection");
 }
-if (currentButton.disabled !== true) throw new Error("empty workbench enabled current work");
-if (newButton.attrs["aria-current"] !== "page") {
-  throw new Error("new creation was not marked current");
+if (selectionView.hidden || !briefView.hidden || !currentView.hidden) {
+  throw new Error("empty workbench exposed the wrong scene");
+}
+if (!briefButton.disabled || !progressButton.disabled || !readingButton.disabled) {
+  throw new Error("empty workbench enabled a gated scene");
+}
+
+state.selectedPersonaId = "wuzhen";
+if (!setWorkspaceView("brief")) throw new Error("selected writer could not open story brief");
+if (!selectionView.hidden || briefView.hidden || !currentView.hidden) {
+  throw new Error("story brief did not replace writer selection");
+}
+if (briefButton.disabled || briefButton.attrs["aria-current"] !== "page") {
+  throw new Error("story brief was not marked current");
 }
 
 state.creationId = "creation-id";
-if (!setWorkspaceView("current")) throw new Error("current work could not be opened");
-if (!newView.hidden || currentView.hidden) {
-  throw new Error("current work did not replace the creation view");
+if (!setWorkspaceView("progress")) throw new Error("creation could not open live progress");
+if (!selectionView.hidden || !briefView.hidden || currentView.hidden || progressScene.hidden) {
+  throw new Error("live progress did not replace the brief");
 }
-if (currentButton.disabled) throw new Error("current work stayed disabled");
-if (currentButton.attrs["aria-current"] !== "page") {
-  throw new Error("current work was not marked current");
+if (readingButton.disabled) {
+  // Expected until a formal result exists.
+} else {
+  throw new Error("unapproved work enabled deliverable reading");
 }
-if (placeholder.hidden) throw new Error("loading current work lost its placeholder");
 
-state.creation = { initial: { state: "running" }, revision: { state: "unavailable" } };
-renderWorkspaceViews();
-if (!placeholder.hidden) throw new Error("loaded current work kept its placeholder");
-
-state.workspaceView = "creation";
-if (!setWorkspaceView("creation")) throw new Error("new creation could not be reopened");
-if (newView.hidden || !currentView.hidden) {
-  throw new Error("new creation did not replace current work");
+state.creation = {
+  initial: { state: "succeeded", result: { content_package: { story_outline: "ready" } } },
+  revision: { state: "unavailable" },
+};
+if (!setWorkspaceView("reading")) throw new Error("formal delivery could not open reading scene");
+if (currentView.hidden || !progressScene.hidden) {
+  throw new Error("reading scene kept live progress visible");
+}
+if (readingButton.disabled || readingButton.attrs["aria-current"] !== "page") {
+  throw new Error("formal delivery did not enable reading scene");
 }
 """
     harness = f"""
@@ -324,7 +353,7 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
-def test_creation_submission_opens_current_work() -> None:
+def test_creation_submission_opens_live_creation_scene() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"
 
@@ -346,7 +375,7 @@ Object.assign(elements, {
   "creation-form": { setAttribute() {} },
 });
 state.selectedPersonaId = "wuzhen";
-state.workspaceView = "creation";
+state.workspaceView = "brief";
 let deliveryFocused = false;
 apiRequest = async (path, options) => {
   if (path !== "/creations" || options.method !== "POST") {
@@ -357,13 +386,13 @@ apiRequest = async (path, options) => {
 renderSeries = () => {};
 renderCreation = () => {};
 refreshCreation = async () => true;
-focusDelivery = () => { deliveryFocused = state.workspaceView === "current"; };
+focusDelivery = () => { deliveryFocused = state.workspaceView === "progress"; };
 
 await handleCreate({ preventDefault() {} });
 if (state.creationId !== "new-creation-id") throw new Error("creation id was not retained");
 if (storage.get(STORAGE_KEY) !== "new-creation-id") throw new Error("creation id was not saved");
-if (state.workspaceView !== "current") throw new Error("submission stayed on new creation");
-if (!deliveryFocused) throw new Error("submission did not open current work");
+if (state.workspaceView !== "progress") throw new Error("submission did not open live creation");
+if (!deliveryFocused) throw new Error("submission did not focus live creation");
 """
     harness = f"""
 const fs = require("fs");
@@ -427,7 +456,7 @@ Object.assign(elements, {
   "quality-rejection-action-message": { textContent: "" },
 });
 renderProgress = () => {};
-renderWorkspace = () => true;
+renderWorkspace = () => false;
 state.creationId = "creation id";
 state.activeDraftRunKind = "";
 state.creation = {
@@ -448,8 +477,8 @@ state.creation = {
 };
 renderCreation();
 if (elements["failure-panel"].hidden) throw new Error("quality rejection stayed hidden");
-if (elements["result-workspace"].hidden) {
-  throw new Error("quality rejection hid retained workspace");
+if (!elements["result-workspace"].hidden) {
+  throw new Error("quality rejection exposed unapproved workspace");
 }
 if (!elements["failure-title"].textContent.includes("L0 创作内核")) {
   throw new Error("L0 rejection was not identified");
@@ -707,7 +736,7 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
-def test_active_drafts_render_from_resource_snapshots_without_formal_results() -> None:
+def test_unapproved_drafts_stay_out_of_the_reading_scene() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"
     page = (root / "src" / "pengine" / "web" / "index.html").read_text()
@@ -793,6 +822,7 @@ const drafts = {
   review_status: { l0: "pending", l4: "pending" },
 };
 state.creationId = "creation-id";
+state.workspaceView = "progress";
 state.activeVersion = "initial";
 state.activeArtifact = "story_outline";
 state.activeDraftRunKind = "";
@@ -802,18 +832,8 @@ state.creation = {
   revision: { state: "unavailable" },
 };
 renderCreation();
-if (elements["result-workspace"].hidden) throw new Error("running drafts stayed hidden");
-if (elements["artifact-version-mark"].textContent !== "创作中草稿") {
-  throw new Error("initial draft label was not rendered");
-}
-if (!elements["artifact-content"].textContent.includes("选择理由：匹配故事母题。")) {
-  throw new Error("direction draft was not rendered");
-}
-if (artifactButtons[0].hidden || artifactButtons[1].hidden) {
-  throw new Error("committed draft tabs stayed hidden");
-}
-if (!artifactButtons[2].hidden || !artifactButtons[5].hidden) {
-  throw new Error("current or future draft tabs were shown");
+if (!elements["result-workspace"].hidden) {
+  throw new Error("running drafts opened the reading scene");
 }
 
 const pausedProgress = {
@@ -828,11 +848,8 @@ state.creation = {
   initial: { state: "paused", progress: pausedProgress, drafts },
 };
 renderCreation();
-if (
-  elements["result-workspace"].hidden ||
-  !elements["artifact-content"].textContent.includes("匹配故事母题")
-) {
-  throw new Error("paused resource lost durable draft text");
+if (!elements["result-workspace"].hidden) {
+  throw new Error("paused drafts opened the reading scene");
 }
 if (!elements["wait-title"].textContent.includes("网络 / Relay")) {
   throw new Error("relay pause did not use safe relay copy");
@@ -846,17 +863,17 @@ renderCreation();
 if (!elements["wait-kicker"].textContent.includes("网络 / Relay")) {
   throw new Error("relay auto recovery did not use safe relay copy");
 }
+if (!elements["result-workspace"].hidden) {
+  throw new Error("recovering drafts opened the reading scene");
+}
 
 state.creation = {
   ...state.creation,
   initial: { state: "queued", progress, drafts },
 };
 renderCreation();
-if (
-  elements["result-workspace"].hidden ||
-  !elements["artifact-content"].textContent.includes("匹配故事母题")
-) {
-  throw new Error("continued resource lost durable draft text");
+if (!elements["result-workspace"].hidden) {
+  throw new Error("queued drafts opened the reading scene");
 }
 
 const formalInitial = {
@@ -872,23 +889,20 @@ const formalInitial = {
   },
 };
 state.activeDraftRunKind = "";
-const revisionProgress = { ...progress, can_continue: true, can_end: true };
 state.creation = {
   persona: { display_name: "测试人格", version: "1" },
   initial: formalInitial,
-  revision: { state: "paused", progress: revisionProgress, drafts },
+  revision: { state: "available" },
 };
 renderCreation();
-if (state.activeVersion !== "revision") throw new Error("revision draft was not selected");
-if (elements["artifact-version-mark"].textContent !== "修订中草稿") {
-  throw new Error("revision draft label was not rendered");
+if (state.workspaceView !== "reading") {
+  throw new Error("formal initial delivery did not enter reading scene");
 }
-state.activeVersion = "initial";
-state.activeArtifact = "story_outline";
-renderVersionControls();
-renderArtifact();
+if (elements["result-workspace"].hidden) {
+  throw new Error("formal delivery stayed hidden");
+}
 if (elements["artifact-content"].textContent !== "初稿故事大纲") {
-  throw new Error("revision draft hid formal initial delivery");
+  throw new Error("formal initial delivery was not rendered");
 }
 """
     harness = f"""

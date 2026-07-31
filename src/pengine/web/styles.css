@@ -348,8 +348,40 @@ main {
   opacity: 0.42;
 }
 
+.flow-nav {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  width: min(100%, 42rem);
+}
+
+.flow-nav button {
+  justify-content: center;
+  white-space: nowrap;
+}
+
 .workspace-view:focus {
   outline: none;
+}
+
+.brief-scene-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0 0 0.85rem;
+  color: var(--paper);
+}
+
+.brief-scene-header .text-button {
+  color: var(--paper);
+}
+
+#brief-persona {
+  margin: 0;
+  color: #cfc3b1;
+  font-family: var(--display);
+  font-size: 0.9rem;
+  text-align: right;
 }
 
 .current-work-placeholder {
@@ -1247,6 +1279,9 @@ textarea:disabled {
 #result-workspace {
   position: relative;
   z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(8.5rem, 0.18fr) minmax(0, 1fr) minmax(13rem, 0.32fr);
+  gap: 1rem;
   margin-left: 2rem;
 }
 
@@ -1256,6 +1291,11 @@ textarea:disabled {
   justify-content: space-between;
   gap: 1rem;
   margin-bottom: 1rem;
+}
+
+#result-workspace .version-bar {
+  grid-column: 1 / -1;
+  margin-bottom: 0;
 }
 
 .segmented-control {
@@ -1298,6 +1338,18 @@ textarea:disabled {
   grid-template-columns: minmax(8.5rem, 0.22fr) minmax(0, 1fr);
   gap: 1rem;
   align-items: start;
+}
+
+#result-workspace .artifact-layout {
+  display: contents;
+}
+
+#result-workspace .artifact-tabs {
+  grid-column: 1;
+}
+
+#result-workspace .artifact-paper {
+  grid-column: 2;
 }
 
 .artifact-tabs {
@@ -1490,6 +1542,20 @@ textarea:disabled {
   background: rgba(217, 200, 167, 0.35);
 }
 
+#result-workspace .revision-desk {
+  grid-column: 3;
+  align-self: start;
+  display: block;
+  margin: 0;
+  padding: 1.1rem;
+  border: 1px solid rgba(72, 57, 40, 0.28);
+  background: rgba(217, 200, 167, 0.35);
+}
+
+#result-workspace .revision-intro {
+  margin-bottom: 1rem;
+}
+
 .revision-intro h3 {
   margin: 0;
   font-family: var(--display);
@@ -1552,6 +1618,26 @@ textarea:disabled {
   .persona-card {
     min-height: 19rem;
   }
+
+  #result-workspace {
+    display: block;
+  }
+
+  #result-workspace .artifact-layout {
+    display: grid;
+    grid-template-columns: minmax(8.5rem, 0.22fr) minmax(0, 1fr);
+    gap: 1rem;
+  }
+
+  #result-workspace .revision-desk {
+    display: grid;
+    grid-template-columns: minmax(11rem, 0.3fr) minmax(0, 1fr);
+    gap: clamp(1rem, 4vw, 3rem);
+    margin-top: 2.2rem;
+    padding: clamp(1.2rem, 3vw, 2rem);
+    border-top: 3px double rgba(72, 57, 40, 0.5);
+    border-bottom: 1px solid rgba(72, 57, 40, 0.25);
+  }
 }
 
 @media (max-width: 860px) {
@@ -1590,7 +1676,8 @@ textarea:disabled {
     display: none;
   }
 
-  .artifact-layout {
+  .artifact-layout,
+  #result-workspace .artifact-layout {
     grid-template-columns: 1fr;
   }
 
@@ -1615,7 +1702,8 @@ textarea:disabled {
     margin-right: 0.25rem;
   }
 
-  .revision-desk {
+  .revision-desk,
+  #result-workspace .revision-desk {
     grid-template-columns: 1fr;
   }
 
@@ -1695,9 +1783,22 @@ textarea:disabled {
     grid-template-columns: 1fr 1fr;
   }
 
+  .flow-nav {
+    grid-template-columns: 1fr 1fr;
+  }
+
   .workspace-nav button {
     justify-content: center;
     padding-inline: 0.65rem;
+  }
+
+  .brief-scene-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  #brief-persona {
+    text-align: left;
   }
 
   .persona-card {
