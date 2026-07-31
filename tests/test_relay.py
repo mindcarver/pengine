@@ -37,6 +37,19 @@ def test_build_chat_model_requires_serial_tool_calls_and_a_tool_result() -> None
     assert bound.kwargs["tool_choice"]["disable_parallel_tool_use"] is True
 
 
+def test_build_chat_model_initializes_with_a_socks_proxy(monkeypatch) -> None:
+    for variable in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:1080")
+    settings = Settings(
+        relay_base_url="https://relay.example/anthropic",
+        relay_api_key="secret-value",
+        relay_model_id="model-id",
+    )
+
+    assert build_chat_model(settings)._async_client is not None
+
+
 def test_missing_relay_configuration_is_safe(monkeypatch) -> None:
     monkeypatch.setenv("PENGINE_RELAY_BASE_URL", "https://ambient.example/anthropic")
     monkeypatch.setenv("PENGINE_RELAY_API_KEY", "ambient-secret")
