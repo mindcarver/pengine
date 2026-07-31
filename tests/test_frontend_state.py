@@ -230,6 +230,169 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
+def test_workbench_separates_new_creation_from_current_work() -> None:
+    root = Path(__file__).parents[1]
+    script_path = root / "src" / "pengine" / "web" / "app.js"
+    page = (root / "src" / "pengine" / "web" / "index.html").read_text()
+    assert 'id="workspace-new-creation"' in page
+    assert 'id="workspace-current-work"' in page
+    assert 'id="new-creation-view"' in page
+    assert 'id="current-work-view"' in page
+    assert page.index('id="new-creation-view"') < page.index('id="current-work-view"')
+
+    assertions = """
+function viewElement() {
+  return {
+    hidden: false,
+    disabled: false,
+    attrs: {},
+    setAttribute(name, value) { this.attrs[name] = value; },
+  };
+}
+const newView = viewElement();
+const currentView = viewElement();
+const newButton = viewElement();
+const currentButton = viewElement();
+const placeholder = viewElement();
+Object.assign(elements, {
+  "new-creation-view": newView,
+  "current-work-view": currentView,
+  "workspace-new-creation": newButton,
+  "workspace-current-work": currentButton,
+  "current-work-placeholder": placeholder,
+});
+
+state.creationId = "";
+state.creation = null;
+state.workspaceView = "current";
+renderWorkspaceViews();
+if (state.workspaceView !== "creation") throw new Error("empty workbench kept current-work view");
+if (newView.hidden || !currentView.hidden) {
+  throw new Error("empty workbench exposed the wrong view");
+}
+if (currentButton.disabled !== true) throw new Error("empty workbench enabled current work");
+if (newButton.attrs["aria-current"] !== "page") {
+  throw new Error("new creation was not marked current");
+}
+
+state.creationId = "creation-id";
+if (!setWorkspaceView("current")) throw new Error("current work could not be opened");
+if (!newView.hidden || currentView.hidden) {
+  throw new Error("current work did not replace the creation view");
+}
+if (currentButton.disabled) throw new Error("current work stayed disabled");
+if (currentButton.attrs["aria-current"] !== "page") {
+  throw new Error("current work was not marked current");
+}
+if (placeholder.hidden) throw new Error("loading current work lost its placeholder");
+
+state.creation = { initial: { state: "running" }, revision: { state: "unavailable" } };
+renderWorkspaceViews();
+if (!placeholder.hidden) throw new Error("loaded current work kept its placeholder");
+
+state.workspaceView = "creation";
+if (!setWorkspaceView("creation")) throw new Error("new creation could not be reopened");
+if (newView.hidden || !currentView.hidden) {
+  throw new Error("new creation did not replace current work");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}} }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(() => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_creation_submission_opens_current_work() -> None:
+    root = Path(__file__).parents[1]
+    script_path = root / "src" / "pengine" / "web" / "app.js"
+
+    assertions = """
+const storage = new Map();
+window.localStorage = {
+  getItem(key) { return storage.get(key) || null; },
+  setItem(key, value) { storage.set(key, value); },
+  removeItem(key) { storage.delete(key); },
+};
+Object.assign(elements, {
+  story: { value: "一段待创作的故事", focus() {} },
+  requirements: { value: "" },
+  "creation-message": { textContent: "" },
+  "create-button": {
+    disabled: false,
+    querySelector() { return { textContent: "" }; },
+  },
+  "creation-form": { setAttribute() {} },
+});
+state.selectedPersonaId = "wuzhen";
+state.workspaceView = "creation";
+let deliveryFocused = false;
+apiRequest = async (path, options) => {
+  if (path !== "/creations" || options.method !== "POST") {
+    throw new Error("creation used the wrong endpoint");
+  }
+  return { creation_id: "new-creation-id" };
+};
+renderSeries = () => {};
+renderCreation = () => {};
+refreshCreation = async () => true;
+focusDelivery = () => { deliveryFocused = state.workspaceView === "current"; };
+
+await handleCreate({ preventDefault() {} });
+if (state.creationId !== "new-creation-id") throw new Error("creation id was not retained");
+if (storage.get(STORAGE_KEY) !== "new-creation-id") throw new Error("creation id was not saved");
+if (state.workspaceView !== "current") throw new Error("submission stayed on new creation");
+if (!deliveryFocused) throw new Error("submission did not open current work");
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}} }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(async () => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_quality_rejection_retains_workspace_and_retries_the_final_review() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"

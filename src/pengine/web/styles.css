@@ -296,6 +296,82 @@ main {
   padding: 0 clamp(1rem, 4vw, 4rem) clamp(4rem, 9vw, 9rem);
 }
 
+.workbench-main {
+  min-width: 0;
+}
+
+.workspace-nav {
+  display: inline-flex;
+  max-width: 100%;
+  margin: 0 0 clamp(1.3rem, 3vw, 2.5rem);
+  padding: 0.35rem;
+  border: 1px solid rgba(238, 228, 207, 0.2);
+  background: #1d1b18;
+  box-shadow: 5px 6px 0 rgba(0, 0, 0, 0.16);
+}
+
+.workspace-nav button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.65rem;
+  padding: 0.55rem 1rem;
+  border: 1px solid transparent;
+  color: #cfc3b1;
+  background: transparent;
+  font-family: var(--display);
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.workspace-nav button span {
+  color: var(--mustard);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+}
+
+.workspace-nav button[aria-current="page"] {
+  border-color: rgba(238, 228, 207, 0.28);
+  color: var(--ink);
+  background: var(--paper);
+}
+
+.workspace-nav button:focus-visible {
+  outline: 3px solid var(--mustard);
+  outline-offset: 2px;
+}
+
+.workspace-nav button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.workspace-view:focus {
+  outline: none;
+}
+
+.current-work-placeholder {
+  padding: clamp(1.6rem, 4vw, 3rem);
+  border: 1px dashed rgba(238, 228, 207, 0.28);
+  color: var(--paper);
+  background: linear-gradient(135deg, rgba(238, 228, 207, 0.06), transparent 56%), #25211d;
+  box-shadow: 5px 6px 0 rgba(0, 0, 0, 0.16);
+}
+
+.current-work-placeholder h2 {
+  margin: 0;
+  font-family: var(--display);
+  font-size: clamp(1.55rem, 3vw, 2.4rem);
+}
+
+.current-work-placeholder p:last-child {
+  max-width: 38rem;
+  margin: 0.65rem 0 0;
+  color: #cfc3b1;
+}
+
 .series-drawer {
   position: sticky;
   top: 1.5rem;
@@ -1496,6 +1572,10 @@ textarea:disabled {
     grid-template-columns: 1fr;
   }
 
+  .workspace-nav {
+    margin-bottom: 1.2rem;
+  }
+
   .series-drawer {
     position: relative;
     top: auto;
@@ -1607,6 +1687,17 @@ textarea:disabled {
 
   .persona-grid {
     grid-template-columns: 1fr;
+  }
+
+  .workspace-nav {
+    display: grid;
+    width: 100%;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .workspace-nav button {
+    justify-content: center;
+    padding-inline: 0.65rem;
   }
 
   .persona-card {

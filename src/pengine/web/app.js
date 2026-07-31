@@ -124,6 +124,7 @@ const state = {
   pendingFeedback: "",
   progressRunKind: "",
   runControlBusy: false,
+  workspaceView: "creation",
 };
 
 const elements = {};
@@ -164,6 +165,11 @@ function cacheElements() {
     "series-persona",
     "series-id",
     "series-date",
+    "workspace-new-creation",
+    "workspace-current-work",
+    "new-creation-view",
+    "current-work-view",
+    "current-work-placeholder",
     "delivery-section",
     "delivery-subtitle",
     "folio-stamp",
@@ -245,6 +251,12 @@ function bindEvents() {
     void handleQualityRejectionControl("end"),
   );
   elements["series-card"].addEventListener("click", focusDelivery);
+  elements["workspace-new-creation"].addEventListener("click", () =>
+    setWorkspaceView("creation"),
+  );
+  elements["workspace-current-work"].addEventListener("click", () =>
+    setWorkspaceView("current"),
+  );
 
   elements["version-tabs"].addEventListener("click", handleVersionClick);
   elements["version-tabs"].addEventListener("keydown", handleHorizontalTabs);
@@ -264,6 +276,8 @@ function bindEvents() {
 async function initialize() {
   const currentId = readCurrentCreationId();
   state.creationId = currentId;
+  state.workspaceView = currentId ? "current" : "creation";
+  renderWorkspaceViews();
   renderSeries();
 
   await loadPersonas();
@@ -422,6 +436,7 @@ async function handleCreate(event) {
     state.activeEpisode = null;
     state.pendingFeedback = "";
     writeCurrentCreationId(state.creationId);
+    setWorkspaceView("current");
     elements["creation-message"].textContent = "投递成功，正在读取真实任务状态。";
     renderSeries();
     renderCreation();
@@ -592,6 +607,7 @@ async function refreshCreation(options = {}) {
 }
 
 function renderCreation() {
+  renderWorkspaceViews();
   if (!state.creationId) {
     elements["delivery-section"].hidden = true;
     elements["run-progress"].hidden = true;
@@ -925,6 +941,7 @@ function startNewCreation() {
   state.activeDraftRunKind = "";
   state.activeEpisode = null;
   state.pendingFeedback = "";
+  setWorkspaceView("creation");
   renderSeries();
   renderCreation();
   elements["creation-message"].textContent =
@@ -1397,11 +1414,48 @@ function focusFirstAvailablePersona() {
 }
 
 function focusDelivery() {
+  if (!setWorkspaceView("current")) {
+    return;
+  }
   if (elements["delivery-section"].hidden) {
     return;
   }
   elements["delivery-section"].scrollIntoView({ behavior: "smooth", block: "start" });
   elements["delivery-section"].focus?.({ preventScroll: true });
+}
+
+function setWorkspaceView(view) {
+  if (view === "current" && !state.creationId) {
+    return false;
+  }
+  state.workspaceView = view === "current" ? "current" : "creation";
+  renderWorkspaceViews();
+  return true;
+}
+
+function renderWorkspaceViews() {
+  const creationView = elements["new-creation-view"];
+  const currentView = elements["current-work-view"];
+  const creationButton = elements["workspace-new-creation"];
+  const currentButton = elements["workspace-current-work"];
+  if (!creationView || !currentView || !creationButton || !currentButton) {
+    return;
+  }
+
+  if (state.workspaceView === "current" && !state.creationId) {
+    state.workspaceView = "creation";
+  }
+  const showingCurrent = state.workspaceView === "current";
+  creationView.hidden = showingCurrent;
+  currentView.hidden = !showingCurrent;
+  creationButton.setAttribute("aria-current", showingCurrent ? "false" : "page");
+  currentButton.setAttribute("aria-current", showingCurrent ? "page" : "false");
+  currentButton.disabled = !state.creationId;
+
+  const placeholder = elements["current-work-placeholder"];
+  if (placeholder) {
+    placeholder.hidden = Boolean(state.creation);
+  }
 }
 
 function shouldPoll() {
