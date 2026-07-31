@@ -477,12 +477,16 @@
           },
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "progress"
+          "progress",
+          "drafts"
         ],
         "title": "AutoResumingRun"
       },
@@ -529,6 +533,62 @@
           "episode_scripts"
         ],
         "title": "ContentPackage"
+      },
+      "CreativeDirectionDraft": {
+        "properties": {
+          "stage": {
+            "type": "string",
+            "const": "determining_direction",
+            "title": "Stage",
+            "default": "determining_direction"
+          },
+          "selected_l0_variant": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Selected L0 Variant"
+          },
+          "selection_rationale": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Selection Rationale"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "selected_l0_variant",
+          "selection_rationale"
+        ],
+        "title": "CreativeDirectionDraft"
+      },
+      "CreativeTextDraft": {
+        "properties": {
+          "stage": {
+            "type": "string",
+            "enum": [
+              "generating_story_outline",
+              "generating_character_biographies",
+              "generating_relationships",
+              "generating_episode_outline"
+            ],
+            "title": "Stage"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Content"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "stage",
+          "content"
+        ],
+        "title": "CreativeTextDraft"
       },
       "CreateCreationRequest": {
         "properties": {
@@ -949,6 +1009,9 @@
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
           },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
+          },
           "pause": {
             "$ref": "#/components/schemas/RunPause"
           }
@@ -957,6 +1020,7 @@
         "type": "object",
         "required": [
           "progress",
+          "drafts",
           "pause"
         ],
         "title": "PausedRun"
@@ -1058,12 +1122,16 @@
           },
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "progress"
+          "progress",
+          "drafts"
         ],
         "title": "QueuedRun"
       },
@@ -1115,12 +1183,16 @@
           },
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "progress"
+          "progress",
+          "drafts"
         ],
         "title": "RevisionAutoResuming"
       },
@@ -1220,6 +1292,9 @@
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
           },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
+          },
           "pause": {
             "$ref": "#/components/schemas/RunPause"
           }
@@ -1228,6 +1303,7 @@
         "type": "object",
         "required": [
           "progress",
+          "drafts",
           "pause"
         ],
         "title": "RevisionPaused"
@@ -1248,12 +1324,16 @@
           },
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "progress"
+          "progress",
+          "drafts"
         ],
         "title": "RevisionQueued"
       },
@@ -1289,12 +1369,16 @@
           },
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "progress"
+          "progress",
+          "drafts"
         ],
         "title": "RevisionRunning"
       },
@@ -1391,6 +1475,43 @@
           "resource_url"
         ],
         "title": "RunControlAccepted"
+      },
+      "RunDraftSnapshot": {
+        "properties": {
+          "artifacts": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/CreativeDirectionDraft"
+                },
+                {
+                  "$ref": "#/components/schemas/CreativeTextDraft"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "stage",
+                "mapping": {
+                  "determining_direction": "#/components/schemas/CreativeDirectionDraft",
+                  "generating_character_biographies": "#/components/schemas/CreativeTextDraft",
+                  "generating_episode_outline": "#/components/schemas/CreativeTextDraft",
+                  "generating_relationships": "#/components/schemas/CreativeTextDraft",
+                  "generating_story_outline": "#/components/schemas/CreativeTextDraft"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Artifacts"
+          },
+          "review_status": {
+            "$ref": "#/components/schemas/FinalReviewProgress"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "review_status"
+        ],
+        "title": "RunDraftSnapshot"
       },
       "RunFailure": {
         "properties": {
@@ -1531,12 +1652,16 @@
           },
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "progress"
+          "progress",
+          "drafts"
         ],
         "title": "RunningRun"
       },

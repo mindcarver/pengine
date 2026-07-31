@@ -40,12 +40,45 @@ const PERSONA_PROFILES = {
   },
 };
 
-const ARTIFACTS = [
+const FORMAL_ARTIFACTS = [
   { key: "story_outline", title: "故事大纲", overline: "DELIVERABLE 01" },
   { key: "character_biographies", title: "人物小传", overline: "DELIVERABLE 02" },
   { key: "relationship_logic", title: "关系逻辑", overline: "DELIVERABLE 03" },
   { key: "episode_outline", title: "分集大纲", overline: "DELIVERABLE 04" },
   { key: "episode_scripts", title: "分集剧本", overline: "DELIVERABLE 05" },
+];
+
+const DRAFT_ARTIFACTS = [
+  {
+    key: "direction",
+    stage: "determining_direction",
+    title: "创作方向",
+    overline: "DRAFT 01",
+  },
+  {
+    key: "story_outline",
+    stage: "generating_story_outline",
+    title: "故事大纲",
+    overline: "DRAFT 02",
+  },
+  {
+    key: "character_biographies",
+    stage: "generating_character_biographies",
+    title: "人物小传",
+    overline: "DRAFT 03",
+  },
+  {
+    key: "relationship_logic",
+    stage: "generating_relationships",
+    title: "关系逻辑",
+    overline: "DRAFT 04",
+  },
+  {
+    key: "episode_outline",
+    stage: "generating_episode_outline",
+    title: "分集大纲",
+    overline: "DRAFT 05",
+  },
 ];
 
 const USER_STAGES = [
@@ -77,6 +110,7 @@ const state = {
   creationId: "",
   activeVersion: "initial",
   activeArtifact: "story_outline",
+  activeDraftRunKind: "",
   pollTimer: null,
   loadingCreation: false,
   pendingFeedback: "",
@@ -354,6 +388,7 @@ async function handleCreate(event) {
     state.creation = null;
     state.activeVersion = "initial";
     state.activeArtifact = "story_outline";
+    state.activeDraftRunKind = "";
     state.pendingFeedback = "";
     writeCurrentCreationId(state.creationId);
     elements["creation-message"].textContent = "投递成功，正在读取真实任务状态。";
@@ -527,38 +562,53 @@ function renderCreation() {
     `${state.creation.persona.display_name} · 人格版本 ${state.creation.persona.version}`;
   renderProgress();
 
+  const activeDraft = activeDraftRun();
+  if (activeDraft && state.activeDraftRunKind !== activeDraft.kind) {
+    state.activeVersion = activeDraft.kind;
+    state.activeArtifact = artifactViewsForRun(activeDraft.run)[0]?.key || "story_outline";
+  }
+  state.activeDraftRunKind = activeDraft?.kind || "";
+
   if (initial.state === "queued") {
+    const showWorkspace = renderWorkspace();
     showWaiting(
       "任务已排队",
       "编辑部已收到你的故事",
-      "本页会持续查询本地服务；后端返回成功或失败前，不会展示假成品。",
+      "本页会持续查询本地服务；已提交的阶段草稿会在这里显示，尚未提交的内容不会展示。",
+      { showWorkspace },
     );
     return;
   }
 
   if (initial.state === "running") {
+    const showWorkspace = renderWorkspace();
     showWaiting(
       "任务创作中",
       "编辑部正在处理当前阶段",
-      "上方阶段与已运行时长均来自本地服务；最终审核通过前不会展示中间文稿。",
+      "上方阶段与已运行时长均来自本地服务；已提交草稿尚未通过成品审核。",
+      { showWorkspace },
     );
     return;
   }
 
   if (initial.state === "auto_resuming") {
+    const showWorkspace = renderWorkspace();
     showWaiting(
       "首次超时 · 自动恢复",
       "正在从已批准检查点继续",
-      "已完成阶段不会重新生成；当前未批准阶段将重新执行。",
+      "已完成阶段不会重新生成；已提交草稿仍可查看，当前未批准阶段将重新执行。",
+      { showWorkspace },
     );
     return;
   }
 
   if (initial.state === "paused") {
+    const showWorkspace = renderWorkspace();
     showWaiting(
       "任务已暂停",
       "当前阶段再次超过整体运行时限",
-      "请在上方选择继续当前阶段，或结束本次任务。",
+      "请在上方选择继续当前阶段，或结束本次任务；已提交草稿仍可查看。",
+      { showWorkspace },
     );
     return;
   }
@@ -575,10 +625,7 @@ function renderCreation() {
 
   elements["task-waiting"].hidden = true;
   elements["failure-panel"].hidden = true;
-  elements["result-workspace"].hidden = false;
-  renderVersionControls();
-  renderArtifact();
-  renderRevision();
+  renderWorkspace();
 }
 
 function activeProgressRun() {
@@ -649,10 +696,10 @@ function renderProgress() {
   }
 }
 
-function showWaiting(kicker, title, description) {
+function showWaiting(kicker, title, description, options = {}) {
   elements["task-waiting"].hidden = false;
   elements["failure-panel"].hidden = true;
-  elements["result-workspace"].hidden = true;
+  elements["result-workspace"].hidden = options.showWorkspace !== true;
   elements["wait-kicker"].textContent = kicker;
   elements["wait-title"].textContent = title;
   elements["wait-description"].textContent = description;
@@ -697,6 +744,7 @@ function startNewCreation() {
   state.creation = null;
   state.activeVersion = "initial";
   state.activeArtifact = "story_outline";
+  state.activeDraftRunKind = "";
   state.pendingFeedback = "";
   renderSeries();
   renderCreation();
@@ -706,45 +754,153 @@ function startNewCreation() {
   elements.story.focus({ preventScroll: true });
 }
 
+function activeDraftRun() {
+  if (!state.creation) {
+    return null;
+  }
+  const initial = state.creation.initial;
+  if (initial.state !== "succeeded" && artifactViewsForRun(initial).length) {
+    return { kind: "initial", run: initial };
+  }
+  const revision = state.creation.revision;
+  if (revision.state !== "succeeded" && artifactViewsForRun(revision).length) {
+    return { kind: "revision", run: revision };
+  }
+  return null;
+}
+
+function isFormalRun(run) {
+  return Boolean(run && run.state === "succeeded" && run.result && run.result.content_package);
+}
+
+function artifactViewsForRun(run) {
+  if (isFormalRun(run)) {
+    return FORMAL_ARTIFACTS.flatMap((artifact) => {
+      const content = run.result.content_package[artifact.key];
+      return typeof content === "string" && content.trim()
+        ? [{ ...artifact, content, isDraft: false }]
+        : [];
+    });
+  }
+
+  const drafts = run?.drafts?.artifacts;
+  if (!Array.isArray(drafts)) {
+    return [];
+  }
+  return drafts.flatMap((draft) => {
+    const artifact = DRAFT_ARTIFACTS.find((item) => item.stage === draft?.stage);
+    const content = draftArtifactContent(draft);
+    return artifact && content
+      ? [{ ...artifact, content, isDraft: true }]
+      : [];
+  });
+}
+
+function draftArtifactContent(draft) {
+  if (draft?.stage === "determining_direction") {
+    const variant = draft.selected_l0_variant;
+    const rationale = draft.selection_rationale;
+    if (typeof variant !== "string" || !variant.trim() || typeof rationale !== "string" || !rationale.trim()) {
+      return "";
+    }
+    return `选择的 L0 变体：${variant}\n\n选择理由：${rationale}`;
+  }
+  return typeof draft?.content === "string" && draft.content.trim() ? draft.content : "";
+}
+
+function renderWorkspace() {
+  const initialArtifacts = artifactViewsForRun(state.creation.initial);
+  const revisionArtifacts = artifactViewsForRun(state.creation.revision);
+  if (!initialArtifacts.length && !revisionArtifacts.length) {
+    elements["result-workspace"].hidden = true;
+    return false;
+  }
+
+  elements["result-workspace"].hidden = false;
+  elements["revision-desk"].hidden = state.creation.initial.state !== "succeeded";
+  renderVersionControls();
+  renderArtifact();
+  if (!elements["revision-desk"].hidden) {
+    renderRevision();
+  }
+  return true;
+}
+
 function renderVersionControls() {
-  const revisionSucceeded = state.creation.revision.state === "succeeded";
-  if (!revisionSucceeded && state.activeVersion === "revision") {
+  const initialAvailable = artifactViewsForRun(state.creation.initial).length > 0;
+  const revisionAvailable = artifactViewsForRun(state.creation.revision).length > 0;
+  if (state.activeVersion === "initial" && !initialAvailable) {
+    state.activeVersion = "revision";
+  }
+  if (state.activeVersion === "revision" && !revisionAvailable) {
     state.activeVersion = "initial";
   }
 
-  elements["version-revision"].disabled = !revisionSucceeded;
+  elements["version-initial"].disabled = !initialAvailable;
+  elements["version-revision"].disabled = !revisionAvailable;
   for (const button of elements["version-tabs"].querySelectorAll("[data-version]")) {
     const active = button.dataset.version === state.activeVersion;
     button.setAttribute("aria-selected", String(active));
     button.tabIndex = active ? 0 : -1;
   }
 
+  const run = state.activeVersion === "revision"
+    ? state.creation.revision
+    : state.creation.initial;
+  if (!isFormalRun(run)) {
+    elements["version-note"].textContent =
+      `${draftLabel(state.activeVersion)}，尚未通过成品审核。`;
+    return;
+  }
   elements["version-note"].textContent =
     state.activeVersion === "revision" ? "正在查看修订后的完整交付" : "正在查看首次交付";
 }
 
 function renderArtifact() {
-  const artifact = ARTIFACTS.find((item) => item.key === state.activeArtifact) || ARTIFACTS[0];
   const run = state.activeVersion === "revision"
     ? state.creation.revision
     : state.creation.initial;
-  const content = run.result.content_package[artifact.key];
+  const artifacts = artifactViewsForRun(run);
+  if (!artifacts.length) {
+    return;
+  }
+  let artifact = artifacts.find((item) => item.key === state.activeArtifact);
+  if (!artifact) {
+    [artifact] = artifacts;
+    state.activeArtifact = artifact.key;
+  }
 
   for (const button of elements["artifact-tabs"].querySelectorAll("[data-artifact]")) {
-    const active = button.dataset.artifact === artifact.key;
+    const index = artifacts.findIndex((item) => item.key === button.dataset.artifact);
+    const active = index >= 0 && button.dataset.artifact === artifact.key;
+    button.hidden = index < 0;
+    button.disabled = index < 0;
     button.setAttribute("aria-selected", String(active));
     button.tabIndex = active ? 0 : -1;
+    const number = button.querySelector?.("span");
+    if (number && index >= 0) {
+      number.textContent = String(index + 1).padStart(2, "0");
+    }
   }
 
   const activeTab = elements["artifact-tabs"].querySelector(
     `[data-artifact="${artifact.key}"]`,
   );
-  elements["artifact-panel"].setAttribute("aria-labelledby", activeTab.id);
+  if (activeTab) {
+    elements["artifact-panel"].setAttribute("aria-labelledby", activeTab.id);
+  }
   elements["artifact-overline"].textContent = artifact.overline;
   elements["artifact-title"].textContent = artifact.title;
-  elements["artifact-version-mark"].textContent =
-    state.activeVersion === "revision" ? "修订稿" : "初稿";
-  elements["artifact-content"].textContent = content;
+  elements["artifact-version-mark"].textContent = artifact.isDraft
+    ? draftLabel(state.activeVersion)
+    : state.activeVersion === "revision"
+      ? "修订稿"
+      : "初稿";
+  elements["artifact-content"].textContent = artifact.content;
+}
+
+function draftLabel(kind) {
+  return kind === "revision" ? "修订中草稿" : "创作中草稿";
 }
 
 function renderRevision() {

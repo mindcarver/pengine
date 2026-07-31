@@ -1434,7 +1434,7 @@ textarea:disabled {
   }
 
   .artifact-tabs {
-    grid-template-columns: repeat(5, minmax(7rem, 1fr));
+    grid-template-columns: repeat(6, minmax(7rem, 1fr));
     overflow-x: auto;
     padding-bottom: 0.4rem;
   }

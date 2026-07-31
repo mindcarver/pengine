@@ -43,3 +43,24 @@ def test_openapi_exposes_creation_and_run_control_operations() -> None:
         ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
     }
+
+
+def test_openapi_exposes_durable_drafts_only_for_non_terminal_runs() -> None:
+    schemas = json.loads((ROOT / "contracts/openapi.json").read_text())["components"]["schemas"]
+
+    for name in (
+        "QueuedRun",
+        "RunningRun",
+        "AutoResumingRun",
+        "PausedRun",
+        "RevisionQueued",
+        "RevisionRunning",
+        "RevisionAutoResuming",
+        "RevisionPaused",
+    ):
+        assert schemas[name]["properties"]["drafts"] == {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
+        }
+
+    assert "drafts" not in schemas["SucceededRun"]["properties"]
+    assert "drafts" not in schemas["RevisionSucceeded"]["properties"]

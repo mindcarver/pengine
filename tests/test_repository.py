@@ -469,6 +469,16 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
     assert running.initial.progress.completed_stages == ["determining_direction"]
     assert running.initial.progress.elapsed_seconds == 20
     assert not hasattr(running.initial, "result")
+    assert running.initial.drafts.model_dump() == {
+        "artifacts": [
+            {
+                "stage": "determining_direction",
+                "selected_l0_variant": "归返",
+                "selection_rationale": "匹配母题",
+            }
+        ],
+        "review_status": {"l0": "pending", "l4": "pending"},
+    }
 
     first_timeout = await repository.handle_run_timeout(
         lease.run_id,
@@ -484,6 +494,7 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
     assert recovering.initial.state == "auto_resuming"
     assert recovering.initial.progress.elapsed_seconds == 30
     assert recovering.initial.progress.recovery_state == "auto_resuming"
+    assert recovering.initial.drafts == running.initial.drafts
 
     resumed = await repository.lease_next_job(
         "worker-2",
@@ -510,6 +521,7 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
     assert paused.initial.pause.timeout_count == 2
     assert paused.initial.progress.can_continue is True
     assert paused.initial.progress.can_end is True
+    assert paused.initial.drafts == running.initial.drafts
 
     first_continue = await repository.continue_run(
         creation_id=accepted.creation_id,
@@ -531,6 +543,10 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
     )
     assert replay_continue == first_continue == duplicate_continue
     assert first_continue.run_state == "queued"
+    continued = await repository.get_creation(accepted.creation_id)
+    assert continued is not None
+    assert continued.initial.state == "queued"
+    assert continued.initial.drafts == running.initial.drafts
 
     resumed_again = await repository.lease_next_job(
         "worker-3",
@@ -584,6 +600,58 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
             idempotency_key="continue-ended",
         )
     assert cannot_continue.value.code == "run_not_controllable"
+
+
+async def test_drafts_are_ordered_from_valid_checkpoints_and_isolate_a_revision(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, initial_lease = await create_and_lease_initial(
+        repository,
+        persona,
+        creation_request,
+    )
+    await repository.succeed_run(initial_lease.run_id, make_delivery())
+    await repository.create_or_retry_revision(
+        creation_id=accepted.creation_id,
+        idempotency_key="revision-drafts",
+        request=RevisionRequest(feedback="加强人物选择。"),
+    )
+    revision_lease = await repository.lease_next_job("worker-2", 30)
+    assert revision_lease is not None
+    checkpoints = [
+        (
+            InternalStage.SELECTING_L0_VARIANT,
+            {"selected_l0_variant": "新方向", "selection_rationale": "响应反馈"},
+        ),
+        (InternalStage.GENERATING_STORY_OUTLINE, {"content": "修订故事大纲"}),
+        (InternalStage.GENERATING_CHARACTER_BIOGRAPHIES, {"content": "   "}),
+        (InternalStage.GENERATING_RELATIONSHIP_LOGIC, {"content": "修订人物关系"}),
+        (InternalStage.GENERATING_EPISODE_OUTLINE, {"content": "修订分集大纲"}),
+        (InternalStage.GENERATING_EPISODE_SCRIPTS, {"content": "不应显示的分集剧本"}),
+    ]
+    for stage, payload in checkpoints:
+        await repository.approve_business_checkpoint(revision_lease.run_id, stage, payload)
+
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "succeeded"
+    assert resource.initial.result == make_delivery()
+    assert resource.revision.state == "running"
+    assert resource.revision.drafts.model_dump() == {
+        "artifacts": [
+            {
+                "stage": "determining_direction",
+                "selected_l0_variant": "新方向",
+                "selection_rationale": "响应反馈",
+            },
+            {"stage": "generating_story_outline", "content": "修订故事大纲"},
+            {"stage": "generating_relationships", "content": "修订人物关系"},
+            {"stage": "generating_episode_outline", "content": "修订分集大纲"},
+        ],
+        "review_status": {"l0": "running", "l4": "pending"},
+    }
 
 
 async def test_schema_v1_database_is_backfilled_without_losing_creation(

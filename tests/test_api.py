@@ -150,6 +150,10 @@ async def test_persona_creation_and_query_contract(tmp_path: Path) -> None:
                 "can_continue": False,
                 "can_end": False,
             },
+            "drafts": {
+                "artifacts": [],
+                "review_status": {"l0": "pending", "l4": "pending"},
+            },
         }
         assert body["revision"] == {
             "state": "unavailable",
@@ -182,6 +186,14 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
         repository = app.state.repository
         lease = await repository.lease_next_job("control-worker-1", 30)
         assert lease is not None
+        await repository.approve_business_checkpoint(
+            lease.run_id,
+            InternalStage.SELECTING_L0_VARIANT,
+            {
+                "selected_l0_variant": "归返",
+                "selection_rationale": "匹配故事母题。",
+            },
+        )
         await repository.record_stage_attempt(
             lease.run_id,
             InternalStage.GENERATING_STORY_OUTLINE,
@@ -211,6 +223,16 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
         assert paused.json()["initial"]["state"] == "paused"
         assert paused.json()["initial"]["progress"]["can_continue"] is True
         assert "result" not in paused.json()["initial"]
+        assert paused.json()["initial"]["drafts"] == {
+            "artifacts": [
+                {
+                    "stage": "determining_direction",
+                    "selected_l0_variant": "归返",
+                    "selection_rationale": "匹配故事母题。",
+                }
+            ],
+            "review_status": {"l0": "pending", "l4": "pending"},
+        }
 
         first_continue = await client.post(
             f"/creations/{creation_id}/runs/initial/continue",
@@ -223,6 +245,9 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
         assert first_continue.status_code == 202
         assert replay_continue.json() == first_continue.json()
         assert first_continue.json()["run_state"] == "queued"
+        continued = await client.get(f"/creations/{creation_id}")
+        assert continued.json()["initial"]["state"] == "queued"
+        assert continued.json()["initial"]["drafts"] == paused.json()["initial"]["drafts"]
 
         resumed_again = await repository.lease_next_job("control-worker-3", 30)
         assert resumed_again is not None

@@ -19,6 +19,8 @@ from pengine.schemas import (
     CreateCreationRequest,
     CreationAccepted,
     CreationResource,
+    CreativeDirectionDraft,
+    CreativeTextDraft,
     Delivery,
     EndedRun,
     FailedRun,
@@ -39,6 +41,7 @@ from pengine.schemas import (
     RevisionSucceeded,
     RevisionUnavailable,
     RunControlAccepted,
+    RunDraftSnapshot,
     RunFailure,
     RunningRun,
     RunPause,
@@ -258,6 +261,17 @@ _COMPLETED_STAGE_CHECKPOINTS = (
     (UserStage.GENERATING_RELATIONSHIPS, InternalStage.GENERATING_RELATIONSHIP_LOGIC),
     (UserStage.GENERATING_EPISODE_OUTLINE, InternalStage.GENERATING_EPISODE_OUTLINE),
     (UserStage.GENERATING_EPISODE_SCRIPTS, InternalStage.GENERATING_EPISODE_SCRIPTS),
+)
+
+_DRAFT_STAGE_CHECKPOINTS = (
+    (InternalStage.SELECTING_L0_VARIANT, UserStage.DETERMINING_DIRECTION),
+    (InternalStage.GENERATING_STORY_OUTLINE, UserStage.GENERATING_STORY_OUTLINE),
+    (
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+        UserStage.GENERATING_CHARACTER_BIOGRAPHIES,
+    ),
+    (InternalStage.GENERATING_RELATIONSHIP_LOGIC, UserStage.GENERATING_RELATIONSHIPS),
+    (InternalStage.GENERATING_EPISODE_OUTLINE, UserStage.GENERATING_EPISODE_OUTLINE),
 )
 
 _INTERNAL_STAGE_ORDER = (
@@ -1731,15 +1745,25 @@ class Repository:
         progress_row, progress = await self._run_progress(connection, run, now)
         match progress_row["execution_state"]:
             case "queued":
-                return QueuedRun(progress=progress)
+                return QueuedRun(
+                    progress=progress,
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                )
             case "running":
-                return RunningRun(progress=progress)
+                return RunningRun(
+                    progress=progress,
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                )
             case "auto_resuming":
-                return AutoResumingRun(progress=progress)
+                return AutoResumingRun(
+                    progress=progress,
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                )
             case "paused":
                 return PausedRun(
                     progress=progress,
                     pause=self._pause_from_progress(progress_row),
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
                 )
             case "ended":
                 return EndedRun(progress=progress)
@@ -1773,15 +1797,25 @@ class Repository:
         progress_row, progress = await self._run_progress(connection, run, now)
         match progress_row["execution_state"]:
             case "queued":
-                return RevisionQueued(progress=progress)
+                return RevisionQueued(
+                    progress=progress,
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                )
             case "running":
-                return RevisionRunning(progress=progress)
+                return RevisionRunning(
+                    progress=progress,
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                )
             case "auto_resuming":
-                return RevisionAutoResuming(progress=progress)
+                return RevisionAutoResuming(
+                    progress=progress,
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                )
             case "paused":
                 return RevisionPaused(
                     progress=progress,
                     pause=self._pause_from_progress(progress_row),
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
                 )
             case "ended":
                 return RevisionEnded(progress=progress)
@@ -1850,6 +1884,54 @@ class Repository:
             can_continue=execution_state == "paused",
             can_end=execution_state == "paused",
         )
+
+    async def _draft_snapshot(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+        progress: RunProgress,
+    ) -> RunDraftSnapshot:
+        cursor = await connection.execute(
+            """
+            SELECT stage, payload_json
+            FROM business_checkpoints
+            WHERE run_id = ?
+            """,
+            (str(run_id),),
+        )
+        payloads = {row["stage"]: row["payload_json"] for row in await cursor.fetchall()}
+        artifacts = []
+        for checkpoint_stage, user_stage in _DRAFT_STAGE_CHECKPOINTS:
+            artifact = self._draft_artifact_from_payload(
+                user_stage,
+                payloads.get(checkpoint_stage.value),
+            )
+            if artifact is not None:
+                artifacts.append(artifact)
+        return RunDraftSnapshot(artifacts=artifacts, review_status=progress.final_review)
+
+    @staticmethod
+    def _draft_artifact_from_payload(
+        stage: UserStage,
+        payload_json: str | None,
+    ) -> CreativeDirectionDraft | CreativeTextDraft | None:
+        if payload_json is None:
+            return None
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        try:
+            if stage is UserStage.DETERMINING_DIRECTION:
+                return CreativeDirectionDraft(
+                    selected_l0_variant=payload["selected_l0_variant"],
+                    selection_rationale=payload["selection_rationale"],
+                )
+            return CreativeTextDraft(stage=stage.value, content=payload["content"])
+        except (KeyError, TypeError, ValueError):
+            return None
 
     @staticmethod
     def _gate_progress(
