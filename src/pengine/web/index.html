@@ -60,10 +60,10 @@
       <div class="workbench">
         <aside class="series-drawer" aria-labelledby="series-title">
           <div class="drawer-heading">
-            <p class="section-number">卷宗</p>
-            <h2 id="series-title">我的剧集</h2>
+            <p class="section-number">当前</p>
+            <h2 id="series-title">当前作品</h2>
           </div>
-          <p class="drawer-explainer">浏览器只记住当前作品编号；作品正文始终从本地服务读取。</p>
+          <p class="drawer-explainer">浏览器只记住当前作品编号；所有状态和文稿始终从本地服务读取。</p>
 
           <div id="series-empty" class="empty-file">
             <span aria-hidden="true">＋</span>
@@ -87,7 +87,28 @@
           </div>
         </aside>
 
-        <div class="editorial-stack">
+        <div class="workbench-main">
+          <nav class="workspace-nav" aria-label="创作工作台">
+            <button
+              id="workspace-new-creation"
+              type="button"
+              data-workspace-view="creation"
+              aria-current="page"
+            >
+              <span>01</span>新建创作
+            </button>
+            <button
+              id="workspace-current-work"
+              type="button"
+              data-workspace-view="current"
+              disabled
+            >
+              <span>02</span>当前作品
+            </button>
+          </nav>
+
+          <section class="workspace-view" id="new-creation-view" aria-label="新建创作" tabindex="-1">
+            <div class="editorial-stack">
           <section class="paper-sheet persona-sheet" aria-labelledby="persona-title">
             <div class="paper-index" aria-hidden="true">01</div>
             <div class="section-heading">
@@ -166,13 +187,22 @@
               </div>
             </form>
           </section>
+            </div>
+          </section>
 
-          <section
-            class="paper-sheet delivery-sheet"
-            id="delivery-section"
-            aria-labelledby="delivery-title"
-            hidden
-          >
+          <section class="workspace-view" id="current-work-view" aria-label="当前作品" tabindex="-1" hidden>
+            <div class="current-work-placeholder" id="current-work-placeholder" role="status">
+              <p class="eyebrow">CURRENT WORK</p>
+              <h2>这里会放进度与文稿</h2>
+              <p>提交故事后，创作进度、审核结果和已生成文稿会在这里持续更新。</p>
+            </div>
+
+            <section
+              class="paper-sheet delivery-sheet"
+              id="delivery-section"
+              aria-labelledby="delivery-title"
+              hidden
+            >
             <div class="paper-index" aria-hidden="true">03</div>
             <div class="section-heading delivery-heading">
               <div>
@@ -444,6 +474,7 @@
                 </form>
               </section>
             </div>
+            </section>
           </section>
         </div>
       </div>
