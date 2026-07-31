@@ -132,6 +132,8 @@ Object.assign(elements, {
   "failure-actions": { hidden: true },
   "run-progress": { hidden: false },
   "delivery-section": { hidden: false },
+  "delivery-subtitle": { textContent: "" },
+  "folio-stamp": { textContent: "" },
   "series-empty": { hidden: true },
   "series-card": { hidden: false },
   "creation-message": { textContent: "" },
@@ -176,6 +178,28 @@ if (!elements["creation-message"].textContent.includes("重新填写故事")) {
 showFailure({ code: "internal_error", message: "failed" }, "修订生成失败");
 if (!elements["failure-guidance"].hidden || !elements["failure-actions"].hidden) {
   throw new Error("non-initial failure exposed initial-run action");
+}
+
+renderProgress = () => {};
+renderWorkspace = () => true;
+state.activeDraftRunKind = "";
+state.creationId = "terminal-creation";
+state.creation = {
+  persona: { display_name: "测试人格", version: "1" },
+  initial: {
+    state: "failed",
+    failure: { code: "internal_error", message: "failed" },
+  },
+  revision: { state: "unavailable" },
+};
+renderCreation();
+if (elements["result-workspace"].hidden) {
+  throw new Error("failed initial run hid durable workspace");
+}
+state.creation.initial = { state: "ended" };
+renderCreation();
+if (elements["result-workspace"].hidden) {
+  throw new Error("ended initial run hid durable workspace");
 }
 """
     harness = f"""
@@ -384,6 +408,10 @@ Object.assign(elements, {
   "artifact-overline": { textContent: "" },
   "artifact-title": { textContent: "" },
   "artifact-version-mark": { textContent: "" },
+  "episode-navigator": { hidden: true },
+  "episode-progress-summary": { textContent: "" },
+  "episode-tabs": { replaceChildren() {} },
+  "episode-content": { textContent: "", setAttribute() {}, removeAttribute() {} },
   "artifact-content": { textContent: "" },
 });
 renderProgress = () => {};
@@ -500,6 +528,157 @@ const vm = require("vm");
 const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
 const context = {{
   document: {{ addEventListener() {{}} }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(() => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_episode_navigator_uses_durable_progress_and_drafts() -> None:
+    root = Path(__file__).parents[1]
+    script_path = root / "src" / "pengine" / "web" / "app.js"
+    page = (root / "src" / "pengine" / "web" / "index.html").read_text()
+    assert 'id="episode-navigator"' in page
+    assert 'id="episode-tabs"' in page
+    assert 'id="episode-content"' in page
+
+    assertions = """
+function tab() {
+  return {
+    dataset: {},
+    attrs: {},
+    disabled: false,
+    tabIndex: 0,
+    textContent: "",
+    setAttribute(name, value) { this.attrs[name] = value; },
+    focus() { focusedEpisode = this.dataset.episodeNumber; },
+  };
+}
+document.createElement = () => tab();
+let focusedEpisode = null;
+const episodeTabs = {
+  children: [],
+  replaceChildren(...children) { this.children = children; },
+  querySelector(selector) {
+    const match = selector.match(/data-episode-number="(\\d+)"/);
+    return match
+      ? this.children.find((child) => child.dataset.episodeNumber === match[1])
+      : null;
+  },
+};
+Object.assign(elements, {
+  "episode-navigator": { hidden: true },
+  "episode-progress-summary": { textContent: "" },
+  "episode-tabs": episodeTabs,
+  "episode-content": {
+    textContent: "",
+    attrs: {},
+    setAttribute(name, value) { this.attrs[name] = value; },
+    removeAttribute(name) { delete this.attrs[name]; },
+  },
+});
+
+const endedRun = {
+  state: "ended",
+  progress: {
+    episodes: { total: 3, completed: 2, current: null },
+  },
+  drafts: {
+    artifacts: [],
+    episodes: [
+      { episode_number: 1, content: "第一集已提交剧本" },
+      { episode_number: 2, content: "第二集已提交剧本" },
+    ],
+  },
+};
+state.activeEpisode = null;
+const views = artifactViewsForRun(endedRun);
+if (!views.some((view) => view.key === "episode_scripts" && view.isEpisodeNavigator)) {
+  throw new Error("episode progress did not expose the script navigator");
+}
+renderEpisodeNavigator(endedRun);
+if (elements["episode-navigator"].hidden) throw new Error("ended navigator was hidden");
+if (!elements["episode-progress-summary"].textContent.includes("共 3 集")) {
+  throw new Error("total was not rendered");
+}
+if (!elements["episode-progress-summary"].textContent.includes("已完成 2 集")) {
+  throw new Error("completed count was not rendered");
+}
+if (!elements["episode-progress-summary"].textContent.includes("任务已结束")) {
+  throw new Error("ended state was not retained");
+}
+if (episodeTabs.children.length !== 3) {
+  throw new Error("episode count did not create navigator tabs");
+}
+if (episodeTabs.children[0].disabled || episodeTabs.children[1].disabled) {
+  throw new Error("committed episode drafts were not navigable");
+}
+if (!episodeTabs.children[2].disabled) throw new Error("undrafted episode became readable");
+if (elements["episode-content"].textContent !== "第一集已提交剧本") {
+  throw new Error("navigator did not use the first durable draft");
+}
+
+state.activeEpisode = 2;
+renderEpisodeNavigator(endedRun);
+if (elements["episode-content"].textContent !== "第二集已提交剧本") {
+  throw new Error("navigator did not preserve the selected durable draft");
+}
+
+const failedRun = {
+  ...endedRun,
+  state: "failed",
+  progress: { episodes: { total: 3, completed: 2, current: 3 } },
+};
+state.activeEpisode = 99;
+renderEpisodeNavigator(failedRun);
+if (!elements["episode-progress-summary"].textContent.includes("当前第 3 集")) {
+  throw new Error("current episode was not rendered");
+}
+if (!elements["episode-progress-summary"].textContent.includes("任务失败")) {
+  throw new Error("failed state was not retained");
+}
+if (episodeTabs.children[2].dataset.status !== "current" || !episodeTabs.children[2].disabled) {
+  throw new Error("undrafted current episode was presented as readable");
+}
+renderArtifact = () => {};
+handleEpisodeClick({ target: { closest() { return episodeTabs.children[1]; } } });
+if (state.activeEpisode !== 2 || focusedEpisode !== "2") {
+  throw new Error("episode selection did not retain keyboard focus");
+}
+const succeededRun = {
+  state: "succeeded",
+  progress: { episodes: { total: 3, completed: 3, current: null } },
+  result: { content_package: { episode_scripts: "完整交付剧本" } },
+};
+const formalScript = artifactViewsForRun(succeededRun).find(
+  (view) => view.key === "episode_scripts",
+);
+if (!formalScript || formalScript.isEpisodeNavigator || formalScript.content !== "完整交付剧本") {
+  throw new Error("formal script was replaced or parsed as episode drafts");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}}, createElement() {{ return {{}}; }} }},
   window: {{}},
   crypto: {{ randomUUID() {{ return "test-id"; }} }},
   console,

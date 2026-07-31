@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
@@ -25,6 +26,8 @@ from langgraph.types import Command
 from pydantic import Field, model_validator
 
 from pengine.schemas import (
+    EpisodeDraft,
+    EpisodePlan,
     FeedbackHandlingItem,
     InternalStage,
     NonEmptyText,
@@ -35,8 +38,12 @@ from pengine.schemas import (
 StageHook = Callable[[InternalStage], Awaitable[int]]
 CheckpointHook = Callable[[InternalStage, Mapping[str, Any]], Awaitable[None]]
 ReferenceRetriever = Callable[[str], Awaitable[str]]
+EpisodeAttemptHook = Callable[[EpisodePlan], Awaitable[int]]
+EpisodeCommitHook = Callable[[int, str], Awaitable[EpisodeDraft]]
+EpisodeAssemblyHook = Callable[[], Awaitable[str]]
+EpisodeDeadlineReset = Callable[[], Awaitable[None]]
 
-_STAGE_TOKEN = re.compile(r"^\[stage=([a-z0-9_]+)\](?:\s|$)")
+_STAGE_TOKEN = re.compile(r"^\[stage=([a-z0-9_]+)\](?:\[episode=\d+\])?(?:\s|$)")
 _REGISTERED_PROFILE_KEYS: set[str] = set()
 
 _STORY_STAGES = (
@@ -89,19 +96,22 @@ _EPISODE_PLANNER_PROMPT = (
     "or relationship logic appears in the matching episode, and that dates, "
     "countdowns, amounts, counts, and arithmetic agree across artifacts. Use "
     "calculate_arithmetic for every derived numeric claim. Never round a "
-    "non-integral division unless the story states the rounding rule."
+    "non-integral division unless the story states the rounding rule. Include a "
+    "contiguous episode list beginning at 1, with one concrete plan for every "
+    "episode, while preserving the readable full outline in content."
 )
 
 _SCRIPT_WRITER_PROMPT = (
-    "Use the approved episode outline and persona rules without changing its "
-    "episode count or numeric constraints. Before returning, reread every "
-    "approved upstream artifact and audit the complete scripts against them. "
+    "Use the requested single episode plan, approved episode outline, and persona "
+    "rules without changing the episode count or numeric constraints. Before "
+    "returning, reread every approved upstream artifact and audit this episode "
+    "against them. "
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
     "exact dialogue-count claims, and episode-specific promised actions. Every "
     "upstream commitment must appear in the scripts. Use calculate_arithmetic "
     "for every derived numeric claim and copy its exact result. Never round a "
     "non-integral division unless the script states the rounding rule. Return "
-    "only the structured episode-script result."
+    "only the structured episode-script result for the requested episode number."
 )
 
 VIRTUAL_FILE_PERMISSIONS = [
@@ -160,10 +170,21 @@ class StoryArchitectResult(StrictModel):
 class EpisodePlannerResult(StrictModel):
     stage: Literal["generating_episode_outline"]
     content: NonEmptyText
+    episode_count: int = Field(ge=1)
+    episodes: list[EpisodePlan] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_episode_sequence(self) -> "EpisodePlannerResult":
+        expected = list(range(1, self.episode_count + 1))
+        numbers = [episode.episode_number for episode in self.episodes]
+        if numbers != expected:
+            raise ValueError("Episode plans must be ordered and contiguous from 1")
+        return self
 
 
 class ScriptWriterResult(StrictModel):
     stage: Literal["generating_episode_scripts"]
+    episode_number: int = Field(ge=1)
     content: NonEmptyText
 
 
@@ -207,6 +228,13 @@ class QualityGateRejectedError(RuntimeError):
 
 class CheckpointUnavailableError(RuntimeError):
     """The durable thread state required for a resumed run is missing."""
+
+
+class EpisodeTimeoutError(TimeoutError):
+    def __init__(self, episode_number: int) -> None:
+        super().__init__("Episode script generation timed out")
+        self.stage = InternalStage.GENERATING_EPISODE_SCRIPTS
+        self.episode_number = episode_number
 
 
 def _calculate_arithmetic(
@@ -317,6 +345,8 @@ def _request_state_after_result(
 def _validated_stage_payload(
     stage: InternalStage,
     content: str,
+    *,
+    expected_episode_number: int | None = None,
 ) -> Mapping[str, Any]:
     try:
         raw = json.loads(content)
@@ -345,6 +375,10 @@ def _validated_stage_payload(
         ) from exc
     if parsed.stage != stage.value:
         raise AgentProtocolError("Subagent returned a different stage", stage=stage)
+    if isinstance(parsed, ScriptWriterResult) and (
+        expected_episode_number is None or parsed.episode_number != expected_episode_number
+    ):
+        raise AgentProtocolError("Subagent returned a different episode", stage=stage)
     if isinstance(parsed, QualityReviewerResult) and not parsed.passed:
         raise QualityGateRejectedError(stage=stage)
     return parsed.model_dump(mode="json")
@@ -408,10 +442,25 @@ class StageGuardMiddleware(AgentMiddleware):
         before_stage: StageHook,
         approve_stage: CheckpointHook,
         approved_stages: set[InternalStage],
+        *,
+        approved_payloads: dict[InternalStage, Any] | None = None,
+        episode_drafts: list[EpisodeDraft] | None = None,
+        before_episode: EpisodeAttemptHook | None = None,
+        commit_episode: EpisodeCommitHook | None = None,
+        assemble_episode_scripts: EpisodeAssemblyHook | None = None,
+        episode_timeout_seconds: float | None = None,
+        reset_episode_deadline: EpisodeDeadlineReset | None = None,
     ) -> None:
         self.before_stage = before_stage
         self.approve_stage = approve_stage
         self.approved_stages = approved_stages
+        self.approved_payloads = approved_payloads if approved_payloads is not None else {}
+        self.episode_drafts = {draft.episode_number for draft in episode_drafts or []}
+        self.before_episode = before_episode
+        self.commit_episode = commit_episode
+        self.assemble_episode_scripts = assemble_episode_scripts
+        self.episode_timeout_seconds = episode_timeout_seconds
+        self.reset_episode_deadline = reset_episode_deadline
 
     async def awrap_tool_call(
         self,
@@ -461,13 +510,42 @@ class StageGuardMiddleware(AgentMiddleware):
                 status="error",
             )
 
+        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+            return await self._write_episodes(request, handler, args)
+
         await self.before_stage(stage)
+        result, payload = await self._call_structured_stage(
+            stage,
+            request,
+            handler,
+            args,
+        )
+        await self.approve_stage(stage, payload)
+        self.approved_stages.add(stage)
+        return result
+
+    async def _call_structured_stage(
+        self,
+        stage: InternalStage,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        args: Mapping[str, Any],
+        *,
+        expected_episode_number: int | None = None,
+    ) -> tuple[ToolMessage | Command[Any], Mapping[str, Any]]:
+        description = args.get("description")
+        if not isinstance(description, str):
+            raise AgentProtocolError("Subagent task omitted its stage token", stage=stage)
         result = await handler(request)
         message = _tool_message(result)
         if not isinstance(message.content, str):
             raise AgentProtocolError("Subagent result was not JSON text", stage=stage)
         try:
-            payload = _validated_stage_payload(stage, message.content)
+            payload = _validated_stage_payload(
+                stage,
+                message.content,
+                expected_episode_number=expected_episode_number,
+            )
         except AgentProtocolError as exc:
             if str(exc) != "Subagent returned invalid structured output":
                 raise
@@ -492,10 +570,94 @@ class StageGuardMiddleware(AgentMiddleware):
                     "Subagent result was not JSON text",
                     stage=stage,
                 ) from exc
-            payload = _validated_stage_payload(stage, message.content)
-        await self.approve_stage(stage, payload)
-        self.approved_stages.add(stage)
-        return result
+            payload = _validated_stage_payload(
+                stage,
+                message.content,
+                expected_episode_number=expected_episode_number,
+            )
+        return result, payload
+
+    async def _write_episodes(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        args: Mapping[str, Any],
+    ) -> ToolMessage | Command[Any]:
+        if (
+            self.before_episode is None
+            or self.commit_episode is None
+            or self.assemble_episode_scripts is None
+        ):
+            raise AgentProtocolError(
+                "Episode generation hooks are required",
+                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            )
+        outline = self.approved_payloads.get(InternalStage.GENERATING_EPISODE_OUTLINE)
+        try:
+            plans = EpisodePlannerResult.model_validate(outline).episodes
+        except Exception as exc:
+            raise AgentProtocolError(
+                "Episode scripts require an approved episode outline",
+                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            ) from exc
+
+        last_result: ToolMessage | Command[Any] | None = None
+        for plan in plans:
+            if plan.episode_number in self.episode_drafts:
+                continue
+            if self.reset_episode_deadline is not None:
+                await self.reset_episode_deadline()
+            await self.before_episode(plan)
+            episode_args = {
+                **args,
+                "description": (
+                    f"[stage=generating_episode_scripts][episode={plan.episode_number}] "
+                    f"Write only episode {plan.episode_number}.\n"
+                    f"Approved episode plan:\n{plan.plan}"
+                ),
+            }
+            episode_request = request.override(
+                tool_call={**request.tool_call, "args": episode_args},
+            )
+            try:
+                if self.episode_timeout_seconds is None:
+                    result, payload = await self._call_structured_stage(
+                        InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        episode_request,
+                        handler,
+                        episode_args,
+                        expected_episode_number=plan.episode_number,
+                    )
+                else:
+                    async with asyncio.timeout(self.episode_timeout_seconds):
+                        result, payload = await self._call_structured_stage(
+                            InternalStage.GENERATING_EPISODE_SCRIPTS,
+                            episode_request,
+                            handler,
+                            episode_args,
+                            expected_episode_number=plan.episode_number,
+                        )
+            except TimeoutError as exc:
+                raise EpisodeTimeoutError(plan.episode_number) from exc
+            await self.commit_episode(plan.episode_number, payload["content"])
+            self.episode_drafts.add(plan.episode_number)
+            last_result = result
+
+        aggregate = await self.assemble_episode_scripts()
+        payload = {
+            "stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+            "content": aggregate,
+        }
+        await self.approve_stage(InternalStage.GENERATING_EPISODE_SCRIPTS, payload)
+        self.approved_payloads[InternalStage.GENERATING_EPISODE_SCRIPTS] = payload
+        self.approved_stages.add(InternalStage.GENERATING_EPISODE_SCRIPTS)
+        if last_result is not None:
+            return last_result
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id=request.tool_call["id"],
+            name="task",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,6 +684,12 @@ class DeepAgentWorkflow:
         before_stage: StageHook,
         approve_stage: CheckpointHook,
         approved_checkpoints: Mapping[InternalStage, Any] | None = None,
+        episode_drafts: list[EpisodeDraft] | None = None,
+        before_episode: EpisodeAttemptHook | None = None,
+        commit_episode: EpisodeCommitHook | None = None,
+        assemble_episode_scripts: EpisodeAssemblyHook | None = None,
+        episode_timeout_seconds: float | None = None,
+        reset_episode_deadline: EpisodeDeadlineReset | None = None,
         feedback: str | None = None,
         retrieve_references: ReferenceRetriever | None = None,
     ) -> WorkflowResult:
@@ -659,6 +827,13 @@ class DeepAgentWorkflow:
                     before_stage,
                     approve_and_capture,
                     set(approved_checkpoints or {}),
+                    approved_payloads=approved_payloads,
+                    episode_drafts=episode_drafts,
+                    before_episode=before_episode,
+                    commit_episode=commit_episode,
+                    assemble_episode_scripts=assemble_episode_scripts,
+                    episode_timeout_seconds=episode_timeout_seconds,
+                    reset_episode_deadline=reset_episode_deadline,
                 )
             ],
             subagents=subagents,

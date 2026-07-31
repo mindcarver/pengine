@@ -852,12 +852,16 @@
           },
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "progress"
+          "progress",
+          "drafts"
         ],
         "title": "EndedRun"
       },
@@ -874,13 +878,17 @@
           },
           "failure": {
             "$ref": "#/components/schemas/RunFailure"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
           "progress",
-          "failure"
+          "failure",
+          "drafts"
         ],
         "title": "FailedRun"
       },
@@ -1231,12 +1239,16 @@
           },
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "progress"
+          "progress",
+          "drafts"
         ],
         "title": "RevisionEnded"
       },
@@ -1265,13 +1277,17 @@
           },
           "failure": {
             "$ref": "#/components/schemas/RunFailure"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
           "progress",
-          "failure"
+          "failure",
+          "drafts"
         ],
         "title": "RevisionFailed"
       },
@@ -1502,6 +1518,13 @@
             "type": "array",
             "title": "Artifacts"
           },
+          "episodes": {
+            "items": {
+              "$ref": "#/components/schemas/EpisodeDraft"
+            },
+            "type": "array",
+            "title": "Episodes"
+          },
           "review_status": {
             "$ref": "#/components/schemas/FinalReviewProgress"
           }
@@ -1580,6 +1603,18 @@
             "type": "integer",
             "minimum": 2.0,
             "title": "Timeout Count"
+          },
+          "episode_number": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Episode Number"
           }
         },
         "additionalProperties": false,
@@ -1619,6 +1654,16 @@
           },
           "final_review": {
             "$ref": "#/components/schemas/FinalReviewProgress"
+          },
+          "episodes": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EpisodeProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "can_continue": {
             "type": "boolean",
@@ -1772,6 +1817,73 @@
       "Sha256": {
         "type": "string",
         "pattern": "^[0-9a-f]{64}$"
+      },
+      "EpisodeDraft": {
+        "properties": {
+          "episode_number": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Episode Number"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Content"
+          },
+          "content_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Content Sha256"
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Completed At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "episode_number",
+          "content",
+          "content_sha256",
+          "completed_at"
+        ],
+        "title": "EpisodeDraft"
+      },
+      "EpisodeProgress": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Total"
+          },
+          "completed": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Completed"
+          },
+          "current": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "total",
+          "completed"
+        ],
+        "title": "EpisodeProgress"
       }
     }
   },

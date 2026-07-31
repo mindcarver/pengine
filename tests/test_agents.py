@@ -1,3 +1,4 @@
+import hashlib
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,7 +30,7 @@ from pengine.agents import (
 from pengine.config import Settings
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
-from pengine.schemas import CreateCreationRequest, InternalStage
+from pengine.schemas import CreateCreationRequest, EpisodeDraft, EpisodePlan, InternalStage
 from pengine.worker import Worker
 
 
@@ -121,13 +122,22 @@ def _successful_responses() -> list[AIMessage]:
             "generating_episode_outline",
             "episode_planner",
             "EpisodePlannerResult",
-            {"stage": "generating_episode_outline", "content": "分集大纲"},
+            {
+                "stage": "generating_episode_outline",
+                "content": "分集大纲",
+                "episode_count": 1,
+                "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+            },
         ),
         (
             "generating_episode_scripts",
             "script_writer",
             "ScriptWriterResult",
-            {"stage": "generating_episode_scripts", "content": "分集剧本"},
+            {
+                "stage": "generating_episode_scripts",
+                "episode_number": 1,
+                "content": "分集剧本",
+            },
         ),
         (
             "accepting_l0",
@@ -175,6 +185,49 @@ def _successful_responses() -> list[AIMessage]:
         )
     )
     return responses
+
+
+def _episode_hook_kwargs(
+    *,
+    episode_drafts: list[EpisodeDraft] | None = None,
+) -> tuple[dict[str, Any], list[int]]:
+    committed = {draft.episode_number: draft for draft in episode_drafts or []}
+    attempts: list[int] = []
+
+    async def before_episode(plan: EpisodePlan) -> int:
+        attempts.append(plan.episode_number)
+        return 1
+
+    async def commit_episode(episode_number: int, content: str) -> EpisodeDraft:
+        existing = committed.get(episode_number)
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        if existing is not None:
+            assert existing.content_sha256 == content_hash
+            return existing
+        draft = EpisodeDraft(
+            episode_number=episode_number,
+            content=content,
+            content_sha256=content_hash,
+            completed_at=datetime(2026, 7, 31, tzinfo=UTC),
+        )
+        committed[episode_number] = draft
+        return draft
+
+    async def assemble_episode_scripts() -> str:
+        return "\n\n---\n\n".join(
+            f"第 {episode_number} 集\n{draft.content}"
+            for episode_number, draft in sorted(committed.items())
+        )
+
+    return (
+        {
+            "episode_drafts": list(committed.values()),
+            "before_episode": before_episode,
+            "commit_episode": commit_episode,
+            "assemble_episode_scripts": assemble_episode_scripts,
+        },
+        attempts,
+    )
 
 
 def test_story_architect_schema_exposes_stage_specific_field_contract() -> None:
@@ -265,6 +318,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             provider_profile_key="toolcallingfakemodel",
         )
 
+        episode_hooks, episode_attempts = _episode_hook_kwargs()
         result = await workflow.execute(
             thread_id="initial-thread",
             story="一个人回乡面对旧事。",
@@ -272,11 +326,20 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             persona_files={"/persona/project.md": "只读人格规则"},
             before_stage=before_stage,
             approve_stage=approve_stage,
+            **episode_hooks,
         )
 
-        assert result.content_package.episode_scripts == "分集剧本"
-        assert [event[0] for event in events] == ["before", "approve"] * 8
-        assert [event[1] for event in events[::2]] == [
+        assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
+        assert [stage for kind, stage in events if kind == "before"] == [
+            "selecting_l0_variant",
+            "generating_story_outline",
+            "generating_character_biographies",
+            "generating_relationship_logic",
+            "generating_episode_outline",
+            "accepting_l0",
+            "accepting_l4",
+        ]
+        assert [stage for kind, stage in events if kind == "approve"] == [
             "selecting_l0_variant",
             "generating_story_outline",
             "generating_character_biographies",
@@ -286,6 +349,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             "accepting_l0",
             "accepting_l4",
         ]
+        assert episode_attempts == [1]
 
         checkpoint = await saver.aget_tuple({"configurable": {"thread_id": "initial-thread"}})
         assert checkpoint is not None
@@ -360,9 +424,10 @@ async def test_structured_output_validation_error_is_corrected_within_stage(
             persona_files={"/persona/project.md": "规则"},
             before_stage=before_stage,
             approve_stage=approve_stage,
+            **_episode_hook_kwargs()[0],
         )
 
-    assert result.content_package.episode_scripts == "分集剧本"
+    assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
     assert attempted.count(InternalStage.SELECTING_L0_VARIANT) == 1
     assert approved[0] is InternalStage.SELECTING_L0_VARIANT
 
@@ -400,6 +465,7 @@ async def test_missing_structured_result_is_corrected_once_within_stage(
             persona_files={"/persona/project.md": "规则"},
             before_stage=before_stage,
             approve_stage=approve_stage,
+            **_episode_hook_kwargs()[0],
         )
 
     assert result.content_package.story_outline == "故事大纲"
@@ -443,6 +509,7 @@ async def test_missing_structured_result_fails_after_one_correction(
                 persona_files={"/persona/project.md": "规则"},
                 before_stage=before_stage,
                 approve_stage=approve_stage,
+                **_episode_hook_kwargs()[0],
             )
 
     assert attempted == [InternalStage.SELECTING_L0_VARIANT]
@@ -540,6 +607,7 @@ async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> Non
                 persona_files={"/persona/project.md": "规则"},
                 before_stage=before_stage,
                 approve_stage=approve_stage,
+                **_episode_hook_kwargs()[0],
             )
 
     assert attempted == []
@@ -583,6 +651,7 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
                 persona_files={"/persona/project.md": "规则"},
                 before_stage=before_stage,
                 approve_stage=approve_stage,
+                **_episode_hook_kwargs()[0],
             )
 
     assert approved == [
@@ -640,6 +709,7 @@ async def test_out_of_order_stage_is_rejected_without_attempt_and_can_recover(
             persona_files={"/persona/project.md": "规则"},
             before_stage=before_stage,
             approve_stage=approve_stage,
+            **_episode_hook_kwargs()[0],
         )
 
     expected = [
@@ -652,8 +722,10 @@ async def test_out_of_order_stage_is_rejected_without_attempt_and_can_recover(
         InternalStage.ACCEPTING_L0,
         InternalStage.ACCEPTING_L4,
     ]
-    assert result.content_package.episode_scripts == "分集剧本"
-    assert attempted == expected
+    assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
+    assert attempted == [
+        stage for stage in expected if stage is not InternalStage.GENERATING_EPISODE_SCRIPTS
+    ]
     assert approved == expected
 
 
@@ -697,6 +769,7 @@ async def test_restart_reuses_thread_checkpoint_and_skips_approved_stage(
                 persona_files={"/persona/project.md": "规则"},
                 before_stage=before_stage,
                 approve_stage=approve_stage,
+                **_episode_hook_kwargs()[0],
             )
 
     first_stage = InternalStage.SELECTING_L0_VARIANT
@@ -724,19 +797,19 @@ async def test_restart_reuses_thread_checkpoint_and_skips_approved_stage(
             before_stage=before_resumed_stage,
             approve_stage=approve_stage,
             approved_checkpoints=approved,
+            **_episode_hook_kwargs()[0],
         )
 
         checkpoint = await saver.aget_tuple({"configurable": {"thread_id": "restart-thread"}})
 
     assert checkpoint is not None
-    assert result.content_package.episode_scripts == "分集剧本"
+    assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
     assert first_stage not in resumed_attempts
     assert resumed_attempts == [
         InternalStage.GENERATING_STORY_OUTLINE,
         InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
         InternalStage.GENERATING_RELATIONSHIP_LOGIC,
         InternalStage.GENERATING_EPISODE_OUTLINE,
-        InternalStage.GENERATING_EPISODE_SCRIPTS,
         InternalStage.ACCEPTING_L0,
         InternalStage.ACCEPTING_L4,
     ]

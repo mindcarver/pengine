@@ -101,6 +101,12 @@ The workbench groups those internal stages into seven stable user stages:
 The final user stage exposes L0 creative-core alignment and L4 craft/value
 review as separate sub-statuses without collapsing their internal gates.
 
+While generating episode scripts, a run resource may additionally expose the
+durably recorded total, completed, and current episode numbers plus committed
+per-episode drafts. The workbench presents those records as read-only
+navigation, including after an ended or failed run; it does not infer or expose
+text for an uncommitted episode.
+
 The persona-bound `workflow_supervisor` advances these stages by delegating to
 four named synchronous subagents:
 
@@ -165,7 +171,7 @@ failed.
 
 | Component | Owns | Does not own |
 |---|---|---|
-| Local workbench | Persona selection, creation/revision commands, 1.8-second status polling, one shared progress display, paused-run controls | Stage inference, partial-result access, workflow execution |
+| Local workbench | Persona selection, creation/revision commands, 1.8-second status polling, one shared progress display, read-only per-episode draft navigation, paused-run controls | Stage inference, partial-result access, workflow execution |
 | Local HTTP API | Runtime validation, idempotent commands, resource queries, paused-run continue/end commands, stable errors | Workflow execution, model retries, persona parsing |
 | Creation service | Domain invariants and state-transition authority | HTTP serialization, vendor requests |
 | Embedded worker | Durable job leases, stage-attempt guards, invocation/resume of Deep Agents threads, restart reconciliation | Creative planning, public request semantics |

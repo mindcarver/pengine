@@ -1311,7 +1311,8 @@ textarea:disabled {
   transform: rotate(-2deg);
 }
 
-#artifact-content {
+#artifact-content,
+#episode-content {
   overflow-wrap: anywhere;
   margin: 0;
   padding-left: 1.9rem;
@@ -1320,6 +1321,86 @@ textarea:disabled {
   font-size: clamp(0.9rem, 1.2vw, 1rem);
   line-height: 1.94rem;
   white-space: pre-wrap;
+}
+
+.episode-navigator {
+  margin-top: 0.2rem;
+}
+
+.episode-progress-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px dashed rgba(90, 69, 45, 0.28);
+}
+
+.episode-navigator-label,
+#episode-progress-summary {
+  margin: 0;
+}
+
+.episode-navigator-label {
+  color: var(--rust-deep);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+#episode-progress-summary {
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  text-align: right;
+}
+
+.episode-tabs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(4.8rem, 1fr));
+  gap: 0.35rem;
+  margin: 0.85rem 0 1rem;
+}
+
+.episode-tabs button {
+  min-width: 0;
+  padding: 0.46rem 0.35rem;
+  border: 1px solid rgba(90, 69, 45, 0.22);
+  color: var(--ink-soft);
+  background: rgba(255, 255, 255, 0.26);
+  font-family: var(--mono);
+  font-size: 0.64rem;
+  text-align: center;
+}
+
+.episode-tabs button[data-status="completed"] {
+  color: #2f4c3e;
+  border-color: rgba(73, 103, 89, 0.48);
+  cursor: pointer;
+}
+
+.episode-tabs button[data-status="completed"]:hover,
+.episode-tabs button[aria-selected="true"] {
+  color: var(--paper-light);
+  border-color: var(--ink);
+  background: var(--ink);
+}
+
+.episode-tabs button[data-status="current"] {
+  color: var(--rust-deep);
+  border-color: rgba(159, 63, 45, 0.5);
+  background: rgba(159, 63, 45, 0.08);
+}
+
+.episode-tabs button:disabled {
+  cursor: default;
+  opacity: 0.68;
+}
+
+#episode-content {
+  min-height: 14rem;
 }
 
 .revision-desk {
@@ -1437,6 +1518,12 @@ textarea:disabled {
     grid-template-columns: repeat(6, minmax(7rem, 1fr));
     overflow-x: auto;
     padding-bottom: 0.4rem;
+  }
+
+  .episode-tabs {
+    grid-template-columns: repeat(6, minmax(4.8rem, 1fr));
+    overflow-x: auto;
+    padding-bottom: 0.35rem;
   }
 
   .artifact-tabs button {
@@ -1597,8 +1684,18 @@ textarea:disabled {
       rgba(255, 251, 240, 0.8);
   }
 
-  #artifact-content {
+  #artifact-content,
+  #episode-content {
     padding-left: 0;
+  }
+
+  .episode-progress-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  #episode-progress-summary {
+    text-align: left;
   }
 }
 

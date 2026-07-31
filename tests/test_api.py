@@ -147,11 +147,13 @@ async def test_persona_creation_and_query_contract(tmp_path: Path) -> None:
                 "elapsed_seconds": 0,
                 "recovery_state": "none",
                 "final_review": {"l0": "pending", "l4": "pending"},
+                "episodes": None,
                 "can_continue": False,
                 "can_end": False,
             },
             "drafts": {
                 "artifacts": [],
+                "episodes": [],
                 "review_status": {"l0": "pending", "l4": "pending"},
             },
         }
@@ -231,6 +233,7 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
                     "selection_rationale": "匹配故事母题。",
                 }
             ],
+            "episodes": [],
             "review_status": {"l0": "pending", "l4": "pending"},
         }
 
@@ -283,6 +286,78 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
         )
         assert cannot_continue.status_code == 409
         assert cannot_continue.json()["code"] == "run_not_controllable"
+
+
+@pytest.mark.asyncio
+async def test_episode_progress_and_committed_drafts_remain_readable_after_end(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client,
+    ):
+        accepted = await client.post(
+            "/creations",
+            headers={"Idempotency-Key": "episode-progress-create"},
+            json={
+                "persona_id": "test-persona",
+                "story": "一个人回乡面对旧事。",
+                "requirements": "生成完整短剧。",
+            },
+        )
+        creation_id = accepted.json()["creation_id"]
+        repository = app.state.repository
+        lease = await repository.lease_next_job("episode-progress-worker-1", 30)
+        assert lease is not None
+        await repository.approve_business_checkpoint(
+            lease.run_id,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+            {
+                "content": "两集大纲",
+                "episode_count": 2,
+                "episodes": [
+                    {"episode_number": 1, "plan": "第一集计划"},
+                    {"episode_number": 2, "plan": "第二集计划"},
+                ],
+            },
+        )
+        await repository.record_episode_attempt(lease.run_id, 1)
+        await repository.commit_episode_draft(lease.run_id, 1, "第一集剧本")
+        await repository.record_episode_attempt(lease.run_id, 2)
+        assert await repository.handle_episode_timeout(lease.run_id, 2) == "auto_resuming"
+
+        recovering = await client.get(f"/creations/{creation_id}")
+        initial = recovering.json()["initial"]
+        assert initial["state"] == "auto_resuming"
+        assert initial["progress"]["episodes"] == {
+            "total": 2,
+            "completed": 1,
+            "current": 2,
+        }
+        assert initial["drafts"]["episodes"][0]["episode_number"] == 1
+        assert initial["drafts"]["episodes"][0]["content"] == "第一集剧本"
+        assert len(initial["drafts"]["episodes"][0]["content_sha256"]) == 64
+
+        resumed = await repository.lease_next_job("episode-progress-worker-2", 30)
+        assert resumed is not None
+        await repository.record_episode_attempt(resumed.run_id, 2)
+        assert await repository.handle_episode_timeout(resumed.run_id, 2) == "paused"
+        paused = await client.get(f"/creations/{creation_id}")
+        assert paused.json()["initial"]["pause"]["episode_number"] == 2
+        assert paused.json()["initial"]["drafts"] == initial["drafts"]
+
+        ended = await client.post(
+            f"/creations/{creation_id}/runs/initial/end",
+            headers={"Idempotency-Key": "end-episode-progress"},
+        )
+        assert ended.status_code == 202
+        terminal = await client.get(f"/creations/{creation_id}")
+        assert terminal.json()["initial"]["state"] == "ended"
+        assert terminal.json()["initial"]["drafts"] == initial["drafts"]
 
 
 @pytest.mark.asyncio

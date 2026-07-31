@@ -45,7 +45,7 @@ def test_openapi_exposes_creation_and_run_control_operations() -> None:
     }
 
 
-def test_openapi_exposes_durable_drafts_only_for_non_terminal_runs() -> None:
+def test_openapi_exposes_durable_episode_drafts_for_readable_runs() -> None:
     schemas = json.loads((ROOT / "contracts/openapi.json").read_text())["components"]["schemas"]
 
     for name in (
@@ -57,6 +57,10 @@ def test_openapi_exposes_durable_drafts_only_for_non_terminal_runs() -> None:
         "RevisionRunning",
         "RevisionAutoResuming",
         "RevisionPaused",
+        "EndedRun",
+        "FailedRun",
+        "RevisionEnded",
+        "RevisionFailed",
     ):
         assert schemas[name]["properties"]["drafts"] == {
             "$ref": "#/components/schemas/RunDraftSnapshot"
@@ -64,3 +68,14 @@ def test_openapi_exposes_durable_drafts_only_for_non_terminal_runs() -> None:
 
     assert "drafts" not in schemas["SucceededRun"]["properties"]
     assert "drafts" not in schemas["RevisionSucceeded"]["properties"]
+    assert schemas["RunProgress"]["properties"]["episodes"] == {
+        "anyOf": [
+            {"$ref": "#/components/schemas/EpisodeProgress"},
+            {"type": "null"},
+        ]
+    }
+    assert schemas["RunDraftSnapshot"]["properties"]["episodes"] == {
+        "items": {"$ref": "#/components/schemas/EpisodeDraft"},
+        "type": "array",
+        "title": "Episodes",
+    }

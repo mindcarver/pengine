@@ -23,6 +23,9 @@ from pengine.schemas import (
     CreativeTextDraft,
     Delivery,
     EndedRun,
+    EpisodeDraft,
+    EpisodePlan,
+    EpisodeProgress,
     FailedRun,
     FinalReviewProgress,
     InternalStage,
@@ -50,8 +53,9 @@ from pengine.schemas import (
     UserStage,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_STAGE_ATTEMPTS = 3
+MAX_EPISODE_ATTEMPTS = 3
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS pengine_schema (
@@ -233,6 +237,48 @@ FROM runs;
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (2);
 """
 
+_SCHEMA_V3_SQL = """
+ALTER TABLE run_progress ADD COLUMN current_episode INTEGER
+    CHECK (current_episode IS NULL OR current_episode >= 1);
+
+CREATE TABLE IF NOT EXISTS episode_plans (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+    plan TEXT NOT NULL,
+    plan_sha256 TEXT NOT NULL,
+    PRIMARY KEY (run_id, episode_number)
+);
+
+CREATE TABLE IF NOT EXISTS episode_drafts (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+    content TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, episode_number)
+);
+
+CREATE TABLE IF NOT EXISTS episode_attempts (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+    attempt_number INTEGER NOT NULL CHECK (
+        attempt_number >= 1 AND attempt_number <= 3
+    ),
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, episode_number, attempt_number)
+);
+
+CREATE TABLE IF NOT EXISTS episode_timeouts (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+    timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, episode_number)
+);
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (3);
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -308,6 +354,8 @@ class RunRecovery:
     state: Literal["queued", "running"]
     stage_attempts: Mapping[InternalStage, int]
     business_checkpoints: Mapping[InternalStage, Any]
+    episode_plans: list[EpisodePlan]
+    episode_drafts: list[EpisodeDraft]
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +372,8 @@ class RunWorkItem:
     frozen_feedback: str | None
     stage_attempts: Mapping[InternalStage, int]
     business_checkpoints: Mapping[InternalStage, Any]
+    episode_plans: list[EpisodePlan]
+    episode_drafts: list[EpisodeDraft]
 
 
 Job = LeasedJob
@@ -364,6 +414,29 @@ def _datetime(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
+def _episode_plans_from_payload(payload: BaseModel | Mapping[str, Any]) -> list[EpisodePlan]:
+    value = payload.model_dump(mode="json") if isinstance(payload, BaseModel) else dict(payload)
+    try:
+        episode_count = value["episode_count"]
+        plans = [EpisodePlan.model_validate(item) for item in value["episodes"]]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Episode outline is missing its structured episode plans") from exc
+    expected = list(range(1, int(episode_count) + 1))
+    if [plan.episode_number for plan in plans] != expected:
+        raise ValueError("Episode plans must be ordered and contiguous from 1")
+    return plans
+
+
+def _aggregate_episode_scripts(
+    plans: list[EpisodePlan],
+    drafts: list[EpisodeDraft],
+) -> str:
+    expected = [plan.episode_number for plan in plans]
+    if not expected or [draft.episode_number for draft in drafts] != expected:
+        raise ValueError("Every planned episode must have one committed draft")
+    return "\n\n---\n\n".join(f"第 {draft.episode_number} 集\n{draft.content}" for draft in drafts)
+
+
 class Repository:
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
@@ -401,10 +474,17 @@ class Repository:
 
             cursor = await connection.execute("SELECT MAX(version) FROM pengine_schema")
             row = await cursor.fetchone()
-            if row is None or row[0] not in {1, SCHEMA_VERSION}:
+            if row is None:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
-            if row[0] == 1:
+            schema_version = int(row[0])
+            if schema_version not in {1, 2, SCHEMA_VERSION}:
+                raise RuntimeError("Unsupported pengine SQLite schema version")
+            if schema_version == 1:
                 await connection.executescript(_SCHEMA_V2_SQL)
+                await connection.commit()
+                schema_version = 2
+            if schema_version == 2:
+                await connection.executescript(_SCHEMA_V3_SQL)
                 await connection.commit()
 
     async def setup(self) -> None:
@@ -882,6 +962,370 @@ class Repository:
             )
             return cursor.rowcount
 
+    async def record_episode_attempt(
+        self,
+        run_id: UUID,
+        episode_number: int,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            run = await self._fetchone(
+                connection,
+                "SELECT state FROM runs WHERE id = ?",
+                (str(run_id),),
+            )
+            if run is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if run["state"] != "running":
+                raise DomainError("run_not_running", "Workflow run is not running.", 409)
+            plans = await self._episode_plans(connection, run_id)
+            if episode_number not in {plan.episode_number for plan in plans}:
+                raise DomainError(
+                    "episode_not_planned",
+                    "The episode is not in the approved outline.",
+                    409,
+                )
+            drafts = await self._episode_drafts(connection, run_id)
+            committed_numbers = {draft.episode_number for draft in drafts}
+            if episode_number in committed_numbers:
+                raise DomainError(
+                    "episode_already_committed",
+                    "The episode draft is already committed.",
+                    409,
+                )
+            first_unfinished = next(
+                (
+                    plan.episode_number
+                    for plan in plans
+                    if plan.episode_number not in committed_numbers
+                ),
+                None,
+            )
+            if episode_number != first_unfinished:
+                raise DomainError(
+                    "episode_out_of_order",
+                    "Only the first unfinished episode can be generated.",
+                    409,
+                )
+            cursor = await connection.execute(
+                """
+                SELECT COALESCE(MAX(attempt_number), 0)
+                FROM episode_attempts
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (str(run_id), episode_number),
+            )
+            row = await cursor.fetchone()
+            current_count = int(row[0]) if row is not None else 0
+            if current_count >= MAX_EPISODE_ATTEMPTS:
+                raise DomainError(
+                    "attempts_exhausted",
+                    "The episode attempt limit has been exhausted.",
+                    409,
+                )
+            attempt_number = current_count + 1
+            await connection.execute(
+                """
+                INSERT INTO episode_attempts(run_id, episode_number, attempt_number, recorded_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (str(run_id), episode_number, attempt_number, timestamp),
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    current_episode = ?,
+                    execution_state = 'running',
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                    episode_number,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            return attempt_number
+
+    async def commit_episode_draft(
+        self,
+        run_id: UUID,
+        episode_number: int,
+        content: str,
+        *,
+        now: datetime | None = None,
+    ) -> EpisodeDraft:
+        if not content.strip():
+            raise DomainError(
+                "invalid_episode_draft",
+                "An episode draft must contain content.",
+                409,
+            )
+        timestamp = _timestamp(now or _utc_now())
+        content_hash = _text_hash(content)
+        async with self._transaction() as connection:
+            run = await self._fetchone(
+                connection,
+                "SELECT state, creation_id FROM runs WHERE id = ?",
+                (str(run_id),),
+            )
+            if run is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if run["state"] != "running":
+                raise DomainError("run_not_running", "Workflow run is not running.", 409)
+            plans = await self._episode_plans(connection, run_id)
+            if episode_number not in {plan.episode_number for plan in plans}:
+                raise DomainError(
+                    "episode_not_planned",
+                    "The episode is not in the approved outline.",
+                    409,
+                )
+            attempt = await self._fetchone(
+                connection,
+                """
+                SELECT 1 FROM episode_attempts
+                WHERE run_id = ? AND episode_number = ?
+                LIMIT 1
+                """,
+                (str(run_id), episode_number),
+            )
+            if attempt is None:
+                raise DomainError(
+                    "episode_attempt_required",
+                    "An episode draft requires a recorded writer attempt.",
+                    409,
+                )
+            existing = await self._fetchone(
+                connection,
+                """
+                SELECT content, content_sha256, completed_at
+                FROM episode_drafts
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (str(run_id), episode_number),
+            )
+            if existing is not None:
+                if existing["content_sha256"] != content_hash:
+                    raise DomainError(
+                        "episode_conflict",
+                        "A committed episode draft cannot be replaced.",
+                        409,
+                    )
+                return EpisodeDraft(
+                    episode_number=episode_number,
+                    content=existing["content"],
+                    content_sha256=existing["content_sha256"],
+                    completed_at=_datetime(existing["completed_at"]),
+                )
+            drafts = await self._episode_drafts(connection, run_id)
+            expected = list(range(1, episode_number))
+            if [draft.episode_number for draft in drafts] != expected:
+                raise DomainError(
+                    "episode_out_of_order",
+                    "Episode drafts must commit in outline order.",
+                    409,
+                )
+            await connection.execute(
+                """
+                INSERT INTO episode_drafts(
+                    run_id, episode_number, content, content_sha256, completed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (str(run_id), episode_number, content, content_hash, timestamp),
+            )
+            next_episode = episode_number + 1 if episode_number < len(plans) else None
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    current_episode = ?,
+                    timeout_stage = NULL,
+                    timeout_count = 0,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                    next_episode,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, run["creation_id"]),
+            )
+            return EpisodeDraft(
+                episode_number=episode_number,
+                content=content,
+                content_sha256=content_hash,
+                completed_at=_datetime(timestamp),
+            )
+
+    async def handle_episode_timeout(
+        self,
+        run_id: UUID,
+        episode_number: int,
+        *,
+        now: datetime | None = None,
+    ) -> Literal["auto_resuming", "paused"]:
+        current = now or _utc_now()
+        timestamp = _timestamp(current)
+        async with self._transaction() as connection:
+            progress = await self._fetchone(
+                connection,
+                """
+                SELECT run_progress.*, runs.state AS run_state, runs.creation_id
+                FROM run_progress
+                JOIN runs ON runs.id = run_progress.run_id
+                WHERE run_progress.run_id = ?
+                """,
+                (str(run_id),),
+            )
+            if progress is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if progress["run_state"] != "running" or progress["execution_state"] != "running":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Workflow run is not actively running.",
+                    409,
+                )
+            plans = await self._episode_plans(connection, run_id)
+            if episode_number not in {plan.episode_number for plan in plans}:
+                raise DomainError(
+                    "episode_not_planned",
+                    "The episode is not in the approved outline.",
+                    409,
+                )
+            drafts = await self._episode_drafts(connection, run_id)
+            committed_numbers = {draft.episode_number for draft in drafts}
+            if episode_number in committed_numbers:
+                raise DomainError(
+                    "episode_already_committed",
+                    "A committed episode cannot time out.",
+                    409,
+                )
+            first_unfinished = next(
+                (
+                    plan.episode_number
+                    for plan in plans
+                    if plan.episode_number not in committed_numbers
+                ),
+                None,
+            )
+            if episode_number != first_unfinished:
+                raise DomainError(
+                    "episode_out_of_order",
+                    "Only the first unfinished episode can time out.",
+                    409,
+                )
+            timeout = await self._fetchone(
+                connection,
+                """
+                SELECT timeout_count FROM episode_timeouts
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (str(run_id), episode_number),
+            )
+            timeout_count = (int(timeout["timeout_count"]) if timeout is not None else 0) + 1
+            next_state = "auto_resuming" if timeout_count == 1 else "paused"
+            await connection.execute(
+                """
+                INSERT INTO episode_timeouts(run_id, episode_number, timeout_count, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(run_id, episode_number) DO UPDATE SET
+                    timeout_count = excluded.timeout_count,
+                    updated_at = excluded.updated_at
+                """,
+                (str(run_id), episode_number, timeout_count, timestamp),
+            )
+            elapsed_seconds = self._elapsed_seconds(progress, current)
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    current_episode = ?,
+                    execution_state = ?,
+                    elapsed_seconds = ?,
+                    active_started_at = NULL,
+                    timeout_stage = ?,
+                    timeout_count = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                    episode_number,
+                    next_state,
+                    elapsed_seconds,
+                    UserStage.GENERATING_EPISODE_SCRIPTS.value,
+                    timeout_count,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = ?,
+                    available_at = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    "queued" if next_state == "auto_resuming" else "failed",
+                    timestamp,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, progress["creation_id"]),
+            )
+            return next_state
+
+    async def get_episode_plans(self, run_id: UUID) -> list[EpisodePlan]:
+        async with self._connection() as connection:
+            return await self._episode_plans(connection, run_id)
+
+    async def get_episode_drafts(self, run_id: UUID) -> list[EpisodeDraft]:
+        async with self._connection() as connection:
+            return await self._episode_drafts(connection, run_id)
+
+    async def get_episode_attempt_counts(self, run_id: UUID) -> dict[int, int]:
+        async with self._connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT episode_number, COUNT(*) AS attempt_count
+                FROM episode_attempts
+                WHERE run_id = ?
+                GROUP BY episode_number
+                """,
+                (str(run_id),),
+            )
+            rows = await cursor.fetchall()
+        return {int(row["episode_number"]): int(row["attempt_count"]) for row in rows}
+
+    async def assemble_episode_scripts(self, run_id: UUID) -> str:
+        async with self._connection() as connection:
+            plans = await self._episode_plans(connection, run_id)
+            drafts = await self._episode_drafts(connection, run_id)
+        try:
+            return _aggregate_episode_scripts(plans, drafts)
+        except ValueError as exc:
+            raise DomainError(
+                "episode_sequence_incomplete",
+                "Every planned episode must be committed before assembly.",
+                409,
+            ) from exc
+
     async def record_stage_attempt(
         self,
         run_id: UUID,
@@ -889,6 +1333,12 @@ class Repository:
         *,
         now: datetime | None = None,
     ) -> int:
+        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+            raise DomainError(
+                "episode_attempt_required",
+                "Episode scripts use per-episode attempts.",
+                409,
+            )
         timestamp = _timestamp(now or _utc_now())
         async with self._transaction() as connection:
             run = await self._fetchone(
@@ -990,6 +1440,53 @@ class Repository:
                     )
                 return json.loads(existing["payload_json"])
 
+            plans: list[EpisodePlan] | None = None
+            if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+                try:
+                    plans = _episode_plans_from_payload(payload)
+                except ValueError as exc:
+                    raise DomainError(
+                        "invalid_episode_plan",
+                        "The episode outline must contain an ordered episode plan.",
+                        409,
+                    ) from exc
+            if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+                try:
+                    supplied_content = json.loads(payload_json)["content"]
+                    expected_content = _aggregate_episode_scripts(
+                        await self._episode_plans(connection, run_id),
+                        await self._episode_drafts(connection, run_id),
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise DomainError(
+                        "episode_sequence_incomplete",
+                        "Every planned episode must be committed before assembly.",
+                        409,
+                    ) from exc
+                if supplied_content != expected_content:
+                    raise DomainError(
+                        "episode_aggregate_conflict",
+                        "The aggregate script must match the committed episode drafts.",
+                        409,
+                    )
+            if stage in {InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4}:
+                existing_episode_plans = await self._episode_plans(connection, run_id)
+                if existing_episode_plans:
+                    scripts = await self._fetchone(
+                        connection,
+                        """
+                        SELECT 1 FROM business_checkpoints
+                        WHERE run_id = ? AND stage = ?
+                        """,
+                        (str(run_id), InternalStage.GENERATING_EPISODE_SCRIPTS.value),
+                    )
+                    if scripts is None:
+                        raise DomainError(
+                            "episode_sequence_incomplete",
+                            "Every planned episode must be assembled before review.",
+                            409,
+                        )
+
             await connection.execute(
                 """
                 INSERT INTO business_checkpoints(
@@ -998,6 +1495,22 @@ class Repository:
                 """,
                 (str(run_id), stage.value, payload_json, payload_hash, timestamp),
             )
+            if plans is not None:
+                await connection.executemany(
+                    """
+                    INSERT INTO episode_plans(run_id, episode_number, plan, plan_sha256)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            str(run_id),
+                            plan.episode_number,
+                            plan.plan,
+                            _text_hash(plan.plan),
+                        )
+                        for plan in plans
+                    ],
+                )
             stage_index = _INTERNAL_STAGE_ORDER.index(stage)
             next_stage = _INTERNAL_STAGE_ORDER[min(stage_index + 1, len(_INTERNAL_STAGE_ORDER) - 1)]
             await connection.execute(
@@ -1245,13 +1758,25 @@ class Repository:
                 )
             elif state == "paused":
                 current_stage = InternalStage(run["current_stage"])
-                cursor = await connection.execute(
-                    """
-                    SELECT COUNT(*) FROM stage_attempts
-                    WHERE run_id = ? AND stage = ?
-                    """,
-                    (run["id"], current_stage.value),
-                )
+                if (
+                    current_stage is InternalStage.GENERATING_EPISODE_SCRIPTS
+                    and run["current_episode"] is not None
+                ):
+                    cursor = await connection.execute(
+                        """
+                        SELECT COUNT(*) FROM episode_attempts
+                        WHERE run_id = ? AND episode_number = ?
+                        """,
+                        (run["id"], run["current_episode"]),
+                    )
+                else:
+                    cursor = await connection.execute(
+                        """
+                        SELECT COUNT(*) FROM stage_attempts
+                        WHERE run_id = ? AND stage = ?
+                        """,
+                        (run["id"], current_stage.value),
+                    )
                 attempt_row = await cursor.fetchone()
                 attempt_count = max(1, min(MAX_STAGE_ATTEMPTS, int(attempt_row[0])))
                 await connection.execute(
@@ -1368,6 +1893,51 @@ class Repository:
                 )
             if run["state"] != "running":
                 raise DomainError("run_not_running", "Workflow run is not running.", 409)
+
+            plans = await self._episode_plans(connection, run_id)
+            if plans:
+                try:
+                    expected_scripts = _aggregate_episode_scripts(
+                        plans,
+                        await self._episode_drafts(connection, run_id),
+                    )
+                except ValueError as exc:
+                    raise DomainError(
+                        "episode_sequence_incomplete",
+                        "Every planned episode must be committed before delivery.",
+                        409,
+                    ) from exc
+                scripts = await self._fetchone(
+                    connection,
+                    """
+                    SELECT payload_json FROM business_checkpoints
+                    WHERE run_id = ? AND stage = ?
+                    """,
+                    (str(run_id), InternalStage.GENERATING_EPISODE_SCRIPTS.value),
+                )
+                if scripts is None:
+                    raise DomainError(
+                        "episode_sequence_incomplete",
+                        "Every planned episode must be assembled before delivery.",
+                        409,
+                    )
+                try:
+                    approved_scripts = json.loads(scripts["payload_json"])["content"]
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise DomainError(
+                        "episode_aggregate_conflict",
+                        "The approved aggregate script is invalid.",
+                        409,
+                    ) from exc
+                if (
+                    approved_scripts != expected_scripts
+                    or delivery.content_package.episode_scripts != expected_scripts
+                ):
+                    raise DomainError(
+                        "episode_aggregate_conflict",
+                        "The delivery must use the committed episode aggregate.",
+                        409,
+                    )
 
             await connection.execute(
                 """
@@ -1627,6 +2197,8 @@ class Repository:
             frozen_feedback=run["frozen_feedback"],
             stage_attempts=await self.get_stage_attempt_counts(run_id),
             business_checkpoints=await self.get_business_checkpoints(run_id),
+            episode_plans=await self.get_episode_plans(run_id),
+            episode_drafts=await self.get_episode_drafts(run_id),
         )
 
     async def get_run_recovery(self, run_id: UUID) -> RunRecovery:
@@ -1661,6 +2233,8 @@ class Repository:
             state=run["state"],
             stage_attempts=await self.get_stage_attempt_counts(run_id),
             business_checkpoints=await self.get_business_checkpoints(run_id),
+            episode_plans=await self.get_episode_plans(run_id),
+            episode_drafts=await self.get_episode_drafts(run_id),
         )
 
     async def reconcile_startup(
@@ -1766,7 +2340,10 @@ class Repository:
                     drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
                 )
             case "ended":
-                return EndedRun(progress=progress)
+                return EndedRun(
+                    progress=progress,
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                )
             case "succeeded":
                 delivery = await self._load_delivery(connection, UUID(run["id"]))
                 if delivery is None:
@@ -1776,6 +2353,7 @@ class Repository:
                 return FailedRun(
                     progress=progress,
                     failure=self._failure_from_row(run),
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
                 )
             case _:
                 raise RuntimeError("Unknown workflow progress state")
@@ -1818,7 +2396,10 @@ class Repository:
                     drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
                 )
             case "ended":
-                return RevisionEnded(progress=progress)
+                return RevisionEnded(
+                    progress=progress,
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                )
             case "succeeded":
                 delivery = await self._load_delivery(connection, UUID(run["id"]))
                 if delivery is None:
@@ -1828,6 +2409,7 @@ class Repository:
                 return RevisionFailed(
                     progress=progress,
                     failure=self._failure_from_row(run),
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
                 )
             case _:
                 raise RuntimeError("Unknown revision progress state")
@@ -1860,6 +2442,11 @@ class Repository:
             completed.append(UserStage.FINAL_REVIEW)
 
         execution_state = progress["execution_state"]
+        episodes = await self._episode_progress(
+            connection,
+            UUID(run["id"]),
+            progress["current_episode"],
+        )
         return progress, RunProgress(
             current_stage=_USER_STAGE_BY_INTERNAL[current_internal],
             completed_stages=completed,
@@ -1881,6 +2468,7 @@ class Repository:
                     execution_state,
                 ),
             ),
+            episodes=episodes,
             can_continue=execution_state == "paused",
             can_end=execution_state == "paused",
         )
@@ -1908,7 +2496,30 @@ class Repository:
             )
             if artifact is not None:
                 artifacts.append(artifact)
-        return RunDraftSnapshot(artifacts=artifacts, review_status=progress.final_review)
+        return RunDraftSnapshot(
+            artifacts=artifacts,
+            episodes=await self._episode_drafts(connection, run_id),
+            review_status=progress.final_review,
+        )
+
+    async def _episode_progress(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+        current_episode: int | None,
+    ) -> EpisodeProgress | None:
+        plans = await self._episode_plans(connection, run_id)
+        if not plans:
+            return None
+        drafts = await self._episode_drafts(connection, run_id)
+        current = int(current_episode) if current_episode is not None else None
+        if current is not None and current not in {plan.episode_number for plan in plans}:
+            raise RuntimeError("Workflow progress references an unplanned episode")
+        return EpisodeProgress(
+            total=len(plans),
+            completed=len(drafts),
+            current=current,
+        )
 
     @staticmethod
     def _draft_artifact_from_payload(
@@ -1955,10 +2566,21 @@ class Repository:
         timeout_stage = progress["timeout_stage"]
         if timeout_stage is None:
             raise RuntimeError("Paused workflow run is missing its timeout stage")
+        stage = UserStage(timeout_stage)
         return RunPause(
-            message="The workflow exceeded its wall-clock limit twice in this stage.",
-            stage=UserStage(timeout_stage),
+            message=(
+                "The episode exceeded its generation limit twice."
+                if stage is UserStage.GENERATING_EPISODE_SCRIPTS
+                else "The workflow exceeded its wall-clock limit twice in this stage."
+            ),
+            stage=stage,
             timeout_count=int(progress["timeout_count"]),
+            episode_number=(
+                int(progress["current_episode"])
+                if stage is UserStage.GENERATING_EPISODE_SCRIPTS
+                and progress["current_episode"] is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -1972,6 +2594,49 @@ class Repository:
             active_since = active_since.replace(tzinfo=UTC)
         current = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
         return max(0, elapsed + (current.astimezone(UTC) - active_since).total_seconds())
+
+    @staticmethod
+    async def _episode_plans(
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+    ) -> list[EpisodePlan]:
+        cursor = await connection.execute(
+            """
+            SELECT episode_number, plan
+            FROM episode_plans
+            WHERE run_id = ?
+            ORDER BY episode_number
+            """,
+            (str(run_id),),
+        )
+        return [
+            EpisodePlan(episode_number=int(row["episode_number"]), plan=row["plan"])
+            for row in await cursor.fetchall()
+        ]
+
+    @staticmethod
+    async def _episode_drafts(
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+    ) -> list[EpisodeDraft]:
+        cursor = await connection.execute(
+            """
+            SELECT episode_number, content, content_sha256, completed_at
+            FROM episode_drafts
+            WHERE run_id = ?
+            ORDER BY episode_number
+            """,
+            (str(run_id),),
+        )
+        return [
+            EpisodeDraft(
+                episode_number=int(row["episode_number"]),
+                content=row["content"],
+                content_sha256=row["content_sha256"],
+                completed_at=_datetime(row["completed_at"]),
+            )
+            for row in await cursor.fetchall()
+        ]
 
     async def _load_delivery(
         self,
@@ -2049,6 +2714,7 @@ class Repository:
                 runs.id,
                 runs.state AS run_state,
                 run_progress.current_stage,
+                run_progress.current_episode,
                 run_progress.execution_state
             FROM runs
             JOIN run_progress ON run_progress.run_id = runs.id
