@@ -326,3 +326,197 @@ Promise.resolve(result).catch((error) => {{
         capture_output=True,
         text=True,
     )
+
+
+def test_active_drafts_render_from_resource_snapshots_without_formal_results() -> None:
+    root = Path(__file__).parents[1]
+    script_path = root / "src" / "pengine" / "web" / "app.js"
+    page = (root / "src" / "pengine" / "web" / "index.html").read_text()
+    assert 'data-artifact="direction"' in page
+    assert 'aria-label="选择文稿类别"' in page
+
+    assertions = """
+function button(key, prefix) {
+  return {
+    id: `${prefix}-${key}`,
+    dataset: { [prefix === "version" ? "version" : "artifact"]: key },
+    attrs: {},
+    hidden: false,
+    disabled: false,
+    tabIndex: 0,
+    number: { textContent: "" },
+    setAttribute(name, value) { this.attrs[name] = value; },
+    querySelector(selector) { return selector === "span" ? this.number : null; },
+  };
+}
+const versionButtons = [button("initial", "version"), button("revision", "version")];
+const artifactButtons = [
+  button("direction", "artifact"),
+  button("story_outline", "artifact"),
+  button("character_biographies", "artifact"),
+  button("relationship_logic", "artifact"),
+  button("episode_outline", "artifact"),
+  button("episode_scripts", "artifact"),
+];
+Object.assign(elements, {
+  "delivery-section": { hidden: true },
+  "delivery-subtitle": { textContent: "" },
+  "folio-stamp": { textContent: "" },
+  "task-waiting": { hidden: true },
+  "wait-kicker": { textContent: "" },
+  "wait-title": { textContent: "" },
+  "wait-description": { textContent: "" },
+  "failure-panel": { hidden: true },
+  "result-workspace": { hidden: true },
+  "revision-desk": { hidden: false },
+  "version-initial": versionButtons[0],
+  "version-revision": versionButtons[1],
+  "version-tabs": { querySelectorAll() { return versionButtons; } },
+  "version-note": { textContent: "" },
+  "artifact-tabs": {
+    querySelectorAll() { return artifactButtons; },
+    querySelector(selector) {
+      const match = selector.match(/data-artifact="([^"]+)"/);
+      return match ? artifactButtons.find((item) => item.dataset.artifact === match[1]) : null;
+    },
+  },
+  "artifact-panel": { setAttribute() {} },
+  "artifact-overline": { textContent: "" },
+  "artifact-title": { textContent: "" },
+  "artifact-version-mark": { textContent: "" },
+  "artifact-content": { textContent: "" },
+});
+renderProgress = () => {};
+renderRevision = () => {};
+const progress = {
+  current_stage: "generating_story_outline",
+  completed_stages: ["determining_direction"],
+  elapsed_seconds: 1,
+  recovery_state: "none",
+  final_review: { l0: "pending", l4: "pending" },
+  can_continue: false,
+  can_end: false,
+};
+const drafts = {
+  artifacts: [
+    {
+      stage: "determining_direction",
+      selected_l0_variant: "归返",
+      selection_rationale: "匹配故事母题。",
+    },
+    { stage: "generating_story_outline", content: "<b>已提交故事大纲</b>" },
+  ],
+  review_status: { l0: "pending", l4: "pending" },
+};
+state.creationId = "creation-id";
+state.activeVersion = "initial";
+state.activeArtifact = "story_outline";
+state.activeDraftRunKind = "";
+state.creation = {
+  persona: { display_name: "测试人格", version: "1" },
+  initial: { state: "running", progress, drafts },
+  revision: { state: "unavailable" },
+};
+renderCreation();
+if (elements["result-workspace"].hidden) throw new Error("running drafts stayed hidden");
+if (elements["artifact-version-mark"].textContent !== "创作中草稿") {
+  throw new Error("initial draft label was not rendered");
+}
+if (!elements["artifact-content"].textContent.includes("选择理由：匹配故事母题。")) {
+  throw new Error("direction draft was not rendered");
+}
+if (artifactButtons[0].hidden || artifactButtons[1].hidden) {
+  throw new Error("committed draft tabs stayed hidden");
+}
+if (!artifactButtons[2].hidden || !artifactButtons[5].hidden) {
+  throw new Error("current or future draft tabs were shown");
+}
+
+const pausedProgress = {
+  ...progress,
+  recovery_state: "paused",
+  can_continue: true,
+  can_end: true,
+};
+state.creation = {
+  ...state.creation,
+  initial: { state: "paused", progress: pausedProgress, drafts },
+};
+renderCreation();
+if (
+  elements["result-workspace"].hidden ||
+  !elements["artifact-content"].textContent.includes("匹配故事母题")
+) {
+  throw new Error("paused resource lost durable draft text");
+}
+
+state.creation = {
+  ...state.creation,
+  initial: { state: "queued", progress, drafts },
+};
+renderCreation();
+if (
+  elements["result-workspace"].hidden ||
+  !elements["artifact-content"].textContent.includes("匹配故事母题")
+) {
+  throw new Error("continued resource lost durable draft text");
+}
+
+const formalInitial = {
+  state: "succeeded",
+  result: {
+    content_package: {
+      story_outline: "初稿故事大纲",
+      character_biographies: "初稿人物小传",
+      relationship_logic: "初稿人物关系",
+      episode_outline: "初稿分集大纲",
+      episode_scripts: "初稿分集剧本",
+    },
+  },
+};
+state.activeDraftRunKind = "";
+const revisionProgress = { ...progress, can_continue: true, can_end: true };
+state.creation = {
+  persona: { display_name: "测试人格", version: "1" },
+  initial: formalInitial,
+  revision: { state: "paused", progress: revisionProgress, drafts },
+};
+renderCreation();
+if (state.activeVersion !== "revision") throw new Error("revision draft was not selected");
+if (elements["artifact-version-mark"].textContent !== "修订中草稿") {
+  throw new Error("revision draft label was not rendered");
+}
+state.activeVersion = "initial";
+state.activeArtifact = "story_outline";
+renderVersionControls();
+renderArtifact();
+if (elements["artifact-content"].textContent !== "初稿故事大纲") {
+  throw new Error("revision draft hid formal initial delivery");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}} }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(() => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )

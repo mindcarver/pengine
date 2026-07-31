@@ -291,7 +291,20 @@
               </div>
 
               <div class="artifact-layout">
-                <div class="artifact-tabs" id="artifact-tabs" role="tablist" aria-label="选择成品类别">
+                <div class="artifact-tabs" id="artifact-tabs" role="tablist" aria-label="选择文稿类别">
+                  <button
+                    id="artifact-tab-direction"
+                    type="button"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="artifact-panel"
+                    data-artifact="direction"
+                    tabindex="-1"
+                    disabled
+                    hidden
+                  >
+                    <span>01</span>创作方向
+                  </button>
                   <button
                     id="artifact-tab-story"
                     type="button"

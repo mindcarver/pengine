@@ -148,6 +148,33 @@ class RunProgress(StrictModel):
     can_end: bool
 
 
+class CreativeDirectionDraft(StrictModel):
+    stage: Literal["determining_direction"] = "determining_direction"
+    selected_l0_variant: NonEmptyText
+    selection_rationale: NonEmptyText
+
+
+class CreativeTextDraft(StrictModel):
+    stage: Literal[
+        "generating_story_outline",
+        "generating_character_biographies",
+        "generating_relationships",
+        "generating_episode_outline",
+    ]
+    content: NonEmptyText
+
+
+CreativeDraft = Annotated[
+    CreativeDirectionDraft | CreativeTextDraft,
+    Field(discriminator="stage"),
+]
+
+
+class RunDraftSnapshot(StrictModel):
+    artifacts: list[CreativeDraft] = Field(default_factory=list)
+    review_status: FinalReviewProgress
+
+
 class RunPause(StrictModel):
     code: Literal["run_timeout"] = "run_timeout"
     message: NonEmptyText
@@ -158,21 +185,25 @@ class RunPause(StrictModel):
 class QueuedRun(StrictModel):
     state: Literal["queued"] = "queued"
     progress: RunProgress
+    drafts: RunDraftSnapshot
 
 
 class RunningRun(StrictModel):
     state: Literal["running"] = "running"
     progress: RunProgress
+    drafts: RunDraftSnapshot
 
 
 class AutoResumingRun(StrictModel):
     state: Literal["auto_resuming"] = "auto_resuming"
     progress: RunProgress
+    drafts: RunDraftSnapshot
 
 
 class PausedRun(StrictModel):
     state: Literal["paused"] = "paused"
     progress: RunProgress
+    drafts: RunDraftSnapshot
     pause: RunPause
 
 
@@ -214,24 +245,28 @@ class RevisionQueued(StrictModel):
     state: Literal["queued"] = "queued"
     feedback_locked: Literal[True] = True
     progress: RunProgress
+    drafts: RunDraftSnapshot
 
 
 class RevisionRunning(StrictModel):
     state: Literal["running"] = "running"
     feedback_locked: Literal[True] = True
     progress: RunProgress
+    drafts: RunDraftSnapshot
 
 
 class RevisionAutoResuming(StrictModel):
     state: Literal["auto_resuming"] = "auto_resuming"
     feedback_locked: Literal[True] = True
     progress: RunProgress
+    drafts: RunDraftSnapshot
 
 
 class RevisionPaused(StrictModel):
     state: Literal["paused"] = "paused"
     feedback_locked: Literal[True] = True
     progress: RunProgress
+    drafts: RunDraftSnapshot
     pause: RunPause
 
 
