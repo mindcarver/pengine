@@ -186,6 +186,41 @@ def create_app(
         )
 
     @app.post(
+        "/creations/{creation_id}/runs/{run_kind}/retry-final-review",
+        operation_id="retryFinalReview",
+        status_code=202,
+        response_model=RunControlAccepted,
+        summary="Retry a rejected L0 or L4 final review",
+        description=(
+            "Queues the same quality_rejected run unless that gate has exhausted its "
+            "three-attempt limit. Durable checkpoints and drafts remain unchanged; the "
+            "worker re-executes only the rejected final-review gate. An identical "
+            "idempotency key replays its prior accepted response."
+        ),
+        responses={
+            202: {
+                "description": "Final review queued or an identical accepted retry command replayed"
+            },
+            404: {"description": "Creation not found", "model": CommandError},
+            409: {
+                "description": "The requested run cannot retry final review",
+                "model": CommandError,
+            },
+            422: {"description": "Request schema validation failed", "model": CommandError},
+        },
+    )
+    async def retry_final_review(
+        creation_id: UUID,
+        run_kind: Literal["initial", "revision"],
+        idempotency_key: IdempotencyKey,
+    ) -> RunControlAccepted:
+        return await resolved_repository.retry_final_review(
+            creation_id=creation_id,
+            run_kind=run_kind,
+            idempotency_key=idempotency_key,
+        )
+
+    @app.post(
         "/creations/{creation_id}/runs/{run_kind}/end",
         operation_id="endRun",
         status_code=202,

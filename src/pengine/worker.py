@@ -345,6 +345,20 @@ class Worker:
                 recovery_state,
             )
             return
+        except QualityGateRejectedError as exc:
+            rejection = await self.repository.reject_quality_gate(
+                work.run_id,
+                stage=exc.stage,
+                evidence=exc.evidence,
+            )
+            logger.info(
+                "quality gate rejected run_id=%s creation_id=%s stage=%s attempt=%s",
+                work.run_id,
+                work.creation_id,
+                rejection.stage,
+                rejection.attempt_count,
+            )
+            return
         except TimeoutError as exc:
             if run_timeout_scope is not None and run_timeout_scope.expired():
                 timeout_stage = self._failure_stage(exc, current_stage, approved)

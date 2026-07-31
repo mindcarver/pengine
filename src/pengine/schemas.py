@@ -133,6 +133,14 @@ class RunFailure(StrictModel):
     attempt_count: int = Field(ge=1, le=3)
 
 
+class QualityGateRejection(StrictModel):
+    code: Literal["quality_gate_rejected"] = "quality_gate_rejected"
+    stage: Literal["accepting_l0", "accepting_l4"]
+    evidence: NonEmptyText | None = None
+    attempt_count: int = Field(ge=1, le=3)
+    can_retry: bool
+
+
 class FinalReviewProgress(StrictModel):
     l0: Literal["pending", "running", "passed", "paused", "failed"]
     l4: Literal["pending", "running", "passed", "paused", "failed"]
@@ -235,6 +243,13 @@ class SucceededRun(StrictModel):
     result: Delivery
 
 
+class QualityRejectedRun(StrictModel):
+    state: Literal["quality_rejected"] = "quality_rejected"
+    progress: RunProgress
+    quality_rejection: QualityGateRejection
+    drafts: RunDraftSnapshot
+
+
 class FailedRun(StrictModel):
     state: Literal["failed"] = "failed"
     progress: RunProgress
@@ -243,7 +258,14 @@ class FailedRun(StrictModel):
 
 
 RunStatus = Annotated[
-    QueuedRun | RunningRun | AutoResumingRun | PausedRun | EndedRun | SucceededRun | FailedRun,
+    QueuedRun
+    | RunningRun
+    | AutoResumingRun
+    | PausedRun
+    | EndedRun
+    | SucceededRun
+    | QualityRejectedRun
+    | FailedRun,
     Field(discriminator="state"),
 ]
 
@@ -311,6 +333,14 @@ class RevisionSucceeded(StrictModel):
     result: Delivery
 
 
+class RevisionQualityRejected(StrictModel):
+    state: Literal["quality_rejected"] = "quality_rejected"
+    feedback_locked: Literal[True] = True
+    progress: RunProgress
+    quality_rejection: QualityGateRejection
+    drafts: RunDraftSnapshot
+
+
 RevisionStatus = Annotated[
     RevisionUnavailable
     | RevisionAvailable
@@ -319,6 +349,7 @@ RevisionStatus = Annotated[
     | RevisionAutoResuming
     | RevisionPaused
     | RevisionEnded
+    | RevisionQualityRejected
     | RevisionFailed
     | RevisionSucceeded,
     Field(discriminator="state"),

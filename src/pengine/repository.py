@@ -31,6 +31,8 @@ from pengine.schemas import (
     InternalStage,
     PausedRun,
     PersonaSnapshot,
+    QualityGateRejection,
+    QualityRejectedRun,
     QueuedRun,
     RevisionAccepted,
     RevisionAutoResuming,
@@ -38,6 +40,7 @@ from pengine.schemas import (
     RevisionEnded,
     RevisionFailed,
     RevisionPaused,
+    RevisionQualityRejected,
     RevisionQueued,
     RevisionRequest,
     RevisionRunning,
@@ -53,7 +56,7 @@ from pengine.schemas import (
     UserStage,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 
@@ -279,6 +282,96 @@ CREATE TABLE IF NOT EXISTS episode_timeouts (
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (3);
 """
 
+_SCHEMA_V4_SQL = """
+CREATE TABLE run_progress_v4 (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    current_stage TEXT NOT NULL,
+    execution_state TEXT NOT NULL CHECK (
+        execution_state IN (
+            'queued', 'running', 'auto_resuming', 'paused',
+            'quality_rejected', 'ended', 'succeeded', 'failed'
+        )
+    ),
+    elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (elapsed_seconds >= 0),
+    active_started_at TEXT,
+    timeout_stage TEXT,
+    timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+    updated_at TEXT NOT NULL,
+    current_episode INTEGER CHECK (current_episode IS NULL OR current_episode >= 1)
+);
+
+INSERT INTO run_progress_v4(
+    run_id, current_stage, execution_state, elapsed_seconds,
+    active_started_at, timeout_stage, timeout_count, updated_at, current_episode
+)
+SELECT
+    run_id, current_stage, execution_state, elapsed_seconds,
+    active_started_at, timeout_stage, timeout_count, updated_at, current_episode
+FROM run_progress;
+
+DROP TABLE run_progress;
+ALTER TABLE run_progress_v4 RENAME TO run_progress;
+
+CREATE TABLE quality_gate_rejections (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK (stage IN ('accepting_l0', 'accepting_l4')),
+    attempt_number INTEGER NOT NULL CHECK (
+        attempt_number >= 1 AND attempt_number <= 3
+    ),
+    evidence TEXT,
+    rejected_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, stage, attempt_number)
+);
+
+INSERT OR IGNORE INTO quality_gate_rejections(
+    run_id, stage, attempt_number, evidence, rejected_at
+)
+SELECT
+    runs.id,
+    runs.failed_stage,
+    CASE
+        WHEN runs.failure_attempt_count BETWEEN 1 AND 3 THEN runs.failure_attempt_count
+        ELSE 3
+    END,
+    NULL,
+    COALESCE(runs.completed_at, runs.updated_at)
+FROM runs
+WHERE runs.state = 'failed'
+  AND runs.failure_code = 'quality_gate_rejected'
+  AND runs.failed_stage IN ('accepting_l0', 'accepting_l4');
+
+UPDATE runs
+SET state = 'running',
+    failure_code = NULL,
+    failure_message = NULL,
+    failed_stage = NULL,
+    failure_attempt_count = NULL,
+    completed_at = NULL
+WHERE state = 'failed'
+  AND failure_code = 'quality_gate_rejected'
+  AND failed_stage IN ('accepting_l0', 'accepting_l4')
+  AND EXISTS (
+      SELECT 1
+      FROM quality_gate_rejections
+      WHERE quality_gate_rejections.run_id = runs.id
+        AND quality_gate_rejections.stage = runs.failed_stage
+        AND quality_gate_rejections.attempt_number = CASE
+            WHEN runs.failure_attempt_count BETWEEN 1 AND 3 THEN runs.failure_attempt_count
+            ELSE 3
+        END
+  );
+
+UPDATE run_progress
+SET execution_state = 'quality_rejected',
+    active_started_at = NULL
+WHERE run_id IN (
+    SELECT run_id FROM quality_gate_rejections
+)
+  AND execution_state = 'failed';
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (4);
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -477,7 +570,7 @@ class Repository:
             if row is None:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
             schema_version = int(row[0])
-            if schema_version not in {1, 2, SCHEMA_VERSION}:
+            if schema_version not in {1, 2, 3, SCHEMA_VERSION}:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
             if schema_version == 1:
                 await connection.executescript(_SCHEMA_V2_SQL)
@@ -485,6 +578,10 @@ class Repository:
                 schema_version = 2
             if schema_version == 2:
                 await connection.executescript(_SCHEMA_V3_SQL)
+                await connection.commit()
+                schema_version = 3
+            if schema_version == 3:
+                await connection.executescript(_SCHEMA_V4_SQL)
                 await connection.commit()
 
     async def setup(self) -> None:
@@ -1650,6 +1747,207 @@ class Repository:
             )
             return next_state
 
+    async def reject_quality_gate(
+        self,
+        run_id: UUID,
+        *,
+        stage: InternalStage,
+        evidence: str | None,
+        now: datetime | None = None,
+    ) -> QualityGateRejection:
+        if stage not in {InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4}:
+            raise ValueError("Only final quality gates can be rejected")
+        current = now or _utc_now()
+        timestamp = _timestamp(current)
+
+        async with self._transaction() as connection:
+            progress = await self._fetchone(
+                connection,
+                """
+                SELECT run_progress.*, runs.state AS run_state, runs.creation_id
+                FROM run_progress
+                JOIN runs ON runs.id = run_progress.run_id
+                WHERE run_progress.run_id = ?
+                """,
+                (str(run_id),),
+            )
+            if progress is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if progress["run_state"] != "running" or progress["execution_state"] != "running":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Workflow run is not actively running.",
+                    409,
+                )
+
+            cursor = await connection.execute(
+                """
+                SELECT COALESCE(MAX(attempt_number), 0)
+                FROM stage_attempts
+                WHERE run_id = ? AND stage = ?
+                """,
+                (str(run_id), stage.value),
+            )
+            attempt_row = await cursor.fetchone()
+            attempt_count = int(attempt_row[0]) if attempt_row is not None else 0
+            if attempt_count == 0:
+                attempt_count = 1
+                await connection.execute(
+                    """
+                    INSERT INTO stage_attempts(run_id, stage, attempt_number, recorded_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (str(run_id), stage.value, attempt_count, timestamp),
+                )
+
+            existing = await self._fetchone(
+                connection,
+                """
+                SELECT evidence FROM quality_gate_rejections
+                WHERE run_id = ? AND stage = ? AND attempt_number = ?
+                """,
+                (str(run_id), stage.value, attempt_count),
+            )
+            if existing is not None:
+                if existing["evidence"] != evidence:
+                    raise DomainError(
+                        "run_not_controllable",
+                        "A quality-gate rejection cannot be replaced.",
+                        409,
+                    )
+            else:
+                await connection.execute(
+                    """
+                    INSERT INTO quality_gate_rejections(
+                        run_id, stage, attempt_number, evidence, rejected_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (str(run_id), stage.value, attempt_count, evidence, timestamp),
+                )
+
+            elapsed_seconds = self._elapsed_seconds(progress, current)
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    execution_state = 'quality_rejected',
+                    elapsed_seconds = ?,
+                    active_started_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (stage.value, elapsed_seconds, timestamp, str(run_id)),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'failed',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, str(run_id)),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, progress["creation_id"]),
+            )
+            return QualityGateRejection(
+                stage=stage.value,
+                evidence=evidence,
+                attempt_count=attempt_count,
+                can_retry=attempt_count < MAX_STAGE_ATTEMPTS,
+            )
+
+    async def retry_final_review(
+        self,
+        *,
+        creation_id: UUID,
+        run_kind: RunKind,
+        idempotency_key: str,
+        now: datetime | None = None,
+    ) -> RunControlAccepted:
+        timestamp = _timestamp(now or _utc_now())
+        scope = f"run-control:{creation_id}:{run_kind}:retry-final-review"
+        payload_hash = canonical_payload_hash({"action": "retry-final-review"})
+
+        async with self._transaction() as connection:
+            replay = await self._idempotency_replay(
+                connection,
+                idempotency_key,
+                scope,
+                payload_hash,
+                RunControlAccepted,
+            )
+            if replay is not None:
+                return replay
+
+            run = await self._fetch_control_run(connection, creation_id, run_kind)
+            state = run["execution_state"]
+            if state != "quality_rejected":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Only a quality-rejected workflow run can retry final review.",
+                    409,
+                )
+            cursor = await connection.execute(
+                """
+                SELECT COALESCE(MAX(attempt_number), 0)
+                FROM quality_gate_rejections
+                WHERE run_id = ? AND stage = ?
+                """,
+                (run["id"], run["current_stage"]),
+            )
+            attempt_row = await cursor.fetchone()
+            if attempt_row is None or int(attempt_row[0]) >= MAX_STAGE_ATTEMPTS:
+                raise DomainError(
+                    "run_not_controllable",
+                    "The quality gate has reached its retry limit.",
+                    409,
+                )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET execution_state = 'queued', updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, run["id"]),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued',
+                    available_at = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, timestamp, run["id"]),
+            )
+            state = "queued"
+
+            response = RunControlAccepted(
+                creation_id=creation_id,
+                run_kind=run_kind,
+                run_state=state,
+                resource_url=f"/creations/{creation_id}",
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, str(creation_id)),
+            )
+            await self._store_idempotency(
+                connection,
+                idempotency_key,
+                scope,
+                payload_hash,
+                response,
+                timestamp,
+            )
+            return response
+
     async def continue_run(
         self,
         *,
@@ -1756,8 +2054,13 @@ class Repository:
                     run_state="ended",
                     resource_url=f"/creations/{creation_id}",
                 )
-            elif state == "paused":
+            elif state in {"paused", "quality_rejected"}:
                 current_stage = InternalStage(run["current_stage"])
+                ended_message = (
+                    "The operator ended the quality-rejected workflow run."
+                    if state == "quality_rejected"
+                    else "The operator ended the paused workflow run."
+                )
                 if (
                     current_stage is InternalStage.GENERATING_EPISODE_SCRIPTS
                     and run["current_episode"] is not None
@@ -1784,7 +2087,7 @@ class Repository:
                     UPDATE runs
                     SET state = 'failed',
                         failure_code = 'ended_by_user',
-                        failure_message = 'The operator ended the paused workflow run.',
+                        failure_message = ?,
                         failed_stage = ?,
                         failure_attempt_count = ?,
                         completed_at = ?,
@@ -1792,6 +2095,7 @@ class Repository:
                     WHERE id = ? AND state = 'running'
                     """,
                     (
+                        ended_message,
                         current_stage.value,
                         attempt_count,
                         timestamp,
@@ -1827,7 +2131,7 @@ class Repository:
             else:
                 raise DomainError(
                     "run_not_controllable",
-                    "Only a paused workflow run can end.",
+                    "Only a paused or quality-rejected workflow run can end.",
                     409,
                 )
 
@@ -2315,7 +2619,16 @@ class Repository:
         connection: aiosqlite.Connection,
         run: aiosqlite.Row,
         now: datetime,
-    ) -> QueuedRun | RunningRun | AutoResumingRun | PausedRun | EndedRun | SucceededRun | FailedRun:
+    ) -> (
+        QueuedRun
+        | RunningRun
+        | AutoResumingRun
+        | PausedRun
+        | EndedRun
+        | SucceededRun
+        | QualityRejectedRun
+        | FailedRun
+    ):
         progress_row, progress = await self._run_progress(connection, run, now)
         match progress_row["execution_state"]:
             case "queued":
@@ -2349,6 +2662,16 @@ class Repository:
                 if delivery is None:
                     raise RuntimeError("Successful run is missing its delivery")
                 return SucceededRun(progress=progress, result=delivery)
+            case "quality_rejected":
+                return QualityRejectedRun(
+                    progress=progress,
+                    quality_rejection=await self._quality_rejection_from_progress(
+                        connection,
+                        UUID(run["id"]),
+                        progress_row,
+                    ),
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                )
             case "failed":
                 return FailedRun(
                     progress=progress,
@@ -2370,6 +2693,7 @@ class Repository:
         | RevisionPaused
         | RevisionEnded
         | RevisionSucceeded
+        | RevisionQualityRejected
         | RevisionFailed
     ):
         progress_row, progress = await self._run_progress(connection, run, now)
@@ -2405,6 +2729,16 @@ class Repository:
                 if delivery is None:
                     raise RuntimeError("Successful revision is missing its delivery")
                 return RevisionSucceeded(progress=progress, result=delivery)
+            case "quality_rejected":
+                return RevisionQualityRejected(
+                    progress=progress,
+                    quality_rejection=await self._quality_rejection_from_progress(
+                        connection,
+                        UUID(run["id"]),
+                        progress_row,
+                    ),
+                    drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                )
             case "failed":
                 return RevisionFailed(
                     progress=progress,
@@ -2557,9 +2891,38 @@ class Repository:
             return "pending"
         if execution_state == "paused":
             return "paused"
-        if execution_state in {"failed", "ended"}:
+        if execution_state in {"quality_rejected", "failed", "ended"}:
             return "failed"
         return "running"
+
+    async def _quality_rejection_from_progress(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+        progress: aiosqlite.Row,
+    ) -> QualityGateRejection:
+        stage = InternalStage(progress["current_stage"])
+        if stage not in {InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4}:
+            raise RuntimeError("Quality-rejected run is not at a final review gate")
+        rejection = await self._fetchone(
+            connection,
+            """
+            SELECT stage, evidence, attempt_number
+            FROM quality_gate_rejections
+            WHERE run_id = ? AND stage = ?
+            ORDER BY attempt_number DESC
+            LIMIT 1
+            """,
+            (str(run_id), stage.value),
+        )
+        if rejection is None:
+            raise RuntimeError("Quality-rejected run is missing rejection evidence")
+        return QualityGateRejection(
+            stage=rejection["stage"],
+            evidence=rejection["evidence"],
+            attempt_count=int(rejection["attempt_number"]),
+            can_retry=int(rejection["attempt_number"]) < MAX_STAGE_ATTEMPTS,
+        )
 
     @staticmethod
     def _pause_from_progress(progress: aiosqlite.Row) -> RunPause:

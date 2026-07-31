@@ -221,9 +221,10 @@ class AgentProtocolError(RuntimeError):
 
 
 class QualityGateRejectedError(RuntimeError):
-    def __init__(self, *, stage: InternalStage) -> None:
+    def __init__(self, *, stage: InternalStage, evidence: str | None = None) -> None:
         super().__init__("Quality gate did not pass")
         self.stage = stage
+        self.evidence = evidence
 
 
 class CheckpointUnavailableError(RuntimeError):
@@ -380,7 +381,7 @@ def _validated_stage_payload(
     ):
         raise AgentProtocolError("Subagent returned a different episode", stage=stage)
     if isinstance(parsed, QualityReviewerResult) and not parsed.passed:
-        raise QualityGateRejectedError(stage=stage)
+        raise QualityGateRejectedError(stage=stage, evidence=parsed.evidence)
     return parsed.model_dump(mode="json")
 
 

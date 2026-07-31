@@ -5,7 +5,7 @@ import aiosqlite
 import pytest
 
 from pengine.errors import DomainError
-from pengine.repository import Repository
+from pengine.repository import SCHEMA_VERSION, Repository
 from pengine.schemas import (
     ContentPackage,
     CreateCreationRequest,
@@ -151,6 +151,7 @@ async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository)
         "episode_drafts",
         "episode_attempts",
         "episode_timeouts",
+        "quality_gate_rejections",
     } <= {row[0] for row in rows}
 
 
@@ -607,6 +608,292 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
     assert cannot_continue.value.code == "run_not_controllable"
 
 
+@pytest.mark.asyncio
+async def test_quality_rejection_is_durable_and_retries_the_same_run(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    checkpoints = [
+        (
+            InternalStage.SELECTING_L0_VARIANT,
+            {"selected_l0_variant": "归返", "selection_rationale": "匹配母题"},
+        ),
+        (InternalStage.GENERATING_STORY_OUTLINE, {"content": "故事梗概"}),
+        (InternalStage.GENERATING_CHARACTER_BIOGRAPHIES, {"content": "人物小传"}),
+        (InternalStage.GENERATING_RELATIONSHIP_LOGIC, {"content": "人物关系"}),
+        (
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+            {
+                "content": "单集大纲",
+                "episode_count": 1,
+                "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+            },
+        ),
+    ]
+    for stage, payload in checkpoints:
+        await repository.record_stage_attempt(lease.run_id, stage, now=NOW)
+        await repository.approve_business_checkpoint(lease.run_id, stage, payload, now=NOW)
+    await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
+    draft = await repository.commit_episode_draft(lease.run_id, 1, "第一集剧本", now=NOW)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+        {"content": await repository.assemble_episode_scripts(lease.run_id)},
+        now=NOW,
+    )
+    await repository.record_stage_attempt(lease.run_id, InternalStage.ACCEPTING_L0, now=NOW)
+    approved_before = await repository.get_business_checkpoints(lease.run_id)
+
+    rejection = await repository.reject_quality_gate(
+        lease.run_id,
+        stage=InternalStage.ACCEPTING_L0,
+        evidence="L0 创作内核与人物选择不一致。",
+        now=NOW + timedelta(seconds=1),
+    )
+    assert rejection.model_dump() == {
+        "code": "quality_gate_rejected",
+        "stage": "accepting_l0",
+        "evidence": "L0 创作内核与人物选择不一致。",
+        "attempt_count": 1,
+        "can_retry": True,
+    }
+    rejected = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=2))
+    assert rejected is not None
+    assert rejected.initial.state == "quality_rejected"
+    assert rejected.initial.quality_rejection == rejection
+    assert rejected.initial.progress.final_review.model_dump() == {"l0": "failed", "l4": "pending"}
+    assert rejected.initial.drafts.episodes == [draft]
+    assert await repository.get_business_checkpoints(lease.run_id) == approved_before
+
+    first_retry = await repository.retry_final_review(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-final-review",
+        now=NOW + timedelta(seconds=3),
+    )
+    replay_retry = await repository.retry_final_review(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-final-review",
+        now=NOW + timedelta(seconds=4),
+    )
+    with pytest.raises(DomainError) as duplicate_retry:
+        await repository.retry_final_review(
+            creation_id=accepted.creation_id,
+            run_kind="initial",
+            idempotency_key="retry-final-review-again",
+            now=NOW + timedelta(seconds=4),
+        )
+    assert first_retry == replay_retry
+    assert first_retry.run_state == "queued"
+    assert duplicate_retry.value.code == "run_not_controllable"
+    resumed = await repository.lease_next_job(
+        "quality-review-worker", 30, now=NOW + timedelta(seconds=5)
+    )
+    assert resumed is not None
+    assert resumed.run_id == lease.run_id
+    assert resumed.thread_id == lease.thread_id
+    assert await repository.get_business_checkpoints(lease.run_id) == approved_before
+
+
+@pytest.mark.asyncio
+async def test_quality_rejection_does_not_queue_a_fourth_final_review(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    for attempt in range(1, 4):
+        if attempt > 1:
+            retry = await repository.retry_final_review(
+                creation_id=accepted.creation_id,
+                run_kind="initial",
+                idempotency_key=f"quality-retry-{attempt}",
+                now=NOW + timedelta(seconds=attempt),
+            )
+            assert retry.run_state == "queued"
+            next_lease = await repository.lease_next_job(
+                f"quality-retry-worker-{attempt}",
+                30,
+                now=NOW + timedelta(seconds=attempt + 1),
+            )
+            assert next_lease is not None
+            assert next_lease.run_id == lease.run_id
+            await repository.mark_run_running(
+                next_lease.run_id, now=NOW + timedelta(seconds=attempt + 1)
+            )
+
+        await repository.record_stage_attempt(
+            lease.run_id,
+            InternalStage.ACCEPTING_L0,
+            now=NOW + timedelta(seconds=attempt),
+        )
+        await repository.reject_quality_gate(
+            lease.run_id,
+            stage=InternalStage.ACCEPTING_L0,
+            evidence=f"L0 第 {attempt} 次未通过。",
+            now=NOW + timedelta(seconds=attempt),
+        )
+
+    with pytest.raises(DomainError) as exhausted:
+        await repository.retry_final_review(
+            creation_id=accepted.creation_id,
+            run_kind="initial",
+            idempotency_key="quality-retry-fourth",
+            now=NOW + timedelta(seconds=5),
+        )
+
+    assert exhausted.value.code == "run_not_controllable"
+    rejected = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=5))
+    assert rejected is not None
+    assert rejected.initial.state == "quality_rejected"
+    assert rejected.initial.quality_rejection.attempt_count == 3
+    ended = await repository.end_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="quality-retry-end",
+        now=NOW + timedelta(seconds=6),
+    )
+    assert ended.run_state == "ended"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("legacy_attempt_count", "expected_attempt_count", "can_retry"),
+    [(1, 1, True), (4, 3, False)],
+)
+async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_drafts(
+    repository,
+    persona,
+    creation_request,
+    legacy_attempt_count,
+    expected_attempt_count,
+    can_retry,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        now=NOW,
+    )
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        {"selected_l0_variant": "归返", "selection_rationale": "匹配母题"},
+        now=NOW,
+    )
+    await repository.record_stage_attempt(lease.run_id, InternalStage.ACCEPTING_L0, now=NOW)
+    original_checkpoints = await repository.get_business_checkpoints(lease.run_id)
+    await repository.reject_quality_gate(
+        lease.run_id,
+        stage=InternalStage.ACCEPTING_L0,
+        evidence="新版本会保存这条意见。",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    async with repository._connection() as connection:
+        await connection.executescript(
+            """
+            CREATE TABLE run_progress_v3 (
+                run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+                current_stage TEXT NOT NULL,
+                execution_state TEXT NOT NULL CHECK (
+                    execution_state IN (
+                        'queued', 'running', 'auto_resuming', 'paused',
+                        'ended', 'succeeded', 'failed'
+                    )
+                ),
+                elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (elapsed_seconds >= 0),
+                active_started_at TEXT,
+                timeout_stage TEXT,
+                timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+                updated_at TEXT NOT NULL,
+                current_episode INTEGER CHECK (current_episode IS NULL OR current_episode >= 1)
+            );
+            INSERT INTO run_progress_v3(
+                run_id, current_stage, execution_state, elapsed_seconds,
+                active_started_at, timeout_stage, timeout_count, updated_at, current_episode
+            )
+            SELECT
+                run_id, current_stage, 'failed', elapsed_seconds,
+                NULL, timeout_stage, timeout_count, updated_at, current_episode
+            FROM run_progress;
+            DROP TABLE run_progress;
+            ALTER TABLE run_progress_v3 RENAME TO run_progress;
+            DROP TABLE quality_gate_rejections;
+            DELETE FROM pengine_schema WHERE version = 4;
+            """
+        )
+        await connection.execute(
+            """
+            UPDATE runs
+            SET state = 'failed',
+                failure_code = 'quality_gate_rejected',
+                failure_message = 'The final quality gate rejected the generated work.',
+                failed_stage = 'accepting_l0',
+                failure_attempt_count = ?,
+                completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                legacy_attempt_count,
+                (NOW + timedelta(seconds=1)).isoformat(),
+                str(lease.run_id),
+            ),
+        )
+        await connection.commit()
+
+    await repository.initialize()
+    await repository.initialize()
+
+    migrated = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=2))
+    assert migrated is not None
+    assert migrated.initial.state == "quality_rejected"
+    assert migrated.initial.quality_rejection.model_dump() == {
+        "code": "quality_gate_rejected",
+        "stage": "accepting_l0",
+        "evidence": None,
+        "attempt_count": expected_attempt_count,
+        "can_retry": can_retry,
+    }
+    assert await repository.get_business_checkpoints(lease.run_id) == original_checkpoints
+    if can_retry:
+        retry = await repository.retry_final_review(
+            creation_id=accepted.creation_id,
+            run_kind="initial",
+            idempotency_key="legacy-quality-retry",
+            now=NOW + timedelta(seconds=3),
+        )
+        assert retry.run_state == "queued"
+        resumed = await repository.lease_next_job(
+            "legacy-quality-review-worker",
+            30,
+            now=NOW + timedelta(seconds=4),
+        )
+        assert resumed is not None
+        assert resumed.run_id == lease.run_id
+        assert resumed.thread_id == lease.thread_id
+    else:
+        with pytest.raises(DomainError) as exhausted:
+            await repository.retry_final_review(
+                creation_id=accepted.creation_id,
+                run_kind="initial",
+                idempotency_key="legacy-quality-retry",
+                now=NOW + timedelta(seconds=3),
+            )
+        assert exhausted.value.code == "run_not_controllable"
+        ended = await repository.end_run(
+            creation_id=accepted.creation_id,
+            run_kind="initial",
+            idempotency_key="legacy-quality-end",
+            now=NOW + timedelta(seconds=4),
+        )
+        assert ended.run_state == "ended"
+    assert await repository.get_business_checkpoints(lease.run_id) == original_checkpoints
+
+
 async def test_episode_drafts_are_ordered_and_isolate_a_revision(
     repository,
     persona,
@@ -933,6 +1220,8 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DROP TABLE run_progress")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 2")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 3")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 4")
+        await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.execute("DROP TABLE episode_timeouts")
         await connection.execute("DROP TABLE episode_attempts")
         await connection.execute("DROP TABLE episode_drafts")
@@ -949,10 +1238,10 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         version = await (
             await connection.execute("SELECT MAX(version) FROM pengine_schema")
         ).fetchone()
-    assert version[0] == 3
+    assert version[0] == SCHEMA_VERSION
 
 
-async def test_schema_v2_database_migrates_to_v3_idempotently(
+async def test_schema_v2_database_migrates_to_current_schema_idempotently(
     repository,
     persona,
     creation_request,
@@ -970,6 +1259,8 @@ async def test_schema_v2_database_migrates_to_v3_idempotently(
         await connection.execute("DROP TABLE episode_plans")
         await connection.execute("ALTER TABLE run_progress DROP COLUMN current_episode")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 3")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 4")
+        await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.commit()
 
     await repository.initialize()
@@ -985,5 +1276,5 @@ async def test_schema_v2_database_migrates_to_v3_idempotently(
         current_episode = await (
             await connection.execute("PRAGMA table_info(run_progress)")
         ).fetchall()
-    assert version[0] == 3
+    assert version[0] == SCHEMA_VERSION
     assert "current_episode" in {row["name"] for row in current_episode}

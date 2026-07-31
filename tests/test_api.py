@@ -60,7 +60,20 @@ async def test_frontend_and_assets_are_served_with_run_control_openapi(
         ("GET", "/creations/{creation_id}"),
         ("POST", "/creations/{creation_id}/revision"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
+        ("POST", "/creations/{creation_id}/runs/{run_kind}/retry-final-review"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
+    }
+
+    retry = app.openapi()["paths"]["/creations/{creation_id}/runs/{run_kind}/retry-final-review"][
+        "post"
+    ]
+    assert retry["summary"] == "Retry a rejected L0 or L4 final review"
+    assert "only the rejected final-review gate" in retry["description"]
+    assert retry["responses"]["202"]["description"] == (
+        "Final review queued or an identical accepted retry command replayed"
+    )
+    assert retry["responses"]["409"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CommandError"
     }
 
 
@@ -286,6 +299,71 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
         )
         assert cannot_continue.status_code == 409
         assert cannot_continue.json()["code"] == "run_not_controllable"
+
+
+@pytest.mark.asyncio
+async def test_quality_rejected_final_review_can_retry_the_same_run(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client,
+    ):
+        accepted = await client.post(
+            "/creations",
+            headers={"Idempotency-Key": "quality-review-create"},
+            json={
+                "persona_id": "test-persona",
+                "story": "一个人回乡面对旧事。",
+                "requirements": "生成完整短剧。",
+            },
+        )
+        creation_id = accepted.json()["creation_id"]
+        repository = app.state.repository
+        lease = await repository.lease_next_job("quality-review-worker", 30)
+        assert lease is not None
+
+        while_running = await client.post(
+            f"/creations/{creation_id}/runs/initial/retry-final-review",
+            headers={"Idempotency-Key": "quality-review-too-early"},
+        )
+        assert while_running.status_code == 409
+        assert while_running.json()["code"] == "run_not_controllable"
+
+        await repository.record_stage_attempt(lease.run_id, InternalStage.ACCEPTING_L0)
+        await repository.reject_quality_gate(
+            lease.run_id,
+            stage=InternalStage.ACCEPTING_L0,
+            evidence="L0 创作内核与人物选择不一致。",
+        )
+        rejected = await client.get(f"/creations/{creation_id}")
+        assert rejected.json()["initial"]["state"] == "quality_rejected"
+        assert rejected.json()["initial"]["quality_rejection"] == {
+            "code": "quality_gate_rejected",
+            "stage": "accepting_l0",
+            "evidence": "L0 创作内核与人物选择不一致。",
+            "attempt_count": 1,
+            "can_retry": True,
+        }
+
+        first_retry = await client.post(
+            f"/creations/{creation_id}/runs/initial/retry-final-review",
+            headers={"Idempotency-Key": "quality-review-retry"},
+        )
+        replay_retry = await client.post(
+            f"/creations/{creation_id}/runs/initial/retry-final-review",
+            headers={"Idempotency-Key": "quality-review-retry"},
+        )
+        assert first_retry.status_code == 202
+        assert replay_retry.json() == first_retry.json()
+        assert first_retry.json()["run_state"] == "queued"
+        queued = await client.get(f"/creations/{creation_id}")
+        assert queued.json()["initial"]["state"] == "queued"
+        resumed = await repository.lease_next_job("quality-review-retry-worker", 30)
+        assert resumed is not None
+        assert resumed.run_id == lease.run_id
 
 
 @pytest.mark.asyncio

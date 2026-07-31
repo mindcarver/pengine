@@ -41,6 +41,7 @@ def test_openapi_exposes_creation_and_run_control_operations() -> None:
         ("GET", "/creations/{creation_id}"),
         ("POST", "/creations/{creation_id}/revision"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
+        ("POST", "/creations/{creation_id}/runs/{run_kind}/retry-final-review"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
     }
 
@@ -53,10 +54,12 @@ def test_openapi_exposes_durable_episode_drafts_for_readable_runs() -> None:
         "RunningRun",
         "AutoResumingRun",
         "PausedRun",
+        "QualityRejectedRun",
         "RevisionQueued",
         "RevisionRunning",
         "RevisionAutoResuming",
         "RevisionPaused",
+        "RevisionQualityRejected",
         "EndedRun",
         "FailedRun",
         "RevisionEnded",
@@ -79,3 +82,37 @@ def test_openapi_exposes_durable_episode_drafts_for_readable_runs() -> None:
         "type": "array",
         "title": "Episodes",
     }
+
+
+def test_openapi_exposes_quality_rejection_recovery_contract() -> None:
+    openapi = json.loads((ROOT / "contracts/openapi.json").read_text())
+    schemas = openapi["components"]["schemas"]
+    retry = openapi["paths"]["/creations/{creation_id}/runs/{run_kind}/retry-final-review"]["post"]
+
+    assert retry["operationId"] == "retryFinalReview"
+    assert retry["responses"]["202"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/RunControlAccepted"
+    }
+    assert schemas["QualityGateRejection"]["properties"]["stage"] == {
+        "type": "string",
+        "enum": ["accepting_l0", "accepting_l4"],
+        "title": "Stage",
+    }
+    assert schemas["QualityGateRejection"]["properties"]["can_retry"] == {
+        "type": "boolean",
+        "title": "Can Retry",
+    }
+    assert "can_retry" in schemas["QualityGateRejection"]["required"]
+    assert schemas["QualityRejectedRun"]["properties"]["quality_rejection"] == {
+        "$ref": "#/components/schemas/QualityGateRejection"
+    }
+    assert schemas["RevisionQualityRejected"]["properties"]["quality_rejection"] == {
+        "$ref": "#/components/schemas/QualityGateRejection"
+    }
+    resource = schemas["CreationResource"]["properties"]
+    assert resource["initial"]["discriminator"]["mapping"]["quality_rejected"] == (
+        "#/components/schemas/QualityRejectedRun"
+    )
+    assert resource["revision"]["discriminator"]["mapping"]["quality_rejected"] == (
+        "#/components/schemas/RevisionQualityRejected"
+    )

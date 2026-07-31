@@ -643,7 +643,7 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
             provider_profile_key="toolcallingfakemodel",
         )
 
-        with pytest.raises(QualityGateRejectedError, match="Quality gate did not pass"):
+        with pytest.raises(QualityGateRejectedError, match="Quality gate did not pass") as error:
             await workflow.execute(
                 thread_id="failed-gate-thread",
                 story="故事",
@@ -654,6 +654,9 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
                 **_episode_hook_kwargs()[0],
             )
 
+    assert error.value.stage is InternalStage.ACCEPTING_L0
+    assert error.value.evidence == "成品没有通过 L0 闸门。"
+
     assert approved == [
         InternalStage.SELECTING_L0_VARIANT,
         InternalStage.GENERATING_STORY_OUTLINE,
@@ -662,6 +665,86 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
         InternalStage.GENERATING_EPISODE_OUTLINE,
         InternalStage.GENERATING_EPISODE_SCRIPTS,
     ]
+
+
+@pytest.mark.asyncio
+async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    responses[13] = _tool_call(
+        "QualityReviewerResult",
+        {
+            "stage": "accepting_l0",
+            "passed": False,
+            "evidence": "成品没有通过 L0 闸门。",
+            "feedback_handling": [],
+        },
+        13,
+    )
+    approved: dict[InternalStage, dict[str, Any]] = {}
+    first_attempts: list[InternalStage] = []
+
+    async def before_first_stage(stage: InternalStage) -> int:
+        first_attempts.append(stage)
+        return 1
+
+    async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
+        approved[stage] = payload
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+        with pytest.raises(QualityGateRejectedError):
+            await workflow.execute(
+                thread_id="quality-retry-thread",
+                story="故事",
+                requirements="要求",
+                persona_files={"/persona/project.md": "规则"},
+                before_stage=before_first_stage,
+                approve_stage=approve_stage,
+                **_episode_hook_kwargs()[0],
+            )
+
+    resumed_attempts: list[InternalStage] = []
+
+    async def before_resumed_stage(stage: InternalStage) -> int:
+        resumed_attempts.append(stage)
+        return 1
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        resumed_workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=_successful_responses()[12:]),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+        result = await resumed_workflow.execute(
+            thread_id="quality-retry-thread",
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_resumed_stage,
+            approve_stage=approve_stage,
+            approved_checkpoints=approved,
+            **_episode_hook_kwargs()[0],
+        )
+
+    assert first_attempts == [
+        InternalStage.SELECTING_L0_VARIANT,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        InternalStage.ACCEPTING_L0,
+    ]
+    assert resumed_attempts == [InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4]
+    assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
 
 
 @pytest.mark.asyncio
