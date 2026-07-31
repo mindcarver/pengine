@@ -145,7 +145,10 @@ function cacheElements() {
     "failure-label",
     "failure-title",
     "failure-message",
+    "failure-guidance",
     "failure-code",
+    "failure-actions",
+    "start-new-creation",
     "result-workspace",
     "version-tabs",
     "version-initial",
@@ -178,6 +181,7 @@ function bindEvents() {
   elements["revision-form"].addEventListener("submit", handleRevision);
   elements["continue-run"].addEventListener("click", () => void handleRunControl("continue"));
   elements["end-run"].addEventListener("click", () => void handleRunControl("end"));
+  elements["start-new-creation"].addEventListener("click", startNewCreation);
   elements["series-card"].addEventListener("click", focusDelivery);
 
   elements["version-tabs"].addEventListener("click", handleVersionClick);
@@ -565,7 +569,7 @@ function renderCreation() {
   }
 
   if (initial.state === "failed") {
-    showFailure(initial.failure, "初稿生成失败");
+    showFailure(initial.failure, "初稿生成失败", { canStartNewCreation: true });
     return;
   }
 
@@ -654,16 +658,22 @@ function showWaiting(kicker, title, description) {
   elements["wait-description"].textContent = description;
 }
 
-function showFailure(failure, title) {
+function showFailure(failure, title, options = {}) {
   elements["task-waiting"].hidden = true;
   elements["failure-panel"].hidden = false;
   elements["result-workspace"].hidden = true;
   elements["failure-label"].textContent = "任务未完成";
   elements["failure-title"].textContent = title;
   elements["failure-message"].textContent = failure?.message || "本地服务未提供失败说明。";
+  const canStartNewCreation = options.canStartNewCreation === true;
+  elements["failure-guidance"].hidden = !canStartNewCreation;
+  elements["failure-guidance"].textContent = canStartNewCreation
+    ? "本次任务已停止，刷新页面不会自动重试。请重新填写故事并投递新的任务。"
+    : "";
   elements["failure-code"].textContent = failure?.code
     ? `错误代码：${failure.code}`
     : "错误代码：未提供";
+  elements["failure-actions"].hidden = !canStartNewCreation;
 }
 
 function showEnded(title) {
@@ -674,7 +684,26 @@ function showEnded(title) {
   elements["failure-title"].textContent = title;
   elements["failure-message"].textContent =
     "你已结束暂停中的任务；已批准检查点保留，但本次任务不能再次继续。";
+  elements["failure-guidance"].hidden = true;
+  elements["failure-guidance"].textContent = "";
   elements["failure-code"].textContent = "状态：ended";
+  elements["failure-actions"].hidden = true;
+}
+
+function startNewCreation() {
+  stopPolling();
+  clearCurrentCreationId();
+  state.creationId = "";
+  state.creation = null;
+  state.activeVersion = "initial";
+  state.activeArtifact = "story_outline";
+  state.pendingFeedback = "";
+  renderSeries();
+  renderCreation();
+  elements["creation-message"].textContent =
+    "前一次任务未自动恢复。请重新填写故事并投递新的任务。";
+  elements["creation-form"].scrollIntoView({ behavior: "smooth", block: "start" });
+  elements.story.focus({ preventScroll: true });
 }
 
 function renderVersionControls() {
