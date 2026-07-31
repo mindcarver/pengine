@@ -88,27 +88,42 @@
         </aside>
 
         <div class="workbench-main">
-          <nav class="workspace-nav" aria-label="创作工作台">
+          <nav class="workspace-nav flow-nav" aria-label="创作流程">
             <button
-              id="workspace-new-creation"
+              id="flow-select-writer"
               type="button"
-              data-workspace-view="creation"
+              data-workspace-view="selection"
               aria-current="page"
             >
-              <span>01</span>新建创作
+              <span>01</span>选编剧
             </button>
             <button
-              id="workspace-current-work"
+              id="flow-tell-story"
               type="button"
-              data-workspace-view="current"
+              data-workspace-view="brief"
               disabled
             >
-              <span>02</span>当前作品
+              <span>02</span>讲故事
+            </button>
+            <button
+              id="flow-create"
+              type="button"
+              data-workspace-view="progress"
+              disabled
+            >
+              <span>03</span>创作中
+            </button>
+            <button
+              id="flow-read-deliverables"
+              type="button"
+              data-workspace-view="reading"
+              disabled
+            >
+              <span>04</span>读成品
             </button>
           </nav>
 
-          <section class="workspace-view" id="new-creation-view" aria-label="新建创作" tabindex="-1">
-            <div class="editorial-stack">
+          <section class="workspace-view" id="selection-view" aria-label="选择编剧" tabindex="-1">
           <section class="paper-sheet persona-sheet" aria-labelledby="persona-title">
             <div class="paper-index" aria-hidden="true">01</div>
             <div class="section-heading">
@@ -133,7 +148,13 @@
               正在读取人格档案……
             </p>
           </section>
+          </section>
 
+          <section class="workspace-view" id="brief-view" aria-label="讲述故事" tabindex="-1" hidden>
+            <div class="brief-scene-header">
+              <button class="text-button" id="back-to-selection" type="button">← 返回选择编剧</button>
+              <p id="brief-persona" aria-live="polite"></p>
+            </div>
           <section class="paper-sheet brief-sheet" aria-labelledby="brief-title">
             <div class="paper-index" aria-hidden="true">02</div>
             <div class="section-heading">
@@ -187,14 +208,13 @@
               </div>
             </form>
           </section>
-            </div>
           </section>
 
           <section class="workspace-view" id="current-work-view" aria-label="当前作品" tabindex="-1" hidden>
             <div class="current-work-placeholder" id="current-work-placeholder" role="status">
               <p class="eyebrow">CURRENT WORK</p>
-              <h2>这里会放进度与文稿</h2>
-              <p>提交故事后，创作进度、审核结果和已生成文稿会在这里持续更新。</p>
+              <h2>正在读取当前作品</h2>
+              <p>提交后会从本地服务恢复真实的进度、审核结果与成品状态。</p>
             </div>
 
             <section
@@ -203,7 +223,7 @@
               aria-labelledby="delivery-title"
               hidden
             >
-            <div class="paper-index" aria-hidden="true">03</div>
+            <div class="paper-index" id="delivery-index" aria-hidden="true">03</div>
             <div class="section-heading delivery-heading">
               <div>
                 <p class="eyebrow">DELIVERY ROOM</p>
@@ -211,8 +231,9 @@
                 <p id="delivery-subtitle">当前剧集的实际任务状态与交付文稿。</p>
               </div>
               <span class="folio-stamp" id="folio-stamp">卷宗 —</span>
-            </div>
+              </div>
 
+            <div id="progress-scene">
             <section
               class="run-progress"
               id="run-progress"
@@ -303,6 +324,7 @@
                 </button>
               </div>
               <p class="form-message" id="quality-rejection-action-message" aria-live="assertive"></p>
+            </div>
             </div>
 
             <div id="result-workspace" hidden>
