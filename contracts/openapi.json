@@ -3,7 +3,7 @@
   "info": {
     "title": "Pengine Local API",
     "version": "1.0.0",
-    "description": "Local-only API for persona selection, observable asynchronous short-drama creation, timeout recovery, complete result retrieval, and one frozen revision."
+    "description": "Local-only API for persona selection, observable asynchronous short-drama creation, timeout and final-review recovery, complete result retrieval, and one frozen revision."
   },
   "servers": [
     {
@@ -286,9 +286,80 @@
         }
       }
     },
+    "/creations/{creation_id}/runs/{run_kind}/retry-final-review": {
+      "post": {
+        "summary": "Retry a rejected L0 or L4 final review",
+        "description": "Queues the same quality_rejected run unless that gate has exhausted its three-attempt limit. Durable checkpoints and drafts remain unchanged; the worker re-executes only the rejected final-review gate. An identical idempotency key replays its prior accepted response.",
+        "operationId": "retryFinalReview",
+        "parameters": [
+          {
+            "name": "creation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Creation Id"
+            }
+          },
+          {
+            "name": "run_kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "initial",
+                "revision"
+              ],
+              "type": "string",
+              "title": "Run Kind"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Final review queued or an identical accepted retry command replayed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunControlAccepted"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/CreationNotFound"
+          },
+          "409": {
+            "description": "The requested run cannot retry final review",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
     "/creations/{creation_id}/runs/{run_kind}/end": {
       "post": {
-        "summary": "End a paused initial or revision run permanently",
+        "summary": "End a paused or quality-rejected initial or revision run permanently",
         "operationId": "endRun",
         "parameters": [
           {
@@ -677,6 +748,9 @@
                 "$ref": "#/components/schemas/SucceededRun"
               },
               {
+                "$ref": "#/components/schemas/QualityRejectedRun"
+              },
+              {
                 "$ref": "#/components/schemas/FailedRun"
               }
             ],
@@ -688,6 +762,7 @@
                 "ended": "#/components/schemas/EndedRun",
                 "failed": "#/components/schemas/FailedRun",
                 "paused": "#/components/schemas/PausedRun",
+                "quality_rejected": "#/components/schemas/QualityRejectedRun",
                 "queued": "#/components/schemas/QueuedRun",
                 "running": "#/components/schemas/RunningRun",
                 "succeeded": "#/components/schemas/SucceededRun"
@@ -718,6 +793,9 @@
                 "$ref": "#/components/schemas/RevisionEnded"
               },
               {
+                "$ref": "#/components/schemas/RevisionQualityRejected"
+              },
+              {
                 "$ref": "#/components/schemas/RevisionFailed"
               },
               {
@@ -733,6 +811,7 @@
                 "ended": "#/components/schemas/RevisionEnded",
                 "failed": "#/components/schemas/RevisionFailed",
                 "paused": "#/components/schemas/RevisionPaused",
+                "quality_rejected": "#/components/schemas/RevisionQualityRejected",
                 "queued": "#/components/schemas/RevisionQueued",
                 "running": "#/components/schemas/RevisionRunning",
                 "succeeded": "#/components/schemas/RevisionSucceeded",
@@ -1143,6 +1222,82 @@
         ],
         "title": "QueuedRun"
       },
+      "QualityGateRejection": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "quality_gate_rejected",
+            "title": "Code",
+            "default": "quality_gate_rejected"
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "accepting_l0",
+              "accepting_l4"
+            ],
+            "title": "Stage"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          },
+          "attempt_count": {
+            "type": "integer",
+            "maximum": 3.0,
+            "minimum": 1.0,
+            "title": "Attempt Count"
+          },
+          "can_retry": {
+            "type": "boolean",
+            "title": "Can Retry"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "stage",
+          "attempt_count",
+          "can_retry"
+        ],
+        "title": "QualityGateRejection"
+      },
+      "QualityRejectedRun": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "quality_rejected",
+            "title": "State",
+            "default": "quality_rejected"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          },
+          "quality_rejection": {
+            "$ref": "#/components/schemas/QualityGateRejection"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress",
+          "quality_rejection",
+          "drafts"
+        ],
+        "title": "QualityRejectedRun"
+      },
       "RevisionAccepted": {
         "properties": {
           "creation_id": {
@@ -1323,6 +1478,39 @@
           "pause"
         ],
         "title": "RevisionPaused"
+      },
+      "RevisionQualityRejected": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "const": "quality_rejected",
+            "title": "State",
+            "default": "quality_rejected"
+          },
+          "feedback_locked": {
+            "type": "boolean",
+            "const": true,
+            "title": "Feedback Locked",
+            "default": true
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunProgress"
+          },
+          "quality_rejection": {
+            "$ref": "#/components/schemas/QualityGateRejection"
+          },
+          "drafts": {
+            "$ref": "#/components/schemas/RunDraftSnapshot"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "progress",
+          "quality_rejection",
+          "drafts"
+        ],
+        "title": "RevisionQualityRejected"
       },
       "RevisionQueued": {
         "properties": {

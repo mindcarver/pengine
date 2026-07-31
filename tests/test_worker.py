@@ -12,6 +12,7 @@ from persona_factory import create_persona_package
 
 from pengine.agents import EpisodeTimeoutError, QualityGateRejectedError
 from pengine.config import Settings
+from pengine.errors import DomainError
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import (
@@ -278,6 +279,38 @@ class TimeoutAfterFirstEpisodeWorkflow(DeterministicWorkflow):
         )
 
 
+class QualityRejectedThenPassedWorkflow(DeterministicWorkflow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.retry_approved: set[InternalStage] = set()
+        self.retry_stages: list[InternalStage] = []
+
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        self.calls += 1
+        if self.calls == 1:
+            approve_stage = kwargs["approve_stage"]
+
+            async def reject_l0(stage: InternalStage, payload: dict[str, Any]) -> None:
+                if stage is InternalStage.ACCEPTING_L0:
+                    raise QualityGateRejectedError(
+                        stage=stage,
+                        evidence="L0 审核发现核心冲突。",
+                    )
+                await approve_stage(stage, payload)
+
+            return await super().execute(**{**kwargs, "approve_stage": reject_l0})
+
+        self.retry_approved = set(kwargs["approved_checkpoints"] or {})
+        before_stage = kwargs["before_stage"]
+
+        async def capture_retry_stage(stage: InternalStage) -> int:
+            self.retry_stages.append(stage)
+            return await before_stage(stage)
+
+        return await super().execute(**{**kwargs, "before_stage": capture_retry_stage})
+
+
 class RaisingWorkflow:
     def __init__(self, error: Exception) -> None:
         self.error = error
@@ -521,12 +554,16 @@ async def test_ten_episode_run_resumes_without_a_writer_call_for_committed_draft
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("error", "expected_code"),
+    ("error", "expected_code", "expected_state"),
     [
-        (GraphRecursionError("recursion exhausted"), "graph_recursion_limit"),
+        (GraphRecursionError("recursion exhausted"), "graph_recursion_limit", "failed"),
         (
-            QualityGateRejectedError(stage=InternalStage.ACCEPTING_L0),
+            QualityGateRejectedError(
+                stage=InternalStage.ACCEPTING_L0,
+                evidence="L0 与已批准稿件的核心冲突。",
+            ),
             "quality_gate_rejected",
+            "quality_rejected",
         ),
     ],
 )
@@ -534,6 +571,7 @@ async def test_worker_reports_graph_and_quality_failures_separately(
     tmp_path: Path,
     error: Exception,
     expected_code: str,
+    expected_state: str,
 ) -> None:
     settings, catalog, repository, snapshot = await _services(tmp_path)
     accepted = await repository.create_creation(
@@ -556,8 +594,82 @@ async def test_worker_reports_graph_and_quality_failures_separately(
     assert await worker.run_once() is True
     resource = await repository.get_creation(accepted.creation_id)
     assert resource is not None
-    assert resource.initial.state == "failed"
-    assert resource.initial.failure.code == expected_code
+    assert resource.initial.state == expected_state
+    if expected_state == "failed":
+        assert resource.initial.failure.code == expected_code
+    else:
+        assert resource.initial.quality_rejection.code == expected_code
+        assert resource.initial.quality_rejection.evidence == "L0 与已批准稿件的核心冲突。"
+
+
+@pytest.mark.asyncio
+async def test_quality_rejection_retries_only_missing_final_gates_on_the_same_run(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "quality-retry-create",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = QualityRejectedThenPassedWorkflow()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="quality-retry-worker",
+    )
+
+    assert await worker.run_once() is True
+    rejected = await repository.get_creation(accepted.creation_id)
+    assert rejected is not None
+    assert rejected.initial.state == "quality_rejected"
+    assert rejected.initial.quality_rejection.model_dump() == {
+        "code": "quality_gate_rejected",
+        "stage": "accepting_l0",
+        "evidence": "L0 审核发现核心冲突。",
+        "attempt_count": 1,
+        "can_retry": True,
+    }
+    first_retry = await repository.retry_final_review(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="quality-retry-review",
+    )
+    replay_retry = await repository.retry_final_review(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="quality-retry-review",
+    )
+    with pytest.raises(DomainError) as duplicate_retry:
+        await repository.retry_final_review(
+            creation_id=accepted.creation_id,
+            run_kind="initial",
+            idempotency_key="quality-retry-review-again",
+        )
+    assert first_retry == replay_retry
+    assert first_retry.run_state == "queued"
+    assert duplicate_retry.value.code == "run_not_controllable"
+
+    assert await worker.run_once() is True
+    completed = await repository.get_creation(accepted.creation_id)
+    assert completed is not None
+    assert completed.initial.state == "succeeded"
+    assert workflow.retry_approved == {
+        InternalStage.LOADING_PERSONA,
+        InternalStage.SELECTING_L0_VARIANT,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+    }
+    assert workflow.retry_stages == [InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4]
 
 
 @pytest.mark.asyncio

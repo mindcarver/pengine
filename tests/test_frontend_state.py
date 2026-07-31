@@ -230,6 +230,182 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
+def test_quality_rejection_retains_workspace_and_retries_the_final_review() -> None:
+    root = Path(__file__).parents[1]
+    script_path = root / "src" / "pengine" / "web" / "app.js"
+    page = (root / "src" / "pengine" / "web" / "index.html").read_text()
+    assert 'id="quality-rejection-details"' in page
+    assert 'id="retry-final-review"' in page
+    assert 'id="end-quality-rejected-run"' in page
+    assert "重新审核" in page
+
+    assertions = """
+const requests = [];
+Object.assign(elements, {
+  "delivery-section": { hidden: true },
+  "folio-stamp": { textContent: "" },
+  "delivery-subtitle": { textContent: "" },
+  "task-waiting": { hidden: false },
+  "failure-panel": { hidden: true },
+  "result-workspace": { hidden: true },
+  "failure-label": { textContent: "" },
+  "failure-title": { textContent: "" },
+  "failure-message": { textContent: "" },
+  "failure-guidance": { hidden: true, textContent: "" },
+  "quality-rejection-details": { hidden: true },
+  "quality-rejection-stage": { textContent: "" },
+  "quality-rejection-evidence": { textContent: "" },
+  "quality-rejection-attempt": { textContent: "" },
+  "failure-code": { textContent: "" },
+  "failure-actions": { hidden: false },
+  "quality-rejection-actions": { hidden: true },
+  "retry-final-review": { hidden: false, disabled: false },
+  "end-quality-rejected-run": { disabled: false },
+  "quality-rejection-action-message": { textContent: "" },
+});
+renderProgress = () => {};
+renderWorkspace = () => true;
+state.creationId = "creation id";
+state.activeDraftRunKind = "";
+state.creation = {
+  persona: { display_name: "测试人格", version: "1" },
+  initial: {
+    state: "quality_rejected",
+    drafts: {
+      artifacts: [{ stage: "generating_story_outline", content: "保留的故事大纲" }],
+    },
+    quality_rejection: {
+      stage: "accepting_l0",
+      evidence: "人物动机没有落实到行动。",
+      attempt_count: 2,
+      can_retry: true,
+    },
+  },
+  revision: { state: "unavailable" },
+};
+renderCreation();
+if (elements["failure-panel"].hidden) throw new Error("quality rejection stayed hidden");
+if (elements["result-workspace"].hidden) {
+  throw new Error("quality rejection hid retained workspace");
+}
+if (!elements["failure-title"].textContent.includes("L0 创作内核")) {
+  throw new Error("L0 rejection was not identified");
+}
+if (!elements["quality-rejection-evidence"].textContent.includes("人物动机没有落实到行动")) {
+  throw new Error("reviewer evidence was not rendered");
+}
+if (elements["quality-rejection-attempt"].textContent !== "审核尝试：第 2 次") {
+  throw new Error("attempt count was not rendered");
+}
+if (!elements["failure-actions"].hidden) {
+  throw new Error("quality rejection exposed start-new-creation");
+}
+if (elements["quality-rejection-actions"].hidden) {
+  throw new Error("quality rejection hid retry and end actions");
+}
+
+apiRequest = async (path, options) => {
+  requests.push({ path, options });
+  await Promise.resolve();
+  return {};
+};
+refreshCreation = async () => true;
+await Promise.all([
+  handleQualityRejectionControl("retry-final-review"),
+  handleQualityRejectionControl("retry-final-review"),
+]);
+if (requests.length !== 1) throw new Error(`expected one retry POST, received ${requests.length}`);
+if (requests[0].path !== "/creations/creation%20id/runs/initial/retry-final-review") {
+  throw new Error(`wrong retry endpoint: ${requests[0].path}`);
+}
+if (requests[0].options.method !== "POST") throw new Error("retry was not a POST");
+if (
+  !requests[0].options.headers["Idempotency-Key"]?.startsWith(
+    "web-run-initial-retry-final-review-",
+  )
+) {
+  throw new Error("retry omitted its idempotency key");
+}
+
+await handleQualityRejectionControl("end");
+if (requests.length !== 2) throw new Error("quality rejection did not expose an end action");
+if (requests[1].path !== "/creations/creation%20id/runs/initial/end") {
+  throw new Error(`wrong end endpoint: ${requests[1].path}`);
+}
+if (!requests[1].options.headers["Idempotency-Key"]?.startsWith("web-run-initial-end-")) {
+  throw new Error("end omitted its idempotency key");
+}
+
+state.creation = {
+  persona: { display_name: "测试人格", version: "1" },
+  initial: { state: "succeeded" },
+  revision: {
+    state: "quality_rejected",
+    quality_rejection: {
+      stage: "accepting_l4",
+      evidence: null,
+      attempt_count: 3,
+      can_retry: false,
+    },
+  },
+};
+showQualityRejection(qualityRejectedRun(), { showWorkspace: true });
+if (!elements["quality-rejection-stage"].textContent.includes("L4 技法与价值观")) {
+  throw new Error("L4 rejection was not identified");
+}
+if (!elements["quality-rejection-evidence"].textContent.includes("旧版本任务未保存审核证据")) {
+  throw new Error("legacy no-evidence state was not explained");
+}
+if (!elements["retry-final-review"].hidden || !elements["retry-final-review"].disabled) {
+  throw new Error("exhausted quality gate still offered retry");
+}
+if (!elements["failure-guidance"].textContent.includes("三次上限")) {
+  throw new Error("exhausted quality gate did not explain the retry limit");
+}
+
+state.creation = {
+  persona: { display_name: "测试人格", version: "1" },
+  initial: { state: "succeeded" },
+  revision: { state: "unavailable" },
+};
+renderQualityRejectionControls();
+if (
+  !elements["quality-rejection-actions"].hidden ||
+  !elements["retry-final-review"].hidden ||
+  !elements["retry-final-review"].disabled ||
+  !elements["end-quality-rejected-run"].disabled
+) {
+  throw new Error("quality rejection controls remained interactive without a rejected run");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}} }},
+  window: {{ confirm() {{ return true; }} }},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(async () => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_initial_and_revision_share_authoritative_progress_component() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"

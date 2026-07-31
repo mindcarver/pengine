@@ -251,12 +251,26 @@
               <h3 id="failure-title">编辑部返回失败</h3>
               <p id="failure-message"></p>
               <p id="failure-guidance" hidden></p>
+              <div id="quality-rejection-details" hidden>
+                <p id="quality-rejection-stage"></p>
+                <p id="quality-rejection-evidence"></p>
+                <p id="quality-rejection-attempt"></p>
+              </div>
               <code id="failure-code"></code>
               <div class="run-control-actions" id="failure-actions" hidden>
                 <button class="secondary-button" id="start-new-creation" type="button">
                   重新开始创作
                 </button>
               </div>
+              <div class="run-control-actions" id="quality-rejection-actions" hidden>
+                <button class="secondary-button" id="retry-final-review" type="button">
+                  重新审核
+                </button>
+                <button class="end-run-button" id="end-quality-rejected-run" type="button">
+                  结束任务
+                </button>
+              </div>
+              <p class="form-message" id="quality-rejection-action-message" aria-live="assertive"></p>
             </div>
 
             <div id="result-workspace" hidden>

@@ -195,8 +195,10 @@ curl --fail-with-body -X POST \
 ```
 
 轮询同一个 creation 资源。运行状态会依次使用 `queued`、`running`，首次整体
-超时进入 `auto_resuming`；同一阶段第二次超时进入 `paused`。终态为
-`succeeded`、`failed` 或用户主动选择的 `ended`。
+超时进入 `auto_resuming`；同一阶段第二次超时进入 `paused`。成品审核未通过会进入
+`quality_rejected`：已提交的工作区和审核证据会保留，可只重试 L0／L4 审核（每关最多
+三次），不会重跑前面的创作阶段。终态为 `succeeded`、`failed` 或用户主动选择的
+`ended`。
 
 暂停后可用同一套幂等命令继续或结束初稿／修订（把 `initial` 换成 `revision`
 即可操作修订）：
@@ -205,6 +207,10 @@ curl --fail-with-body -X POST \
 curl --fail-with-body -X POST \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/continue \
   -H 'Idempotency-Key: continue-001'
+
+curl --fail-with-body -X POST \
+  http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/retry-final-review \
+  -H 'Idempotency-Key: final-review-001'
 
 curl --fail-with-body -X POST \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/end \
@@ -222,7 +228,8 @@ PENGINE_DATA_DIR/
 进程中断后，使用同一数据目录重启即可。过期租约会重新入队；已批准的业务检查点
 不会重新生成；现有 LangGraph `thread_id` 会继续用于恢复。首次整体墙钟超时
 也会按同一原则自动继续；同一用户阶段再次超时时，SQLite 会冻结时长并等待
-操作员继续或结束。图递归、结构化输出、质量门和 relay 故障不会伪装成可恢复超时。
+操作员继续或结束。成品审核拒绝不是超时：系统会保留审核证据和已批准检查点，等待
+操作员只重试最终审核或结束任务。图递归、结构化输出和 relay 故障不会伪装成可恢复超时。
 
 数据不会自动过期。故事、反馈、生成内容和备份都应按敏感内容保护。
 

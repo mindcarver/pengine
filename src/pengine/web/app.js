@@ -188,9 +188,17 @@ function cacheElements() {
     "failure-title",
     "failure-message",
     "failure-guidance",
+    "quality-rejection-details",
+    "quality-rejection-stage",
+    "quality-rejection-evidence",
+    "quality-rejection-attempt",
     "failure-code",
     "failure-actions",
     "start-new-creation",
+    "quality-rejection-actions",
+    "retry-final-review",
+    "end-quality-rejected-run",
+    "quality-rejection-action-message",
     "result-workspace",
     "version-tabs",
     "version-initial",
@@ -228,6 +236,12 @@ function bindEvents() {
   elements["continue-run"].addEventListener("click", () => void handleRunControl("continue"));
   elements["end-run"].addEventListener("click", () => void handleRunControl("end"));
   elements["start-new-creation"].addEventListener("click", startNewCreation);
+  elements["retry-final-review"].addEventListener("click", () =>
+    void handleQualityRejectionControl("retry-final-review"),
+  );
+  elements["end-quality-rejected-run"].addEventListener("click", () =>
+    void handleQualityRejectionControl("end"),
+  );
   elements["series-card"].addEventListener("click", focusDelivery);
 
   elements["version-tabs"].addEventListener("click", handleVersionClick);
@@ -474,8 +488,9 @@ async function handleRevision(event) {
   }
 }
 
-async function handleRunControl(action) {
-  const runKind = state.progressRunKind;
+async function handleRunControl(action, options = {}) {
+  const runKind = options.runKind || state.progressRunKind;
+  const messageElement = options.messageElement || elements["run-control-message"];
   if (!runKind || state.runControlBusy) {
     return;
   }
@@ -488,8 +503,16 @@ async function handleRunControl(action) {
 
   state.runControlBusy = true;
   renderProgress();
-  elements["run-control-message"].textContent =
-    action === "continue" ? "正在恢复当前阶段……" : "正在结束本次任务……";
+  renderQualityRejectionControls();
+  if (messageElement) {
+    let actionMessage = "正在结束本次任务……";
+    if (action === "continue") {
+      actionMessage = "正在恢复当前阶段……";
+    } else if (action === "retry-final-review") {
+      actionMessage = "正在重新提交成品审核……";
+    }
+    messageElement.textContent = actionMessage;
+  }
   try {
     await apiRequest(
       `/creations/${encodeURIComponent(state.creationId)}/runs/${runKind}/${action}`,
@@ -502,11 +525,25 @@ async function handleRunControl(action) {
     );
     await refreshCreation();
   } catch (error) {
-    elements["run-control-message"].textContent = formatError(error);
+    if (messageElement) {
+      messageElement.textContent = formatError(error);
+    }
   } finally {
     state.runControlBusy = false;
     renderProgress();
+    renderQualityRejectionControls();
   }
+}
+
+async function handleQualityRejectionControl(action) {
+  const rejected = qualityRejectedRun();
+  if (!rejected) {
+    return;
+  }
+  await handleRunControl(action, {
+    runKind: rejected.kind,
+    messageElement: elements["quality-rejection-action-message"],
+  });
 }
 
 async function refreshCreation(options = {}) {
@@ -584,6 +621,13 @@ function renderCreation() {
     state.activeEpisode = null;
   }
   state.activeDraftRunKind = activeDraft?.kind || "";
+
+  const rejected = qualityRejectedRun();
+  if (rejected) {
+    const showWorkspace = renderWorkspace();
+    showQualityRejection(rejected, { showWorkspace });
+    return;
+  }
 
   if (initial.state === "queued") {
     const showWorkspace = renderWorkspace();
@@ -665,6 +709,19 @@ function activeProgressRun() {
   return null;
 }
 
+function qualityRejectedRun() {
+  if (!state.creation) {
+    return null;
+  }
+  if (state.creation.initial.state === "quality_rejected") {
+    return { kind: "initial", run: state.creation.initial };
+  }
+  if (state.creation.revision?.state === "quality_rejected") {
+    return { kind: "revision", run: state.creation.revision };
+  }
+  return null;
+}
+
 function renderProgress() {
   const active = activeProgressRun();
   if (!active) {
@@ -718,6 +775,7 @@ function renderProgress() {
 }
 
 function showWaiting(kicker, title, description, options = {}) {
+  resetQualityRejectionPresentation();
   elements["task-waiting"].hidden = false;
   elements["failure-panel"].hidden = true;
   elements["result-workspace"].hidden = options.showWorkspace !== true;
@@ -727,6 +785,7 @@ function showWaiting(kicker, title, description, options = {}) {
 }
 
 function showFailure(failure, title, options = {}) {
+  resetQualityRejectionPresentation();
   elements["task-waiting"].hidden = true;
   elements["failure-panel"].hidden = false;
   elements["result-workspace"].hidden = options.showWorkspace !== true;
@@ -744,7 +803,90 @@ function showFailure(failure, title, options = {}) {
   elements["failure-actions"].hidden = !canStartNewCreation;
 }
 
+function showQualityRejection(rejected, options = {}) {
+  resetQualityRejectionPresentation();
+  const rejection = rejected.run.quality_rejection || {};
+  const stage = rejection.stage;
+  const stageLabel = qualityReviewStageLabel(stage);
+  const runLabel = rejected.kind === "revision" ? "修订稿" : "初稿";
+  const evidence =
+    typeof rejection.evidence === "string" && rejection.evidence.trim()
+      ? rejection.evidence.trim()
+      : "旧版本任务未保存审核证据；请查看保留工作区后再决定是否重新审核。";
+  const attempt = Number.isInteger(rejection.attempt_count)
+    ? `审核尝试：第 ${rejection.attempt_count} 次`
+    : "审核尝试：服务端未提供次数。";
+  const canRetry = canRetryQualityReview(rejected);
+
+  elements["task-waiting"].hidden = true;
+  elements["failure-panel"].hidden = false;
+  elements["result-workspace"].hidden = options.showWorkspace !== true;
+  elements["failure-label"].textContent = "成品审核未通过";
+  elements["failure-title"].textContent = `${runLabel} ${stageLabel}未通过`;
+  elements["failure-message"].textContent =
+    `${runLabel}在${stageLabel}未通过。已提交的工作区保留在下方，可继续查看。`;
+  elements["failure-guidance"].hidden = false;
+  elements["failure-guidance"].textContent =
+    canRetry
+      ? "请根据审核证据选择重新审核，或明确结束本次任务。"
+      : "该审核关已达到三次上限；工作区仍保留，请结束本次任务并据此处理。";
+  elements["quality-rejection-details"].hidden = false;
+  elements["quality-rejection-stage"].textContent = `审核关卡：${stageLabel}`;
+  elements["quality-rejection-evidence"].textContent = `审核证据：${evidence}`;
+  elements["quality-rejection-attempt"].textContent = attempt;
+  elements["failure-code"].textContent = "状态：quality_rejected";
+  elements["failure-actions"].hidden = true;
+  renderQualityRejectionControls();
+}
+
+function qualityReviewStageLabel(stage) {
+  if (stage === "accepting_l0") {
+    return "L0 创作内核审核";
+  }
+  if (stage === "accepting_l4") {
+    return "L4 技法与价值观审核";
+  }
+  return "成品审核";
+}
+
+function renderQualityRejectionControls() {
+  const actions = elements["quality-rejection-actions"];
+  const retry = elements["retry-final-review"];
+  const end = elements["end-quality-rejected-run"];
+  const message = elements["quality-rejection-action-message"];
+  if (!actions || !retry || !end) {
+    return;
+  }
+
+  const rejected = qualityRejectedRun();
+  const canRetry = rejected !== null && canRetryQualityReview(rejected);
+  actions.hidden = !rejected;
+  retry.hidden = !rejected || !canRetry;
+  retry.disabled = !rejected || state.runControlBusy || !canRetry;
+  end.disabled = !rejected || state.runControlBusy;
+  if (!rejected && message) {
+    message.textContent = "";
+  }
+}
+
+function canRetryQualityReview(rejected) {
+  return rejected?.run?.quality_rejection?.can_retry === true;
+}
+
+function resetQualityRejectionPresentation() {
+  if (elements["quality-rejection-details"]) {
+    elements["quality-rejection-details"].hidden = true;
+  }
+  if (elements["quality-rejection-actions"]) {
+    elements["quality-rejection-actions"].hidden = true;
+  }
+  if (elements["quality-rejection-action-message"]) {
+    elements["quality-rejection-action-message"].textContent = "";
+  }
+}
+
 function showEnded(title, options = {}) {
+  resetQualityRejectionPresentation();
   elements["task-waiting"].hidden = true;
   elements["failure-panel"].hidden = false;
   elements["result-workspace"].hidden = options.showWorkspace !== true;
@@ -1059,6 +1201,11 @@ function renderRevision() {
     buttonLabel = "修订已结束";
     description = "暂停中的修订已由你结束，不能再次继续；初稿仍可浏览。";
     message = "本次修订已结束。";
+  } else if (revision.state === "quality_rejected") {
+    feedbackState = "成品审核未通过";
+    buttonLabel = "审核未通过";
+    description = "修订工作区已保留；请在上方查看审核证据，并选择重新审核或结束任务。";
+    message = "修订稿正在等待你的审核决定。";
   } else if (revision.state === "failed") {
     feedbackState = "修订失败";
     buttonLabel = "修订失败";
@@ -1117,6 +1264,9 @@ function currentSeriesStatus() {
   if (state.creation.initial.state === "failed") {
     return { label: "初稿失败", tone: "failed" };
   }
+  if (state.creation.initial.state === "quality_rejected") {
+    return { label: "初稿审核未通过", tone: "failed" };
+  }
   if (state.creation.initial.state === "ended") {
     return { label: "初稿已结束", tone: "failed" };
   }
@@ -1136,6 +1286,9 @@ function currentSeriesStatus() {
   }
   if (state.creation.revision.state === "failed") {
     return { label: "修订失败", tone: "failed" };
+  }
+  if (state.creation.revision.state === "quality_rejected") {
+    return { label: "修订审核未通过", tone: "failed" };
   }
   if (state.creation.revision.state === "ended") {
     return { label: "修订已结束", tone: "failed" };
@@ -1324,6 +1477,7 @@ function setRevisionBusy(busy) {
       auto_resuming: "自动恢复中",
       paused: "修订已暂停",
       ended: "修订已结束",
+      quality_rejected: "审核未通过",
       failed: "修订失败",
       succeeded: "修订已完成",
     };
