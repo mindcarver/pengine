@@ -159,6 +159,7 @@ async def test_persona_creation_and_query_contract(tmp_path: Path) -> None:
                 "completed_stages": [],
                 "elapsed_seconds": 0,
                 "recovery_state": "none",
+                "recovery_reason": "none",
                 "final_review": {"l0": "pending", "l4": "pending"},
                 "episodes": None,
                 "can_continue": False,
@@ -276,6 +277,63 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
                 resumed_again.run_id,
                 InternalStage.GENERATING_STORY_OUTLINE,
             )
+            == "failed"
+        )
+        exhausted = await client.get(f"/creations/{creation_id}")
+        assert exhausted.json()["initial"]["state"] == "failed"
+        assert exhausted.json()["initial"]["failure"]["code"] == "attempts_exhausted"
+        assert exhausted.json()["initial"]["progress"]["can_continue"] is False
+        assert exhausted.json()["initial"]["progress"]["can_end"] is False
+        cannot_continue = await client.post(
+            f"/creations/{creation_id}/runs/initial/continue",
+            headers={"Idempotency-Key": "control-continue-ended"},
+        )
+        assert cannot_continue.status_code == 409
+        assert cannot_continue.json()["code"] == "run_not_controllable"
+
+
+@pytest.mark.asyncio
+async def test_paused_run_end_command_is_idempotent(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client,
+    ):
+        accepted = await client.post(
+            "/creations",
+            headers={"Idempotency-Key": "end-control-create"},
+            json={
+                "persona_id": "test-persona",
+                "story": "一个人回乡面对旧事。",
+                "requirements": "生成完整短剧。",
+            },
+        )
+        creation_id = accepted.json()["creation_id"]
+        repository = app.state.repository
+        lease = await repository.lease_next_job("end-worker-1", 30)
+        assert lease is not None
+        await repository.record_stage_attempt(lease.run_id, InternalStage.GENERATING_STORY_OUTLINE)
+        assert (
+            await repository.handle_run_timeout(
+                lease.run_id,
+                InternalStage.GENERATING_STORY_OUTLINE,
+            )
+            == "auto_resuming"
+        )
+        resumed = await repository.lease_next_job("end-worker-2", 30)
+        assert resumed is not None
+        await repository.record_stage_attempt(
+            resumed.run_id,
+            InternalStage.GENERATING_STORY_OUTLINE,
+        )
+        assert (
+            await repository.handle_run_timeout(
+                resumed.run_id,
+                InternalStage.GENERATING_STORY_OUTLINE,
+            )
             == "paused"
         )
 
@@ -290,15 +348,8 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
         assert first_end.status_code == 202
         assert replay_end.json() == first_end.json()
         assert first_end.json()["run_state"] == "ended"
-
         ended = await client.get(f"/creations/{creation_id}")
         assert ended.json()["initial"]["state"] == "ended"
-        cannot_continue = await client.post(
-            f"/creations/{creation_id}/runs/initial/continue",
-            headers={"Idempotency-Key": "control-continue-ended"},
-        )
-        assert cannot_continue.status_code == 409
-        assert cannot_continue.json()["code"] == "run_not_controllable"
 
 
 @pytest.mark.asyncio

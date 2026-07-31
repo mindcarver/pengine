@@ -157,6 +157,7 @@ class RunProgress(StrictModel):
     completed_stages: list[UserStage]
     elapsed_seconds: int = Field(ge=0)
     recovery_state: Literal["none", "auto_resuming", "paused"]
+    recovery_reason: Literal["none", "run_timeout", "relay_interruption"]
     final_review: FinalReviewProgress
     episodes: EpisodeProgress | None = None
     can_continue: bool
@@ -199,7 +200,7 @@ class RunDraftSnapshot(StrictModel):
 
 
 class RunPause(StrictModel):
-    code: Literal["run_timeout"] = "run_timeout"
+    code: Literal["run_timeout", "relay_interruption"] = "run_timeout"
     message: NonEmptyText
     stage: UserStage
     timeout_count: int = Field(ge=2)

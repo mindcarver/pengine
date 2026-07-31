@@ -1774,7 +1774,10 @@
         "properties": {
           "code": {
             "type": "string",
-            "const": "run_timeout",
+            "enum": [
+              "run_timeout",
+              "relay_interruption"
+            ],
             "title": "Code",
             "default": "run_timeout"
           },
@@ -1840,6 +1843,15 @@
             ],
             "title": "Recovery State"
           },
+          "recovery_reason": {
+            "type": "string",
+            "enum": [
+              "none",
+              "run_timeout",
+              "relay_interruption"
+            ],
+            "title": "Recovery Reason"
+          },
           "final_review": {
             "$ref": "#/components/schemas/FinalReviewProgress"
           },
@@ -1869,6 +1881,7 @@
           "completed_stages",
           "elapsed_seconds",
           "recovery_state",
+          "recovery_reason",
           "final_review",
           "can_continue",
           "can_end"

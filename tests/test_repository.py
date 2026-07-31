@@ -571,33 +571,15 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
             InternalStage.GENERATING_STORY_OUTLINE,
             now=NOW + timedelta(seconds=70),
         )
-        == "paused"
+        == "failed"
     )
-
-    first_end = await repository.end_run(
-        creation_id=accepted.creation_id,
-        run_kind="initial",
-        idempotency_key="end-paused",
-        now=NOW + timedelta(seconds=71),
-    )
-    replay_end = await repository.end_run(
-        creation_id=accepted.creation_id,
-        run_kind="initial",
-        idempotency_key="end-paused",
-        now=NOW + timedelta(seconds=72),
-    )
-    duplicate_end = await repository.end_run(
-        creation_id=accepted.creation_id,
-        run_kind="initial",
-        idempotency_key="end-paused-again",
-        now=NOW + timedelta(seconds=72),
-    )
-    assert replay_end == first_end == duplicate_end
-    assert first_end.run_state == "ended"
-
-    ended = await repository.get_creation(accepted.creation_id)
-    assert ended is not None
-    assert ended.initial.state == "ended"
+    exhausted = await repository.get_creation(accepted.creation_id)
+    assert exhausted is not None
+    assert exhausted.initial.state == "failed"
+    assert exhausted.initial.failure.code == "attempts_exhausted"
+    assert exhausted.initial.progress.can_continue is False
+    assert exhausted.initial.progress.can_end is False
+    assert exhausted.initial.drafts == running.initial.drafts
     assert await repository.reconcile_startup(now=NOW + timedelta(minutes=5)) == []
     with pytest.raises(DomainError) as cannot_continue:
         await repository.continue_run(
@@ -606,6 +588,79 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
             idempotency_key="continue-ended",
         )
     assert cannot_continue.value.code == "run_not_controllable"
+
+
+async def test_relay_interruption_is_delayed_and_shares_the_stage_recovery_budget(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        now=NOW,
+    )
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        {"selected_l0_variant": "归返", "selection_rationale": "匹配母题"},
+        now=NOW + timedelta(seconds=1),
+    )
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert (
+        await repository.handle_run_relay_interruption(
+            lease.run_id,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            retry_delay_seconds=17,
+            now=NOW + timedelta(seconds=3),
+        )
+        == "auto_resuming"
+    )
+    recovering = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=4))
+    assert recovering is not None
+    assert recovering.initial.state == "auto_resuming"
+    assert recovering.initial.progress.recovery_reason == "relay_interruption"
+    assert recovering.initial.drafts.artifacts[0].selected_l0_variant == "归返"
+
+    restarted = Repository(repository.database_path)
+    await restarted.initialize()
+    after_restart = await restarted.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=5),
+    )
+    assert after_restart == recovering
+    assert await restarted.lease_next_job("too-early", 30, now=NOW + timedelta(seconds=19)) is None
+    resumed = await restarted.lease_next_job("after-delay", 30, now=NOW + timedelta(seconds=20))
+    assert resumed is not None
+    assert resumed.run_id == lease.run_id
+    assert resumed.thread_id == lease.thread_id
+
+    await restarted.record_stage_attempt(
+        resumed.run_id,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        now=NOW + timedelta(seconds=21),
+    )
+    assert (
+        await restarted.handle_run_timeout(
+            resumed.run_id,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            now=NOW + timedelta(seconds=22),
+        )
+        == "paused"
+    )
+    paused = await restarted.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=23))
+    assert paused is not None
+    assert paused.initial.pause.code == "run_timeout"
+    assert paused.initial.pause.timeout_count == 2
+    assert paused.initial.progress.recovery_reason == "run_timeout"
+    assert paused.initial.progress.can_continue is True
+    assert paused.initial.progress.can_end is True
 
 
 @pytest.mark.asyncio
@@ -824,6 +879,7 @@ async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_draf
             ALTER TABLE run_progress_v3 RENAME TO run_progress;
             DROP TABLE quality_gate_rejections;
             DELETE FROM pengine_schema WHERE version = 4;
+            DELETE FROM pengine_schema WHERE version = 5;
             """
         )
         await connection.execute(
@@ -1114,9 +1170,10 @@ async def test_episode_timeout_recovers_first_unfinished_and_ended_run_keeps_dra
     await repository.record_episode_attempt(lease.run_id, 2, now=NOW + timedelta(seconds=2))
 
     assert (
-        await repository.handle_episode_timeout(
+        await repository.handle_episode_relay_interruption(
             lease.run_id,
             2,
+            retry_delay_seconds=10,
             now=NOW + timedelta(seconds=3),
         )
         == "auto_resuming"
@@ -1124,24 +1181,25 @@ async def test_episode_timeout_recovers_first_unfinished_and_ended_run_keeps_dra
     recovering = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=3))
     assert recovering is not None
     assert recovering.initial.state == "auto_resuming"
+    assert recovering.initial.progress.recovery_reason == "relay_interruption"
     assert recovering.initial.progress.episodes.model_dump() == {
         "total": 2,
         "completed": 1,
         "current": 2,
     }
     assert recovering.initial.drafts.episodes == [first]
-    recovery = (await repository.reconcile_startup(now=NOW + timedelta(seconds=4)))[0]
+    recovery = (await repository.reconcile_startup(now=NOW + timedelta(seconds=13)))[0]
     assert recovery.run_id == lease.run_id
     assert recovery.episode_drafts == [first]
 
-    resumed = await repository.lease_next_job("worker-2", 30, now=NOW + timedelta(seconds=4))
+    resumed = await repository.lease_next_job("worker-2", 30, now=NOW + timedelta(seconds=13))
     assert resumed is not None
     assert resumed.run_id == lease.run_id
     assert (
         await repository.record_episode_attempt(
             resumed.run_id,
             2,
-            now=NOW + timedelta(seconds=5),
+            now=NOW + timedelta(seconds=14),
         )
         == 2
     )
@@ -1149,24 +1207,25 @@ async def test_episode_timeout_recovers_first_unfinished_and_ended_run_keeps_dra
         await repository.handle_episode_timeout(
             resumed.run_id,
             2,
-            now=NOW + timedelta(seconds=6),
+            now=NOW + timedelta(seconds=15),
         )
         == "paused"
     )
 
-    paused = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=6))
+    paused = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=15))
     assert paused is not None
     assert paused.initial.state == "paused"
     assert paused.initial.pause.episode_number == 2
     assert paused.initial.pause.timeout_count == 2
+    assert paused.initial.pause.code == "run_timeout"
     assert paused.initial.drafts.episodes == [first]
     await repository.end_run(
         creation_id=accepted.creation_id,
         run_kind="initial",
         idempotency_key="end-episode-timeout",
-        now=NOW + timedelta(seconds=7),
+        now=NOW + timedelta(seconds=16),
     )
-    ended = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=7))
+    ended = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=16))
     assert ended is not None
     assert ended.initial.state == "ended"
     assert ended.initial.drafts.episodes == [first]
@@ -1221,6 +1280,7 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 2")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 3")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 4")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.execute("DROP TABLE episode_timeouts")
         await connection.execute("DROP TABLE episode_attempts")
@@ -1260,6 +1320,7 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         await connection.execute("ALTER TABLE run_progress DROP COLUMN current_episode")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 3")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 4")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.commit()
 
@@ -1278,3 +1339,53 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         ).fetchall()
     assert version[0] == SCHEMA_VERSION
     assert "current_episode" in {row["name"] for row in current_episode}
+
+
+async def test_schema_v4_recovery_rows_gain_the_timeout_reason_without_losing_drafts(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        now=NOW,
+    )
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        {"selected_l0_variant": "归返", "selection_rationale": "匹配母题"},
+        now=NOW + timedelta(seconds=1),
+    )
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert (
+        await repository.handle_run_timeout(
+            lease.run_id,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            now=NOW + timedelta(seconds=3),
+        )
+        == "auto_resuming"
+    )
+    before_migration = await repository.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert before_migration is not None
+
+    async with repository._connection() as connection:
+        await connection.execute("ALTER TABLE run_progress DROP COLUMN recovery_reason")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
+        await connection.commit()
+
+    await repository.initialize()
+    await repository.initialize()
+    migrated = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=5))
+    assert migrated is not None
+    assert migrated.initial.state == "auto_resuming"
+    assert migrated.initial.progress.recovery_reason == "run_timeout"
+    assert migrated.initial.drafts == before_migration.initial.drafts

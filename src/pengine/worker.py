@@ -21,7 +21,12 @@ from pengine.agents import (
 from pengine.config import Settings
 from pengine.errors import DomainError
 from pengine.personas import PersonaCatalog, PersonaPackageError
-from pengine.relay import RelayError, build_chat_model, classify_relay_exception
+from pengine.relay import (
+    RelayError,
+    build_chat_model,
+    classify_relay_exception,
+    retryable_relay_interruption,
+)
 from pengine.repository import LeasedJob, Repository, RunWorkItem
 from pengine.schemas import (
     Delivery,
@@ -402,6 +407,24 @@ class Worker:
             )
         except Exception as exc:
             failure_stage = self._failure_stage(exc, current_stage, approved)
+            interruption = retryable_relay_interruption(exc)
+            if interruption is not None:
+                recovery_state, episode_number = await self._recover_relay_interruption(
+                    work,
+                    failure_stage,
+                    interruption.retry_delay_seconds,
+                )
+                logger.warning(
+                    "relay interruption recovered run_id=%s creation_id=%s stage=%s episode=%s "
+                    "state=%s retry_delay_seconds=%s",
+                    work.run_id,
+                    work.creation_id,
+                    failure_stage.value,
+                    episode_number,
+                    recovery_state,
+                    interruption.retry_delay_seconds,
+                )
+                return
             failure = await self._safe_failure(work.run_id, failure_stage, exc)
             await self.repository.fail_run(work.run_id, failure)
             logger.warning(
@@ -411,6 +434,33 @@ class Worker:
                 failure.failed_stage.value,
                 failure.code,
             )
+
+    async def _recover_relay_interruption(
+        self,
+        work: RunWorkItem,
+        stage: InternalStage,
+        retry_delay_seconds: int,
+    ) -> tuple[str, int | None]:
+        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+            refreshed = await self.repository.get_run_work_item(work.run_id)
+            episode_number = len(refreshed.episode_drafts) + 1
+            if episode_number <= len(refreshed.episode_plans):
+                return (
+                    await self.repository.handle_episode_relay_interruption(
+                        work.run_id,
+                        episode_number,
+                        retry_delay_seconds=retry_delay_seconds,
+                    ),
+                    episode_number,
+                )
+        return (
+            await self.repository.handle_run_relay_interruption(
+                work.run_id,
+                stage,
+                retry_delay_seconds=retry_delay_seconds,
+            ),
+            None,
+        )
 
     def _persona_files(self, work: RunWorkItem) -> dict[str, str]:
         files: dict[str, str] = {}

@@ -240,7 +240,7 @@ immutable snapshots already referenced by creations.
    feedback conversation.
 4. A successful revision commits a new complete delivery and permanently closes
    revision.
-5. Revision progress and timeout control use the same persisted contract and
+5. Revision progress and interruption control use the same persisted contract and
    workbench component as the initial run; the successful initial delivery
    remains visible throughout.
 
@@ -260,14 +260,21 @@ immutable snapshots already referenced by creations.
   never cause the worker to treat unverified agent state as approved output.
 - Exhausting three attempts for a stage fails that run with a stable stage and
   error identifier.
-- The first worker wall-clock timeout in a user stage parks the active clock,
-  requeues the same run and `thread_id`, and automatically resumes from approved
-  business checkpoints. The unapproved in-flight stage is invoked again.
-- A second wall-clock timeout in the same user stage parks the job in `paused`.
-  Idempotent operator commands may requeue that same run or mark it `ended`.
-  Graph recursion exhaustion, invalid structured output, quality-gate
-  rejection, and relay/provider failures remain terminal and are never routed
-  through timeout recovery.
+- The first worker wall-clock timeout or approved temporary relay interruption
+  in a user stage parks the active clock, requeues the same run and `thread_id`,
+  and automatically resumes from approved business checkpoints. Relay recovery
+  waits at least 10 seconds (or a longer relay `Retry-After`) before the
+  unapproved in-flight stage is invoked again.
+- A second shared timeout or retryable relay interruption in the same user
+  stage or first unfinished episode parks the job in `paused`. Idempotent
+  operator commands may requeue that same run or mark it `ended`.
+  Configuration errors detectable before a request, certificate verification,
+  authentication, parameter/protocol incompatibility, graph recursion
+  exhaustion, invalid structured output, quality-gate rejection, missing
+  checkpoints, and unknown failures remain terminal. A syntactically valid
+  relay address that then has a DNS or connection failure is indistinguishable
+  from a transient transport failure, so it follows the bounded recovery path
+  and becomes terminal when the three-call limit is exhausted.
 - A paused or ended job is excluded from lease-expiry reconciliation. Refresh
   reconstructs its stage, completed checkpoints, frozen elapsed time, and
   available actions from SQLite.
@@ -392,8 +399,9 @@ duplicate the full field contract.
 - Agent code has no tool that writes the persona source root, snapshots, or
   business tables. Structured stage output crosses back through the creation
   service for validation and persistence.
-- Relay and parsing failures map to stable safe errors; vendor bodies, database
-  messages, and stack traces do not cross the API boundary.
+- Relay and parsing failures map to stable safe errors; only approved temporary
+  relay interruptions enter recovery. Vendor bodies, database messages, and
+  stack traces do not cross the API boundary.
 
 ## Reliability and operations
 
@@ -401,8 +409,8 @@ duplicate the full field contract.
   installed. The worker is the sole owner of the three-attempt budget.
 - A finite LangGraph recursion limit and a worker-enforced wall-clock deadline
   bound each run attempt. Graph recursion exhaustion fails with its own stable
-  error. A wall-clock timeout follows the one-auto-resume/then-pause policy and
-  never starts an unrecorded model call.
+  error. A wall-clock timeout and an approved relay interruption share the
+  one-auto-resume/then-pause policy and never start an unrecorded model call.
 - Provider-specific prompt caching and beta-only Anthropic features remain
   disabled until the configured relay smoke test proves compatibility.
 - Each POST command requires an `Idempotency-Key`.
@@ -418,7 +426,8 @@ duplicate the full field contract.
   queue semantics deterministic.
 - There is no ordinary-running cancellation, priority, SSE/WebSocket streaming,
   token streaming, partial result, percentage, ETA, or budget display in V1.
-  Manual continue/end is available only after the second timeout pauses a run.
+  Manual continue/end is available only after the second shared interruption
+  pauses a run.
 
 ## Compatibility, migration, and rollback
 
@@ -506,8 +515,11 @@ quality.
   workbench progress component.
 - Checkpoint recovery resumes the existing Deep Agents thread while approved
   business checkpoints remain authoritative.
-- Wall-clock timeout recovery is distinct from recursion, structured-output,
-  quality-gate, and relay/provider failure handling.
+- Wall-clock timeout and approved temporary relay interruption share durable
+  recovery; recursion, structured-output, quality-gate, request-preflight
+  configuration, certificate verification, authentication, protocol, and
+  unknown failures remain terminal. A syntactically valid relay address with a
+  DNS or connection failure follows the bounded temporary-transport path.
 - `ContentPackage` and `DeliveryReport` are separate contract objects.
 
 ### Open items
