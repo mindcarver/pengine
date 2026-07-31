@@ -56,9 +56,13 @@ from pengine.schemas import (
     UserStage,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
+_MIN_RELAY_RETRY_DELAY_SECONDS = 10
+
+RecoveryReason = Literal["run_timeout", "relay_interruption"]
+RecoveryState = Literal["auto_resuming", "paused", "failed"]
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS pengine_schema (
@@ -372,6 +376,17 @@ WHERE run_id IN (
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (4);
 """
 
+_SCHEMA_V5_SQL = """
+ALTER TABLE run_progress ADD COLUMN recovery_reason TEXT NOT NULL DEFAULT 'none'
+    CHECK (recovery_reason IN ('none', 'run_timeout', 'relay_interruption'));
+
+UPDATE run_progress
+SET recovery_reason = 'run_timeout'
+WHERE execution_state IN ('auto_resuming', 'paused');
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (5);
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -570,7 +585,7 @@ class Repository:
             if row is None:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
             schema_version = int(row[0])
-            if schema_version not in {1, 2, 3, SCHEMA_VERSION}:
+            if schema_version not in {1, 2, 3, 4, SCHEMA_VERSION}:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
             if schema_version == 1:
                 await connection.executescript(_SCHEMA_V2_SQL)
@@ -582,6 +597,10 @@ class Repository:
                 schema_version = 3
             if schema_version == 3:
                 await connection.executescript(_SCHEMA_V4_SQL)
+                await connection.commit()
+                schema_version = 4
+            if schema_version == 4:
+                await connection.executescript(_SCHEMA_V5_SQL)
                 await connection.commit()
 
     async def setup(self) -> None:
@@ -932,6 +951,7 @@ class Repository:
                 UPDATE run_progress
                 SET execution_state = 'running',
                     active_started_at = COALESCE(active_started_at, ?),
+                    recovery_reason = 'none',
                     updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -973,6 +993,7 @@ class Repository:
                     UPDATE run_progress
                     SET execution_state = 'running',
                         active_started_at = COALESCE(active_started_at, ?),
+                        recovery_reason = 'none',
                         updated_at = ?
                     WHERE run_id = ?
                       AND execution_state IN ('queued', 'running', 'auto_resuming')
@@ -997,6 +1018,7 @@ class Repository:
                 UPDATE run_progress
                 SET execution_state = 'running',
                     active_started_at = COALESCE(active_started_at, ?),
+                    recovery_reason = 'none',
                     updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -1136,6 +1158,7 @@ class Repository:
                 SET current_stage = ?,
                     current_episode = ?,
                     execution_state = 'running',
+                    recovery_reason = 'none',
                     updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -1242,6 +1265,7 @@ class Repository:
                     current_episode = ?,
                     timeout_stage = NULL,
                     timeout_count = 0,
+                    recovery_reason = 'none',
                     updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -1269,7 +1293,41 @@ class Repository:
         episode_number: int,
         *,
         now: datetime | None = None,
-    ) -> Literal["auto_resuming", "paused"]:
+    ) -> RecoveryState:
+        return await self.handle_episode_interruption(
+            run_id,
+            episode_number,
+            recovery_reason="run_timeout",
+            now=now,
+        )
+
+    async def handle_episode_relay_interruption(
+        self,
+        run_id: UUID,
+        episode_number: int,
+        *,
+        retry_delay_seconds: int,
+        now: datetime | None = None,
+    ) -> RecoveryState:
+        return await self.handle_episode_interruption(
+            run_id,
+            episode_number,
+            recovery_reason="relay_interruption",
+            retry_delay_seconds=retry_delay_seconds,
+            now=now,
+        )
+
+    async def handle_episode_interruption(
+        self,
+        run_id: UUID,
+        episode_number: int,
+        *,
+        recovery_reason: RecoveryReason,
+        retry_delay_seconds: int = 0,
+        now: datetime | None = None,
+    ) -> RecoveryState:
+        if retry_delay_seconds < 0:
+            raise ValueError("Retry delay cannot be negative")
         current = now or _utc_now()
         timestamp = _timestamp(current)
         async with self._transaction() as connection:
@@ -1317,7 +1375,7 @@ class Repository:
             if episode_number != first_unfinished:
                 raise DomainError(
                     "episode_out_of_order",
-                    "Only the first unfinished episode can time out.",
+                    "Only the first unfinished episode can recover.",
                     409,
                 )
             timeout = await self._fetchone(
@@ -1329,7 +1387,25 @@ class Repository:
                 (str(run_id), episode_number),
             )
             timeout_count = (int(timeout["timeout_count"]) if timeout is not None else 0) + 1
-            next_state = "auto_resuming" if timeout_count == 1 else "paused"
+            attempt = await self._fetchone(
+                connection,
+                """
+                SELECT COUNT(*) AS attempt_count
+                FROM episode_attempts
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (str(run_id), episode_number),
+            )
+            if attempt is None:
+                raise RuntimeError("Episode attempt count is unavailable")
+            attempt_count = int(attempt["attempt_count"])
+            next_state: RecoveryState = (
+                "failed"
+                if attempt_count >= MAX_EPISODE_ATTEMPTS
+                else "auto_resuming"
+                if timeout_count == 1
+                else "paused"
+            )
             await connection.execute(
                 """
                 INSERT INTO episode_timeouts(run_id, episode_number, timeout_count, updated_at)
@@ -1341,6 +1417,18 @@ class Repository:
                 (str(run_id), episode_number, timeout_count, timestamp),
             )
             elapsed_seconds = self._elapsed_seconds(progress, current)
+            if next_state == "failed":
+                await self._mark_attempts_exhausted(
+                    connection,
+                    run_id=run_id,
+                    creation_id=progress["creation_id"],
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    attempt_count=attempt_count,
+                    elapsed_seconds=elapsed_seconds,
+                    timestamp=timestamp,
+                    episode=True,
+                )
+                return next_state
             await connection.execute(
                 """
                 UPDATE run_progress
@@ -1351,6 +1439,7 @@ class Repository:
                     active_started_at = NULL,
                     timeout_stage = ?,
                     timeout_count = ?,
+                    recovery_reason = ?,
                     updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -1361,6 +1450,7 @@ class Repository:
                     elapsed_seconds,
                     UserStage.GENERATING_EPISODE_SCRIPTS.value,
                     timeout_count,
+                    recovery_reason,
                     timestamp,
                     str(run_id),
                 ),
@@ -1377,7 +1467,11 @@ class Repository:
                 """,
                 (
                     "queued" if next_state == "auto_resuming" else "failed",
-                    timestamp,
+                    self._interruption_available_at(
+                        current,
+                        recovery_reason,
+                        retry_delay_seconds,
+                    ),
                     timestamp,
                     str(run_id),
                 ),
@@ -1490,7 +1584,10 @@ class Repository:
             await connection.execute(
                 """
                 UPDATE run_progress
-                SET current_stage = ?, execution_state = 'running', updated_at = ?
+                SET current_stage = ?,
+                    execution_state = 'running',
+                    recovery_reason = 'none',
+                    updated_at = ?
                 WHERE run_id = ?
                 """,
                 (stage.value, timestamp, str(run_id)),
@@ -1670,7 +1767,41 @@ class Repository:
         stage: InternalStage,
         *,
         now: datetime | None = None,
-    ) -> Literal["auto_resuming", "paused"]:
+    ) -> RecoveryState:
+        return await self.handle_run_interruption(
+            run_id,
+            stage,
+            recovery_reason="run_timeout",
+            now=now,
+        )
+
+    async def handle_run_relay_interruption(
+        self,
+        run_id: UUID,
+        stage: InternalStage,
+        *,
+        retry_delay_seconds: int,
+        now: datetime | None = None,
+    ) -> RecoveryState:
+        return await self.handle_run_interruption(
+            run_id,
+            stage,
+            recovery_reason="relay_interruption",
+            retry_delay_seconds=retry_delay_seconds,
+            now=now,
+        )
+
+    async def handle_run_interruption(
+        self,
+        run_id: UUID,
+        stage: InternalStage,
+        *,
+        recovery_reason: RecoveryReason,
+        retry_delay_seconds: int = 0,
+        now: datetime | None = None,
+    ) -> RecoveryState:
+        if retry_delay_seconds < 0:
+            raise ValueError("Retry delay cannot be negative")
         current = now or _utc_now()
         timestamp = _timestamp(current)
         user_stage = _USER_STAGE_BY_INTERNAL[stage]
@@ -1700,8 +1831,37 @@ class Repository:
                 if progress["timeout_stage"] == user_stage.value
                 else 1
             )
-            next_state = "auto_resuming" if timeout_count == 1 else "paused"
+            attempt = await self._fetchone(
+                connection,
+                """
+                SELECT COUNT(*) AS attempt_count
+                FROM stage_attempts
+                WHERE run_id = ? AND stage = ?
+                """,
+                (str(run_id), stage.value),
+            )
+            if attempt is None:
+                raise RuntimeError("Stage attempt count is unavailable")
+            attempt_count = int(attempt["attempt_count"])
+            next_state: RecoveryState = (
+                "failed"
+                if attempt_count >= MAX_STAGE_ATTEMPTS
+                else "auto_resuming"
+                if timeout_count == 1
+                else "paused"
+            )
             elapsed_seconds = self._elapsed_seconds(progress, current)
+            if next_state == "failed":
+                await self._mark_attempts_exhausted(
+                    connection,
+                    run_id=run_id,
+                    creation_id=progress["creation_id"],
+                    stage=stage,
+                    attempt_count=attempt_count,
+                    elapsed_seconds=elapsed_seconds,
+                    timestamp=timestamp,
+                )
+                return next_state
             await connection.execute(
                 """
                 UPDATE run_progress
@@ -1711,6 +1871,7 @@ class Repository:
                     active_started_at = NULL,
                     timeout_stage = ?,
                     timeout_count = ?,
+                    recovery_reason = ?,
                     updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -1720,6 +1881,7 @@ class Repository:
                     elapsed_seconds,
                     user_stage.value,
                     timeout_count,
+                    recovery_reason,
                     timestamp,
                     str(run_id),
                 ),
@@ -1736,7 +1898,11 @@ class Repository:
                 """,
                 (
                     "queued" if next_state == "auto_resuming" else "failed",
-                    timestamp,
+                    self._interruption_available_at(
+                        current,
+                        recovery_reason,
+                        retry_delay_seconds,
+                    ),
                     timestamp,
                     str(run_id),
                 ),
@@ -1974,10 +2140,23 @@ class Repository:
             run = await self._fetch_control_run(connection, creation_id, run_kind)
             state = run["execution_state"]
             if state == "paused":
+                if not await self._has_remaining_attempts(
+                    connection,
+                    run_id=run["id"],
+                    current_stage=run["current_stage"],
+                    current_episode=run["current_episode"],
+                ):
+                    raise DomainError(
+                        "run_not_controllable",
+                        "The stage attempt limit has been exhausted.",
+                        409,
+                    )
                 await connection.execute(
                     """
                     UPDATE run_progress
-                    SET execution_state = 'queued', updated_at = ?
+                    SET execution_state = 'queued',
+                        recovery_reason = 'none',
+                        updated_at = ?
                     WHERE run_id = ?
                     """,
                     (timestamp, run["id"]),
@@ -2106,7 +2285,9 @@ class Repository:
                 await connection.execute(
                     """
                     UPDATE run_progress
-                    SET execution_state = 'ended', updated_at = ?
+                    SET execution_state = 'ended',
+                        recovery_reason = 'none',
+                        updated_at = ?
                     WHERE run_id = ?
                     """,
                     (timestamp, run["id"]),
@@ -2277,6 +2458,7 @@ class Repository:
                 SET execution_state = 'succeeded',
                     elapsed_seconds = ?,
                     active_started_at = NULL,
+                    recovery_reason = 'none',
                     updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -2374,6 +2556,7 @@ class Repository:
                     execution_state = 'failed',
                     elapsed_seconds = ?,
                     active_started_at = NULL,
+                    recovery_reason = 'none',
                     updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -2788,6 +2971,11 @@ class Repository:
             recovery_state=(
                 execution_state if execution_state in {"auto_resuming", "paused"} else "none"
             ),
+            recovery_reason=(
+                progress["recovery_reason"]
+                if execution_state in {"auto_resuming", "paused"}
+                else "none"
+            ),
             final_review=FinalReviewProgress(
                 l0=self._gate_progress(
                     InternalStage.ACCEPTING_L0,
@@ -2803,7 +2991,15 @@ class Repository:
                 ),
             ),
             episodes=episodes,
-            can_continue=execution_state == "paused",
+            can_continue=(
+                execution_state == "paused"
+                and await self._has_remaining_attempts(
+                    connection,
+                    run_id=progress["run_id"],
+                    current_stage=progress["current_stage"],
+                    current_episode=progress["current_episode"],
+                )
+            ),
             can_end=execution_state == "paused",
         )
 
@@ -2930,12 +3126,22 @@ class Repository:
         if timeout_stage is None:
             raise RuntimeError("Paused workflow run is missing its timeout stage")
         stage = UserStage(timeout_stage)
+        recovery_reason = progress["recovery_reason"]
+        if recovery_reason not in {"run_timeout", "relay_interruption"}:
+            raise RuntimeError("Paused workflow run is missing its recovery reason")
         return RunPause(
             message=(
-                "The episode exceeded its generation limit twice."
+                "The relay or network connection was interrupted twice "
+                "while generating this episode."
+                if recovery_reason == "relay_interruption"
+                and stage is UserStage.GENERATING_EPISODE_SCRIPTS
+                else "The relay or network connection was interrupted twice in this stage."
+                if recovery_reason == "relay_interruption"
+                else "The episode exceeded its generation limit twice."
                 if stage is UserStage.GENERATING_EPISODE_SCRIPTS
                 else "The workflow exceeded its wall-clock limit twice in this stage."
             ),
+            code=recovery_reason,
             stage=stage,
             timeout_count=int(progress["timeout_count"]),
             episode_number=(
@@ -2945,6 +3151,118 @@ class Repository:
                 else None
             ),
         )
+
+    @staticmethod
+    def _interruption_available_at(
+        current: datetime,
+        recovery_reason: RecoveryReason,
+        retry_delay_seconds: int,
+    ) -> str:
+        delay_seconds = (
+            max(_MIN_RELAY_RETRY_DELAY_SECONDS, retry_delay_seconds)
+            if recovery_reason == "relay_interruption"
+            else retry_delay_seconds
+        )
+        return _timestamp(current + timedelta(seconds=delay_seconds))
+
+    @staticmethod
+    async def _mark_attempts_exhausted(
+        connection: aiosqlite.Connection,
+        *,
+        run_id: UUID,
+        creation_id: str,
+        stage: InternalStage,
+        attempt_count: int,
+        elapsed_seconds: float,
+        timestamp: str,
+        episode: bool = False,
+    ) -> None:
+        message = (
+            "The episode attempt limit has been exhausted."
+            if episode
+            else "The stage attempt limit has been exhausted."
+        )
+        await connection.execute(
+            """
+            UPDATE runs
+            SET state = 'failed',
+                failure_code = 'attempts_exhausted',
+                failure_message = ?,
+                failed_stage = ?,
+                failure_attempt_count = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE id = ? AND state = 'running'
+            """,
+            (
+                message,
+                stage.value,
+                max(
+                    1,
+                    min(
+                        MAX_EPISODE_ATTEMPTS if episode else MAX_STAGE_ATTEMPTS,
+                        attempt_count,
+                    ),
+                ),
+                timestamp,
+                timestamp,
+                str(run_id),
+            ),
+        )
+        await connection.execute(
+            """
+            UPDATE run_progress
+            SET current_stage = ?,
+                execution_state = 'failed',
+                elapsed_seconds = ?,
+                active_started_at = NULL,
+                recovery_reason = 'none',
+                updated_at = ?
+            WHERE run_id = ?
+            """,
+            (stage.value, elapsed_seconds, timestamp, str(run_id)),
+        )
+        await connection.execute(
+            """
+            UPDATE jobs
+            SET state = 'failed',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?
+            WHERE run_id = ?
+            """,
+            (timestamp, str(run_id)),
+        )
+        await connection.execute(
+            "UPDATE creations SET updated_at = ? WHERE id = ?",
+            (timestamp, creation_id),
+        )
+
+    @staticmethod
+    async def _has_remaining_attempts(
+        connection: aiosqlite.Connection,
+        *,
+        run_id: str,
+        current_stage: str,
+        current_episode: int | None,
+    ) -> bool:
+        stage = InternalStage(current_stage)
+        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS and current_episode is not None:
+            cursor = await connection.execute(
+                """
+                SELECT COUNT(*) FROM episode_attempts
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (run_id, current_episode),
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) < MAX_EPISODE_ATTEMPTS
+        cursor = await connection.execute(
+            "SELECT COUNT(*) FROM stage_attempts WHERE run_id = ? AND stage = ?",
+            (run_id, stage.value),
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) < MAX_STAGE_ATTEMPTS
 
     @staticmethod
     def _elapsed_seconds(progress: aiosqlite.Row, now: datetime) -> float:

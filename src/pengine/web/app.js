@@ -176,6 +176,8 @@ function cacheElements() {
     "review-l0",
     "review-l4",
     "run-controls",
+    "run-control-title",
+    "run-control-description",
     "continue-run",
     "end-run",
     "run-control-message",
@@ -653,10 +655,13 @@ function renderCreation() {
 
   if (initial.state === "auto_resuming") {
     const showWorkspace = renderWorkspace();
+    const relayInterrupted = initial.progress.recovery_reason === "relay_interruption";
     showWaiting(
-      "首次超时 · 自动恢复",
-      "正在从已批准检查点继续",
-      "已完成阶段不会重新生成；已提交草稿仍可查看，当前未批准阶段将重新执行。",
+      relayInterrupted ? "网络 / Relay 暂时中断 · 自动恢复" : "首次超时 · 自动恢复",
+      relayInterrupted ? "正在等待后从已批准检查点继续" : "正在从已批准检查点继续",
+      relayInterrupted
+        ? "当前阶段、已运行时长和已提交草稿均已保留；未批准阶段将在短暂等待后重新执行。"
+        : "已完成阶段不会重新生成；已提交草稿仍可查看，当前未批准阶段将重新执行。",
       { showWorkspace },
     );
     return;
@@ -664,10 +669,11 @@ function renderCreation() {
 
   if (initial.state === "paused") {
     const showWorkspace = renderWorkspace();
+    const relayInterrupted = initial.progress.recovery_reason === "relay_interruption";
     showWaiting(
       "任务已暂停",
-      "当前阶段再次超过整体运行时限",
-      "请在上方选择继续当前阶段，或结束本次任务；已提交草稿仍可查看。",
+      relayInterrupted ? "当前阶段再次发生网络 / Relay 中断" : "当前阶段再次超过整体运行时限",
+      "请在上方选择继续当前阶段，或结束本次任务；当前阶段、时长和已提交草稿仍可查看。",
       { showWorkspace },
     );
     return;
@@ -765,10 +771,19 @@ function renderProgress() {
   elements["review-l4"].textContent =
     `L4 技法与价值观 · ${REVIEW_STATUS_LABELS[progress.final_review.l4]}`;
 
-  const controllable = progress.can_continue && progress.can_end;
+  const controllable = progress.can_continue || progress.can_end;
   elements["run-controls"].hidden = !controllable;
-  elements["continue-run"].disabled = state.runControlBusy;
-  elements["end-run"].disabled = state.runControlBusy;
+  const relayInterrupted = progress.recovery_reason === "relay_interruption";
+  elements["run-control-title"].textContent = relayInterrupted
+    ? "本阶段已两次发生网络 / Relay 中断"
+    : "本阶段已两次超过整体运行时限";
+  elements["run-control-description"].textContent = relayInterrupted
+    ? "可从当前未批准阶段继续；已完成阶段、时长和已提交草稿不会重新生成或丢失，也可以结束本次任务。"
+    : "可从当前未批准阶段继续，已完成阶段不会重新生成；也可以结束本次任务。";
+  elements["continue-run"].hidden = !progress.can_continue;
+  elements["continue-run"].disabled = state.runControlBusy || !progress.can_continue;
+  elements["end-run"].hidden = !progress.can_end;
+  elements["end-run"].disabled = state.runControlBusy || !progress.can_end;
   if (!controllable) {
     elements["run-control-message"].textContent = "";
   }
@@ -1189,12 +1204,18 @@ function renderRevision() {
   } else if (revision.state === "auto_resuming") {
     feedbackState = "自动恢复中";
     buttonLabel = "自动恢复中";
-    description = "首次整体超时后，修订正在从已批准检查点自动继续；初稿仍可浏览。";
+    description =
+      revision.progress.recovery_reason === "relay_interruption"
+        ? "网络 / Relay 暂时中断后，修订将在短暂等待后从已批准检查点继续；初稿仍可浏览。"
+        : "首次整体超时后，修订正在从已批准检查点自动继续；初稿仍可浏览。";
     message = "修订正在自动恢复。";
   } else if (revision.state === "paused") {
     feedbackState = "修订已暂停";
     buttonLabel = "修订已暂停";
-    description = "当前阶段再次超时。请使用上方进度卡继续或结束；初稿仍可浏览。";
+    description =
+      revision.progress.recovery_reason === "relay_interruption"
+        ? "当前阶段再次发生网络 / Relay 中断。请使用上方进度卡继续或结束；初稿仍可浏览。"
+        : "当前阶段再次超时。请使用上方进度卡继续或结束；初稿仍可浏览。";
     message = "修订等待你的决定。";
   } else if (revision.state === "ended") {
     feedbackState = "修订已结束";

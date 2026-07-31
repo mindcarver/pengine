@@ -84,6 +84,21 @@ def test_openapi_exposes_durable_episode_drafts_for_readable_runs() -> None:
     }
 
 
+def test_openapi_exposes_relay_recovery_reason_and_pause_code() -> None:
+    schemas = json.loads((ROOT / "contracts/openapi.json").read_text())["components"]["schemas"]
+
+    assert schemas["RunProgress"]["properties"]["recovery_reason"]["enum"] == [
+        "none",
+        "run_timeout",
+        "relay_interruption",
+    ]
+    assert "recovery_reason" in schemas["RunProgress"]["required"]
+    assert schemas["RunPause"]["properties"]["code"]["enum"] == [
+        "run_timeout",
+        "relay_interruption",
+    ]
+
+
 def test_openapi_exposes_quality_rejection_recovery_contract() -> None:
     openapi = json.loads((ROOT / "contracts/openapi.json").read_text())
     schemas = openapi["components"]["schemas"]

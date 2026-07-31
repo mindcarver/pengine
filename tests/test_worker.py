@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -14,6 +15,7 @@ from pengine.agents import EpisodeTimeoutError, QualityGateRejectedError
 from pengine.config import Settings
 from pengine.errors import DomainError
 from pengine.personas import PersonaCatalog
+from pengine.relay import RelayError
 from pengine.repository import Repository
 from pengine.schemas import (
     ContentPackage,
@@ -171,8 +173,27 @@ class DeterministicWorkflow:
         )
 
 
-class ProviderFailureWorkflow:
-    async def execute(self, **_: Any) -> WorkflowResult:
+class ProviderFailureWorkflow(DeterministicWorkflow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        self.calls += 1
+        if self.calls > 1:
+            return await super().execute(**kwargs)
+        approved = dict(kwargs["approved_checkpoints"] or {})
+        if InternalStage.SELECTING_L0_VARIANT not in approved:
+            await kwargs["before_stage"](InternalStage.SELECTING_L0_VARIANT)
+            await kwargs["approve_stage"](
+                InternalStage.SELECTING_L0_VARIANT,
+                {
+                    "stage": "selecting_l0_variant",
+                    "selected_l0_variant": "主动选择",
+                    "selection_rationale": "符合测试故事",
+                },
+            )
+        await kwargs["before_stage"](InternalStage.GENERATING_STORY_OUTLINE)
         raise httpx.ReadTimeout(
             "vendor-body SECRET-API-KEY SECRET-STORY-CONTENT SECRET-GENERATED-CONTENT"
         )
@@ -240,12 +261,14 @@ class TimeoutAfterFirstEpisodeWorkflow(DeterministicWorkflow):
         *,
         episode_count: int = 2,
         timeout_after_episode: int = 1,
+        relay_interruption: bool = False,
     ) -> None:
         super().__init__(episode_count)
         if timeout_after_episode >= episode_count:
             raise ValueError("A timeout must leave one episode unfinished")
         self.calls = 0
         self.timeout_after_episode = timeout_after_episode
+        self.relay_interruption = relay_interruption
         self.writer_commits: list[int] = []
         self.retry_drafts: list[int] = []
         self.events: list[str] = []
@@ -263,6 +286,8 @@ class TimeoutAfterFirstEpisodeWorkflow(DeterministicWorkflow):
             self.writer_commits.append(episode_number)
             self.events.append(f"commit:{episode_number}")
             if self.calls == 1 and episode_number == self.timeout_after_episode:
+                if self.relay_interruption:
+                    raise httpx.ReadTimeout("relay read timed out")
                 raise EpisodeTimeoutError(episode_number + 1)
             return draft
 
@@ -490,6 +515,50 @@ async def test_worker_resumes_the_first_unfinished_episode_without_rewriting_pri
 
 
 @pytest.mark.asyncio
+async def test_worker_resumes_the_first_unfinished_episode_after_a_relay_interruption(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "episode-relay-recovery",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = TimeoutAfterFirstEpisodeWorkflow(relay_interruption=True)
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="episode-relay-recovery-worker",
+    )
+
+    assert await worker.run_once() is True
+    recovering = await repository.get_creation(accepted.creation_id)
+    assert recovering is not None
+    assert recovering.initial.state == "auto_resuming"
+    assert recovering.initial.progress.recovery_reason == "relay_interruption"
+    assert [draft.episode_number for draft in recovering.initial.drafts.episodes] == [1]
+
+    resumed = await repository.lease_next_job(
+        "episode-relay-recovery-worker-2",
+        30,
+        now=datetime.now(UTC) + timedelta(seconds=11),
+    )
+    assert resumed is not None
+    await worker._process_job(resumed)
+    completed = await repository.get_creation(accepted.creation_id)
+    assert completed is not None
+    assert completed.initial.state == "succeeded"
+    assert workflow.retry_drafts == [1]
+    assert workflow.writer_commits == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_ten_episode_run_resumes_without_a_writer_call_for_committed_drafts(
     tmp_path: Path,
 ) -> None:
@@ -557,6 +626,15 @@ async def test_ten_episode_run_resumes_without_a_writer_call_for_committed_draft
     ("error", "expected_code", "expected_state"),
     [
         (GraphRecursionError("recursion exhausted"), "graph_recursion_limit", "failed"),
+        (httpx.RemoteProtocolError("relay protocol mismatch"), "relay_unavailable", "failed"),
+        (
+            RelayError(
+                code="relay_incompatible",
+                safe_message="The model relay does not support the required tool protocol.",
+            ),
+            "relay_incompatible",
+            "failed",
+        ),
         (
             QualityGateRejectedError(
                 stage=InternalStage.ACCEPTING_L0,
@@ -597,6 +675,8 @@ async def test_worker_reports_graph_and_quality_failures_separately(
     assert resource.initial.state == expected_state
     if expected_state == "failed":
         assert resource.initial.failure.code == expected_code
+        assert resource.initial.progress.can_continue is False
+        assert resource.initial.progress.can_end is False
     else:
         assert resource.initial.quality_rejection.code == expected_code
         assert resource.initial.quality_rejection.evidence == "L0 与已批准稿件的核心冲突。"
@@ -814,11 +894,12 @@ async def test_provider_failure_is_safe_and_never_logged(
         ),
         snapshot.summary,
     )
+    workflow = ProviderFailureWorkflow()
     worker = Worker(
         settings=settings,
         repository=repository,
         catalog=catalog,
-        workflow=ProviderFailureWorkflow(),
+        workflow=workflow,
         worker_id="provider-failure-test-worker",
     )
 
@@ -826,9 +907,39 @@ async def test_provider_failure_is_safe_and_never_logged(
     resource = await repository.get_creation(accepted.creation_id)
 
     assert resource is not None
-    assert resource.initial.state == "failed"
-    assert resource.initial.failure.code == "relay_unavailable"
-    assert resource.initial.failure.message == "The model relay request failed."
+    assert resource.initial.state == "auto_resuming"
+    assert resource.initial.progress.recovery_reason == "relay_interruption"
+    assert resource.initial.progress.current_stage == "generating_story_outline"
+    assert resource.initial.drafts.artifacts[0].selected_l0_variant == "主动选择"
+    async with repository._connection() as connection:
+        run = await (
+            await connection.execute(
+                "SELECT id, thread_id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+                (str(accepted.creation_id),),
+            )
+        ).fetchone()
+        assert run is not None
+        job = await (
+            await connection.execute(
+                "SELECT available_at FROM jobs WHERE run_id = ?",
+                (run["id"],),
+            )
+        ).fetchone()
+    assert job is not None
+    assert datetime.fromisoformat(job["available_at"]) > datetime.now(UTC)
+    resumed = await repository.lease_next_job(
+        "provider-recovery-worker",
+        30,
+        now=datetime.now(UTC) + timedelta(seconds=11),
+    )
+    assert resumed is not None
+    assert str(resumed.run_id) == run["id"]
+    assert resumed.thread_id == run["thread_id"]
+    await worker._process_job(resumed)
+    completed = await repository.get_creation(accepted.creation_id)
+    assert completed is not None
+    assert completed.initial.state == "succeeded"
+    assert workflow.calls == 2
     for sensitive_value in (
         "SECRET-API-KEY",
         "vendor-body",
@@ -837,6 +948,7 @@ async def test_provider_failure_is_safe_and_never_logged(
         "SECRET-GENERATED-CONTENT",
     ):
         assert sensitive_value not in caplog.text
+        assert sensitive_value not in resource.model_dump_json()
 
 
 @pytest.mark.asyncio

@@ -432,6 +432,8 @@ Object.assign(elements, {
   "review-l0": { textContent: "" },
   "review-l4": { textContent: "" },
   "run-controls": { hidden: true },
+  "run-control-title": { textContent: "" },
+  "run-control-description": { textContent: "" },
   "continue-run": { disabled: false },
   "end-run": { disabled: false },
   "run-control-message": { textContent: "" },
@@ -441,6 +443,7 @@ const progress = {
   completed_stages: ["determining_direction"],
   elapsed_seconds: 125,
   recovery_state: "none",
+  recovery_reason: "none",
   final_review: { l0: "pending", l4: "pending" },
   can_continue: false,
   can_end: false,
@@ -466,6 +469,7 @@ state.creation = {
       current_stage: "final_review",
       completed_stages: USER_STAGES.slice(0, 6).map(([stage]) => stage),
       recovery_state: "paused",
+      recovery_reason: "run_timeout",
       final_review: { l0: "passed", l4: "paused" },
       can_continue: true,
       can_end: true,
@@ -475,10 +479,22 @@ state.creation = {
 renderProgress();
 if (elements["progress-kind"].textContent !== "修订进度") throw new Error("revision not reused");
 if (elements["run-controls"].hidden) throw new Error("paused controls stayed hidden");
+if (!elements["run-control-title"].textContent.includes("整体运行时限")) {
+  throw new Error("timeout pause control did not identify the timeout reason");
+}
 if (elements["review-progress"].hidden) throw new Error("review substatus stayed hidden");
 if (!elements["review-l0"].textContent.includes("已通过")) throw new Error("L0 status lost");
 if (!elements["review-l4"].textContent.includes("已暂停")) throw new Error("L4 status lost");
 if (shouldPoll()) throw new Error("paused run kept polling");
+
+state.creation.revision.progress.recovery_reason = "relay_interruption";
+renderProgress();
+if (!elements["run-control-title"].textContent.includes("网络 / Relay")) {
+  throw new Error("relay pause control did not identify the relay interruption");
+}
+if (!elements["run-control-description"].textContent.includes("已提交草稿")) {
+  throw new Error("relay pause control did not retain draft guidance");
+}
 
 state.creation.revision.state = "auto_resuming";
 state.creation.revision.progress.can_continue = false;
@@ -597,6 +613,7 @@ const progress = {
   completed_stages: ["determining_direction"],
   elapsed_seconds: 1,
   recovery_state: "none",
+  recovery_reason: "none",
   final_review: { l0: "pending", l4: "pending" },
   can_continue: false,
   can_end: false,
@@ -639,6 +656,7 @@ if (!artifactButtons[2].hidden || !artifactButtons[5].hidden) {
 const pausedProgress = {
   ...progress,
   recovery_state: "paused",
+  recovery_reason: "relay_interruption",
   can_continue: true,
   can_end: true,
 };
@@ -652,6 +670,18 @@ if (
   !elements["artifact-content"].textContent.includes("匹配故事母题")
 ) {
   throw new Error("paused resource lost durable draft text");
+}
+if (!elements["wait-title"].textContent.includes("网络 / Relay")) {
+  throw new Error("relay pause did not use safe relay copy");
+}
+
+state.creation = {
+  ...state.creation,
+  initial: { state: "auto_resuming", progress: pausedProgress, drafts },
+};
+renderCreation();
+if (!elements["wait-kicker"].textContent.includes("网络 / Relay")) {
+  throw new Error("relay auto recovery did not use safe relay copy");
 }
 
 state.creation = {
