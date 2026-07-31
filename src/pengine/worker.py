@@ -15,6 +15,7 @@ from pengine.agents import (
     AgentProtocolError,
     CheckpointUnavailableError,
     DeepAgentWorkflow,
+    EpisodeTimeoutError,
     QualityGateRejectedError,
 )
 from pengine.config import Settings
@@ -25,6 +26,8 @@ from pengine.repository import LeasedJob, Repository, RunWorkItem
 from pengine.schemas import (
     Delivery,
     DeliveryReport,
+    EpisodeDraft,
+    EpisodePlan,
     InternalStage,
     RunFailure,
     WorkflowResult,
@@ -51,6 +54,10 @@ _ALL_STAGES = (
 StageHook = Callable[[InternalStage], Awaitable[int]]
 CheckpointHook = Callable[[InternalStage, Mapping[str, Any]], Awaitable[None]]
 ReferenceRetriever = Callable[[str], Awaitable[str]]
+EpisodeAttemptHook = Callable[[EpisodePlan], Awaitable[int]]
+EpisodeCommitHook = Callable[[int, str], Awaitable[EpisodeDraft]]
+EpisodeAssemblyHook = Callable[[], Awaitable[str]]
+EpisodeDeadlineReset = Callable[[], Awaitable[None]]
 
 
 class WorkflowExecutor(Protocol):
@@ -64,6 +71,12 @@ class WorkflowExecutor(Protocol):
         before_stage: StageHook,
         approve_stage: CheckpointHook,
         approved_checkpoints: Mapping[InternalStage, Any] | None = None,
+        episode_drafts: list[EpisodeDraft] | None = None,
+        before_episode: EpisodeAttemptHook | None = None,
+        commit_episode: EpisodeCommitHook | None = None,
+        assemble_episode_scripts: EpisodeAssemblyHook | None = None,
+        episode_timeout_seconds: float | None = None,
+        reset_episode_deadline: EpisodeDeadlineReset | None = None,
         feedback: str | None = None,
         retrieve_references: ReferenceRetriever | None = None,
     ) -> WorkflowResult: ...
@@ -156,6 +169,22 @@ class Worker:
         await self.repository.mark_run_running(job.run_id)
         work = await self.repository.get_run_work_item(job.run_id)
         approved: dict[InternalStage, Any] = dict(work.business_checkpoints)
+        if (
+            work.episode_plans
+            and len(work.episode_drafts) == len(work.episode_plans)
+            and InternalStage.GENERATING_EPISODE_SCRIPTS not in approved
+        ):
+            aggregate = await self.repository.assemble_episode_scripts(work.run_id)
+            payload = {
+                "stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                "content": aggregate,
+            }
+            await self.repository.approve_checkpoint(
+                work.run_id,
+                InternalStage.GENERATING_EPISODE_SCRIPTS,
+                payload,
+            )
+            approved[InternalStage.GENERATING_EPISODE_SCRIPTS] = payload
         current_stage = InternalStage.LOADING_PERSONA
         run_timeout_scope: asyncio.Timeout | None = None
         logger.info(
@@ -183,9 +212,22 @@ class Worker:
 
             persona_files = self._persona_files(work)
 
+            if InternalStage.GENERATING_EPISODE_OUTLINE in approved and not work.episode_plans:
+                current_stage = InternalStage.GENERATING_EPISODE_SCRIPTS
+                raise CheckpointUnavailableError(
+                    "The approved legacy episode outline has no durable episode plan."
+                )
+
             if self.workflow is None:
                 current_stage = self._next_unapproved(approved)
-                await self.repository.record_stage_attempt(work.run_id, current_stage)
+                if current_stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+                    refreshed = await self.repository.get_run_work_item(work.run_id)
+                    await self.repository.record_episode_attempt(
+                        work.run_id,
+                        len(refreshed.episode_drafts) + 1,
+                    )
+                else:
+                    await self.repository.record_stage_attempt(work.run_id, current_stage)
                 raise RelayError(
                     code="relay_unavailable",
                     safe_message="The model relay is not configured.",
@@ -209,6 +251,21 @@ class Worker:
                 await self.repository.approve_checkpoint(work.run_id, stage, payload)
                 approved[stage] = dict(payload)
 
+            async def before_episode(plan: EpisodePlan) -> int:
+                nonlocal current_stage
+                current_stage = InternalStage.GENERATING_EPISODE_SCRIPTS
+                return await self.repository.record_episode_attempt(
+                    work.run_id,
+                    plan.episode_number,
+                )
+
+            async def commit_episode(episode_number: int, content: str) -> EpisodeDraft:
+                return await self.repository.commit_episode_draft(
+                    work.run_id,
+                    episode_number,
+                    content,
+                )
+
             async def retrieve_references(query: str) -> str:
                 hits = self.catalog.retrieve_references(
                     work.persona.snapshot_sha256,
@@ -223,6 +280,12 @@ class Worker:
 
             run_timeout_scope = asyncio.timeout(self.settings.run_timeout_seconds)
             async with run_timeout_scope:
+
+                async def reset_episode_deadline() -> None:
+                    run_timeout_scope.reschedule(
+                        asyncio.get_running_loop().time() + self.settings.run_timeout_seconds
+                    )
+
                 result = await self.workflow.execute(
                     thread_id=work.thread_id,
                     story=work.story,
@@ -231,6 +294,14 @@ class Worker:
                     before_stage=before_stage,
                     approve_stage=approve_stage,
                     approved_checkpoints=approved,
+                    episode_drafts=work.episode_drafts,
+                    before_episode=before_episode,
+                    commit_episode=commit_episode,
+                    assemble_episode_scripts=lambda: self.repository.assemble_episode_scripts(
+                        work.run_id
+                    ),
+                    episode_timeout_seconds=self.settings.run_timeout_seconds,
+                    reset_episode_deadline=reset_episode_deadline,
                     feedback=work.frozen_feedback,
                     retrieve_references=retrieve_references,
                 )
@@ -239,7 +310,7 @@ class Worker:
                     "Revision result omitted feedback handling",
                     stage=InternalStage.ACCEPTING_L4,
                 )
-            result = self._validated_checkpoint_result(result, approved)
+            result = await self._validated_checkpoint_result(work, result, approved)
 
             current_stage = InternalStage.ASSEMBLING_DELIVERY
             if current_stage not in approved:
@@ -261,9 +332,38 @@ class Worker:
             )
         except asyncio.CancelledError:
             raise
+        except EpisodeTimeoutError as exc:
+            recovery_state = await self.repository.handle_episode_timeout(
+                work.run_id,
+                exc.episode_number,
+            )
+            logger.warning(
+                "episode script timed out run_id=%s creation_id=%s episode=%s state=%s",
+                work.run_id,
+                work.creation_id,
+                exc.episode_number,
+                recovery_state,
+            )
+            return
         except TimeoutError as exc:
             if run_timeout_scope is not None and run_timeout_scope.expired():
                 timeout_stage = self._failure_stage(exc, current_stage, approved)
+                if timeout_stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+                    refreshed = await self.repository.get_run_work_item(work.run_id)
+                    episode_number = len(refreshed.episode_drafts) + 1
+                    if episode_number <= len(refreshed.episode_plans):
+                        recovery_state = await self.repository.handle_episode_timeout(
+                            work.run_id,
+                            episode_number,
+                        )
+                        logger.warning(
+                            "episode script timed out run_id=%s creation_id=%s episode=%s state=%s",
+                            work.run_id,
+                            work.creation_id,
+                            episode_number,
+                            recovery_state,
+                        )
+                        return
                 recovery_state = await self.repository.handle_run_timeout(
                     work.run_id,
                     timeout_stage,
@@ -339,10 +439,15 @@ class Worker:
     @staticmethod
     def _requires_langgraph_checkpoint(work: RunWorkItem) -> bool:
         durable_stages = set(work.stage_attempts) | set(work.business_checkpoints)
-        return any(stage in durable_stages for stage in _SPECIALIST_STAGES)
+        return (
+            bool(work.episode_plans)
+            or bool(work.episode_drafts)
+            or any(stage in durable_stages for stage in _SPECIALIST_STAGES)
+        )
 
-    @staticmethod
-    def _validated_checkpoint_result(
+    async def _validated_checkpoint_result(
+        self,
+        work: RunWorkItem,
         result: WorkflowResult,
         approved: Mapping[InternalStage, Any],
     ) -> WorkflowResult:
@@ -353,6 +458,7 @@ class Worker:
                 stage=missing[0],
             )
         try:
+            aggregate_episode_scripts = await self.repository.assemble_episode_scripts(work.run_id)
             l0_selection = approved[InternalStage.SELECTING_L0_VARIANT]
             l0_gate = approved[InternalStage.ACCEPTING_L0]
             l4_gate = approved[InternalStage.ACCEPTING_L4]
@@ -371,9 +477,7 @@ class Worker:
                         "episode_outline": approved[InternalStage.GENERATING_EPISODE_OUTLINE][
                             "content"
                         ],
-                        "episode_scripts": approved[InternalStage.GENERATING_EPISODE_SCRIPTS][
-                            "content"
-                        ],
+                        "episode_scripts": aggregate_episode_scripts,
                     },
                     "selected_l0_variant": l0_selection["selected_l0_variant"],
                     "selection_rationale": l0_selection["selection_rationale"],
@@ -393,6 +497,14 @@ class Worker:
                 "Approved specialist checkpoints are invalid",
                 stage=InternalStage.ASSEMBLING_DELIVERY,
             ) from exc
+        if (
+            approved[InternalStage.GENERATING_EPISODE_SCRIPTS]["content"]
+            != aggregate_episode_scripts
+        ):
+            raise AgentProtocolError(
+                "Approved episode scripts differ from committed episode drafts",
+                stage=InternalStage.ASSEMBLING_DELIVERY,
+            )
         if result != expected:
             raise AgentProtocolError(
                 "Supervisor result differs from approved specialist checkpoints",
@@ -419,6 +531,26 @@ class Worker:
         stage: InternalStage,
         exc: Exception,
     ) -> RunFailure:
+        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+            work = await self.repository.get_run_work_item(run_id)
+            episode_number = len(work.episode_drafts) + 1
+            counts = await self.repository.get_episode_attempt_counts(run_id)
+            attempt_count = counts.get(episode_number, 0)
+            if attempt_count == 0 and episode_number <= len(work.episode_plans):
+                try:
+                    attempt_count = await self.repository.record_episode_attempt(
+                        run_id,
+                        episode_number,
+                    )
+                except DomainError:
+                    attempt_count = 1
+            code, message = _classify_failure(exc)
+            return RunFailure(
+                code=code,
+                message=message,
+                failed_stage=stage,
+                attempt_count=max(1, min(3, attempt_count)),
+            )
         counts = await self.repository.get_stage_attempt_counts(run_id)
         attempt_count = counts.get(stage, 0)
         if attempt_count == 0:

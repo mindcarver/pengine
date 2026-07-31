@@ -138,12 +138,19 @@ class FinalReviewProgress(StrictModel):
     l4: Literal["pending", "running", "passed", "paused", "failed"]
 
 
+class EpisodeProgress(StrictModel):
+    total: int = Field(ge=1)
+    completed: int = Field(ge=0)
+    current: int | None = Field(default=None, ge=1)
+
+
 class RunProgress(StrictModel):
     current_stage: UserStage
     completed_stages: list[UserStage]
     elapsed_seconds: int = Field(ge=0)
     recovery_state: Literal["none", "auto_resuming", "paused"]
     final_review: FinalReviewProgress
+    episodes: EpisodeProgress | None = None
     can_continue: bool
     can_end: bool
 
@@ -164,6 +171,13 @@ class CreativeTextDraft(StrictModel):
     content: NonEmptyText
 
 
+class EpisodeDraft(StrictModel):
+    episode_number: int = Field(ge=1)
+    content: NonEmptyText
+    content_sha256: Sha256
+    completed_at: datetime
+
+
 CreativeDraft = Annotated[
     CreativeDirectionDraft | CreativeTextDraft,
     Field(discriminator="stage"),
@@ -172,6 +186,7 @@ CreativeDraft = Annotated[
 
 class RunDraftSnapshot(StrictModel):
     artifacts: list[CreativeDraft] = Field(default_factory=list)
+    episodes: list[EpisodeDraft] = Field(default_factory=list)
     review_status: FinalReviewProgress
 
 
@@ -180,6 +195,7 @@ class RunPause(StrictModel):
     message: NonEmptyText
     stage: UserStage
     timeout_count: int = Field(ge=2)
+    episode_number: int | None = Field(default=None, ge=1)
 
 
 class QueuedRun(StrictModel):
@@ -210,6 +226,7 @@ class PausedRun(StrictModel):
 class EndedRun(StrictModel):
     state: Literal["ended"] = "ended"
     progress: RunProgress
+    drafts: RunDraftSnapshot
 
 
 class SucceededRun(StrictModel):
@@ -222,6 +239,7 @@ class FailedRun(StrictModel):
     state: Literal["failed"] = "failed"
     progress: RunProgress
     failure: RunFailure
+    drafts: RunDraftSnapshot
 
 
 RunStatus = Annotated[
@@ -274,6 +292,7 @@ class RevisionEnded(StrictModel):
     state: Literal["ended"] = "ended"
     feedback_locked: Literal[True] = True
     progress: RunProgress
+    drafts: RunDraftSnapshot
 
 
 class RevisionFailed(StrictModel):
@@ -282,6 +301,7 @@ class RevisionFailed(StrictModel):
     retryable: Literal[True] = True
     progress: RunProgress
     failure: RunFailure
+    drafts: RunDraftSnapshot
 
 
 class RevisionSucceeded(StrictModel):
@@ -356,6 +376,11 @@ class L0Selection(StrictModel):
 
 class TextArtifact(StrictModel):
     content: NonEmptyText
+
+
+class EpisodePlan(StrictModel):
+    episode_number: int = Field(ge=1)
+    plan: NonEmptyText
 
 
 class QualityReview(StrictModel):

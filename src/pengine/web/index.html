@@ -375,6 +375,24 @@
                     </div>
                     <span id="artifact-version-mark">初稿</span>
                   </header>
+                  <section
+                    class="episode-navigator"
+                    id="episode-navigator"
+                    aria-labelledby="episode-progress-title"
+                    hidden
+                  >
+                    <div class="episode-progress-header">
+                      <p class="episode-navigator-label" id="episode-progress-title">逐集进度</p>
+                      <p id="episode-progress-summary" aria-live="polite"></p>
+                    </div>
+                    <div
+                      class="episode-tabs"
+                      id="episode-tabs"
+                      role="tablist"
+                      aria-label="选择已生成的分集草稿"
+                    ></div>
+                    <pre id="episode-content" role="tabpanel" tabindex="0"></pre>
+                  </section>
                   <pre id="artifact-content"></pre>
                 </article>
               </div>

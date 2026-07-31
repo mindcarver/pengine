@@ -10,13 +10,14 @@ import pytest
 from langgraph.errors import GraphRecursionError
 from persona_factory import create_persona_package
 
-from pengine.agents import QualityGateRejectedError
+from pengine.agents import EpisodeTimeoutError, QualityGateRejectedError
 from pengine.config import Settings
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import (
     ContentPackage,
     CreateCreationRequest,
+    EpisodePlan,
     FeedbackHandlingItem,
     GateResult,
     InternalStage,
@@ -27,6 +28,9 @@ from pengine.worker import Worker
 
 
 class DeterministicWorkflow:
+    def __init__(self, episode_count: int = 2) -> None:
+        self.episode_count = episode_count
+
     async def execute(
         self,
         *,
@@ -37,10 +41,23 @@ class DeterministicWorkflow:
         before_stage,
         approve_stage,
         approved_checkpoints=None,
+        episode_drafts=None,
+        before_episode=None,
+        commit_episode=None,
+        assemble_episode_scripts=None,
+        episode_timeout_seconds=None,
+        reset_episode_deadline=None,
         feedback=None,
         retrieve_references=None,
     ) -> WorkflowResult:
-        del thread_id, story, requirements, persona_files, retrieve_references
+        del (
+            thread_id,
+            story,
+            requirements,
+            persona_files,
+            episode_timeout_seconds,
+            retrieve_references,
+        )
         approved = dict(approved_checkpoints or {})
         handling = (
             [
@@ -74,10 +91,14 @@ class DeterministicWorkflow:
             InternalStage.GENERATING_EPISODE_OUTLINE: {
                 "stage": "generating_episode_outline",
                 "content": "分集大纲",
-            },
-            InternalStage.GENERATING_EPISODE_SCRIPTS: {
-                "stage": "generating_episode_scripts",
-                "content": "分集剧本",
+                "episode_count": self.episode_count,
+                "episodes": [
+                    {
+                        "episode_number": episode_number,
+                        "plan": f"第{episode_number}集计划",
+                    }
+                    for episode_number in range(1, self.episode_count + 1)
+                ],
             },
             InternalStage.ACCEPTING_L0: {
                 "stage": "accepting_l0",
@@ -92,16 +113,54 @@ class DeterministicWorkflow:
             },
         }
         for stage, payload in payloads.items():
+            if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+                continue
             if stage not in approved:
                 await before_stage(stage)
                 await approve_stage(stage, payload)
+                approved[stage] = payload
+            if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+                break
+
+        if InternalStage.GENERATING_EPISODE_SCRIPTS not in approved:
+            assert before_episode is not None
+            assert commit_episode is not None
+            assert assemble_episode_scripts is not None
+            committed = {draft.episode_number for draft in episode_drafts or []}
+            for episode_number in range(1, self.episode_count + 1):
+                if episode_number in committed:
+                    continue
+                if reset_episode_deadline is not None:
+                    await reset_episode_deadline()
+                await before_episode(EpisodePlan(episode_number=episode_number, plan="测试计划"))
+                await commit_episode(episode_number, f"第{episode_number}集剧本")
+            aggregate = await assemble_episode_scripts()
+            payload = {
+                "stage": "generating_episode_scripts",
+                "content": aggregate,
+            }
+            await approve_stage(InternalStage.GENERATING_EPISODE_SCRIPTS, payload)
+            approved[InternalStage.GENERATING_EPISODE_SCRIPTS] = payload
+
+        for stage, payload in payloads.items():
+            if stage in approved or stage in {
+                InternalStage.GENERATING_EPISODE_OUTLINE,
+                InternalStage.GENERATING_EPISODE_SCRIPTS,
+            }:
+                continue
+            await before_stage(stage)
+            await approve_stage(stage, payload)
+            approved[stage] = payload
+        aggregate = (
+            await assemble_episode_scripts() if assemble_episode_scripts is not None else "分集剧本"
+        )
         return WorkflowResult(
             content_package=ContentPackage(
                 story_outline="故事大纲",
                 character_biographies="人物小传",
                 relationship_logic="关系逻辑",
                 episode_outline="分集大纲",
-                episode_scripts="分集剧本",
+                episode_scripts=aggregate,
             ),
             selected_l0_variant="主动选择",
             selection_rationale="符合测试故事",
@@ -150,6 +209,7 @@ class CheckpointMismatchWorkflow(DeterministicWorkflow):
 
 class TimeoutOnceWorkflow(DeterministicWorkflow):
     def __init__(self) -> None:
+        super().__init__()
         self.calls = 0
 
     async def execute(self, **kwargs: Any) -> WorkflowResult:
@@ -171,6 +231,51 @@ class TimeoutOnceWorkflow(DeterministicWorkflow):
         await kwargs["before_stage"](InternalStage.GENERATING_STORY_OUTLINE)
         await asyncio.sleep(0.1)
         raise AssertionError("the workflow timeout did not cancel execution")
+
+
+class TimeoutAfterFirstEpisodeWorkflow(DeterministicWorkflow):
+    def __init__(
+        self,
+        *,
+        episode_count: int = 2,
+        timeout_after_episode: int = 1,
+    ) -> None:
+        super().__init__(episode_count)
+        if timeout_after_episode >= episode_count:
+            raise ValueError("A timeout must leave one episode unfinished")
+        self.calls = 0
+        self.timeout_after_episode = timeout_after_episode
+        self.writer_commits: list[int] = []
+        self.retry_drafts: list[int] = []
+        self.events: list[str] = []
+
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        self.calls += 1
+        if self.calls > 1:
+            self.retry_drafts = [draft.episode_number for draft in kwargs["episode_drafts"]]
+        commit_episode = kwargs["commit_episode"]
+        approve_stage = kwargs["approve_stage"]
+        assert commit_episode is not None
+
+        async def commit_then_timeout(episode_number: int, content: str):
+            draft = await commit_episode(episode_number, content)
+            self.writer_commits.append(episode_number)
+            self.events.append(f"commit:{episode_number}")
+            if self.calls == 1 and episode_number == self.timeout_after_episode:
+                raise EpisodeTimeoutError(episode_number + 1)
+            return draft
+
+        async def capture_approval(stage: InternalStage, payload: dict[str, Any]) -> None:
+            self.events.append(f"approve:{stage.value}")
+            await approve_stage(stage, payload)
+
+        return await super().execute(
+            **{
+                **kwargs,
+                "approve_stage": capture_approval,
+                "commit_episode": commit_then_timeout,
+            },
+        )
 
 
 class RaisingWorkflow:
@@ -294,6 +399,124 @@ async def test_worker_auto_resumes_first_wall_clock_timeout_from_approved_checkp
     counts = await repository.get_stage_attempt_counts(UUID(row["id"]))
     assert counts[InternalStage.SELECTING_L0_VARIANT] == 1
     assert counts[InternalStage.GENERATING_STORY_OUTLINE] == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_resumes_the_first_unfinished_episode_without_rewriting_prior_drafts(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "episode-timeout-recovery",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = TimeoutAfterFirstEpisodeWorkflow()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="episode-timeout-recovery-worker",
+    )
+
+    assert await worker.run_once() is True
+    recovering = await repository.get_creation(accepted.creation_id)
+    assert recovering is not None
+    assert recovering.initial.state == "auto_resuming"
+    assert recovering.initial.progress.episodes.model_dump() == {
+        "total": 2,
+        "completed": 1,
+        "current": 2,
+    }
+    recovered_episodes = [
+        (draft.episode_number, draft.content) for draft in recovering.initial.drafts.episodes
+    ]
+    assert recovered_episodes == [(1, "第1集剧本")]
+    assert workflow.writer_commits == [1]
+
+    assert await worker.run_once() is True
+    completed = await repository.get_creation(accepted.creation_id)
+    assert completed is not None
+    assert completed.initial.state == "succeeded"
+    assert workflow.retry_drafts == [1]
+    assert workflow.writer_commits == [1, 2]
+    async with repository._connection() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+                (str(accepted.creation_id),),
+            )
+        ).fetchone()
+    assert row is not None
+    assert await repository.get_episode_attempt_counts(UUID(row["id"])) == {1: 1, 2: 1}
+
+
+@pytest.mark.asyncio
+async def test_ten_episode_run_resumes_without_a_writer_call_for_committed_drafts(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "ten-episode-recovery",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整十集短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = TimeoutAfterFirstEpisodeWorkflow(
+        episode_count=10,
+        timeout_after_episode=5,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="ten-episode-recovery-worker",
+    )
+
+    assert await worker.run_once() is True
+    recovering = await repository.get_creation(accepted.creation_id)
+    assert recovering is not None
+    assert recovering.initial.state == "auto_resuming"
+    assert recovering.initial.progress.episodes.model_dump() == {
+        "total": 10,
+        "completed": 5,
+        "current": 6,
+    }
+    assert workflow.writer_commits == [1, 2, 3, 4, 5]
+
+    assert await worker.run_once() is True
+    completed = await repository.get_creation(accepted.creation_id)
+    assert completed is not None
+    assert completed.initial.state == "succeeded"
+    assert workflow.retry_drafts == [1, 2, 3, 4, 5]
+    assert workflow.writer_commits == list(range(1, 11))
+    assert workflow.events.index("approve:accepting_l0") > workflow.events.index("commit:10")
+    assert workflow.events.index("approve:accepting_l4") > workflow.events.index("commit:10")
+
+    async with repository._connection() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+                (str(accepted.creation_id),),
+            )
+        ).fetchone()
+    assert row is not None
+    run_id = UUID(row["id"])
+    assert [draft.episode_number for draft in await repository.get_episode_drafts(run_id)] == list(
+        range(1, 11)
+    )
+    assert await repository.get_episode_attempt_counts(run_id) == {
+        episode_number: 1 for episode_number in range(1, 11)
+    }
 
 
 @pytest.mark.asyncio

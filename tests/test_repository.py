@@ -147,6 +147,10 @@ async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository)
         "frozen_revisions",
         "idempotency_records",
         "run_progress",
+        "episode_plans",
+        "episode_drafts",
+        "episode_attempts",
+        "episode_timeouts",
     } <= {row[0] for row in rows}
 
 
@@ -477,6 +481,7 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
                 "selection_rationale": "匹配母题",
             }
         ],
+        "episodes": [],
         "review_status": {"l0": "pending", "l4": "pending"},
     }
 
@@ -602,7 +607,7 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
     assert cannot_continue.value.code == "run_not_controllable"
 
 
-async def test_drafts_are_ordered_from_valid_checkpoints_and_isolate_a_revision(
+async def test_episode_drafts_are_ordered_and_isolate_a_revision(
     repository,
     persona,
     creation_request,
@@ -628,30 +633,289 @@ async def test_drafts_are_ordered_from_valid_checkpoints_and_isolate_a_revision(
         (InternalStage.GENERATING_STORY_OUTLINE, {"content": "修订故事大纲"}),
         (InternalStage.GENERATING_CHARACTER_BIOGRAPHIES, {"content": "   "}),
         (InternalStage.GENERATING_RELATIONSHIP_LOGIC, {"content": "修订人物关系"}),
-        (InternalStage.GENERATING_EPISODE_OUTLINE, {"content": "修订分集大纲"}),
-        (InternalStage.GENERATING_EPISODE_SCRIPTS, {"content": "不应显示的分集剧本"}),
+        (
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+            {
+                "content": "修订分集大纲",
+                "episode_count": 2,
+                "episodes": [
+                    {"episode_number": 1, "plan": "修订第一集"},
+                    {"episode_number": 2, "plan": "修订第二集"},
+                ],
+            },
+        ),
     ]
     for stage, payload in checkpoints:
         await repository.approve_business_checkpoint(revision_lease.run_id, stage, payload)
+    for episode_number in (1, 2):
+        await repository.record_episode_attempt(revision_lease.run_id, episode_number)
+        await repository.commit_episode_draft(
+            revision_lease.run_id,
+            episode_number,
+            f"修订第 {episode_number} 集剧本",
+        )
+    await repository.approve_business_checkpoint(
+        revision_lease.run_id,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+        {
+            "content": await repository.assemble_episode_scripts(revision_lease.run_id),
+        },
+    )
 
     resource = await repository.get_creation(accepted.creation_id)
     assert resource is not None
     assert resource.initial.state == "succeeded"
     assert resource.initial.result == make_delivery()
     assert resource.revision.state == "running"
-    assert resource.revision.drafts.model_dump() == {
-        "artifacts": [
-            {
-                "stage": "determining_direction",
-                "selected_l0_variant": "新方向",
-                "selection_rationale": "响应反馈",
-            },
-            {"stage": "generating_story_outline", "content": "修订故事大纲"},
-            {"stage": "generating_relationships", "content": "修订人物关系"},
-            {"stage": "generating_episode_outline", "content": "修订分集大纲"},
-        ],
-        "review_status": {"l0": "running", "l4": "pending"},
+    assert [artifact.model_dump() for artifact in resource.revision.drafts.artifacts] == [
+        {
+            "stage": "determining_direction",
+            "selected_l0_variant": "新方向",
+            "selection_rationale": "响应反馈",
+        },
+        {"stage": "generating_story_outline", "content": "修订故事大纲"},
+        {"stage": "generating_relationships", "content": "修订人物关系"},
+        {"stage": "generating_episode_outline", "content": "修订分集大纲"},
+    ]
+    revision_episodes = [
+        (draft.episode_number, draft.content) for draft in resource.revision.drafts.episodes
+    ]
+    assert revision_episodes == [
+        (1, "修订第 1 集剧本"),
+        (2, "修订第 2 集剧本"),
+    ]
+    assert all(len(draft.content_sha256) == 64 for draft in resource.revision.drafts.episodes)
+    assert resource.revision.drafts.review_status.model_dump() == {
+        "l0": "running",
+        "l4": "pending",
     }
+
+
+async def test_episode_drafts_require_ordered_attempts_and_complete_aggregate(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    outline = {
+        "content": "两集分集大纲",
+        "episode_count": 2,
+        "episodes": [
+            {"episode_number": 1, "plan": "第一集计划"},
+            {"episode_number": 2, "plan": "第二集计划"},
+        ],
+    }
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        outline,
+        now=NOW,
+    )
+
+    assert [plan.model_dump() for plan in await repository.get_episode_plans(lease.run_id)] == [
+        {"episode_number": 1, "plan": "第一集计划"},
+        {"episode_number": 2, "plan": "第二集计划"},
+    ]
+    planned = await repository.get_creation(accepted.creation_id, now=NOW)
+    assert planned is not None
+    assert planned.initial.progress.episodes.model_dump() == {
+        "total": 2,
+        "completed": 0,
+        "current": None,
+    }
+
+    with pytest.raises(DomainError) as without_attempt:
+        await repository.commit_episode_draft(lease.run_id, 1, "第一集剧本", now=NOW)
+    assert without_attempt.value.code == "episode_attempt_required"
+    with pytest.raises(DomainError) as out_of_order:
+        await repository.record_episode_attempt(lease.run_id, 2, now=NOW)
+    assert out_of_order.value.code == "episode_out_of_order"
+
+    assert await repository.record_episode_attempt(lease.run_id, 1, now=NOW) == 1
+    first = await repository.commit_episode_draft(
+        lease.run_id,
+        1,
+        "第一集剧本",
+        now=NOW + timedelta(seconds=1),
+    )
+    assert (
+        await repository.commit_episode_draft(
+            lease.run_id,
+            1,
+            "第一集剧本",
+            now=NOW + timedelta(seconds=2),
+        )
+        == first
+    )
+    with pytest.raises(DomainError) as immutable:
+        await repository.commit_episode_draft(lease.run_id, 1, "替换的第一集剧本")
+    assert immutable.value.code == "episode_conflict"
+    with pytest.raises(DomainError) as incomplete:
+        await repository.assemble_episode_scripts(lease.run_id)
+    assert incomplete.value.code == "episode_sequence_incomplete"
+    with pytest.raises(DomainError) as premature_gate:
+        await repository.approve_business_checkpoint(
+            lease.run_id,
+            InternalStage.ACCEPTING_L0,
+            {"passed": True, "evidence": "尚未完成的检查"},
+        )
+    assert premature_gate.value.code == "episode_sequence_incomplete"
+
+    assert await repository.record_episode_attempt(lease.run_id, 2, now=NOW) == 1
+    assert await repository.record_episode_attempt(lease.run_id, 2, now=NOW) == 2
+    assert await repository.record_episode_attempt(lease.run_id, 2, now=NOW) == 3
+    with pytest.raises(DomainError) as exhausted:
+        await repository.record_episode_attempt(lease.run_id, 2, now=NOW)
+    assert exhausted.value.code == "attempts_exhausted"
+    second = await repository.commit_episode_draft(
+        lease.run_id,
+        2,
+        "第二集剧本",
+        now=NOW + timedelta(seconds=3),
+    )
+    assert await repository.get_episode_attempt_counts(lease.run_id) == {1: 1, 2: 3}
+
+    aggregate = "第 1 集\n第一集剧本\n\n---\n\n第 2 集\n第二集剧本"
+    assert await repository.assemble_episode_scripts(lease.run_id) == aggregate
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+        {"content": aggregate},
+        now=NOW + timedelta(seconds=4),
+    )
+
+    active = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=4))
+    assert active is not None
+    assert active.initial.state == "running"
+    assert active.initial.progress.episodes.model_dump() == {
+        "total": 2,
+        "completed": 2,
+        "current": None,
+    }
+    assert active.initial.drafts.episodes == [first, second]
+    with pytest.raises(DomainError) as delivery_without_aggregate:
+        await repository.succeed_run(lease.run_id, make_delivery())
+    assert delivery_without_aggregate.value.code == "episode_aggregate_conflict"
+
+
+async def test_episode_timeout_recovers_first_unfinished_and_ended_run_keeps_drafts(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        {
+            "content": "两集分集大纲",
+            "episode_count": 2,
+            "episodes": [
+                {"episode_number": 1, "plan": "第一集计划"},
+                {"episode_number": 2, "plan": "第二集计划"},
+            ],
+        },
+        now=NOW,
+    )
+    await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
+    first = await repository.commit_episode_draft(
+        lease.run_id,
+        1,
+        "第一集剧本",
+        now=NOW + timedelta(seconds=1),
+    )
+    await repository.record_episode_attempt(lease.run_id, 2, now=NOW + timedelta(seconds=2))
+
+    assert (
+        await repository.handle_episode_timeout(
+            lease.run_id,
+            2,
+            now=NOW + timedelta(seconds=3),
+        )
+        == "auto_resuming"
+    )
+    recovering = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=3))
+    assert recovering is not None
+    assert recovering.initial.state == "auto_resuming"
+    assert recovering.initial.progress.episodes.model_dump() == {
+        "total": 2,
+        "completed": 1,
+        "current": 2,
+    }
+    assert recovering.initial.drafts.episodes == [first]
+    recovery = (await repository.reconcile_startup(now=NOW + timedelta(seconds=4)))[0]
+    assert recovery.run_id == lease.run_id
+    assert recovery.episode_drafts == [first]
+
+    resumed = await repository.lease_next_job("worker-2", 30, now=NOW + timedelta(seconds=4))
+    assert resumed is not None
+    assert resumed.run_id == lease.run_id
+    assert (
+        await repository.record_episode_attempt(
+            resumed.run_id,
+            2,
+            now=NOW + timedelta(seconds=5),
+        )
+        == 2
+    )
+    assert (
+        await repository.handle_episode_timeout(
+            resumed.run_id,
+            2,
+            now=NOW + timedelta(seconds=6),
+        )
+        == "paused"
+    )
+
+    paused = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=6))
+    assert paused is not None
+    assert paused.initial.state == "paused"
+    assert paused.initial.pause.episode_number == 2
+    assert paused.initial.pause.timeout_count == 2
+    assert paused.initial.drafts.episodes == [first]
+    await repository.end_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="end-episode-timeout",
+        now=NOW + timedelta(seconds=7),
+    )
+    ended = await repository.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=7))
+    assert ended is not None
+    assert ended.initial.state == "ended"
+    assert ended.initial.drafts.episodes == [first]
+
+
+async def test_failed_run_keeps_committed_episode_drafts(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        {
+            "content": "单集分集大纲",
+            "episode_count": 1,
+            "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        },
+    )
+    await repository.record_episode_attempt(lease.run_id, 1)
+    draft = await repository.commit_episode_draft(lease.run_id, 1, "第一集剧本")
+    await repository.fail_run(
+        lease.run_id,
+        RunFailure(
+            code="internal_error",
+            message="The workflow failed safely.",
+            failed_stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            attempt_count=1,
+        ),
+    )
+
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.state == "failed"
+    assert failed.initial.drafts.episodes == [draft]
 
 
 async def test_schema_v1_database_is_backfilled_without_losing_creation(
@@ -668,6 +932,11 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
     async with repository._connection() as connection:
         await connection.execute("DROP TABLE run_progress")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 2")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 3")
+        await connection.execute("DROP TABLE episode_timeouts")
+        await connection.execute("DROP TABLE episode_attempts")
+        await connection.execute("DROP TABLE episode_drafts")
+        await connection.execute("DROP TABLE episode_plans")
         await connection.commit()
 
     await repository.initialize()
@@ -680,4 +949,41 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         version = await (
             await connection.execute("SELECT MAX(version) FROM pengine_schema")
         ).fetchone()
-    assert version[0] == 2
+    assert version[0] == 3
+
+
+async def test_schema_v2_database_migrates_to_v3_idempotently(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted = await repository.create_creation(
+        idempotency_key="migration-v2-create",
+        request=creation_request,
+        persona_snapshot=persona,
+        now=NOW,
+    )
+    async with repository._connection() as connection:
+        await connection.execute("DROP TABLE episode_timeouts")
+        await connection.execute("DROP TABLE episode_attempts")
+        await connection.execute("DROP TABLE episode_drafts")
+        await connection.execute("DROP TABLE episode_plans")
+        await connection.execute("ALTER TABLE run_progress DROP COLUMN current_episode")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 3")
+        await connection.commit()
+
+    await repository.initialize()
+    await repository.initialize()
+
+    migrated = await repository.get_creation(accepted.creation_id, now=NOW)
+    assert migrated is not None
+    assert migrated.initial.progress.episodes is None
+    async with repository._connection() as connection:
+        version = await (
+            await connection.execute("SELECT MAX(version) FROM pengine_schema")
+        ).fetchone()
+        current_episode = await (
+            await connection.execute("PRAGMA table_info(run_progress)")
+        ).fetchall()
+    assert version[0] == 3
+    assert "current_episode" in {row["name"] for row in current_episode}

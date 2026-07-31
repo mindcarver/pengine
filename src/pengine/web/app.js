@@ -81,6 +81,13 @@ const DRAFT_ARTIFACTS = [
   },
 ];
 
+const EPISODE_SCRIPTS_DRAFT = {
+  key: "episode_scripts",
+  title: "分集剧本",
+  overline: "DRAFT 06",
+  isEpisodeNavigator: true,
+};
+
 const USER_STAGES = [
   ["determining_direction", "确定创作方向"],
   ["generating_story_outline", "生成故事大纲"],
@@ -111,6 +118,7 @@ const state = {
   activeVersion: "initial",
   activeArtifact: "story_outline",
   activeDraftRunKind: "",
+  activeEpisode: null,
   pollTimer: null,
   loadingCreation: false,
   pendingFeedback: "",
@@ -193,6 +201,10 @@ function cacheElements() {
     "artifact-title",
     "artifact-overline",
     "artifact-version-mark",
+    "episode-navigator",
+    "episode-progress-summary",
+    "episode-tabs",
+    "episode-content",
     "artifact-content",
     "revision-desk",
     "revision-description",
@@ -222,6 +234,8 @@ function bindEvents() {
   elements["version-tabs"].addEventListener("keydown", handleHorizontalTabs);
   elements["artifact-tabs"].addEventListener("click", handleArtifactClick);
   elements["artifact-tabs"].addEventListener("keydown", handleHorizontalTabs);
+  elements["episode-tabs"].addEventListener("click", handleEpisodeClick);
+  elements["episode-tabs"].addEventListener("keydown", handleHorizontalTabs);
 
   window.addEventListener("beforeunload", stopPolling);
   document.addEventListener("visibilitychange", () => {
@@ -389,6 +403,7 @@ async function handleCreate(event) {
     state.activeVersion = "initial";
     state.activeArtifact = "story_outline";
     state.activeDraftRunKind = "";
+    state.activeEpisode = null;
     state.pendingFeedback = "";
     writeCurrentCreationId(state.creationId);
     elements["creation-message"].textContent = "投递成功，正在读取真实任务状态。";
@@ -566,6 +581,7 @@ function renderCreation() {
   if (activeDraft && state.activeDraftRunKind !== activeDraft.kind) {
     state.activeVersion = activeDraft.kind;
     state.activeArtifact = artifactViewsForRun(activeDraft.run)[0]?.key || "story_outline";
+    state.activeEpisode = null;
   }
   state.activeDraftRunKind = activeDraft?.kind || "";
 
@@ -614,12 +630,17 @@ function renderCreation() {
   }
 
   if (initial.state === "ended") {
-    showEnded("初稿任务已结束");
+    const showWorkspace = renderWorkspace();
+    showEnded("初稿任务已结束", { showWorkspace });
     return;
   }
 
   if (initial.state === "failed") {
-    showFailure(initial.failure, "初稿生成失败", { canStartNewCreation: true });
+    const showWorkspace = renderWorkspace();
+    showFailure(initial.failure, "初稿生成失败", {
+      canStartNewCreation: true,
+      showWorkspace,
+    });
     return;
   }
 
@@ -708,7 +729,7 @@ function showWaiting(kicker, title, description, options = {}) {
 function showFailure(failure, title, options = {}) {
   elements["task-waiting"].hidden = true;
   elements["failure-panel"].hidden = false;
-  elements["result-workspace"].hidden = true;
+  elements["result-workspace"].hidden = options.showWorkspace !== true;
   elements["failure-label"].textContent = "任务未完成";
   elements["failure-title"].textContent = title;
   elements["failure-message"].textContent = failure?.message || "本地服务未提供失败说明。";
@@ -723,10 +744,10 @@ function showFailure(failure, title, options = {}) {
   elements["failure-actions"].hidden = !canStartNewCreation;
 }
 
-function showEnded(title) {
+function showEnded(title, options = {}) {
   elements["task-waiting"].hidden = true;
   elements["failure-panel"].hidden = false;
-  elements["result-workspace"].hidden = true;
+  elements["result-workspace"].hidden = options.showWorkspace !== true;
   elements["failure-label"].textContent = "任务已结束";
   elements["failure-title"].textContent = title;
   elements["failure-message"].textContent =
@@ -745,6 +766,7 @@ function startNewCreation() {
   state.activeVersion = "initial";
   state.activeArtifact = "story_outline";
   state.activeDraftRunKind = "";
+  state.activeEpisode = null;
   state.pendingFeedback = "";
   renderSeries();
   renderCreation();
@@ -785,15 +807,28 @@ function artifactViewsForRun(run) {
 
   const drafts = run?.drafts?.artifacts;
   if (!Array.isArray(drafts)) {
-    return [];
+    return episodeScriptDraftView(run);
   }
-  return drafts.flatMap((draft) => {
+  const artifacts = drafts.flatMap((draft) => {
     const artifact = DRAFT_ARTIFACTS.find((item) => item.stage === draft?.stage);
     const content = draftArtifactContent(draft);
     return artifact && content
       ? [{ ...artifact, content, isDraft: true }]
       : [];
   });
+  return [...artifacts, ...episodeScriptDraftView(run)];
+}
+
+function episodeScriptDraftView(run) {
+  const episodes = run?.progress?.episodes;
+  if (!episodes || !Number.isInteger(episodes.total) || episodes.total < 1) {
+    return [];
+  }
+  return [{ ...EPISODE_SCRIPTS_DRAFT, content: "", isDraft: true }];
+}
+
+function episodeDraftsForRun(run) {
+  return Array.isArray(run?.drafts?.episodes) ? run.drafts.episodes : [];
 }
 
 function draftArtifactContent(draft) {
@@ -896,7 +931,86 @@ function renderArtifact() {
     : state.activeVersion === "revision"
       ? "修订稿"
       : "初稿";
+  const showEpisodeNavigator = artifact.isEpisodeNavigator === true;
+  elements["episode-navigator"].hidden = !showEpisodeNavigator;
+  elements["artifact-content"].hidden = showEpisodeNavigator;
+  if (showEpisodeNavigator) {
+    renderEpisodeNavigator(run);
+    return;
+  }
   elements["artifact-content"].textContent = artifact.content;
+}
+
+function renderEpisodeNavigator(run) {
+  const progress = run?.progress?.episodes;
+  if (!progress) {
+    elements["episode-navigator"].hidden = true;
+    return;
+  }
+  elements["episode-navigator"].hidden = false;
+
+  const drafts = episodeDraftsForRun(run);
+  const draftByEpisode = new Map(
+    drafts.map((draft) => [draft.episode_number, draft]),
+  );
+  const availableEpisodes = drafts
+    .map((draft) => draft.episode_number)
+    .filter((episodeNumber) => episodeNumber >= 1 && episodeNumber <= progress.total);
+  if (!availableEpisodes.includes(state.activeEpisode)) {
+    state.activeEpisode = availableEpisodes.includes(progress.current)
+      ? progress.current
+      : availableEpisodes[0] || null;
+  }
+
+  const summary = [
+    `共 ${progress.total} 集`,
+    `已完成 ${progress.completed} 集`,
+  ];
+  if (progress.current !== null && progress.current !== undefined) {
+    summary.push(`当前第 ${progress.current} 集`);
+  }
+  if (run.state === "ended") {
+    summary.push("任务已结束");
+  } else if (run.state === "failed") {
+    summary.push("任务失败");
+  }
+  elements["episode-progress-summary"].textContent = summary.join(" · ");
+
+  const buttons = [];
+  for (let episodeNumber = 1; episodeNumber <= progress.total; episodeNumber += 1) {
+    const draft = draftByEpisode.get(episodeNumber);
+    const active = draft !== undefined && episodeNumber === state.activeEpisode;
+    const button = document.createElement("button");
+    button.id = `episode-tab-${episodeNumber}`;
+    button.type = "button";
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-controls", "episode-content");
+    button.setAttribute("aria-selected", String(active));
+    button.dataset.episodeNumber = String(episodeNumber);
+    button.dataset.status = draft
+      ? "completed"
+      : episodeNumber === progress.current
+        ? "current"
+        : "pending";
+    button.disabled = !draft;
+    button.tabIndex = active ? 0 : -1;
+    button.textContent = `第 ${episodeNumber} 集`;
+    buttons.push(button);
+  }
+  elements["episode-tabs"].replaceChildren(...buttons);
+
+  const activeDraft = draftByEpisode.get(state.activeEpisode);
+  elements["episode-content"].textContent = activeDraft
+    ? activeDraft.content
+    : "本地服务尚未提交可阅览的分集草稿。";
+  if (activeDraft) {
+    elements["episode-content"].setAttribute(
+      "aria-labelledby",
+      `episode-tab-${state.activeEpisode}`,
+    );
+  } else {
+    elements["episode-content"].removeAttribute("aria-labelledby");
+  }
 }
 
 function draftLabel(kind) {
@@ -1063,6 +1177,19 @@ function handleArtifactClick(event) {
   }
   state.activeArtifact = button.dataset.artifact;
   renderArtifact();
+}
+
+function handleEpisodeClick(event) {
+  const button = event.target.closest("[data-episode-number]");
+  if (!button || button.disabled) {
+    return;
+  }
+  const episodeNumber = Number(button.dataset.episodeNumber);
+  state.activeEpisode = episodeNumber;
+  renderArtifact();
+  elements["episode-tabs"]
+    .querySelector(`[data-episode-number="${episodeNumber}"]`)
+    ?.focus();
 }
 
 function handleHorizontalTabs(event) {
