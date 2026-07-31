@@ -108,6 +108,104 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
+def test_terminal_initial_failure_guides_a_new_submission_without_a_request() -> None:
+    root = Path(__file__).parents[1]
+    script_path = root / "src" / "pengine" / "web" / "app.js"
+    page = (root / "src" / "pengine" / "web" / "index.html").read_text()
+    assert 'id="failure-guidance"' in page
+    assert 'id="start-new-creation"' in page
+
+    assertions = """
+const storage = new Map([[STORAGE_KEY, "failed-creation"]]);
+let requestCount = 0;
+let storyFocused = false;
+let formScrolled = false;
+Object.assign(elements, {
+  "task-waiting": { hidden: false },
+  "failure-panel": { hidden: true },
+  "result-workspace": { hidden: false },
+  "failure-label": { textContent: "" },
+  "failure-title": { textContent: "" },
+  "failure-message": { textContent: "" },
+  "failure-guidance": { hidden: true, textContent: "" },
+  "failure-code": { textContent: "" },
+  "failure-actions": { hidden: true },
+  "run-progress": { hidden: false },
+  "delivery-section": { hidden: false },
+  "series-empty": { hidden: true },
+  "series-card": { hidden: false },
+  "creation-message": { textContent: "" },
+  "creation-form": {
+    scrollIntoView() { formScrolled = true; },
+  },
+  story: {
+    focus() { storyFocused = true; },
+  },
+});
+window.localStorage = {
+  getItem(key) { return storage.get(key) || null; },
+  setItem(key, value) { storage.set(key, value); },
+  removeItem(key) { storage.delete(key); },
+};
+apiRequest = async () => {
+  requestCount += 1;
+  return {};
+};
+state.creationId = "failed-creation";
+state.creation = { initial: { state: "failed" }, revision: { state: "unavailable" } };
+showFailure(
+  { code: "internal_error", message: "The workflow failed safely." },
+  "初稿生成失败",
+  { canStartNewCreation: true },
+);
+if (elements["failure-guidance"].hidden) throw new Error("initial failure hid recovery guidance");
+if (!elements["failure-guidance"].textContent.includes("不会自动重试")) {
+  throw new Error("initial failure did not explain terminal state");
+}
+if (elements["failure-actions"].hidden) throw new Error("initial failure hid start action");
+
+startNewCreation();
+if (state.creationId || state.creation) throw new Error("failed creation stayed selected");
+if (storage.has(STORAGE_KEY)) throw new Error("failed creation id stayed in storage");
+if (requestCount !== 0) throw new Error("start action made a request");
+if (!storyFocused || !formScrolled) throw new Error("start action did not return focus to story");
+if (!elements["creation-message"].textContent.includes("重新填写故事")) {
+  throw new Error("start action did not explain the next step");
+}
+
+showFailure({ code: "internal_error", message: "failed" }, "修订生成失败");
+if (!elements["failure-guidance"].hidden || !elements["failure-actions"].hidden) {
+  throw new Error("non-initial failure exposed initial-run action");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}} }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(async () => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_initial_and_revision_share_authoritative_progress_component() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"
