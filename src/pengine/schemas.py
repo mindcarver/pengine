@@ -3,7 +3,16 @@ from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
+
+from pengine.continuity import EpisodeStateDelta, SemanticReview, SeriesState
 
 NonEmptyText = Annotated[
     str,
@@ -120,6 +129,7 @@ class RunFailure(StrictModel):
         "relay_incompatible",
         "structured_output_invalid",
         "stage_validation_failed",
+        "content_review_rejected",
         "agent_execution_limit",
         "graph_recursion_limit",
         "quality_gate_rejected",
@@ -157,7 +167,12 @@ class RunProgress(StrictModel):
     completed_stages: list[UserStage]
     elapsed_seconds: int = Field(ge=0)
     recovery_state: Literal["none", "auto_resuming", "paused"]
-    recovery_reason: Literal["none", "run_timeout", "relay_interruption"]
+    recovery_reason: Literal[
+        "none",
+        "run_timeout",
+        "relay_interruption",
+        "content_rejected",
+    ]
     final_review: FinalReviewProgress
     episodes: EpisodeProgress | None = None
     can_continue: bool
@@ -185,6 +200,12 @@ class EpisodeDraft(StrictModel):
     content: NonEmptyText
     content_sha256: Sha256
     completed_at: datetime
+    contract_sha256: Sha256 | None = None
+    state_delta: EpisodeStateDelta | None = None
+    series_state: SeriesState | None = None
+    series_state_sha256: Sha256 | None = None
+    semantic_review: SemanticReview | None = None
+    repair_rounds: int | None = Field(default=None, ge=0, le=2)
 
 
 CreativeDraft = Annotated[
@@ -200,11 +221,25 @@ class RunDraftSnapshot(StrictModel):
 
 
 class RunPause(StrictModel):
-    code: Literal["run_timeout", "relay_interruption"] = "run_timeout"
+    code: Literal["run_timeout", "relay_interruption", "content_rejected"] = "run_timeout"
     message: NonEmptyText
     stage: UserStage
-    timeout_count: int = Field(ge=2)
+    timeout_count: int | None = Field(default=None, ge=2)
+    content_repair_count: int | None = Field(default=None, ge=2, le=2)
     episode_number: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_reason_counts(self) -> "RunPause":
+        if self.code == "content_rejected":
+            if self.content_repair_count != 2 or self.timeout_count is not None:
+                raise ValueError(
+                    "Content rejection requires exactly two content repairs and no timeout count"
+                )
+        elif self.timeout_count is None or self.content_repair_count is not None:
+            raise ValueError(
+                "Timeout and relay pauses require a timeout count and no content repair count"
+            )
+        return self
 
 
 class QueuedRun(StrictModel):

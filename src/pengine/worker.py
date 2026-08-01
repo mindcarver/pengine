@@ -14,11 +14,13 @@ from langgraph.errors import GraphRecursionError
 from pengine.agents import (
     AgentProtocolError,
     CheckpointUnavailableError,
+    ContentReviewRejectedError,
     DeepAgentWorkflow,
     EpisodeTimeoutError,
     QualityGateRejectedError,
 )
 from pengine.config import Settings
+from pengine.continuity import EpisodeLock
 from pengine.errors import DomainError
 from pengine.personas import PersonaCatalog, PersonaPackageError
 from pengine.relay import (
@@ -60,7 +62,7 @@ StageHook = Callable[[InternalStage], Awaitable[int]]
 CheckpointHook = Callable[[InternalStage, Mapping[str, Any]], Awaitable[None]]
 ReferenceRetriever = Callable[[str], Awaitable[str]]
 EpisodeAttemptHook = Callable[[EpisodePlan], Awaitable[int]]
-EpisodeCommitHook = Callable[[int, str], Awaitable[EpisodeDraft]]
+EpisodeCommitHook = Callable[[int, str, EpisodeLock | None], Awaitable[EpisodeDraft]]
 EpisodeAssemblyHook = Callable[[], Awaitable[str]]
 EpisodeDeadlineReset = Callable[[], Awaitable[None]]
 
@@ -179,10 +181,10 @@ class Worker:
             and len(work.episode_drafts) == len(work.episode_plans)
             and InternalStage.GENERATING_EPISODE_SCRIPTS not in approved
         ):
-            aggregate = await self.repository.assemble_episode_scripts(work.run_id)
+            aggregate = await self.repository.episode_aggregate_checkpoint_payload(work.run_id)
             payload = {
                 "stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value,
-                "content": aggregate,
+                **aggregate,
             }
             await self.repository.approve_checkpoint(
                 work.run_id,
@@ -264,11 +266,16 @@ class Worker:
                     plan.episode_number,
                 )
 
-            async def commit_episode(episode_number: int, content: str) -> EpisodeDraft:
+            async def commit_episode(
+                episode_number: int,
+                content: str,
+                episode_lock: EpisodeLock | None = None,
+            ) -> EpisodeDraft:
                 return await self.repository.commit_episode_draft(
                     work.run_id,
                     episode_number,
                     content,
+                    episode_lock=episode_lock,
                 )
 
             async def retrieve_references(query: str) -> str:
@@ -348,6 +355,22 @@ class Worker:
                 work.creation_id,
                 exc.episode_number,
                 recovery_state,
+            )
+            return
+        except ContentReviewRejectedError as exc:
+            await self.repository.pause_content_rejection(
+                work.run_id,
+                stage=exc.stage,
+                evidence=exc.evidence,
+                repair_rounds=exc.repair_rounds,
+                episode_number=exc.episode_number,
+            )
+            logger.info(
+                "content review paused run_id=%s creation_id=%s stage=%s episode=%s",
+                work.run_id,
+                work.creation_id,
+                exc.stage.value,
+                exc.episode_number,
             )
             return
         except QualityGateRejectedError as exc:
@@ -522,7 +545,10 @@ class Worker:
                 stage=missing[0],
             )
         try:
-            aggregate_episode_scripts = await self.repository.assemble_episode_scripts(work.run_id)
+            aggregate_payload = dict(
+                await self.repository.episode_aggregate_checkpoint_payload(work.run_id)
+            )
+            aggregate_episode_scripts = aggregate_payload["content"]
             l0_selection = approved[InternalStage.SELECTING_L0_VARIANT]
             l0_gate = approved[InternalStage.ACCEPTING_L0]
             l4_gate = approved[InternalStage.ACCEPTING_L4]
@@ -561,12 +587,18 @@ class Worker:
                 "Approved specialist checkpoints are invalid",
                 stage=InternalStage.ASSEMBLING_DELIVERY,
             ) from exc
-        if (
-            approved[InternalStage.GENERATING_EPISODE_SCRIPTS]["content"]
-            != aggregate_episode_scripts
-        ):
+        approved_episode_scripts = dict(approved[InternalStage.GENERATING_EPISODE_SCRIPTS])
+        expected_episode_scripts = {
+            **(
+                {"stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value}
+                if "stage" in approved_episode_scripts
+                else {}
+            ),
+            **aggregate_payload,
+        }
+        if approved_episode_scripts != expected_episode_scripts:
             raise AgentProtocolError(
-                "Approved episode scripts differ from committed episode drafts",
+                "Approved episode scripts or lock hashes differ from committed episodes",
                 stage=InternalStage.ASSEMBLING_DELIVERY,
             )
         if result != expected:
@@ -639,6 +671,8 @@ def _classify_failure(exc: Exception) -> tuple[str, str]:
         return "structured_output_invalid", "The agent returned invalid structured output."
     if isinstance(exc, QualityGateRejectedError):
         return "quality_gate_rejected", "The final quality gate rejected the generated work."
+    if isinstance(exc, ContentReviewRejectedError):
+        return "content_review_rejected", "The bounded content review did not converge."
     if isinstance(exc, PersonaPackageError):
         return "persona_package_invalid", "The persona snapshot could not be loaded."
     if isinstance(exc, CheckpointUnavailableError):

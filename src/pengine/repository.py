@@ -13,6 +13,17 @@ from uuid import UUID, uuid4
 import aiosqlite
 from pydantic import BaseModel
 
+from pengine.continuity import (
+    EpisodeLock,
+    SemanticReview,
+    SeriesState,
+    StoryContract,
+    build_episode_lock,
+    canonical_model_hash,
+    initial_series_state,
+    render_story_contract_markdown,
+    story_contract_sha256,
+)
 from pengine.errors import DomainError
 from pengine.schemas import (
     AutoResumingRun,
@@ -56,12 +67,12 @@ from pengine.schemas import (
     UserStage,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
 
-RecoveryReason = Literal["run_timeout", "relay_interruption"]
+RecoveryReason = Literal["run_timeout", "relay_interruption", "content_rejected"]
 RecoveryState = Literal["auto_resuming", "paused", "failed"]
 
 _SCHEMA_SQL = """
@@ -387,6 +398,72 @@ WHERE execution_state IN ('auto_resuming', 'paused');
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (5);
 """
 
+_SCHEMA_V6_SQL = """
+CREATE TABLE run_progress_v6 (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    current_stage TEXT NOT NULL,
+    execution_state TEXT NOT NULL CHECK (
+        execution_state IN (
+            'queued', 'running', 'auto_resuming', 'paused',
+            'quality_rejected', 'ended', 'succeeded', 'failed'
+        )
+    ),
+    elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (elapsed_seconds >= 0),
+    active_started_at TEXT,
+    timeout_stage TEXT,
+    timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+    updated_at TEXT NOT NULL,
+    current_episode INTEGER CHECK (current_episode IS NULL OR current_episode >= 1),
+    recovery_reason TEXT NOT NULL DEFAULT 'none' CHECK (
+        recovery_reason IN (
+            'none', 'run_timeout', 'relay_interruption', 'content_rejected'
+        )
+    ),
+    content_repair_count INTEGER CHECK (
+        content_repair_count IS NULL
+        OR (content_repair_count >= 2 AND content_repair_count <= 2)
+    ),
+    pause_message TEXT
+);
+
+INSERT INTO run_progress_v6(
+    run_id, current_stage, execution_state, elapsed_seconds,
+    active_started_at, timeout_stage, timeout_count, updated_at,
+    current_episode, recovery_reason, content_repair_count, pause_message
+)
+SELECT
+    run_id, current_stage, execution_state, elapsed_seconds,
+    active_started_at, timeout_stage, timeout_count, updated_at,
+    current_episode, recovery_reason, NULL, NULL
+FROM run_progress;
+
+DROP TABLE run_progress;
+ALTER TABLE run_progress_v6 RENAME TO run_progress;
+
+ALTER TABLE episode_drafts ADD COLUMN contract_sha256 TEXT;
+ALTER TABLE episode_drafts ADD COLUMN state_delta_json TEXT;
+ALTER TABLE episode_drafts ADD COLUMN series_state_json TEXT;
+ALTER TABLE episode_drafts ADD COLUMN series_state_sha256 TEXT;
+ALTER TABLE episode_drafts ADD COLUMN semantic_review_json TEXT;
+ALTER TABLE episode_drafts ADD COLUMN repair_rounds INTEGER CHECK (
+    repair_rounds IS NULL OR (repair_rounds >= 0 AND repair_rounds <= 2)
+);
+
+CREATE TABLE IF NOT EXISTS content_rejections (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK (
+        stage IN ('generating_episode_outline', 'generating_episode_scripts')
+    ),
+    episode_number INTEGER CHECK (episode_number IS NULL OR episode_number >= 1),
+    repair_rounds INTEGER NOT NULL CHECK (repair_rounds = 2),
+    evidence TEXT NOT NULL,
+    rejected_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, stage, episode_number, rejected_at)
+);
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (6);
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -585,7 +662,7 @@ class Repository:
             if row is None:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
             schema_version = int(row[0])
-            if schema_version not in {1, 2, 3, 4, SCHEMA_VERSION}:
+            if schema_version not in {1, 2, 3, 4, 5, SCHEMA_VERSION}:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
             if schema_version == 1:
                 await connection.executescript(_SCHEMA_V2_SQL)
@@ -601,6 +678,10 @@ class Repository:
                 schema_version = 4
             if schema_version == 4:
                 await connection.executescript(_SCHEMA_V5_SQL)
+                await connection.commit()
+                schema_version = 5
+            if schema_version == 5:
+                await connection.executescript(_SCHEMA_V6_SQL)
                 await connection.commit()
 
     async def setup(self) -> None:
@@ -1177,6 +1258,7 @@ class Repository:
         episode_number: int,
         content: str,
         *,
+        episode_lock: EpisodeLock | None = None,
         now: datetime | None = None,
     ) -> EpisodeDraft:
         if not content.strip():
@@ -1187,6 +1269,16 @@ class Repository:
             )
         timestamp = _timestamp(now or _utc_now())
         content_hash = _text_hash(content)
+        if episode_lock is not None and (
+            episode_lock.episode_number != episode_number
+            or episode_lock.content != content
+            or episode_lock.content_sha256 != content_hash
+        ):
+            raise DomainError(
+                "invalid_episode_lock",
+                "The episode lock must match the committed script exactly.",
+                409,
+            )
         async with self._transaction() as connection:
             run = await self._fetchone(
                 connection,
@@ -1204,6 +1296,108 @@ class Repository:
                     "The episode is not in the approved outline.",
                     409,
                 )
+            outline = await self._fetchone(
+                connection,
+                """
+                SELECT payload_json FROM business_checkpoints
+                WHERE run_id = ? AND stage = ?
+                """,
+                (str(run_id), InternalStage.GENERATING_EPISODE_OUTLINE.value),
+            )
+            if outline is None:
+                raise DomainError(
+                    "invalid_episode_plan",
+                    "A locked episode outline is required before script commit.",
+                    409,
+                )
+            outline_payload = json.loads(outline["payload_json"])
+            contract_payload = outline_payload.get("story_contract")
+            existing = await self._fetchone(
+                connection,
+                """
+                SELECT *
+                FROM episode_drafts
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (str(run_id), episode_number),
+            )
+            if existing is not None:
+                if existing["content_sha256"] != content_hash:
+                    raise DomainError(
+                        "episode_conflict",
+                        "A committed episode draft cannot be replaced.",
+                        409,
+                    )
+                existing_draft = self._episode_draft_from_row(existing)
+                if contract_payload is not None and episode_lock is None:
+                    raise DomainError(
+                        "episode_lock_required",
+                        "A contract-bound episode requires validated lock evidence.",
+                        409,
+                    )
+                if contract_payload is None and episode_lock is not None:
+                    raise DomainError(
+                        "unexpected_episode_lock",
+                        "A legacy outline cannot accept unrelated contract lock data.",
+                        409,
+                    )
+                if episode_lock is not None and (
+                    existing_draft.contract_sha256 != episode_lock.contract_sha256
+                    or existing_draft.state_delta != episode_lock.state_delta
+                    or existing_draft.series_state != episode_lock.series_state
+                    or existing_draft.series_state_sha256 != episode_lock.series_state_sha256
+                    or existing_draft.semantic_review != episode_lock.semantic_review
+                    or existing_draft.repair_rounds != episode_lock.repair_rounds
+                ):
+                    raise DomainError(
+                        "episode_conflict",
+                        "A committed episode lock cannot be replaced.",
+                        409,
+                    )
+                return existing_draft
+            if contract_payload is not None:
+                if episode_lock is None:
+                    raise DomainError(
+                        "episode_lock_required",
+                        "A contract-bound episode requires validated lock evidence.",
+                        409,
+                    )
+                try:
+                    contract = StoryContract.model_validate(contract_payload)
+                    contract_hash = story_contract_sha256(contract)
+                    if outline_payload["story_contract_sha256"] != contract_hash:
+                        raise ValueError("Contract hash mismatch")
+                    prior_drafts = await self._episode_drafts(connection, run_id)
+                    prior_state = (
+                        prior_drafts[-1].series_state
+                        if prior_drafts
+                        else initial_series_state(contract, contract_hash)
+                    )
+                    if prior_state is None:
+                        raise ValueError("Prior series state is missing")
+                    rebuilt = build_episode_lock(
+                        contract=contract,
+                        contract_sha256=contract_hash,
+                        prior_state=prior_state,
+                        content=content,
+                        delta=episode_lock.state_delta,
+                        semantic_review=episode_lock.semantic_review,
+                        repair_rounds=episode_lock.repair_rounds,
+                    )
+                    if rebuilt != episode_lock:
+                        raise ValueError("Episode lock is not deterministic")
+                except Exception as exc:
+                    raise DomainError(
+                        "invalid_episode_lock",
+                        "The episode lock conflicts with the approved story contract.",
+                        409,
+                    ) from exc
+            elif episode_lock is not None:
+                raise DomainError(
+                    "unexpected_episode_lock",
+                    "A legacy outline cannot accept unrelated contract lock data.",
+                    409,
+                )
             attempt = await self._fetchone(
                 connection,
                 """
@@ -1219,28 +1413,6 @@ class Repository:
                     "An episode draft requires a recorded writer attempt.",
                     409,
                 )
-            existing = await self._fetchone(
-                connection,
-                """
-                SELECT content, content_sha256, completed_at
-                FROM episode_drafts
-                WHERE run_id = ? AND episode_number = ?
-                """,
-                (str(run_id), episode_number),
-            )
-            if existing is not None:
-                if existing["content_sha256"] != content_hash:
-                    raise DomainError(
-                        "episode_conflict",
-                        "A committed episode draft cannot be replaced.",
-                        409,
-                    )
-                return EpisodeDraft(
-                    episode_number=episode_number,
-                    content=existing["content"],
-                    content_sha256=existing["content_sha256"],
-                    completed_at=_datetime(existing["completed_at"]),
-                )
             drafts = await self._episode_drafts(connection, run_id)
             expected = list(range(1, episode_number))
             if [draft.episode_number for draft in drafts] != expected:
@@ -1252,10 +1424,24 @@ class Repository:
             await connection.execute(
                 """
                 INSERT INTO episode_drafts(
-                    run_id, episode_number, content, content_sha256, completed_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    run_id, episode_number, content, content_sha256, completed_at,
+                    contract_sha256, state_delta_json, series_state_json,
+                    series_state_sha256, semantic_review_json, repair_rounds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (str(run_id), episode_number, content, content_hash, timestamp),
+                (
+                    str(run_id),
+                    episode_number,
+                    content,
+                    content_hash,
+                    timestamp,
+                    episode_lock.contract_sha256 if episode_lock else None,
+                    _json(episode_lock.state_delta) if episode_lock else None,
+                    _json(episode_lock.series_state) if episode_lock else None,
+                    episode_lock.series_state_sha256 if episode_lock else None,
+                    _json(episode_lock.semantic_review) if episode_lock else None,
+                    episode_lock.repair_rounds if episode_lock else None,
+                ),
             )
             next_episode = episode_number + 1 if episode_number < len(plans) else None
             await connection.execute(
@@ -1266,6 +1452,8 @@ class Repository:
                     timeout_stage = NULL,
                     timeout_count = 0,
                     recovery_reason = 'none',
+                    content_repair_count = NULL,
+                    pause_message = NULL,
                     updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -1285,6 +1473,12 @@ class Repository:
                 content=content,
                 content_sha256=content_hash,
                 completed_at=_datetime(timestamp),
+                contract_sha256=episode_lock.contract_sha256 if episode_lock else None,
+                state_delta=episode_lock.state_delta if episode_lock else None,
+                series_state=episode_lock.series_state if episode_lock else None,
+                series_state_sha256=(episode_lock.series_state_sha256 if episode_lock else None),
+                semantic_review=episode_lock.semantic_review if episode_lock else None,
+                repair_rounds=episode_lock.repair_rounds if episode_lock else None,
             )
 
     async def handle_episode_timeout(
@@ -1300,6 +1494,105 @@ class Repository:
             recovery_reason="run_timeout",
             now=now,
         )
+
+    async def pause_content_rejection(
+        self,
+        run_id: UUID,
+        *,
+        stage: InternalStage,
+        evidence: str,
+        repair_rounds: int,
+        episode_number: int | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        if stage not in {
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+            InternalStage.GENERATING_EPISODE_SCRIPTS,
+        }:
+            raise ValueError("Only contract or episode generation can pause for content review")
+        if repair_rounds != 2 or not evidence.strip():
+            raise ValueError("Content rejection requires two repair rounds and evidence")
+        if (stage is InternalStage.GENERATING_EPISODE_SCRIPTS) != (episode_number is not None):
+            raise ValueError("Episode content rejection requires its episode number")
+        current = now or _utc_now()
+        timestamp = _timestamp(current)
+        async with self._transaction() as connection:
+            progress = await self._fetchone(
+                connection,
+                """
+                SELECT run_progress.*, runs.state AS run_state, runs.creation_id
+                FROM run_progress
+                JOIN runs ON runs.id = run_progress.run_id
+                WHERE run_progress.run_id = ?
+                """,
+                (str(run_id),),
+            )
+            if progress is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if progress["run_state"] != "running" or progress["execution_state"] != "running":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Workflow run is not actively running.",
+                    409,
+                )
+            await connection.execute(
+                """
+                INSERT INTO content_rejections(
+                    run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(run_id),
+                    stage.value,
+                    episode_number,
+                    repair_rounds,
+                    evidence,
+                    timestamp,
+                ),
+            )
+            user_stage = _USER_STAGE_BY_INTERNAL[stage]
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    current_episode = ?,
+                    execution_state = 'paused',
+                    elapsed_seconds = ?,
+                    active_started_at = NULL,
+                    timeout_stage = ?,
+                    timeout_count = 0,
+                    recovery_reason = 'content_rejected',
+                    content_repair_count = ?,
+                    pause_message = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    stage.value,
+                    episode_number,
+                    self._elapsed_seconds(progress, current),
+                    user_stage.value,
+                    repair_rounds,
+                    evidence,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'failed',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, str(run_id)),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, progress["creation_id"]),
+            )
 
     async def handle_episode_relay_interruption(
         self,
@@ -1517,6 +1810,101 @@ class Repository:
                 409,
             ) from exc
 
+    async def episode_aggregate_checkpoint_payload(
+        self,
+        run_id: UUID,
+    ) -> Mapping[str, Any]:
+        async with self._connection() as connection:
+            return await self._episode_aggregate_payload(connection, run_id)
+
+    async def _episode_aggregate_payload(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+    ) -> Mapping[str, Any]:
+        plans = await self._episode_plans(connection, run_id)
+        drafts = await self._episode_drafts(connection, run_id)
+        try:
+            content = _aggregate_episode_scripts(plans, drafts)
+        except ValueError as exc:
+            raise DomainError(
+                "episode_sequence_incomplete",
+                "Every planned episode must be committed before assembly.",
+                409,
+            ) from exc
+        outline = await self._fetchone(
+            connection,
+            """
+            SELECT payload_json FROM business_checkpoints
+            WHERE run_id = ? AND stage = ?
+            """,
+            (str(run_id), InternalStage.GENERATING_EPISODE_OUTLINE.value),
+        )
+        if outline is None:
+            raise DomainError(
+                "invalid_episode_plan",
+                "The approved episode outline is unavailable.",
+                409,
+            )
+        outline_payload = json.loads(outline["payload_json"])
+        if "story_contract" not in outline_payload:
+            return {"content": content}
+        try:
+            contract = StoryContract.model_validate(outline_payload["story_contract"])
+            contract_hash = story_contract_sha256(contract)
+            if outline_payload["story_contract_sha256"] != contract_hash:
+                raise ValueError("Contract hash mismatch")
+            review = SemanticReview.model_validate(outline_payload["contract_review"])
+            if not review.passed:
+                raise ValueError("Contract review did not pass")
+            state = initial_series_state(contract, contract_hash)
+            episode_hashes = []
+            for draft in drafts:
+                if (
+                    draft.contract_sha256 != contract_hash
+                    or draft.state_delta is None
+                    or draft.series_state is None
+                    or draft.series_state_sha256 is None
+                    or draft.semantic_review is None
+                    or draft.repair_rounds is None
+                ):
+                    raise ValueError("Episode lock data is incomplete")
+                rebuilt = build_episode_lock(
+                    contract=contract,
+                    contract_sha256=contract_hash,
+                    prior_state=state,
+                    content=draft.content,
+                    delta=draft.state_delta,
+                    semantic_review=draft.semantic_review,
+                    repair_rounds=draft.repair_rounds,
+                )
+                if (
+                    rebuilt.series_state != draft.series_state
+                    or rebuilt.series_state_sha256 != draft.series_state_sha256
+                    or rebuilt.content_sha256 != draft.content_sha256
+                ):
+                    raise ValueError("Episode lock data is not deterministic")
+                state = draft.series_state
+                episode_hashes.append(
+                    {
+                        "episode_number": draft.episode_number,
+                        "content_sha256": draft.content_sha256,
+                        "series_state_sha256": draft.series_state_sha256,
+                    }
+                )
+        except Exception as exc:
+            raise DomainError(
+                "episode_lock_invalid",
+                "Every episode lock must match the approved story contract before review.",
+                409,
+            ) from exc
+        return {
+            "content": content,
+            "contract_sha256": contract_hash,
+            "episode_hashes": episode_hashes,
+            "series_state_sha256": canonical_model_hash(state),
+        }
+
     async def record_stage_attempt(
         self,
         run_id: UUID,
@@ -1644,23 +2032,47 @@ class Repository:
                         "The episode outline must contain an ordered episode plan.",
                         409,
                     ) from exc
+                supplied_outline = json.loads(payload_json)
+                if "story_contract" in supplied_outline:
+                    try:
+                        contract = StoryContract.model_validate(supplied_outline["story_contract"])
+                        contract_hash = story_contract_sha256(contract)
+                        review = SemanticReview.model_validate(supplied_outline["contract_review"])
+                        if (
+                            supplied_outline["story_contract_sha256"] != contract_hash
+                            or supplied_outline["story_contract_markdown"]
+                            != render_story_contract_markdown(contract, contract_hash)
+                            or not review.passed
+                            or not 0 <= int(supplied_outline["contract_repair_rounds"]) <= 2
+                        ):
+                            raise ValueError("Story contract lock metadata is invalid")
+                    except Exception as exc:
+                        raise DomainError(
+                            "invalid_story_contract",
+                            "The episode outline story contract is not lockable.",
+                            409,
+                        ) from exc
             if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
                 try:
-                    supplied_content = json.loads(payload_json)["content"]
-                    expected_content = _aggregate_episode_scripts(
-                        await self._episode_plans(connection, run_id),
-                        await self._episode_drafts(connection, run_id),
+                    supplied_scripts = json.loads(payload_json)
+                    expected_scripts = dict(
+                        await self._episode_aggregate_payload(connection, run_id)
                     )
-                except (KeyError, TypeError, ValueError) as exc:
+                    if "stage" in supplied_scripts:
+                        expected_scripts = {
+                            "stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                            **expected_scripts,
+                        }
+                except (KeyError, TypeError, ValueError, DomainError) as exc:
                     raise DomainError(
                         "episode_sequence_incomplete",
                         "Every planned episode must be committed before assembly.",
                         409,
                     ) from exc
-                if supplied_content != expected_content:
+                if supplied_scripts != expected_scripts:
                     raise DomainError(
                         "episode_aggregate_conflict",
-                        "The aggregate script must match the committed episode drafts.",
+                        "The aggregate script and lock hashes must match committed episodes.",
                         409,
                     )
             if stage in {InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4}:
@@ -2156,6 +2568,8 @@ class Repository:
                     UPDATE run_progress
                     SET execution_state = 'queued',
                         recovery_reason = 'none',
+                        content_repair_count = NULL,
+                        pause_message = NULL,
                         updated_at = ?
                     WHERE run_id = ?
                     """,
@@ -2382,11 +2796,11 @@ class Repository:
             plans = await self._episode_plans(connection, run_id)
             if plans:
                 try:
-                    expected_scripts = _aggregate_episode_scripts(
-                        plans,
-                        await self._episode_drafts(connection, run_id),
+                    expected_payload = dict(
+                        await self._episode_aggregate_payload(connection, run_id)
                     )
-                except ValueError as exc:
+                    expected_scripts = expected_payload["content"]
+                except (ValueError, DomainError) as exc:
                     raise DomainError(
                         "episode_sequence_incomplete",
                         "Every planned episode must be committed before delivery.",
@@ -2407,7 +2821,15 @@ class Repository:
                         409,
                     )
                 try:
-                    approved_scripts = json.loads(scripts["payload_json"])["content"]
+                    approved_payload = json.loads(scripts["payload_json"])
+                    expected_checkpoint = {
+                        **(
+                            {"stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value}
+                            if "stage" in approved_payload
+                            else {}
+                        ),
+                        **expected_payload,
+                    }
                 except (KeyError, TypeError, ValueError) as exc:
                     raise DomainError(
                         "episode_aggregate_conflict",
@@ -2415,7 +2837,7 @@ class Repository:
                         409,
                     ) from exc
                 if (
-                    approved_scripts != expected_scripts
+                    approved_payload != expected_checkpoint
                     or delivery.content_package.episode_scripts != expected_scripts
                 ):
                     raise DomainError(
@@ -3127,8 +3549,26 @@ class Repository:
             raise RuntimeError("Paused workflow run is missing its timeout stage")
         stage = UserStage(timeout_stage)
         recovery_reason = progress["recovery_reason"]
-        if recovery_reason not in {"run_timeout", "relay_interruption"}:
+        if recovery_reason not in {
+            "run_timeout",
+            "relay_interruption",
+            "content_rejected",
+        }:
             raise RuntimeError("Paused workflow run is missing its recovery reason")
+        if recovery_reason == "content_rejected":
+            if progress["content_repair_count"] is None or not progress["pause_message"]:
+                raise RuntimeError("Content-rejected run is missing review evidence")
+            return RunPause(
+                message=progress["pause_message"],
+                code="content_rejected",
+                stage=stage,
+                content_repair_count=int(progress["content_repair_count"]),
+                episode_number=(
+                    int(progress["current_episode"])
+                    if progress["current_episode"] is not None
+                    else None
+                ),
+            )
         return RunPause(
             message=(
                 "The relay or network connection was interrupted twice "
@@ -3302,22 +3742,39 @@ class Repository:
     ) -> list[EpisodeDraft]:
         cursor = await connection.execute(
             """
-            SELECT episode_number, content, content_sha256, completed_at
+            SELECT *
             FROM episode_drafts
             WHERE run_id = ?
             ORDER BY episode_number
             """,
             (str(run_id),),
         )
-        return [
-            EpisodeDraft(
-                episode_number=int(row["episode_number"]),
-                content=row["content"],
-                content_sha256=row["content_sha256"],
-                completed_at=_datetime(row["completed_at"]),
-            )
-            for row in await cursor.fetchall()
-        ]
+        return [Repository._episode_draft_from_row(row) for row in await cursor.fetchall()]
+
+    @staticmethod
+    def _episode_draft_from_row(row: aiosqlite.Row) -> EpisodeDraft:
+        return EpisodeDraft(
+            episode_number=int(row["episode_number"]),
+            content=row["content"],
+            content_sha256=row["content_sha256"],
+            completed_at=_datetime(row["completed_at"]),
+            contract_sha256=row["contract_sha256"],
+            state_delta=(
+                json.loads(row["state_delta_json"]) if row["state_delta_json"] is not None else None
+            ),
+            series_state=(
+                SeriesState.model_validate_json(row["series_state_json"])
+                if row["series_state_json"] is not None
+                else None
+            ),
+            series_state_sha256=row["series_state_sha256"],
+            semantic_review=(
+                SemanticReview.model_validate_json(row["semantic_review_json"])
+                if row["semantic_review_json"] is not None
+                else None
+            ),
+            repair_rounds=(int(row["repair_rounds"]) if row["repair_rounds"] is not None else None),
+        )
 
     async def _load_delivery(
         self,

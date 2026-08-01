@@ -688,7 +688,24 @@ if (!elements["run-control-description"].textContent.includes("已提交草稿")
   throw new Error("relay pause control did not retain draft guidance");
 }
 
+state.creation.revision.progress.recovery_reason = "content_rejected";
+state.creation.revision.pause = {
+  code: "content_rejected",
+  message: "人物知识状态仍与锁定合同冲突。",
+  stage: "generating_episode_scripts",
+  content_repair_count: 2,
+  episode_number: 3,
+};
+renderProgress();
+if (!elements["run-control-title"].textContent.includes("两轮修复")) {
+  throw new Error("content rejection did not identify the repair boundary");
+}
+if (!elements["run-control-description"].textContent.includes("人物知识状态")) {
+  throw new Error("content rejection did not expose review evidence");
+}
+
 state.creation.revision.state = "auto_resuming";
+state.creation.revision.progress.recovery_reason = "relay_interruption";
 state.creation.revision.progress.can_continue = false;
 state.creation.revision.progress.can_end = false;
 if (!shouldPoll()) throw new Error("auto recovery was not polled");

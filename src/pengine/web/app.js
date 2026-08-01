@@ -716,10 +716,17 @@ function renderCreation() {
   if (initial.state === "paused") {
     const showWorkspace = renderWorkspace();
     const relayInterrupted = initial.progress.recovery_reason === "relay_interruption";
+    const contentRejected = initial.progress.recovery_reason === "content_rejected";
     showWaiting(
       "任务已暂停",
-      relayInterrupted ? "当前阶段再次发生网络 / Relay 中断" : "当前阶段再次超过整体运行时限",
-      "请在上方选择继续当前阶段，或结束本次任务；已完成阶段、分集草稿与已运行时长均已保留。",
+      contentRejected
+        ? "内容一致性审查连续修复后仍未通过"
+        : relayInterrupted
+          ? "当前阶段再次发生网络 / Relay 中断"
+          : "当前阶段再次超过整体运行时限",
+      contentRejected
+        ? "审查证据已保留。请在上方选择继续重新生成当前未锁内容，或结束本次任务；锁定内容不会改变。"
+        : "请在上方选择继续当前阶段，或结束本次任务；已完成阶段、分集草稿与已运行时长均已保留。",
       { showWorkspace },
     );
     return;
@@ -829,12 +836,17 @@ function renderProgress() {
   const controllable = progress.can_continue || progress.can_end;
   elements["run-controls"].hidden = !controllable;
   const relayInterrupted = progress.recovery_reason === "relay_interruption";
-  elements["run-control-title"].textContent = relayInterrupted
-    ? "本阶段已两次发生网络 / Relay 中断"
-    : "本阶段已两次超过整体运行时限";
-  elements["run-control-description"].textContent = relayInterrupted
-    ? "可从当前未批准阶段继续；已完成阶段、时长和已提交草稿不会重新生成或丢失，也可以结束本次任务。"
-    : "可从当前未批准阶段继续，已完成阶段不会重新生成；也可以结束本次任务。";
+  const contentRejected = progress.recovery_reason === "content_rejected";
+  elements["run-control-title"].textContent = contentRejected
+    ? "内容一致性审查已完成两轮修复"
+    : relayInterrupted
+      ? "本阶段已两次发生网络 / Relay 中断"
+      : "本阶段已两次超过整体运行时限";
+  elements["run-control-description"].textContent = contentRejected
+    ? `${run.pause?.message || "当前内容仍与锁定合同冲突。"} 可重新生成当前未锁内容，或结束本次任务。`
+    : relayInterrupted
+      ? "可从当前未批准阶段继续；已完成阶段、时长和已提交草稿不会重新生成或丢失，也可以结束本次任务。"
+      : "可从当前未批准阶段继续，已完成阶段不会重新生成；也可以结束本次任务。";
   elements["continue-run"].hidden = !progress.can_continue;
   elements["continue-run"].disabled = state.runControlBusy || !progress.can_continue;
   elements["end-run"].hidden = !progress.can_end;
@@ -1282,7 +1294,9 @@ function renderRevision() {
     feedbackState = "修订已暂停";
     buttonLabel = "修订已暂停";
     description =
-      revision.progress.recovery_reason === "relay_interruption"
+      revision.progress.recovery_reason === "content_rejected"
+        ? "内容一致性审查连续修复后仍未通过。请使用上方进度卡重新生成当前未锁内容或结束；初稿仍可浏览。"
+        : revision.progress.recovery_reason === "relay_interruption"
         ? "当前阶段再次发生网络 / Relay 中断。请使用上方进度卡继续或结束；初稿仍可浏览。"
         : "当前阶段再次超时。请使用上方进度卡继续或结束；初稿仍可浏览。";
     message = "修订等待你的决定。";

@@ -25,6 +25,19 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 from pydantic import Field, model_validator
 
+from pengine.continuity import (
+    ContinuityViolation,
+    EpisodeLock,
+    EpisodeStateDelta,
+    SemanticReview,
+    StoryContract,
+    build_episode_lock,
+    canonical_model_hash,
+    initial_series_state,
+    render_story_contract_markdown,
+    story_contract_sha256,
+    validate_episode_candidate,
+)
 from pengine.schemas import (
     EpisodeDraft,
     EpisodePlan,
@@ -34,17 +47,24 @@ from pengine.schemas import (
     StrictModel,
     WorkflowResult,
 )
+from pengine.skill_assets import load_agent_skill_files
 
 StageHook = Callable[[InternalStage], Awaitable[int]]
 CheckpointHook = Callable[[InternalStage, Mapping[str, Any]], Awaitable[None]]
 ReferenceRetriever = Callable[[str], Awaitable[str]]
 EpisodeAttemptHook = Callable[[EpisodePlan], Awaitable[int]]
-EpisodeCommitHook = Callable[[int, str], Awaitable[EpisodeDraft]]
+EpisodeCommitHook = Callable[[int, str, EpisodeLock | None], Awaitable[EpisodeDraft]]
 EpisodeAssemblyHook = Callable[[], Awaitable[str]]
 EpisodeDeadlineReset = Callable[[], Awaitable[None]]
 
 _STAGE_TOKEN = re.compile(r"^\[stage=([a-z0-9_]+)\](?:\[episode=\d+\])?(?:\s|$)")
 _REGISTERED_PROFILE_KEYS: set[str] = set()
+_SPECIALIST_SKILL_SOURCES = {
+    "canon_reviewer": ["/skills/canon-review"],
+    "canon_repair": ["/skills/continuity-repair"],
+    "episode_reviewer": ["/skills/episode-continuity-review"],
+    "episode_repair": ["/skills/continuity-repair"],
+}
 
 _STORY_STAGES = (
     InternalStage.SELECTING_L0_VARIANT,
@@ -94,7 +114,9 @@ _STORY_ARCHITECT_PROMPT = (
 )
 
 _EPISODE_PLANNER_PROMPT = (
-    "Use approved upstream artifacts and persona rules. Return only the "
+    "Read /workspace/creation-request.md, /workspace/approved-checkpoints.json, "
+    "/workspace/story_outline.md, /workspace/character_biographies.md, and "
+    "/workspace/relationship_logic.md, then apply the persona rules. Return only the "
     "structured episode-outline result. Preserve every explicit numeric "
     "constraint from the script requirements. When the requirements do not "
     "specify an episode count, read the stage-specific persona L4 file and use "
@@ -105,12 +127,23 @@ _EPISODE_PLANNER_PROMPT = (
     "calculate_arithmetic for every derived numeric claim. Never round a "
     "non-integral division unless the story states the rounding rule. Include a "
     "contiguous episode list beginning at 1, with one concrete plan for every "
-    "episode, while preserving the readable full outline in content."
+    "episode, while preserving the readable full outline in content. Compile "
+    "the same approved facts into story_contract. Use unique lowercase snake_case IDs "
+    "and a closed cast; every relationship, timeline participant, and knowledge entry "
+    "must reference that cast. Use ISO dates/times. Numeric facts require exact decimal "
+    "values and explicit units, and the same numeric value cannot mean different kinds "
+    "or units. Timeline order must be contiguous from 1. Include exactly one knowledge "
+    "state for every character in every episode, and never remove known facts. Every "
+    "clue must first be visible or audible, with introduction no later than explanation "
+    "or callback. Include exactly one obligation and hook per episode; its "
+    "new_information_fact_ids must exactly equal all facts whose first_revealed_episode "
+    "is that episode."
 )
 
 _SCRIPT_WRITER_PROMPT = (
-    "Use the requested single episode plan, approved episode outline, and persona "
-    "rules without changing the episode count or numeric constraints. Before "
+    "Read /workspace/story_contract.json and /workspace/series_state.json. Use the "
+    "requested single episode plan and persona rules without changing the locked "
+    "episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
     "returning, reread every approved upstream artifact and audit this episode "
     "against them. "
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
@@ -118,7 +151,10 @@ _SCRIPT_WRITER_PROMPT = (
     "upstream commitment must appear in the scripts. Use calculate_arithmetic "
     "for every derived numeric claim and copy its exact result. Never round a "
     "non-integral division unless the script states the rounding rule. Return "
-    "only the structured episode-script result for the requested episode number."
+    "the script plus a structured state_delta bound to the supplied contract "
+    "hash. Every required fact, clue event, and episode obligation must cite a verbatim "
+    "excerpt that exists in the script. Return only the structured episode-script "
+    "result for the requested episode number."
 )
 
 VIRTUAL_FILE_PERMISSIONS = [
@@ -133,6 +169,31 @@ VIRTUAL_FILE_PERMISSIONS = [
         paths=["/workspace", "/workspace/**"],
     ),
     FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="deny"),
+]
+
+SKILLED_WRITE_PERMISSIONS = [
+    FilesystemPermission(
+        operations=["read"],
+        paths=["/persona", "/persona/**", "/skills", "/skills/**"],
+    ),
+    FilesystemPermission(
+        operations=["write"],
+        paths=["/persona", "/persona/**", "/skills", "/skills/**"],
+        mode="deny",
+    ),
+    FilesystemPermission(
+        operations=["read", "write"],
+        paths=["/workspace", "/workspace/**"],
+    ),
+    FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="deny"),
+]
+
+REVIEW_FILE_PERMISSIONS = [
+    FilesystemPermission(
+        operations=["read"],
+        paths=["/persona", "/persona/**", "/skills", "/skills/**", "/workspace", "/workspace/**"],
+    ),
+    FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
 ]
 
 
@@ -179,6 +240,7 @@ class EpisodePlannerResult(StrictModel):
     content: NonEmptyText
     episode_count: int = Field(ge=1)
     episodes: list[EpisodePlan] = Field(min_length=1)
+    story_contract: StoryContract
 
     @model_validator(mode="after")
     def validate_episode_sequence(self) -> "EpisodePlannerResult":
@@ -186,6 +248,8 @@ class EpisodePlannerResult(StrictModel):
         numbers = [episode.episode_number for episode in self.episodes]
         if numbers != expected:
             raise ValueError("Episode plans must be ordered and contiguous from 1")
+        if self.story_contract.episode_count != self.episode_count:
+            raise ValueError("Story contract episode count must match the episode plan")
         return self
 
 
@@ -193,6 +257,21 @@ class ScriptWriterResult(StrictModel):
     stage: Literal["generating_episode_scripts"]
     episode_number: int = Field(ge=1)
     content: NonEmptyText
+    state_delta: EpisodeStateDelta
+
+    @model_validator(mode="after")
+    def validate_delta_episode(self) -> "ScriptWriterResult":
+        if self.state_delta.episode_number != self.episode_number:
+            raise ValueError("Episode state delta must match the script episode")
+        return self
+
+
+class CanonReviewerResult(SemanticReview):
+    pass
+
+
+class EpisodeReviewerResult(SemanticReview):
+    pass
 
 
 class QualityReviewerResult(StrictModel):
@@ -232,6 +311,22 @@ class QualityGateRejectedError(RuntimeError):
         super().__init__("Quality gate did not pass")
         self.stage = stage
         self.evidence = evidence
+
+
+class ContentReviewRejectedError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        stage: InternalStage,
+        evidence: str,
+        episode_number: int | None = None,
+        repair_rounds: int = 2,
+    ) -> None:
+        super().__init__("Content review did not converge")
+        self.stage = stage
+        self.evidence = evidence
+        self.episode_number = episode_number
+        self.repair_rounds = repair_rounds
 
 
 class CheckpointUnavailableError(RuntimeError):
@@ -350,6 +445,45 @@ def _request_state_after_result(
     return {**request.state, **result.update}
 
 
+def _request_with_files(
+    request: ToolCallRequest,
+    files: Mapping[str, str],
+) -> ToolCallRequest:
+    if not isinstance(request.state, Mapping):
+        raise AgentProtocolError("Task state is unavailable")
+    existing_files = request.state.get("files")
+    state = {
+        **request.state,
+        "files": {
+            **(dict(existing_files) if isinstance(existing_files, Mapping) else {}),
+            **{path: {"content": content, "encoding": "utf-8"} for path, content in files.items()},
+        },
+    }
+    return request.override(
+        state=state,
+        runtime=(replace(request.runtime, state=state) if request.runtime is not None else None),
+    )
+
+
+def _subagent_request(
+    request: ToolCallRequest,
+    *,
+    subagent_type: str,
+    description: str,
+    files: Mapping[str, str],
+) -> ToolCallRequest:
+    with_files = _request_with_files(request, files)
+    return with_files.override(
+        tool_call={
+            **request.tool_call,
+            "args": {
+                "description": description,
+                "subagent_type": subagent_type,
+            },
+        }
+    )
+
+
 def _validated_stage_payload(
     stage: InternalStage,
     content: str,
@@ -455,6 +589,19 @@ def _review_workspace_files(
         content = payload.get("content")
         if isinstance(content, str) and content:
             files[path] = {"content": content, "encoding": "utf-8"}
+        if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+            contract = payload.get("story_contract")
+            contract_markdown = payload.get("story_contract_markdown")
+            if isinstance(contract, Mapping):
+                files["/workspace/story_contract.json"] = {
+                    "content": json.dumps(contract, ensure_ascii=False, sort_keys=True),
+                    "encoding": "utf-8",
+                }
+            if isinstance(contract_markdown, str) and contract_markdown:
+                files["/workspace/story_contract.md"] = {
+                    "content": contract_markdown,
+                    "encoding": "utf-8",
+                }
     manifest = json.dumps(
         {stage.value: payload for stage, payload in approved.items()},
         ensure_ascii=False,
@@ -486,7 +633,7 @@ class StageGuardMiddleware(AgentMiddleware):
         self.approve_stage = approve_stage
         self.approved_stages = approved_stages
         self.approved_payloads = approved_payloads if approved_payloads is not None else {}
-        self.episode_drafts = {draft.episode_number for draft in episode_drafts or []}
+        self.episode_drafts = {draft.episode_number: draft for draft in episode_drafts or []}
         self.before_episode = before_episode
         self.commit_episode = commit_episode
         self.assemble_episode_scripts = assemble_episode_scripts
@@ -582,6 +729,23 @@ class StageGuardMiddleware(AgentMiddleware):
             return await self._write_episodes(request, handler, args)
 
         await self.before_stage(stage)
+        if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+            request = _request_with_files(
+                request,
+                {
+                    path: data["content"]
+                    for path, data in _review_workspace_files(self.approved_payloads).items()
+                },
+            )
+            result, payload = await self._generate_locked_outline(
+                request,
+                handler,
+                args,
+            )
+            await self.approve_stage(stage, payload)
+            self.approved_payloads[stage] = dict(payload)
+            self.approved_stages.add(stage)
+            return result
         result, payload = await self._call_structured_stage(
             stage,
             request,
@@ -591,6 +755,83 @@ class StageGuardMiddleware(AgentMiddleware):
         await self.approve_stage(stage, payload)
         self.approved_stages.add(stage)
         return result
+
+    async def _generate_locked_outline(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        args: Mapping[str, Any],
+    ) -> tuple[ToolMessage | Command[Any], Mapping[str, Any]]:
+        result, payload = await self._call_structured_stage(
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+            request,
+            handler,
+            args,
+        )
+        repair_rounds = 0
+        while True:
+            contract = StoryContract.model_validate(payload["story_contract"])
+            contract_hash = story_contract_sha256(contract)
+            contract_markdown = render_story_contract_markdown(contract, contract_hash)
+            candidate = {
+                **payload,
+                "story_contract_sha256": contract_hash,
+                "story_contract_markdown": contract_markdown,
+            }
+            review = await self._invoke_semantic_reviewer(
+                request=request,
+                handler=handler,
+                subagent_type="canon_reviewer",
+                description=(
+                    "Review the proposed story contract against every approved upstream "
+                    "artifact. Fail on contradictions, missing commitments, ambiguous typed "
+                    "numbers, unfair knowledge withholding, or incomplete clue lifecycle."
+                ),
+                files={
+                    "/workspace/story_contract.json": json.dumps(
+                        contract.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    "/workspace/story_contract.md": contract_markdown,
+                    "/workspace/episode_outline.md": payload["content"],
+                },
+                schema=CanonReviewerResult,
+            )
+            if review.passed:
+                return result, {
+                    **candidate,
+                    "contract_review": review.model_dump(mode="json"),
+                    "contract_repair_rounds": repair_rounds,
+                }
+            if repair_rounds >= 2:
+                raise ContentReviewRejectedError(
+                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                    evidence=review.evidence,
+                    repair_rounds=repair_rounds,
+                )
+            repair_rounds += 1
+            result, payload = await self._invoke_repair_subagent(
+                request=request,
+                handler=handler,
+                subagent_type="canon_repair",
+                description=(
+                    "Repair the episode outline and story contract using the frozen upstream "
+                    f"artifacts. This is repair round {repair_rounds} of 2. Address every "
+                    "review issue without changing approved story intent."
+                ),
+                files={
+                    "/workspace/story_contract.json": json.dumps(
+                        contract.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    "/workspace/story_contract_review.json": review.model_dump_json(),
+                    "/workspace/episode_outline.md": payload["content"],
+                },
+                schema=EpisodePlannerResult,
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            )
 
     async def _call_structured_stage(
         self,
@@ -645,6 +886,83 @@ class StageGuardMiddleware(AgentMiddleware):
             )
         return result, payload
 
+    async def _invoke_semantic_reviewer(
+        self,
+        *,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        subagent_type: str,
+        description: str,
+        files: Mapping[str, str],
+        schema: type[SemanticReview],
+    ) -> SemanticReview:
+        review_request = _subagent_request(
+            request,
+            subagent_type=subagent_type,
+            description=description,
+            files={
+                **{
+                    path: data["content"]
+                    for path, data in _review_workspace_files(self.approved_payloads).items()
+                },
+                **files,
+            },
+        )
+        result = await handler(review_request)
+        message = _tool_message(result)
+        if not isinstance(message.content, str):
+            raise AgentProtocolError("Semantic reviewer result was not JSON text")
+        try:
+            return schema.model_validate_json(message.content)
+        except Exception as exc:
+            raise AgentProtocolError(
+                "Semantic reviewer returned invalid structured output"
+            ) from exc
+
+    async def _invoke_repair_subagent(
+        self,
+        *,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        subagent_type: str,
+        description: str,
+        files: Mapping[str, str],
+        schema: type[EpisodePlannerResult] | type[ScriptWriterResult],
+        stage: InternalStage,
+        expected_episode_number: int | None = None,
+    ) -> tuple[ToolMessage | Command[Any], Mapping[str, Any]]:
+        repair_request = _subagent_request(
+            request,
+            subagent_type=subagent_type,
+            description=description,
+            files={
+                **{
+                    path: data["content"]
+                    for path, data in _review_workspace_files(self.approved_payloads).items()
+                },
+                **files,
+            },
+        )
+        result = await handler(repair_request)
+        message = _tool_message(result)
+        if not isinstance(message.content, str):
+            raise AgentProtocolError("Repair result was not JSON text", stage=stage)
+        try:
+            parsed = schema.model_validate_json(message.content)
+        except Exception as exc:
+            raise AgentProtocolError(
+                "Repair subagent returned invalid structured output",
+                stage=stage,
+            ) from exc
+        if parsed.stage != stage.value:
+            raise AgentProtocolError("Repair subagent returned a different stage", stage=stage)
+        if (
+            isinstance(parsed, ScriptWriterResult)
+            and parsed.episode_number != expected_episode_number
+        ):
+            raise AgentProtocolError("Repair subagent returned a different episode", stage=stage)
+        return result, parsed.model_dump(mode="json")
+
     async def _write_episodes(
         self,
         request: ToolCallRequest,
@@ -662,12 +980,41 @@ class StageGuardMiddleware(AgentMiddleware):
             )
         outline = self.approved_payloads.get(InternalStage.GENERATING_EPISODE_OUTLINE)
         try:
-            plans = EpisodePlannerResult.model_validate(outline).episodes
+            parsed_outline = EpisodePlannerResult.model_validate(
+                {field: outline[field] for field in EpisodePlannerResult.model_fields}
+            )
+            plans = parsed_outline.episodes
+            contract = parsed_outline.story_contract
+            contract_hash = story_contract_sha256(contract)
+            if outline["story_contract_sha256"] != contract_hash:
+                raise ValueError("Story contract hash does not match its content")
+            contract_review = CanonReviewerResult.model_validate(outline["contract_review"])
+            if not contract_review.passed:
+                raise ValueError("Story contract was not independently approved")
         except Exception as exc:
             raise AgentProtocolError(
-                "Episode scripts require an approved episode outline",
+                "Episode scripts require an approved locked story contract",
                 stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
             ) from exc
+
+        contract_json = json.dumps(
+            contract.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        prior_state = initial_series_state(contract, contract_hash)
+        for episode_number, draft in sorted(self.episode_drafts.items()):
+            if (
+                draft.contract_sha256 != contract_hash
+                or draft.series_state is None
+                or draft.series_state_sha256 is None
+                or canonical_model_hash(draft.series_state) != draft.series_state_sha256
+                or episode_number != prior_state.locked_through_episode + 1
+            ):
+                raise CheckpointUnavailableError(
+                    "Committed episode continuity state is unavailable or mismatched."
+                )
+            prior_state = draft.series_state
 
         last_result: ToolMessage | Command[Any] | None = None
         for plan in plans:
@@ -681,11 +1028,24 @@ class StageGuardMiddleware(AgentMiddleware):
                 "description": (
                     f"[stage=generating_episode_scripts][episode={plan.episode_number}] "
                     f"Write only episode {plan.episode_number}.\n"
-                    f"Approved episode plan:\n{plan.plan}"
+                    f"Approved episode plan:\n{plan.plan}\n"
+                    f"Locked contract SHA-256: {contract_hash}"
                 ),
             }
-            episode_request = request.override(
-                tool_call={**request.tool_call, "args": episode_args},
+            episode_request = _request_with_files(
+                request.override(
+                    tool_call={**request.tool_call, "args": episode_args},
+                ),
+                {
+                    "/workspace/story_contract.json": contract_json,
+                    "/workspace/story_contract.md": outline["story_contract_markdown"],
+                    "/workspace/series_state.json": prior_state.model_dump_json(),
+                    "/workspace/previous_episode_handoff.md": prior_state.handoff or "None",
+                    **{
+                        f"/workspace/episodes/ep{number}.md": draft.content
+                        for number, draft in sorted(self.episode_drafts.items())
+                    },
+                },
             )
             try:
                 if self.episode_timeout_seconds is None:
@@ -707,14 +1067,115 @@ class StageGuardMiddleware(AgentMiddleware):
                         )
             except TimeoutError as exc:
                 raise EpisodeTimeoutError(plan.episode_number) from exc
-            await self.commit_episode(plan.episode_number, payload["content"])
-            self.episode_drafts.add(plan.episode_number)
-            last_result = result
+
+            repair_rounds = 0
+            while True:
+                parsed = ScriptWriterResult.model_validate(payload)
+                deterministic_issues = validate_episode_candidate(
+                    contract=contract,
+                    contract_sha256=contract_hash,
+                    prior_state=prior_state,
+                    content=parsed.content,
+                    delta=parsed.state_delta,
+                )
+                if deterministic_issues:
+                    review = EpisodeReviewerResult(
+                        passed=False,
+                        evidence="; ".join(
+                            f"{issue.code}: {issue.message}" for issue in deterministic_issues
+                        ),
+                        issues=deterministic_issues,
+                    )
+                else:
+                    review = await self._invoke_semantic_reviewer(
+                        request=episode_request,
+                        handler=handler,
+                        subagent_type="episode_reviewer",
+                        description=(
+                            f"Review episode {plan.episode_number} against the locked contract, "
+                            "prior series state, viewpoint knowledge, clue fairness, cast, and "
+                            "episode obligation. Return structured evidence only."
+                        ),
+                        files={
+                            "/workspace/story_contract.json": contract_json,
+                            "/workspace/series_state.json": prior_state.model_dump_json(),
+                            "/workspace/candidate_episode.md": parsed.content,
+                            "/workspace/candidate_state_delta.json": (
+                                parsed.state_delta.model_dump_json()
+                            ),
+                        },
+                        schema=EpisodeReviewerResult,
+                    )
+                if review.passed:
+                    try:
+                        episode_lock = build_episode_lock(
+                            contract=contract,
+                            contract_sha256=contract_hash,
+                            prior_state=prior_state,
+                            content=parsed.content,
+                            delta=parsed.state_delta,
+                            semantic_review=review,
+                            repair_rounds=repair_rounds,
+                        )
+                    except ContinuityViolation as exc:
+                        raise AgentProtocolError(
+                            exc.evidence,
+                            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        ) from exc
+                    committed = await self.commit_episode(
+                        plan.episode_number,
+                        parsed.content,
+                        episode_lock,
+                    )
+                    self.episode_drafts[plan.episode_number] = committed
+                    prior_state = episode_lock.series_state
+                    last_result = result
+                    break
+                if repair_rounds >= 2:
+                    raise ContentReviewRejectedError(
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        evidence=review.evidence,
+                        episode_number=plan.episode_number,
+                        repair_rounds=repair_rounds,
+                    )
+                repair_rounds += 1
+                result, payload = await self._invoke_repair_subagent(
+                    request=episode_request,
+                    handler=handler,
+                    subagent_type="episode_repair",
+                    description=(
+                        f"Repair episode {plan.episode_number}; round {repair_rounds} of 2. "
+                        "Change only the unlocked candidate and state delta. Keep the locked "
+                        "contract and earlier episodes unchanged, and address every review issue."
+                    ),
+                    files={
+                        "/workspace/story_contract.json": contract_json,
+                        "/workspace/series_state.json": prior_state.model_dump_json(),
+                        "/workspace/candidate_episode.md": parsed.content,
+                        "/workspace/candidate_state_delta.json": (
+                            parsed.state_delta.model_dump_json()
+                        ),
+                        "/workspace/episode_review.json": review.model_dump_json(),
+                    },
+                    schema=ScriptWriterResult,
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    expected_episode_number=plan.episode_number,
+                )
 
         aggregate = await self.assemble_episode_scripts()
         payload = {
             "stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value,
             "content": aggregate,
+            "contract_sha256": contract_hash,
+            "episode_hashes": [
+                {
+                    "episode_number": episode_number,
+                    "content_sha256": draft.content_sha256,
+                    "series_state_sha256": draft.series_state_sha256,
+                }
+                for episode_number, draft in sorted(self.episode_drafts.items())
+            ],
+            "series_state_sha256": canonical_model_hash(prior_state),
         }
         await self.approve_stage(InternalStage.GENERATING_EPISODE_SCRIPTS, payload)
         self.approved_payloads[InternalStage.GENERATING_EPISODE_SCRIPTS] = payload
@@ -774,7 +1235,14 @@ class DeepAgentWorkflow:
 
         files = {
             path: {"content": content, "encoding": "utf-8"}
-            for path, content in persona_files.items()
+            for path, content in {**persona_files, **load_agent_skill_files()}.items()
+        }
+        files["/workspace/creation-request.md"] = {
+            "content": (
+                f"# Story\n\n{story}\n\n# Script requirements\n\n{requirements}\n\n"
+                f"# Frozen revision feedback\n\n{feedback or 'None; this is the initial run.'}\n"
+            ),
+            "encoding": "utf-8",
         }
         approved_json = json.dumps(
             {stage.value: payload for stage, payload in (approved_checkpoints or {}).items()},
@@ -878,6 +1346,72 @@ class DeepAgentWorkflow:
                     handle_errors=structured_output_retry,
                 ),
             },
+            {
+                "name": "canon_reviewer",
+                "description": "Independently reviews a proposed structured story contract.",
+                "system_prompt": (
+                    "Use the canon-review skill. Treat upstream artifacts as frozen. Read the "
+                    "proposed JSON contract and return only structured review evidence. Never "
+                    "repair or rewrite the candidate."
+                ),
+                "model": self.model,
+                "tools": tools,
+                "permissions": REVIEW_FILE_PERMISSIONS,
+                "skills": _SPECIALIST_SKILL_SOURCES["canon_reviewer"],
+                "response_format": ToolStrategy(
+                    schema=CanonReviewerResult,
+                    handle_errors=structured_output_retry,
+                ),
+            },
+            {
+                "name": "canon_repair",
+                "description": "Repairs an unlocked episode outline and contract candidate.",
+                "system_prompt": (
+                    "Use the continuity-repair skill. Address every review issue while "
+                    "preserving frozen upstream intent. Return the full structured episode "
+                    "planner result only."
+                ),
+                "model": self.model,
+                "tools": tools,
+                "permissions": SKILLED_WRITE_PERMISSIONS,
+                "skills": _SPECIALIST_SKILL_SOURCES["canon_repair"],
+                "response_format": ToolStrategy(
+                    schema=EpisodePlannerResult,
+                    handle_errors=structured_output_retry,
+                ),
+            },
+            {
+                "name": "episode_reviewer",
+                "description": "Independently reviews one episode against locked continuity.",
+                "system_prompt": (
+                    "Use the episode-continuity-review skill. The contract and prior state are "
+                    "immutable. Return only structured review evidence and never repair content."
+                ),
+                "model": self.model,
+                "tools": tools,
+                "permissions": REVIEW_FILE_PERMISSIONS,
+                "skills": _SPECIALIST_SKILL_SOURCES["episode_reviewer"],
+                "response_format": ToolStrategy(
+                    schema=EpisodeReviewerResult,
+                    handle_errors=structured_output_retry,
+                ),
+            },
+            {
+                "name": "episode_repair",
+                "description": "Repairs only the current unlocked episode candidate.",
+                "system_prompt": (
+                    "Use the continuity-repair skill. Keep the locked contract and earlier "
+                    "episodes unchanged. Return the complete structured script result only."
+                ),
+                "model": self.model,
+                "tools": tools,
+                "permissions": SKILLED_WRITE_PERMISSIONS,
+                "skills": _SPECIALIST_SKILL_SOURCES["episode_repair"],
+                "response_format": ToolStrategy(
+                    schema=ScriptWriterResult,
+                    handle_errors=structured_output_retry,
+                ),
+            },
         ]
 
         supervisor = create_deep_agent(
@@ -978,8 +1512,10 @@ Delegate every missing specialist stage exactly once, in this order:
 Every task description MUST begin with the exact token
 `[stage=<stage_name>]`. Issue exactly one task tool call per model turn and wait
 for its tool result before delegating the next stage. Do not delegate an already
-approved stage. Do not use any subagent other than the four listed above. Treat
-/persona as read-only and /workspace as temporary thread scratch. Never claim a
+approved stage. Direct stage tasks only to the four owners listed above; the
+guarded runtime invokes contract review, episode review, and bounded repair
+specialists automatically. Treat /persona as read-only and /workspace as temporary
+thread scratch. Never claim a
 gate passed without the quality_reviewer evidence. After all stages are
 complete, return WorkflowCompletion only. Do not repeat the approved artifacts
 or return partial content.
