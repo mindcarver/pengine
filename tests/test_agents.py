@@ -568,6 +568,66 @@ async def test_wrong_stage_result_is_not_corrected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_quality_review_drops_stale_script_when_canonical_payload_is_missing() -> None:
+    approved_stages = {
+        InternalStage.SELECTING_L0_VARIANT,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+    }
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        return None
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=approved_stages,
+        approved_payloads={
+            InternalStage.GENERATING_EPISODE_SCRIPTS: {"stage": "generating_episode_scripts"}
+        },
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=accepting_l0] review the approved artifacts",
+                "subagent_type": "quality_reviewer",
+            },
+            "id": "call-missing-canonical-script",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={
+            "files": {
+                "/workspace/episode_scripts.md": {
+                    "content": "旧工作区剧本",
+                    "encoding": "utf-8",
+                }
+            }
+        },
+        runtime=None,
+    )
+
+    async def handler(review_request: ToolCallRequest) -> ToolMessage:
+        assert "/workspace/episode_scripts.md" not in review_request.state["files"]
+        return ToolMessage(
+            content=(
+                '{"stage":"accepting_l0","passed":true,'
+                '"evidence":"缺失稿件未被旧文件替代","feedback_handling":[]}'
+            ),
+            tool_call_id="call-missing-canonical-script",
+        )
+
+    await middleware.awrap_tool_call(request, handler)
+
+
+@pytest.mark.asyncio
 async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     model = ToolCallingFakeModel(
@@ -670,18 +730,52 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = tmp_path / "checkpoints.sqlite3"
+    reviewer_reads: list[str] = []
+    original_generate = ToolCallingFakeModel._generate
+
+    def capture_reviewer_reads(
+        model: ToolCallingFakeModel,
+        messages: list[Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        reviewer_reads.extend(
+            str(message.content)
+            for message in messages
+            if isinstance(message, ToolMessage) and message.name == "read_file"
+        )
+        return original_generate(model, messages, *args, **kwargs)
+
+    monkeypatch.setattr(ToolCallingFakeModel, "_generate", capture_reviewer_reads)
     responses = _successful_responses()
-    responses[13] = _tool_call(
+    responses[15] = _tool_call(
         "QualityReviewerResult",
         {
-            "stage": "accepting_l0",
+            "stage": "accepting_l4",
             "passed": False,
-            "evidence": "成品没有通过 L0 闸门。",
+            "evidence": "成品没有通过 L4 闸门。",
             "feedback_handling": [],
         },
-        13,
+        15,
+    )
+    responses.insert(
+        15,
+        _tool_call(
+            "read_file",
+            {"file_path": "/workspace/episode_scripts.md"},
+            100,
+        ),
+    )
+    responses.insert(
+        16,
+        _tool_call(
+            "read_file",
+            {"file_path": "/workspace/approved-checkpoints.json"},
+            101,
+        ),
     )
     approved: dict[InternalStage, dict[str, Any]] = {}
     first_attempts: list[InternalStage] = []
@@ -705,11 +799,21 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
                 thread_id="quality-retry-thread",
                 story="故事",
                 requirements="要求",
-                persona_files={"/persona/project.md": "规则"},
+                persona_files={
+                    "/persona/project.md": "规则",
+                    "/workspace/episode_scripts.md": "旧工作区剧本",
+                    "/workspace/approved-checkpoints.json": "{}",
+                },
                 before_stage=before_first_stage,
                 approve_stage=approve_stage,
                 **_episode_hook_kwargs()[0],
             )
+
+    assert not any("not found" in content for content in reviewer_reads)
+    assert any("第 1 集" in content and "分集剧本" in content for content in reviewer_reads)
+    assert any("generating_episode_scripts" in content for content in reviewer_reads)
+    assert not any("旧工作区剧本" in content for content in reviewer_reads)
+    reviewer_reads.clear()
 
     resumed_attempts: list[InternalStage] = []
 
@@ -719,20 +823,42 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
+        resumed_responses = _successful_responses()[14:]
+        resumed_responses.insert(
+            1,
+            _tool_call(
+                "read_file",
+                {"file_path": "/workspace/episode_scripts.md"},
+                102,
+            ),
+        )
+        resumed_responses.insert(
+            2,
+            _tool_call(
+                "read_file",
+                {"file_path": "/workspace/approved-checkpoints.json"},
+                103,
+            ),
+        )
         resumed_workflow = DeepAgentWorkflow(
-            model=ToolCallingFakeModel(responses=_successful_responses()[12:]),
+            model=ToolCallingFakeModel(responses=resumed_responses),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
         )
+        resumed_episode_hooks, resumed_episode_attempts = _episode_hook_kwargs()
         result = await resumed_workflow.execute(
             thread_id="quality-retry-thread",
             story="故事",
             requirements="要求",
-            persona_files={"/persona/project.md": "规则"},
+            persona_files={
+                "/persona/project.md": "规则",
+                "/workspace/episode_scripts.md": "旧工作区剧本",
+                "/workspace/approved-checkpoints.json": "{}",
+            },
             before_stage=before_resumed_stage,
             approve_stage=approve_stage,
             approved_checkpoints=approved,
-            **_episode_hook_kwargs()[0],
+            **resumed_episode_hooks,
         )
 
     assert first_attempts == [
@@ -742,8 +868,14 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
         InternalStage.GENERATING_RELATIONSHIP_LOGIC,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         InternalStage.ACCEPTING_L0,
+        InternalStage.ACCEPTING_L4,
     ]
-    assert resumed_attempts == [InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4]
+    assert resumed_attempts == [InternalStage.ACCEPTING_L4]
+    assert resumed_episode_attempts == []
+    assert not any("not found" in content for content in reviewer_reads)
+    assert any("第 1 集" in content and "分集剧本" in content for content in reviewer_reads)
+    assert any("generating_episode_scripts" in content for content in reviewer_reads)
+    assert not any("旧工作区剧本" in content for content in reviewer_reads)
     assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
 
 

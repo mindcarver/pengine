@@ -2,7 +2,7 @@ import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
 from fractions import Fraction
 from typing import Any, Literal
@@ -72,6 +72,13 @@ _RESULT_TOOL = {
     InternalStage.GENERATING_EPISODE_SCRIPTS: "ScriptWriterResult",
     InternalStage.ACCEPTING_L0: "QualityReviewerResult",
     InternalStage.ACCEPTING_L4: "QualityReviewerResult",
+}
+_WORKSPACE_ARTIFACT_PATHS = {
+    InternalStage.GENERATING_STORY_OUTLINE: "/workspace/story_outline.md",
+    InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: "/workspace/character_biographies.md",
+    InternalStage.GENERATING_RELATIONSHIP_LOGIC: "/workspace/relationship_logic.md",
+    InternalStage.GENERATING_EPISODE_OUTLINE: "/workspace/episode_outline.md",
+    InternalStage.GENERATING_EPISODE_SCRIPTS: "/workspace/episode_scripts.md",
 }
 
 _STORY_ARCHITECT_PROMPT = (
@@ -437,6 +444,29 @@ def _workflow_result_from_checkpoints(
         ) from exc
 
 
+def _review_workspace_files(
+    approved: Mapping[InternalStage, Any],
+) -> dict[str, dict[str, str]]:
+    files: dict[str, dict[str, str]] = {}
+    for stage, path in _WORKSPACE_ARTIFACT_PATHS.items():
+        payload = approved.get(stage)
+        if not isinstance(payload, Mapping):
+            continue
+        content = payload.get("content")
+        if isinstance(content, str) and content:
+            files[path] = {"content": content, "encoding": "utf-8"}
+    manifest = json.dumps(
+        {stage.value: payload for stage, payload in approved.items()},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    files["/workspace/approved-checkpoints.json"] = {
+        "content": manifest,
+        "encoding": "utf-8",
+    }
+    return files
+
+
 class StageGuardMiddleware(AgentMiddleware):
     def __init__(
         self,
@@ -509,6 +539,43 @@ class StageGuardMiddleware(AgentMiddleware):
                 tool_call_id=request.tool_call["id"],
                 name="task",
                 status="error",
+            )
+
+        if stage in (
+            InternalStage.ACCEPTING_L0,
+            InternalStage.ACCEPTING_L4,
+        ):
+            review_files = _review_workspace_files(self.approved_payloads)
+            if not isinstance(request.state, Mapping):
+                raise AgentProtocolError("Task state is unavailable", stage=stage)
+            existing_files = request.state.get("files")
+            canonical_paths = {
+                *_WORKSPACE_ARTIFACT_PATHS.values(),
+                "/workspace/approved-checkpoints.json",
+            }
+            noncanonical_files = (
+                {
+                    path: file_data
+                    for path, file_data in existing_files.items()
+                    if path not in canonical_paths
+                }
+                if isinstance(existing_files, Mapping)
+                else {}
+            )
+            review_state = {
+                **request.state,
+                "files": {
+                    **noncanonical_files,
+                    **review_files,
+                },
+            }
+            request = request.override(
+                state=review_state,
+                runtime=(
+                    replace(request.runtime, state=review_state)
+                    if request.runtime is not None
+                    else None
+                ),
             )
 
         if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
