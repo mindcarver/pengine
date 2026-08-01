@@ -1062,35 +1062,59 @@ textarea:disabled {
 
 .stage-list li {
   min-width: 0;
-  padding: 0.55rem 0.45rem;
-  border-top: 3px solid rgba(90, 69, 45, 0.18);
-  color: var(--ink-faint);
-  font-size: 0.67rem;
-  line-height: 1.35;
 }
 
-.stage-list li span {
+.stage-list button {
+  width: 100%;
+  min-width: 0;
+  padding: 0.55rem 0.45rem;
+  border-top: 3px solid rgba(90, 69, 45, 0.18);
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
+  color: var(--ink-faint);
+  background: transparent;
+  font: inherit;
+  font-size: 0.67rem;
+  line-height: 1.35;
+  text-align: left;
+}
+
+.stage-list button span {
   display: block;
   margin-bottom: 0.22rem;
   font-family: var(--mono);
   font-size: 0.58rem;
 }
 
-.stage-list li[data-status="completed"] {
+.stage-list button[data-status="completed"] {
   border-color: #496759;
   color: #2f4c3e;
+  cursor: pointer;
 }
 
-.stage-list li[data-status="completed"] span::after {
+.stage-list button[data-status="completed"] span::after {
   margin-left: 0.2rem;
   content: "✓";
 }
 
-.stage-list li[data-status="current"] {
+.stage-list button[data-status="current"] {
   border-color: var(--rust);
   color: var(--rust-deep);
   background: rgba(159, 63, 45, 0.06);
   font-weight: 700;
+}
+
+.stage-list button[data-reading="true"] {
+  box-shadow: inset 0 -2px 0 var(--ink);
+}
+
+.stage-list button:disabled {
+  cursor: default;
+}
+
+.stage-list button[data-status="pending"] {
+  opacity: 0.72;
 }
 
 .review-progress {
@@ -1286,7 +1310,15 @@ textarea:disabled {
 }
 
 #result-workspace[data-mode="progress"] {
-  grid-template-columns: minmax(8.5rem, 0.22fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+}
+
+#result-workspace[data-mode="progress"] .artifact-tabs {
+  display: none;
+}
+
+#result-workspace[data-mode="progress"] .artifact-paper {
+  grid-column: 1;
 }
 
 .version-bar {
@@ -1844,13 +1876,13 @@ textarea:disabled {
     grid-template-columns: 1fr;
   }
 
-  .stage-list li {
+  .stage-list button {
     display: grid;
     grid-template-columns: 2.2rem 1fr;
     align-items: center;
   }
 
-  .stage-list li span {
+  .stage-list button span {
     margin: 0;
   }
 

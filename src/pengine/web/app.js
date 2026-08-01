@@ -88,6 +88,11 @@ const EPISODE_SCRIPTS_DRAFT = {
   isEpisodeNavigator: true,
 };
 
+const STAGE_ARTIFACT_KEYS = new Map([
+  ...DRAFT_ARTIFACTS.map(({ stage, key }) => [stage, key]),
+  ["generating_episode_scripts", "episode_scripts"],
+]);
+
 const USER_STAGES = [
   ["determining_direction", "确定创作方向"],
   ["generating_story_outline", "生成故事大纲"],
@@ -273,6 +278,7 @@ function bindEvents() {
 
   elements["version-tabs"].addEventListener("click", handleVersionClick);
   elements["version-tabs"].addEventListener("keydown", handleHorizontalTabs);
+  elements["progress-stages"].addEventListener("click", handleStageClick);
   elements["artifact-tabs"].addEventListener("click", handleArtifactClick);
   elements["artifact-tabs"].addEventListener("keydown", handleHorizontalTabs);
   elements["episode-tabs"].addEventListener("click", handleEpisodeClick);
@@ -778,6 +784,7 @@ function renderProgress() {
 
   const { kind, run } = active;
   const progress = run.progress;
+  const artifactKeys = new Set(artifactViewsForRun(run).map(({ key }) => key));
   state.progressRunKind = kind;
   elements["run-progress"].hidden = false;
   elements["progress-kind"].textContent = kind === "initial" ? "初稿进度" : "修订进度";
@@ -788,12 +795,20 @@ function renderProgress() {
   const completed = new Set(progress.completed_stages);
   for (const item of elements["progress-stages"].querySelectorAll("[data-stage]")) {
     const stage = item.dataset.stage;
+    const artifactKey = STAGE_ARTIFACT_KEYS.get(stage);
     const status = completed.has(stage)
       ? "completed"
       : stage === progress.current_stage
         ? "current"
         : "pending";
     item.dataset.status = status;
+    if (artifactKey) {
+      item.dataset.artifact = artifactKey;
+    } else {
+      delete item.dataset.artifact;
+    }
+    item.dataset.reading = String(artifactKey === state.activeArtifact);
+    item.disabled = !artifactKey || !artifactKeys.has(artifactKey);
     if (status === "current") {
       item.setAttribute("aria-current", "step");
     } else {
@@ -1405,6 +1420,19 @@ function handleArtifactClick(event) {
   }
   state.activeArtifact = button.dataset.artifact;
   renderArtifact();
+}
+
+function handleStageClick(event) {
+  const button = event.target.closest("[data-stage]");
+  const artifactKey = button?.dataset.artifact;
+  if (!button || button.disabled || !artifactKey) {
+    return;
+  }
+  state.activeVersion = state.progressRunKind || state.activeVersion;
+  state.activeArtifact = artifactKey;
+  renderProgress();
+  renderWorkspace();
+  elements["artifact-panel"].focus?.({ preventScroll: true });
 }
 
 function handleEpisodeClick(event) {
