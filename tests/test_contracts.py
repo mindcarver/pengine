@@ -97,12 +97,14 @@ def test_openapi_exposes_recovery_reasons_and_pause_evidence() -> None:
         "run_timeout",
         "relay_interruption",
         "content_rejected",
+        "episode_error",
     ]
     assert "recovery_reason" in schemas["RunProgress"]["required"]
     assert schemas["RunPause"]["properties"]["code"]["enum"] == [
         "run_timeout",
         "relay_interruption",
         "content_rejected",
+        "episode_error",
     ]
     assert schemas["RunPause"]["properties"]["content_repair_count"]["anyOf"] == [
         {"type": "integer", "maximum": 2.0, "minimum": 2.0},

@@ -67,12 +67,17 @@ from pengine.schemas import (
     UserStage,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
 
-RecoveryReason = Literal["run_timeout", "relay_interruption", "content_rejected"]
+RecoveryReason = Literal[
+    "run_timeout",
+    "relay_interruption",
+    "content_rejected",
+    "episode_error",
+]
 RecoveryState = Literal["auto_resuming", "paused", "failed"]
 
 _SCHEMA_SQL = """
@@ -464,6 +469,111 @@ CREATE TABLE IF NOT EXISTS content_rejections (
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (6);
 """
 
+_SCHEMA_V7_SQL = """
+CREATE TABLE run_progress_v7 (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    current_stage TEXT NOT NULL,
+    execution_state TEXT NOT NULL CHECK (
+        execution_state IN (
+            'queued', 'running', 'auto_resuming', 'paused',
+            'quality_rejected', 'ended', 'succeeded', 'failed'
+        )
+    ),
+    elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (elapsed_seconds >= 0),
+    active_started_at TEXT,
+    timeout_stage TEXT,
+    timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+    updated_at TEXT NOT NULL,
+    current_episode INTEGER CHECK (current_episode IS NULL OR current_episode >= 1),
+    recovery_reason TEXT NOT NULL DEFAULT 'none' CHECK (
+        recovery_reason IN (
+            'none', 'run_timeout', 'relay_interruption', 'content_rejected',
+            'episode_error'
+        )
+    ),
+    content_repair_count INTEGER CHECK (
+        content_repair_count IS NULL
+        OR (content_repair_count >= 2 AND content_repair_count <= 2)
+    ),
+    pause_message TEXT
+);
+
+INSERT INTO run_progress_v7(
+    run_id, current_stage, execution_state, elapsed_seconds,
+    active_started_at, timeout_stage, timeout_count, updated_at,
+    current_episode, recovery_reason, content_repair_count, pause_message
+)
+SELECT
+    run_id, current_stage, execution_state, elapsed_seconds,
+    active_started_at, timeout_stage, timeout_count, updated_at,
+    current_episode, recovery_reason, content_repair_count, pause_message
+FROM run_progress;
+
+DROP TABLE run_progress;
+ALTER TABLE run_progress_v7 RENAME TO run_progress;
+
+UPDATE run_progress
+SET execution_state = 'paused',
+    active_started_at = NULL,
+    timeout_stage = 'generating_episode_scripts',
+    timeout_count = 0,
+    recovery_reason = 'episode_error',
+    content_repair_count = NULL,
+    pause_message = (
+        '旧版本未保存可安全展示的详细原因；已完成分集仍完好，'
+        || '可从当前集继续。'
+    )
+WHERE execution_state = 'failed'
+  AND current_stage = 'generating_episode_scripts'
+  AND current_episode IS NOT NULL
+  AND EXISTS (
+      SELECT 1
+      FROM runs
+      WHERE runs.id = run_progress.run_id
+        AND runs.state = 'failed'
+        AND runs.failure_code = 'internal_error'
+        AND runs.failed_stage = 'generating_episode_scripts'
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM episode_drafts
+      WHERE episode_drafts.run_id = run_progress.run_id
+        AND episode_drafts.episode_number < run_progress.current_episode
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM episode_plans
+      WHERE episode_plans.run_id = run_progress.run_id
+        AND episode_plans.episode_number = run_progress.current_episode
+  )
+  AND (
+      SELECT COUNT(*)
+      FROM episode_attempts
+      WHERE episode_attempts.run_id = run_progress.run_id
+        AND episode_attempts.episode_number = run_progress.current_episode
+  ) BETWEEN 1 AND 2;
+
+UPDATE runs
+SET state = 'running',
+    failure_code = NULL,
+    failure_message = NULL,
+    failed_stage = NULL,
+    failure_attempt_count = NULL,
+    completed_at = NULL
+WHERE state = 'failed'
+  AND failure_code = 'internal_error'
+  AND failed_stage = 'generating_episode_scripts'
+  AND EXISTS (
+      SELECT 1
+      FROM run_progress
+      WHERE run_progress.run_id = runs.id
+        AND run_progress.execution_state = 'paused'
+        AND run_progress.recovery_reason = 'episode_error'
+  );
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (7);
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -662,7 +772,7 @@ class Repository:
             if row is None:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
             schema_version = int(row[0])
-            if schema_version not in {1, 2, 3, 4, 5, SCHEMA_VERSION}:
+            if schema_version not in {1, 2, 3, 4, 5, 6, SCHEMA_VERSION}:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
             if schema_version == 1:
                 await connection.executescript(_SCHEMA_V2_SQL)
@@ -682,6 +792,10 @@ class Repository:
                 schema_version = 5
             if schema_version == 5:
                 await connection.executescript(_SCHEMA_V6_SQL)
+                await connection.commit()
+                schema_version = 6
+            if schema_version == 6:
+                await connection.executescript(_SCHEMA_V7_SQL)
                 await connection.commit()
 
     async def setup(self) -> None:
@@ -1574,6 +1688,115 @@ class Repository:
                     user_stage.value,
                     repair_rounds,
                     evidence,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'failed',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, str(run_id)),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, progress["creation_id"]),
+            )
+
+    async def pause_episode_error(
+        self,
+        run_id: UUID,
+        *,
+        episode_number: int,
+        safe_message: str,
+        now: datetime | None = None,
+    ) -> None:
+        if episode_number < 1 or not safe_message.strip():
+            raise ValueError("Episode errors require an episode number and safe message")
+        current = now or _utc_now()
+        timestamp = _timestamp(current)
+        async with self._transaction() as connection:
+            progress = await self._fetchone(
+                connection,
+                """
+                SELECT run_progress.*, runs.state AS run_state, runs.creation_id
+                FROM run_progress
+                JOIN runs ON runs.id = run_progress.run_id
+                WHERE run_progress.run_id = ?
+                """,
+                (str(run_id),),
+            )
+            if progress is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if progress["run_state"] != "running" or progress["execution_state"] != "running":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Workflow run is not actively running.",
+                    409,
+                )
+            planned = await self._fetchone(
+                connection,
+                """
+                SELECT 1 FROM episode_plans
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (str(run_id), episode_number),
+            )
+            if planned is None:
+                raise DomainError(
+                    "episode_not_planned",
+                    "The episode is not in the approved outline.",
+                    409,
+                )
+            attempt = await self._fetchone(
+                connection,
+                """
+                SELECT COUNT(*) AS attempt_count
+                FROM episode_attempts
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (str(run_id), episode_number),
+            )
+            attempt_count = int(attempt["attempt_count"]) if attempt is not None else 0
+            if attempt_count == 0:
+                raise DomainError(
+                    "episode_attempt_required",
+                    "An episode error requires a recorded writer attempt.",
+                    409,
+                )
+            if attempt_count >= MAX_EPISODE_ATTEMPTS:
+                raise DomainError(
+                    "attempts_exhausted",
+                    "The episode attempt limit has been exhausted.",
+                    409,
+                )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    current_episode = ?,
+                    execution_state = 'paused',
+                    elapsed_seconds = ?,
+                    active_started_at = NULL,
+                    timeout_stage = ?,
+                    timeout_count = 0,
+                    recovery_reason = 'episode_error',
+                    content_repair_count = NULL,
+                    pause_message = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                    episode_number,
+                    self._elapsed_seconds(progress, current),
+                    UserStage.GENERATING_EPISODE_SCRIPTS.value,
+                    safe_message.strip(),
                     timestamp,
                     str(run_id),
                 ),
@@ -3553,6 +3776,7 @@ class Repository:
             "run_timeout",
             "relay_interruption",
             "content_rejected",
+            "episode_error",
         }:
             raise RuntimeError("Paused workflow run is missing its recovery reason")
         if recovery_reason == "content_rejected":
@@ -3568,6 +3792,15 @@ class Repository:
                     if progress["current_episode"] is not None
                     else None
                 ),
+            )
+        if recovery_reason == "episode_error":
+            if not progress["pause_message"] or progress["current_episode"] is None:
+                raise RuntimeError("Episode-error pause is missing safe recovery evidence")
+            return RunPause(
+                message=progress["pause_message"],
+                code="episode_error",
+                stage=stage,
+                episode_number=int(progress["current_episode"]),
             )
         return RunPause(
             message=(

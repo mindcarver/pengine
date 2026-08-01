@@ -20,7 +20,7 @@ from langchain.agents.middleware.types import ToolCallRequest
 from langchain.agents.structured_output import ToolStrategy
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import StructuredTool, ToolException
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 from pydantic import Field, model_validator
@@ -141,18 +141,23 @@ _EPISODE_PLANNER_PROMPT = (
 )
 
 _SCRIPT_WRITER_PROMPT = (
-    "Read /workspace/story_contract.json and /workspace/series_state.json. Use the "
-    "requested single episode plan and persona rules without changing the locked "
-    "episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
+    "If the task explicitly identifies a grandfathered pre-contract run, the contract "
+    "and series-state files are absent by design: do not read or invent them, preserve "
+    "every approved upstream artifact and committed earlier episode, and return null "
+    "state_delta. Otherwise, read /workspace/story_contract.json and "
+    "/workspace/series_state.json and return a state_delta bound to the supplied contract "
+    "hash. Use the requested single episode plan and persona rules without changing any "
+    "locked episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
     "returning, reread every approved upstream artifact and audit this episode "
     "against them. "
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
     "exact dialogue-count claims, and episode-specific promised actions. Every "
     "upstream commitment must appear in the scripts. Use calculate_arithmetic "
-    "for every derived numeric claim and copy its exact result. Never round a "
-    "non-integral division unless the script states the rounding rule. Return "
-    "the script plus a structured state_delta bound to the supplied contract "
-    "hash. Every required fact, clue event, and episode obligation must cite a verbatim "
+    "for every derived numeric claim and copy its exact result. The tool accepts "
+    "decimal operands only: convert clock times to elapsed minutes before subtracting "
+    "them (for example, 22:50 becomes 1370 and 22:20 becomes 1340). Never round a "
+    "non-integral division unless the script states the rounding rule. Every required "
+    "fact, clue event, and episode obligation must cite a verbatim "
     "excerpt that exists in the script. Return only the structured episode-script "
     "result for the requested episode number."
 )
@@ -253,15 +258,31 @@ class EpisodePlannerResult(StrictModel):
         return self
 
 
+class LegacyEpisodePlannerResult(StrictModel):
+    """Pre-contract outline retained only so an already-started run can finish."""
+
+    stage: Literal["generating_episode_outline"]
+    content: NonEmptyText
+    episode_count: int = Field(ge=1)
+    episodes: list[EpisodePlan] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_episode_sequence(self) -> "LegacyEpisodePlannerResult":
+        expected = list(range(1, self.episode_count + 1))
+        if [episode.episode_number for episode in self.episodes] != expected:
+            raise ValueError("Episode plans must be ordered and contiguous from 1")
+        return self
+
+
 class ScriptWriterResult(StrictModel):
     stage: Literal["generating_episode_scripts"]
     episode_number: int = Field(ge=1)
     content: NonEmptyText
-    state_delta: EpisodeStateDelta
+    state_delta: EpisodeStateDelta | None = None
 
     @model_validator(mode="after")
     def validate_delta_episode(self) -> "ScriptWriterResult":
-        if self.state_delta.episode_number != self.episode_number:
+        if self.state_delta is not None and self.state_delta.episode_number != self.episode_number:
             raise ValueError("Episode state delta must match the script episode")
         return self
 
@@ -365,6 +386,33 @@ def _calculate_arithmetic(
     return (
         f"{result.numerator}/{result.denominator} "
         "(non-terminating decimal; do not round without an explicit rule)"
+    )
+
+
+def _calculate_arithmetic_tool(
+    left: str,
+    operation: Literal["add", "subtract", "multiply", "divide"],
+    right: str,
+) -> str:
+    try:
+        return _calculate_arithmetic(left, operation, right)
+    except ValueError as exc:
+        raise ToolException(
+            f"Invalid arithmetic input: {exc}. Use decimal operands only; "
+            "convert clock times to elapsed minutes before calculating."
+        ) from exc
+
+
+def _arithmetic_tool() -> StructuredTool:
+    return StructuredTool.from_function(
+        func=_calculate_arithmetic_tool,
+        name="calculate_arithmetic",
+        description=(
+            "Calculate one exact decimal add, subtract, multiply, or divide operation. "
+            "Operands must be decimal numbers; convert clock times to elapsed minutes first. "
+            "Use it before writing any derived numeric claim."
+        ),
+        handle_tool_error=True,
     )
 
 
@@ -979,42 +1027,64 @@ class StageGuardMiddleware(AgentMiddleware):
                 stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
             )
         outline = self.approved_payloads.get(InternalStage.GENERATING_EPISODE_OUTLINE)
+        legacy_recovery = isinstance(outline, Mapping) and "story_contract" not in outline
         try:
-            parsed_outline = EpisodePlannerResult.model_validate(
-                {field: outline[field] for field in EpisodePlannerResult.model_fields}
-            )
-            plans = parsed_outline.episodes
-            contract = parsed_outline.story_contract
-            contract_hash = story_contract_sha256(contract)
-            if outline["story_contract_sha256"] != contract_hash:
-                raise ValueError("Story contract hash does not match its content")
-            contract_review = CanonReviewerResult.model_validate(outline["contract_review"])
-            if not contract_review.passed:
-                raise ValueError("Story contract was not independently approved")
+            if legacy_recovery:
+                legacy_outline = LegacyEpisodePlannerResult.model_validate(outline)
+                plans = legacy_outline.episodes
+                contract = None
+                contract_hash = None
+                contract_json = None
+                prior_state = None
+                if any(
+                    draft.contract_sha256 is not None
+                    or draft.series_state is not None
+                    or draft.series_state_sha256 is not None
+                    for draft in self.episode_drafts.values()
+                ):
+                    raise ValueError("Legacy episode drafts contain unexpected lock data")
+            else:
+                parsed_outline = EpisodePlannerResult.model_validate(
+                    {field: outline[field] for field in EpisodePlannerResult.model_fields}
+                )
+                plans = parsed_outline.episodes
+                contract = parsed_outline.story_contract
+                contract_hash = story_contract_sha256(contract)
+                if outline["story_contract_sha256"] != contract_hash:
+                    raise ValueError("Story contract hash does not match its content")
+                contract_review = CanonReviewerResult.model_validate(outline["contract_review"])
+                if not contract_review.passed:
+                    raise ValueError("Story contract was not independently approved")
+                contract_json = json.dumps(
+                    contract.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                prior_state = initial_series_state(contract, contract_hash)
+                for episode_number, draft in sorted(self.episode_drafts.items()):
+                    if (
+                        draft.contract_sha256 != contract_hash
+                        or draft.series_state is None
+                        or draft.series_state_sha256 is None
+                        or canonical_model_hash(draft.series_state) != draft.series_state_sha256
+                        or episode_number != prior_state.locked_through_episode + 1
+                    ):
+                        raise CheckpointUnavailableError(
+                            "Committed episode continuity state is unavailable or mismatched."
+                        )
+                    prior_state = draft.series_state
+        except CheckpointUnavailableError:
+            raise
         except Exception as exc:
+            message = (
+                "Legacy episode recovery requires a valid approved episode outline"
+                if legacy_recovery
+                else "Episode scripts require an approved locked story contract"
+            )
             raise AgentProtocolError(
-                "Episode scripts require an approved locked story contract",
+                message,
                 stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
             ) from exc
-
-        contract_json = json.dumps(
-            contract.model_dump(mode="json"),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        prior_state = initial_series_state(contract, contract_hash)
-        for episode_number, draft in sorted(self.episode_drafts.items()):
-            if (
-                draft.contract_sha256 != contract_hash
-                or draft.series_state is None
-                or draft.series_state_sha256 is None
-                or canonical_model_hash(draft.series_state) != draft.series_state_sha256
-                or episode_number != prior_state.locked_through_episode + 1
-            ):
-                raise CheckpointUnavailableError(
-                    "Committed episode continuity state is unavailable or mismatched."
-                )
-            prior_state = draft.series_state
 
         last_result: ToolMessage | Command[Any] | None = None
         for plan in plans:
@@ -1028,24 +1098,35 @@ class StageGuardMiddleware(AgentMiddleware):
                 "description": (
                     f"[stage=generating_episode_scripts][episode={plan.episode_number}] "
                     f"Write only episode {plan.episode_number}.\n"
-                    f"Approved episode plan:\n{plan.plan}\n"
-                    f"Locked contract SHA-256: {contract_hash}"
+                    f"Approved episode plan:\n{plan.plan}"
+                    + (
+                        "\nThis is a grandfathered pre-contract run. Preserve every approved "
+                        "upstream artifact and committed earlier episode; return content for this "
+                        "episode without inventing a replacement story contract."
+                        if legacy_recovery
+                        else f"\nLocked contract SHA-256: {contract_hash}"
+                    )
                 ),
             }
+            episode_files = {
+                f"/workspace/episodes/ep{number}.md": draft.content
+                for number, draft in sorted(self.episode_drafts.items())
+            }
+            if not legacy_recovery:
+                assert contract_json is not None and prior_state is not None
+                episode_files.update(
+                    {
+                        "/workspace/story_contract.json": contract_json,
+                        "/workspace/story_contract.md": outline["story_contract_markdown"],
+                        "/workspace/series_state.json": prior_state.model_dump_json(),
+                        "/workspace/previous_episode_handoff.md": prior_state.handoff or "None",
+                    }
+                )
             episode_request = _request_with_files(
                 request.override(
                     tool_call={**request.tool_call, "args": episode_args},
                 ),
-                {
-                    "/workspace/story_contract.json": contract_json,
-                    "/workspace/story_contract.md": outline["story_contract_markdown"],
-                    "/workspace/series_state.json": prior_state.model_dump_json(),
-                    "/workspace/previous_episode_handoff.md": prior_state.handoff or "None",
-                    **{
-                        f"/workspace/episodes/ep{number}.md": draft.content
-                        for number, draft in sorted(self.episode_drafts.items())
-                    },
-                },
+                episode_files,
             )
             try:
                 if self.episode_timeout_seconds is None:
@@ -1068,9 +1149,24 @@ class StageGuardMiddleware(AgentMiddleware):
             except TimeoutError as exc:
                 raise EpisodeTimeoutError(plan.episode_number) from exc
 
+            parsed = ScriptWriterResult.model_validate(payload)
+            if legacy_recovery:
+                committed = await self.commit_episode(
+                    plan.episode_number,
+                    parsed.content,
+                    None,
+                )
+                self.episode_drafts[plan.episode_number] = committed
+                last_result = result
+                continue
+            if parsed.state_delta is None:
+                raise AgentProtocolError(
+                    "Contract-bound episode omitted its continuity state delta",
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                )
+            assert contract is not None and contract_hash is not None and prior_state is not None
             repair_rounds = 0
             while True:
-                parsed = ScriptWriterResult.model_validate(payload)
                 deterministic_issues = validate_episode_candidate(
                     contract=contract,
                     contract_sha256=contract_hash,
@@ -1161,22 +1257,31 @@ class StageGuardMiddleware(AgentMiddleware):
                     stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
                     expected_episode_number=plan.episode_number,
                 )
+                parsed = ScriptWriterResult.model_validate(payload)
+                if parsed.state_delta is None:
+                    raise AgentProtocolError(
+                        "Contract-bound episode repair omitted its continuity state delta",
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    )
 
         aggregate = await self.assemble_episode_scripts()
-        payload = {
-            "stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value,
-            "content": aggregate,
-            "contract_sha256": contract_hash,
-            "episode_hashes": [
+        payload = {"stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value, "content": aggregate}
+        if not legacy_recovery:
+            assert contract_hash is not None and prior_state is not None
+            payload.update(
                 {
-                    "episode_number": episode_number,
-                    "content_sha256": draft.content_sha256,
-                    "series_state_sha256": draft.series_state_sha256,
+                    "contract_sha256": contract_hash,
+                    "episode_hashes": [
+                        {
+                            "episode_number": episode_number,
+                            "content_sha256": draft.content_sha256,
+                            "series_state_sha256": draft.series_state_sha256,
+                        }
+                        for episode_number, draft in sorted(self.episode_drafts.items())
+                    ],
+                    "series_state_sha256": canonical_model_hash(prior_state),
                 }
-                for episode_number, draft in sorted(self.episode_drafts.items())
-            ],
-            "series_state_sha256": canonical_model_hash(prior_state),
-        }
+            )
         await self.approve_stage(InternalStage.GENERATING_EPISODE_SCRIPTS, payload)
         self.approved_payloads[InternalStage.GENERATING_EPISODE_SCRIPTS] = payload
         self.approved_stages.add(InternalStage.GENERATING_EPISODE_SCRIPTS)
@@ -1254,16 +1359,7 @@ class DeepAgentWorkflow:
             "encoding": "utf-8",
         }
 
-        tools = [
-            StructuredTool.from_function(
-                func=_calculate_arithmetic,
-                name="calculate_arithmetic",
-                description=(
-                    "Calculate one exact decimal add, subtract, multiply, or divide "
-                    "operation. Use it before writing any derived numeric claim."
-                ),
-            )
-        ]
+        tools = [_arithmetic_tool()]
         if retrieve_references is not None:
 
             async def retrieve_persona_references(query: str) -> str:

@@ -172,6 +172,7 @@ class RunProgress(StrictModel):
         "run_timeout",
         "relay_interruption",
         "content_rejected",
+        "episode_error",
     ]
     final_review: FinalReviewProgress
     episodes: EpisodeProgress | None = None
@@ -221,7 +222,12 @@ class RunDraftSnapshot(StrictModel):
 
 
 class RunPause(StrictModel):
-    code: Literal["run_timeout", "relay_interruption", "content_rejected"] = "run_timeout"
+    code: Literal[
+        "run_timeout",
+        "relay_interruption",
+        "content_rejected",
+        "episode_error",
+    ] = "run_timeout"
     message: NonEmptyText
     stage: UserStage
     timeout_count: int | None = Field(default=None, ge=2)
@@ -235,6 +241,9 @@ class RunPause(StrictModel):
                 raise ValueError(
                     "Content rejection requires exactly two content repairs and no timeout count"
                 )
+        elif self.code == "episode_error":
+            if self.timeout_count is not None or self.content_repair_count is not None:
+                raise ValueError("Episode errors do not use timeout or repair counts")
         elif self.timeout_count is None or self.content_repair_count is not None:
             raise ValueError(
                 "Timeout and relay pauses require a timeout count and no content repair count"
