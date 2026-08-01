@@ -456,7 +456,7 @@ Object.assign(elements, {
   "quality-rejection-action-message": { textContent: "" },
 });
 renderProgress = () => {};
-renderWorkspace = () => false;
+renderWorkspace = () => true;
 state.creationId = "creation id";
 state.activeDraftRunKind = "";
 state.creation = {
@@ -477,8 +477,8 @@ state.creation = {
 };
 renderCreation();
 if (elements["failure-panel"].hidden) throw new Error("quality rejection stayed hidden");
-if (!elements["result-workspace"].hidden) {
-  throw new Error("quality rejection exposed unapproved workspace");
+if (elements["result-workspace"].hidden) {
+  throw new Error("quality rejection hid persisted workspace");
 }
 if (!elements["failure-title"].textContent.includes("L0 创作内核")) {
   throw new Error("L0 rejection was not identified");
@@ -736,7 +736,7 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
-def test_unapproved_drafts_stay_out_of_the_reading_scene() -> None:
+def test_live_drafts_render_in_the_creation_scene_but_not_the_formal_reader() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"
     page = (root / "src" / "pengine" / "web" / "index.html").read_text()
@@ -798,6 +798,22 @@ Object.assign(elements, {
   "episode-content": { textContent: "", setAttribute() {}, removeAttribute() {} },
   "artifact-content": { textContent: "" },
 });
+function episodeTab() {
+  return {
+    dataset: {},
+    disabled: false,
+    tabIndex: 0,
+    textContent: "",
+    setAttribute() {},
+  };
+}
+document.createElement = () => episodeTab();
+const renderedEpisodeTabs = [];
+elements["episode-tabs"] = {
+  replaceChildren(...tabs) {
+    renderedEpisodeTabs.splice(0, renderedEpisodeTabs.length, ...tabs);
+  },
+};
 renderProgress = () => {};
 renderRevision = () => {};
 const progress = {
@@ -832,9 +848,23 @@ state.creation = {
   revision: { state: "unavailable" },
 };
 renderCreation();
-if (!elements["result-workspace"].hidden) {
-  throw new Error("running drafts opened the reading scene");
+if (elements["result-workspace"].hidden) {
+  throw new Error("running drafts were not visible in the creation scene");
 }
+state.activeArtifact = "story_outline";
+renderArtifact();
+if (elements["artifact-content"].textContent !== "<b>已提交故事大纲</b>") {
+  throw new Error("running draft content was not rendered");
+}
+if (elements["artifact-version-mark"].textContent !== "创作中草稿") {
+  throw new Error("running content was presented as a formal delivery");
+}
+state.workspaceView = "reading";
+renderWorkspace();
+if (!elements["result-workspace"].hidden) {
+  throw new Error("drafts appeared in the formal reader");
+}
+state.workspaceView = "progress";
 
 const pausedProgress = {
   ...progress,
@@ -848,8 +878,8 @@ state.creation = {
   initial: { state: "paused", progress: pausedProgress, drafts },
 };
 renderCreation();
-if (!elements["result-workspace"].hidden) {
-  throw new Error("paused drafts opened the reading scene");
+if (elements["result-workspace"].hidden) {
+  throw new Error("paused drafts were not retained for inspection");
 }
 if (!elements["wait-title"].textContent.includes("网络 / Relay")) {
   throw new Error("relay pause did not use safe relay copy");
@@ -863,8 +893,8 @@ renderCreation();
 if (!elements["wait-kicker"].textContent.includes("网络 / Relay")) {
   throw new Error("relay auto recovery did not use safe relay copy");
 }
-if (!elements["result-workspace"].hidden) {
-  throw new Error("recovering drafts opened the reading scene");
+if (elements["result-workspace"].hidden) {
+  throw new Error("recovering drafts were not retained for inspection");
 }
 
 state.creation = {
@@ -872,8 +902,39 @@ state.creation = {
   initial: { state: "queued", progress, drafts },
 };
 renderCreation();
-if (!elements["result-workspace"].hidden) {
-  throw new Error("queued drafts opened the reading scene");
+if (elements["result-workspace"].hidden) {
+  throw new Error("queued drafts were not retained for inspection");
+}
+
+const episodeProgress = {
+  ...progress,
+  current_stage: "generating_episode_scripts",
+  episodes: { total: 3, completed: 1, current: 2 },
+};
+const episodeDrafts = {
+  ...drafts,
+  episodes: [{ episode_number: 1, content: "第一集已提交剧本" }],
+};
+state.activeArtifact = "episode_scripts";
+state.creation = {
+  ...state.creation,
+  initial: { state: "running", progress: episodeProgress, drafts: episodeDrafts },
+};
+renderCreation();
+if (elements["result-workspace"].hidden || elements["episode-navigator"].hidden) {
+  throw new Error("episode drafts were not visible during script generation");
+}
+if (!elements["episode-progress-summary"].textContent.includes("共 3 集")) {
+  throw new Error("episode progress summary was not rendered");
+}
+if (renderedEpisodeTabs[0]?.dataset.status !== "completed") {
+  throw new Error("completed episode did not retain its status");
+}
+if (renderedEpisodeTabs[1]?.dataset.status !== "current" || !renderedEpisodeTabs[1]?.disabled) {
+  throw new Error("unsubmitted current episode was presented as readable");
+}
+if (elements["episode-content"].textContent !== "第一集已提交剧本") {
+  throw new Error("persisted episode content was not rendered");
 }
 
 const formalInitial = {
@@ -889,6 +950,7 @@ const formalInitial = {
   },
 };
 state.activeDraftRunKind = "";
+state.activeArtifact = "story_outline";
 state.creation = {
   persona: { display_name: "测试人格", version: "1" },
   initial: formalInitial,

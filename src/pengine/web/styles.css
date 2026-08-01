@@ -1285,6 +1285,10 @@ textarea:disabled {
   margin-left: 2rem;
 }
 
+#result-workspace[data-mode="progress"] {
+  grid-template-columns: minmax(8.5rem, 0.22fr) minmax(0, 1fr);
+}
+
 .version-bar {
   display: flex;
   align-items: end;
