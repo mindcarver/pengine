@@ -1,9 +1,14 @@
 import json
 from pathlib import Path
 
+import pytest
 from jsonschema import Draft202012Validator
+from pydantic import ValidationError
 
+from pengine.api import create_app
+from pengine.config import Settings
 from pengine.personas import canonical_snapshot_sha256
+from pengine.schemas import RunPause, UserStage
 
 ROOT = Path(__file__).parents[1]
 
@@ -84,19 +89,72 @@ def test_openapi_exposes_durable_episode_drafts_for_readable_runs() -> None:
     }
 
 
-def test_openapi_exposes_relay_recovery_reason_and_pause_code() -> None:
+def test_openapi_exposes_recovery_reasons_and_pause_evidence() -> None:
     schemas = json.loads((ROOT / "contracts/openapi.json").read_text())["components"]["schemas"]
 
     assert schemas["RunProgress"]["properties"]["recovery_reason"]["enum"] == [
         "none",
         "run_timeout",
         "relay_interruption",
+        "content_rejected",
     ]
     assert "recovery_reason" in schemas["RunProgress"]["required"]
     assert schemas["RunPause"]["properties"]["code"]["enum"] == [
         "run_timeout",
         "relay_interruption",
+        "content_rejected",
     ]
+    assert schemas["RunPause"]["properties"]["content_repair_count"]["anyOf"] == [
+        {"type": "integer", "maximum": 2.0, "minimum": 2.0},
+        {"type": "null"},
+    ]
+    assert schemas["EpisodeDraft"]["properties"]["state_delta"]["anyOf"][0] == {
+        "$ref": "#/components/schemas/EpisodeStateDelta"
+    }
+
+    generated = create_app(settings=Settings()).openapi()["components"]["schemas"]
+    for name in (
+        "RunFailure",
+        "RunPause",
+        "RunProgress",
+        "EpisodeDraft",
+        "EpisodeStateDelta",
+        "SeriesState",
+        "CharacterKnowledge",
+        "KnowledgeGain",
+        "ScriptEvidence",
+        "ReviewIssue",
+        "SemanticReview",
+    ):
+        assert schemas[name] == generated[name]
+
+
+def test_pause_counts_cannot_mix_transport_and_content_recovery() -> None:
+    content_pause = RunPause(
+        code="content_rejected",
+        message="Continuity review still failed.",
+        stage=UserStage.GENERATING_EPISODE_SCRIPTS,
+        content_repair_count=2,
+        episode_number=1,
+    )
+    assert content_pause.timeout_count is None
+
+    with pytest.raises(ValidationError):
+        RunPause(
+            code="content_rejected",
+            message="Continuity review still failed.",
+            stage=UserStage.GENERATING_EPISODE_SCRIPTS,
+            timeout_count=2,
+            content_repair_count=2,
+            episode_number=1,
+        )
+
+    with pytest.raises(ValidationError):
+        RunPause(
+            code="relay_interruption",
+            message="Relay was interrupted twice.",
+            stage=UserStage.GENERATING_EPISODE_SCRIPTS,
+        )
 
 
 def test_openapi_exposes_quality_rejection_recovery_contract() -> None:

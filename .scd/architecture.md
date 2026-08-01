@@ -4,6 +4,7 @@ status: ready
 sources:
   - https://github.com/mindcarver/pengine/issues/1
   - https://github.com/mindcarver/pengine/issues/10
+  - https://github.com/mindcarver/pengine/issues/37
   - /Users/carver/Downloads/Telegram Desktop/短剧线_九文件与调用逻辑说明_v1_2.docx
 contracts:
   - contracts/openapi.json
@@ -108,7 +109,7 @@ navigation, including after an ended or failed run; it does not infer or expose
 text for an uncommitted episode.
 
 The persona-bound `workflow_supervisor` advances these stages by delegating to
-four named synchronous subagents:
+four primary synchronous subagents:
 
 - `story_architect` handles L0 selection, story outline, character biographies,
   and relationship logic through stage-specific structured tasks;
@@ -116,6 +117,24 @@ four named synchronous subagents:
 - `script_writer` handles episode scripts;
 - `quality_reviewer` produces structured L0/L4 evidence and revision-feedback
   coverage.
+
+The episode-outline result also contains a versioned `StoryContract`, which is
+the sole machine-readable source for cast membership, relationships, typed
+facts and units, temporal order, character knowledge, clue lifecycle, and
+per-episode obligations. The service runs deterministic validation and then a
+fresh `canon_reviewer` model review. A failing candidate may be handled by the
+skill-scoped `canon_repair` subagent at most twice. Only a candidate that passes
+both checks is persisted with its canonical Markdown projection and SHA-256 in
+the approved episode-outline checkpoint.
+
+For each episode, `script_writer` returns both script text and a typed
+`EpisodeStateDelta`. Deterministic validation compares them with the locked
+contract and preceding folded `SeriesState`; a fresh `episode_reviewer` then
+checks semantic continuity. The skill-scoped `episode_repair` subagent may
+repair only the current unlocked episode, at most twice. A successful commit
+atomically persists the full script, delta, folded state, semantic evidence,
+repair count, and content/state hashes. Specialist skills are loaded only into
+their matching review or repair subagents, never into the supervisor globally.
 
 There are two distinct checkpoint meanings:
 
@@ -175,8 +194,8 @@ failed.
 | Local HTTP API | Runtime validation, idempotent commands, resource queries, paused-run continue/end commands, stable errors | Workflow execution, model retries, persona parsing |
 | Creation service | Domain invariants and state-transition authority | HTTP serialization, vendor requests |
 | Embedded worker | Durable job leases, stage-attempt guards, invocation/resume of Deep Agents threads, restart reconciliation | Creative planning, public request semantics |
-| Deep Agents supervisor | Run-local planning, ordered specialist delegation, correction loops, structured candidate assembly | Domain state transitions, retry entitlement, final gate authority |
-| Synchronous subagents | Stage-scoped creative work and structured review evidence | Job scheduling, direct database writes, persona mutation |
+| Deep Agents supervisor | Run-local planning, ordered specialist delegation, bounded correction loops, structured candidate assembly | Domain state transitions, retry entitlement, final gate authority |
+| Synchronous subagents | Stage-scoped creative work, skill-scoped canon/continuity review, and repair candidates | Job scheduling, direct database writes, persona mutation, silent lock mutation |
 | Persona loader | Manifest/schema validation, immutable snapshots, read-only virtual context projection, bounded L5/L6 retrieval | Production persona content |
 | LangGraph checkpointer | Thread messages, plans, subagent results, and `StateBackend` scratch checkpoints | Business checkpoints, public run state, revision entitlement |
 | Relay client | Preconfigured `ChatAnthropic`, Anthropic-compatible request/response mapping, explicit timeouts, safe error mapping | Workflow retry policy, API keys at rest |
@@ -216,15 +235,20 @@ immutable snapshots already referenced by creations.
 5. Before a specialist invocation for a stage, the worker's guarded delegation
    boundary durably records the next stage-attempt number. A fourth invocation
    is rejected before any model request.
-6. Subagents return schema-validated structured results. The creation service
-   applies deterministic structural checks and commits an approved business
-   checkpoint before the supervisor can rely on the output downstream.
-7. `quality_reviewer` produces the structured evidence packs for the L0 and L4
+6. The episode planner returns both the human outline and structured story
+   contract. Deterministic validation and an independent model reviewer must
+   pass before the creation service locks their hash-bearing checkpoint.
+7. Each episode is generated against that immutable contract and the previous
+   folded series state. Deterministic and independent model checks must pass
+   before its script and state evidence commit atomically.
+8. `quality_reviewer` produces the structured evidence packs for the L0 and L4
    gates. The creation service evaluates the required gate contract and owns
    the pass/fail state transition.
-8. The complete content package and delivery report commit atomically with the
+9. Before L4, the service reconstructs the complete scripts checkpoint from
+   every locked episode and verifies the contract, script, and state hashes.
+10. The complete content package and delivery report commit atomically with the
    run's `succeeded` state.
-9. Each guarded attempt records the current internal stage in SQLite. Resource
+11. Each guarded attempt records the current internal stage in SQLite. Resource
    queries map it and approved checkpoints to the seven user stages, completed
    stages, elapsed active time, final-review sub-status, and available actions.
 
@@ -275,6 +299,11 @@ immutable snapshots already referenced by creations.
   relay address that then has a DNS or connection failure is indistinguishable
   from a transient transport failure, so it follows the bounded recovery path
   and becomes terminal when the three-call limit is exhausted.
+- Contract and per-episode content review use a separate two-repair budget.
+  Exhaustion records `content_rejected`, the exact review evidence, and the
+  current episode when applicable, then pauses with continue/end actions.
+  Transport failures never consume this content budget, and continuing never
+  unlocks or rewrites previously committed contract or episode state.
 - A paused or ended job is excluded from lease-expiry reconciliation. Refresh
   reconstructs its stage, completed checkpoints, frozen elapsed time, and
   available actions from SQLite.
@@ -381,7 +410,7 @@ duplicate the full field contract.
   stage outputs needed for continuation, and validation prompts.
 - `base_url`, `api_key`, and `model_id` are deployment configuration.
 - One process-level `ChatAnthropic` instance is constructed from those values
-  and supplied to the supervisor and all four subagents. The relay must support
+  and supplied to the supervisor and registered subagents. The relay must support
   Anthropic Messages tool use. Supervisor and subagent schemas use LangChain
   `ToolStrategy` rather than provider-native structured-output extensions.
 - The API key is read from the environment, never returned by the API, stored in
@@ -392,7 +421,8 @@ duplicate the full field contract.
 - Persona paths are resolved below the configured persona root; absolute paths
   and traversal outside that root are rejected.
 - The default Deep Agents general-purpose subagent is disabled. Only the four
-  named synchronous subagents are registered.
+  primary creative subagents and four skill-scoped review/repair subagents are
+  registered.
 - `FilesystemBackend`, `LocalShellBackend`, sandbox `execute`, asynchronous or
   remote subagents, arbitrary MCP tools, agent-authored skills, and
   cross-creation writable memory are disabled in V1.
@@ -445,8 +475,9 @@ run-control commands are additive. Breaking HTTP or persona format changes
 require a new contract version. Persona source packages remain outside the
 database so application rollback does not rewrite operator content.
 
-SQLite schema version 2 adds `run_progress` and backfills existing runs without
-rewriting creations, checkpoints, deliveries, or frozen revisions. Migrations
+SQLite schema version 6 adds contract-bound episode lock evidence and distinct
+content-review pause state while preserving existing creations, checkpoints,
+deliveries, and frozen revisions. Migrations
 must remain forward and transactional where SQLite permits; production rollback
 automation is outside this architecture-delivery slice.
 
@@ -498,9 +529,8 @@ quality.
 
 - Modular monolith, FastAPI/Pydantic HTTP layer, direct SQLite repository, one
   embedded worker, and an embedded Deep Agents/LangGraph creative runtime.
-- One persona-bound `workflow_supervisor` plus four synchronous specialist
-  subagents: `story_architect`, `episode_planner`, `script_writer`, and
-  `quality_reviewer`.
+- One persona-bound `workflow_supervisor`, four primary creative subagents, and
+  four skill-scoped canon/continuity review and repair subagents.
 - A preconfigured LangChain `ChatAnthropic` model uses the operator-supplied
   `base_url`, `api_key`, and `model_id`, with automatic retries disabled.
 - `AsyncSqliteSaver` provides durable per-run thread checkpoints in the same

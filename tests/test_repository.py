@@ -3,7 +3,15 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 import pytest
+from test_continuity import make_contract, make_delta
 
+from pengine.continuity import (
+    SemanticReview,
+    build_episode_lock,
+    initial_series_state,
+    render_story_contract_markdown,
+    story_contract_sha256,
+)
 from pengine.errors import DomainError
 from pengine.repository import SCHEMA_VERSION, Repository
 from pengine.schemas import (
@@ -110,6 +118,29 @@ async def create_and_lease_initial(
     )
     assert lease is not None
     return accepted, lease
+
+
+def locked_outline_payload():
+    contract = make_contract()
+    contract_hash = story_contract_sha256(contract)
+    return contract, {
+        "stage": "generating_episode_outline",
+        "content": "单集锁定分集大纲",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "林岚回到旧屋。"}],
+        "story_contract": contract.model_dump(mode="json"),
+        "story_contract_sha256": contract_hash,
+        "story_contract_markdown": render_story_contract_markdown(
+            contract,
+            contract_hash,
+        ),
+        "contract_review": {
+            "passed": True,
+            "evidence": "独立合同审查通过",
+            "issues": [],
+        },
+        "contract_repair_rounds": 0,
+    }
 
 
 async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository) -> None:
@@ -878,8 +909,16 @@ async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_draf
             DROP TABLE run_progress;
             ALTER TABLE run_progress_v3 RENAME TO run_progress;
             DROP TABLE quality_gate_rejections;
+            DROP TABLE content_rejections;
+            ALTER TABLE episode_drafts DROP COLUMN contract_sha256;
+            ALTER TABLE episode_drafts DROP COLUMN state_delta_json;
+            ALTER TABLE episode_drafts DROP COLUMN series_state_json;
+            ALTER TABLE episode_drafts DROP COLUMN series_state_sha256;
+            ALTER TABLE episode_drafts DROP COLUMN semantic_review_json;
+            ALTER TABLE episode_drafts DROP COLUMN repair_rounds;
             DELETE FROM pengine_schema WHERE version = 4;
             DELETE FROM pengine_schema WHERE version = 5;
+            DELETE FROM pengine_schema WHERE version = 6;
             """
         )
         await connection.execute(
@@ -1231,6 +1270,177 @@ async def test_episode_timeout_recovers_first_unfinished_and_ended_run_keeps_dra
     assert ended.initial.drafts.episodes == [first]
 
 
+async def test_contract_bound_episode_lock_persists_and_controls_aggregate(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    contract, outline = locked_outline_payload()
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        now=NOW,
+    )
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        outline,
+        now=NOW,
+    )
+    await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
+    content = "林岚：日期是2015-08-12，时间是21:40，记录持续80分钟。\n门后传来第二次敲击"
+    contract_hash = story_contract_sha256(contract)
+    episode_lock = build_episode_lock(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=initial_series_state(contract, contract_hash),
+        content=content,
+        delta=make_delta(contract),
+        semantic_review=SemanticReview(
+            passed=True,
+            evidence="独立分集审查通过",
+            issues=[],
+        ),
+        repair_rounds=1,
+    )
+
+    with pytest.raises(DomainError) as missing_lock:
+        await repository.commit_episode_draft(lease.run_id, 1, content, now=NOW)
+    assert missing_lock.value.code == "episode_lock_required"
+
+    draft = await repository.commit_episode_draft(
+        lease.run_id,
+        1,
+        content,
+        episode_lock=episode_lock,
+        now=NOW,
+    )
+    assert draft.contract_sha256 == contract_hash
+    assert draft.series_state == episode_lock.series_state
+    assert draft.semantic_review is not None and draft.semantic_review.passed
+
+    conflicting_lock = build_episode_lock(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=initial_series_state(contract, contract_hash),
+        content=content,
+        delta=make_delta(contract),
+        semantic_review=SemanticReview(
+            passed=True,
+            evidence="另一份不可替换的审查证据",
+            issues=[],
+        ),
+        repair_rounds=1,
+    )
+    with pytest.raises(DomainError) as lock_conflict:
+        await repository.commit_episode_draft(
+            lease.run_id,
+            1,
+            content,
+            episode_lock=conflicting_lock,
+            now=NOW,
+        )
+    assert lock_conflict.value.code == "episode_conflict"
+
+    aggregate = dict(await repository.episode_aggregate_checkpoint_payload(lease.run_id))
+    assert aggregate["contract_sha256"] == contract_hash
+    assert aggregate["episode_hashes"] == [
+        {
+            "episode_number": 1,
+            "content_sha256": draft.content_sha256,
+            "series_state_sha256": draft.series_state_sha256,
+        }
+    ]
+    with pytest.raises(DomainError) as mismatched_hash:
+        await repository.approve_business_checkpoint(
+            lease.run_id,
+            InternalStage.GENERATING_EPISODE_SCRIPTS,
+            {
+                "stage": "generating_episode_scripts",
+                **aggregate,
+                "contract_sha256": "f" * 64,
+            },
+        )
+    assert mismatched_hash.value.code == "episode_aggregate_conflict"
+
+    checkpoint = {
+        "stage": "generating_episode_scripts",
+        **aggregate,
+    }
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+        checkpoint,
+    )
+    reopened = Repository(repository.database_path)
+    await reopened.initialize()
+    assert await reopened.get_episode_drafts(lease.run_id) == [draft]
+    assert (await reopened.get_business_checkpoints(lease.run_id))[
+        InternalStage.GENERATING_EPISODE_SCRIPTS
+    ] == checkpoint
+    assert (await reopened.get_creation(accepted.creation_id)) is not None
+
+
+async def test_content_rejection_pauses_with_evidence_without_consuming_writer_attempts(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    _, outline = locked_outline_payload()
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        now=NOW,
+    )
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        outline,
+        now=NOW,
+    )
+    await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
+
+    await repository.pause_content_rejection(
+        lease.run_id,
+        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+        evidence="人物知识状态仍与合同冲突。",
+        repair_rounds=2,
+        episode_number=1,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    paused = await repository.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert paused is not None
+    assert paused.initial.state == "paused"
+    assert paused.initial.pause.code == "content_rejected"
+    assert paused.initial.pause.message == "人物知识状态仍与合同冲突。"
+    assert paused.initial.pause.content_repair_count == 2
+    assert paused.initial.pause.timeout_count is None
+    assert paused.initial.progress.can_continue is True
+    assert await repository.get_episode_attempt_counts(lease.run_id) == {1: 1}
+
+    continued = await repository.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-after-content-review",
+        now=NOW + timedelta(seconds=2),
+    )
+    assert continued.run_state == "queued"
+    resumed = await repository.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert resumed is not None
+    assert resumed.initial.state == "queued"
+    assert resumed.initial.progress.recovery_reason == "none"
+    assert await repository.get_episode_attempt_counts(lease.run_id) == {1: 1}
+
+
 async def test_failed_run_keeps_committed_episode_drafts(
     repository,
     persona,
@@ -1281,6 +1491,7 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 3")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 4")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.execute("DROP TABLE episode_timeouts")
         await connection.execute("DROP TABLE episode_attempts")
@@ -1321,6 +1532,7 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 3")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 4")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.commit()
 
@@ -1379,7 +1591,17 @@ async def test_schema_v4_recovery_rows_gain_the_timeout_reason_without_losing_dr
 
     async with repository._connection() as connection:
         await connection.execute("ALTER TABLE run_progress DROP COLUMN recovery_reason")
+        await connection.execute("ALTER TABLE run_progress DROP COLUMN content_repair_count")
+        await connection.execute("ALTER TABLE run_progress DROP COLUMN pause_message")
+        await connection.execute("ALTER TABLE episode_drafts DROP COLUMN contract_sha256")
+        await connection.execute("ALTER TABLE episode_drafts DROP COLUMN state_delta_json")
+        await connection.execute("ALTER TABLE episode_drafts DROP COLUMN series_state_json")
+        await connection.execute("ALTER TABLE episode_drafts DROP COLUMN series_state_sha256")
+        await connection.execute("ALTER TABLE episode_drafts DROP COLUMN semantic_review_json")
+        await connection.execute("ALTER TABLE episode_drafts DROP COLUMN repair_rounds")
+        await connection.execute("DROP TABLE content_rejections")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
         await connection.commit()
 
     await repository.initialize()

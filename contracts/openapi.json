@@ -1734,6 +1734,7 @@
               "relay_incompatible",
               "structured_output_invalid",
               "stage_validation_failed",
+              "content_review_rejected",
               "agent_execution_limit",
               "graph_recursion_limit",
               "quality_gate_rejected",
@@ -1776,7 +1777,8 @@
             "type": "string",
             "enum": [
               "run_timeout",
-              "relay_interruption"
+              "relay_interruption",
+              "content_rejected"
             ],
             "title": "Code",
             "default": "run_timeout"
@@ -1791,9 +1793,29 @@
             "$ref": "#/components/schemas/UserStage"
           },
           "timeout_count": {
-            "type": "integer",
-            "minimum": 2.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 2.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Timeout Count"
+          },
+          "content_repair_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 2.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Repair Count"
           },
           "episode_number": {
             "anyOf": [
@@ -1812,8 +1834,7 @@
         "type": "object",
         "required": [
           "message",
-          "stage",
-          "timeout_count"
+          "stage"
         ],
         "title": "RunPause"
       },
@@ -1848,7 +1869,8 @@
             "enum": [
               "none",
               "run_timeout",
-              "relay_interruption"
+              "relay_interruption",
+              "content_rejected"
             ],
             "title": "Recovery Reason"
           },
@@ -2019,6 +2041,278 @@
         "type": "string",
         "pattern": "^[0-9a-f]{64}$"
       },
+      "CharacterKnowledge": {
+        "properties": {
+          "character_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$",
+            "title": "Character Id"
+          },
+          "known_fact_ids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "title": "Known Fact Ids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "character_id"
+        ],
+        "title": "CharacterKnowledge"
+      },
+      "KnowledgeGain": {
+        "properties": {
+          "character_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$",
+            "title": "Character Id"
+          },
+          "fact_ids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Fact Ids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "character_id",
+          "fact_ids"
+        ],
+        "title": "KnowledgeGain"
+      },
+      "ScriptEvidence": {
+        "properties": {
+          "target_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$",
+            "title": "Target Id"
+          },
+          "excerpt": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Excerpt"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "target_id",
+          "excerpt"
+        ],
+        "title": "ScriptEvidence"
+      },
+      "ReviewIssue": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Message"
+          },
+          "contract_refs": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "title": "Contract Refs"
+          },
+          "script_excerpt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Script Excerpt"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ReviewIssue"
+      },
+      "SemanticReview": {
+        "properties": {
+          "passed": {
+            "type": "boolean",
+            "title": "Passed"
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Evidence"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewIssue"
+            },
+            "type": "array",
+            "title": "Issues"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "passed",
+          "evidence"
+        ],
+        "title": "SemanticReview"
+      },
+      "EpisodeStateDelta": {
+        "properties": {
+          "episode_number": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Episode Number"
+          },
+          "contract_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Contract Sha256"
+          },
+          "established_fact_ids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "title": "Established Fact Ids"
+          },
+          "knowledge_gains": {
+            "items": {
+              "$ref": "#/components/schemas/KnowledgeGain"
+            },
+            "type": "array",
+            "title": "Knowledge Gains"
+          },
+          "introduced_clue_ids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "title": "Introduced Clue Ids"
+          },
+          "resolved_clue_ids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "title": "Resolved Clue Ids"
+          },
+          "satisfied_obligation_ids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "title": "Satisfied Obligation Ids"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/ScriptEvidence"
+            },
+            "type": "array",
+            "title": "Evidence"
+          },
+          "handoff": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Handoff"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "episode_number",
+          "contract_sha256",
+          "handoff"
+        ],
+        "title": "EpisodeStateDelta"
+      },
+      "SeriesState": {
+        "properties": {
+          "contract_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Contract Sha256"
+          },
+          "locked_through_episode": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Locked Through Episode"
+          },
+          "established_fact_ids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "title": "Established Fact Ids"
+          },
+          "character_knowledge": {
+            "items": {
+              "$ref": "#/components/schemas/CharacterKnowledge"
+            },
+            "type": "array",
+            "title": "Character Knowledge"
+          },
+          "introduced_clue_ids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "title": "Introduced Clue Ids"
+          },
+          "resolved_clue_ids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "title": "Resolved Clue Ids"
+          },
+          "handoff": {
+            "type": "string",
+            "default": "",
+            "title": "Handoff"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "contract_sha256",
+          "locked_through_episode"
+        ],
+        "title": "SeriesState"
+      },
       "EpisodeDraft": {
         "properties": {
           "episode_number": {
@@ -2041,6 +2335,73 @@
             "type": "string",
             "format": "date-time",
             "title": "Completed At"
+          },
+          "contract_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contract Sha256"
+          },
+          "state_delta": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EpisodeStateDelta"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "series_state": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SeriesState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "series_state_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Series State Sha256"
+          },
+          "semantic_review": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SemanticReview"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "repair_rounds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repair Rounds"
           }
         },
         "additionalProperties": false,

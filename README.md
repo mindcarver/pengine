@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/pengine-retro-workbench.jpg" alt="Pengine 复古创作工作台：人格档案、创作终端、四个专业 Agent 与成片胶卷" width="100%">
+  <img src="docs/assets/pengine-retro-workbench.jpg" alt="Pengine 复古创作工作台：人格档案、创作终端、专业 Agent 与成片胶卷" width="100%">
 </p>
 
 <h1 align="center">PENGINE</h1>
@@ -20,7 +20,7 @@
 
 Pengine V1 是一个带同源 Web 原型的本地短剧创作 Agent。它通过
 [Deep Agents](https://github.com/langchain-ai/deepagents) 与 LangGraph，
-让四个专业 Agent 按固定阶段协作；业务状态、检查点和交付物全部落在本地
+让阶段化专业 Agent 按固定流程协作；业务状态、检查点和交付物全部落在本地
 SQLite，模型请求则通过 Anthropic Messages 兼容 relay 发出。
 
 Web 原型只服务本机单操作员，并以约 1.8 秒轮询展示后端确认的七阶段进度、
@@ -46,7 +46,7 @@ WebSocket 或跨项目可写记忆。
                                     │                       └──────┬───────┘
                                     │ 只读上下文                    │
                               ┌─────▼──────┐              ┌───────▼────────┐
-                              │ L0–L6 文件 │              │ 4 个专业 Agent │
+                              │ L0–L6 文件 │              │ 创作与审查 Agent│
                               └────────────┘              └───────┬────────┘
                                                                   │
                                                            ┌──────▼──────┐
@@ -61,7 +61,7 @@ WebSocket 或跨项目可写记忆。
 | 人格加载器 | 校验九文件人格包，生成内容寻址的不可变快照 |
 | 状态仓库 | 管理创作、运行、任务、反馈、检查点与交付物 |
 | 内嵌任务器 | 租约、重启恢复、阶段尝试预算、工作流调度 |
-| Agent 编排层 | 由监督 Agent 编排四个同步专业 Agent |
+| Agent 编排层 | 由监督 Agent 编排同步创作 Agent 与技能化审查/修复子代理 |
 | 模型中继客户端 | 以固定超时和安全错误映射调用模型 |
 
 系统采用模块化单体：一个进程、一个 Worker、一次处理一个创作任务，不依赖外部
@@ -104,25 +104,36 @@ persona/
             └─▶ 人物小传
                  └─▶ 关系逻辑
                       └─▶ 分集大纲
-                           └─▶ 分集剧本
+                           └─▶ 剧情合同双检并锁定
+                                └─▶ 分集剧本
                                 └─▶ L0 闸门
                                      └─▶ L4 闸门
                                           └─▶ 组装交付
 ```
 
-四个 Agent 分工明确：
+四个主创 Agent 分工明确：
 
 - `story_architect`：L0 选择、故事大纲、人物小传、关系逻辑；
 - `episode_planner`：分集大纲；
 - `script_writer`：分集剧本；
 - `quality_reviewer`：L0/L4 验收证据与修订反馈覆盖。
 
+分集大纲批准前，`episode_planner` 同步产出结构化、带版本的剧情合同。
+确定性校验与加载 `canon-review` skill 的独立审查子代理均通过后，合同及其
+SHA-256 才会写入业务检查点并锁定。后续每集只读取该合同、上一集折叠后的
+`series_state` 和已锁剧本；`episode-continuity-review` 独立审查通过后，剧本、
+`episode_state_delta`、新状态及其哈希才会原子提交。Skill 只加载到对应审查或
+修复子代理，不作为监督 Agent 的全局提示。
+
 系统同时保留两类检查点：
 
 - **LangGraph checkpoint**：保存 Agent 线程、消息与临时工作区；
 - **Business checkpoint**：保存已批准的阶段结果，是推进状态和组装交付的唯一依据。
 
-每阶段最多尝试三次。只有通过结构校验和 L0/L4 闸门的完整内容包才会公开。
+普通生成阶段最多尝试三次。合同或单集内容审查最多修复两轮；仍不通过时，系统
+保留具体证据并暂停，让操作员继续重生当前未锁内容或结束任务。Relay／网络恢复
+次数与内容修复次数分别记录，互不消耗。只有全部分集锁定、聚合哈希复验通过，
+且 L0/L4 闸门通过的完整内容包才会公开。
 
 <h2 align="center">04 · 一次创作，一次修订</h2>
 
@@ -206,6 +217,10 @@ curl --fail-with-body -X POST \
 三次），不会重跑前面的创作阶段。终态为 `succeeded`、`failed` 或用户主动选择的
 `ended`。
 
+剧情合同或单集连续性在两轮修复后仍未通过会进入 `paused`，恢复原因是
+`content_rejected`。界面显示独立审查证据；继续只会重新生成当前未锁内容，已经
+锁定的合同和分集不会静默改变。
+
 暂停后可用同一套幂等命令继续或结束初稿／修订（把 `initial` 换成 `revision`
 即可操作修订）：
 
@@ -237,6 +252,8 @@ relay／网络中断也会按同一原则自动继续；同一用户阶段或首
 中断时，SQLite 会冻结时长并等待操作员继续或结束。请求前可验证的配置、证书校验、
 鉴权、参数／协议不兼容、结构化输出、检查点缺失、图递归、质量拒绝和未知错误仍是终态
 失败，不会伪装成可恢复中断；语法正确地址的 DNS／连接失败则受三次调用上限约束。
+剧情合同和每集状态增量也持久化在 SQLite；汇总剧本检查点必须带有合同哈希、每集
+内容哈希和连续状态哈希，缺失或冲突时不能进入 L4。
 
 数据不会自动过期。故事、反馈、生成内容和备份都应按敏感内容保护。
 
@@ -256,3 +273,5 @@ uv build --no-sources
 [Issue #1](https://github.com/mindcarver/pengine/issues/1)，可运行前端原型见
 [Issue #9](https://github.com/mindcarver/pengine/issues/9)，长任务进度与恢复见
 [Issue #10](https://github.com/mindcarver/pengine/issues/10)。
+[Issue #37](https://github.com/mindcarver/pengine/issues/37) 记录剧情合同硬锁与逐集连续性
+审查的验收契约。

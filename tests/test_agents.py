@@ -15,9 +15,12 @@ from pydantic import Field
 from pengine.agents import (
     _EPISODE_PLANNER_PROMPT,
     _SCRIPT_WRITER_PROMPT,
+    _SPECIALIST_SKILL_SOURCES,
     _STORY_ARCHITECT_PROMPT,
+    SKILLED_WRITE_PERMISSIONS,
     VIRTUAL_FILE_PERMISSIONS,
     AgentProtocolError,
+    ContentReviewRejectedError,
     DeepAgentWorkflow,
     QualityGateRejectedError,
     QualityReviewerResult,
@@ -28,9 +31,11 @@ from pengine.agents import (
     _supervisor_prompt,
 )
 from pengine.config import Settings
+from pengine.continuity import StoryContract, story_contract_sha256
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import CreateCreationRequest, EpisodeDraft, EpisodePlan, InternalStage
+from pengine.skill_assets import load_agent_skill_files
 from pengine.worker import Worker
 
 
@@ -72,7 +77,94 @@ def _tool_call(name: str, args: dict[str, Any], index: int) -> AIMessage:
     )
 
 
+def _story_contract(episode_count: int = 1) -> StoryContract:
+    facts = [
+        {
+            "fact_id": f"fact_ep{episode}",
+            "subject": "测试人物",
+            "predicate": "确认事实",
+            "kind": "text",
+            "value": f"事实{episode}",
+            "first_revealed_episode": episode,
+        }
+        for episode in range(1, episode_count + 1)
+    ]
+    return StoryContract.model_validate(
+        {
+            "version": 1,
+            "episode_count": episode_count,
+            "characters": [
+                {
+                    "character_id": "test_character",
+                    "name": "测试人物",
+                    "role": "主角",
+                    "initial_known_fact_ids": [],
+                }
+            ],
+            "relationships": [],
+            "facts": facts,
+            "timeline": [
+                {
+                    "event_id": f"event_ep{episode}",
+                    "order": episode,
+                    "when": f"episode-{episode}",
+                    "participant_ids": ["test_character"],
+                    "fact_ids": [f"fact_ep{episode}"],
+                }
+                for episode in range(1, episode_count + 1)
+            ],
+            "knowledge_states": [
+                {
+                    "episode_number": episode,
+                    "character_id": "test_character",
+                    "known_fact_ids": [f"fact_ep{known}" for known in range(1, episode + 1)],
+                }
+                for episode in range(1, episode_count + 1)
+            ],
+            "clues": [],
+            "prohibitions": ["不得增加人物"],
+            "episode_obligations": [
+                {
+                    "obligation_id": f"obligation_ep{episode}",
+                    "episode_number": episode,
+                    "new_information_fact_ids": [f"fact_ep{episode}"],
+                    "end_hook": f"钩子{episode}",
+                    "required_clue_ids": [],
+                }
+                for episode in range(1, episode_count + 1)
+            ],
+        }
+    )
+
+
+def _state_delta(contract: StoryContract, episode_number: int) -> dict[str, Any]:
+    contract_hash = story_contract_sha256(contract)
+    return {
+        "episode_number": episode_number,
+        "contract_sha256": contract_hash,
+        "established_fact_ids": [f"fact_ep{episode_number}"],
+        "knowledge_gains": [
+            {
+                "character_id": "test_character",
+                "fact_ids": [f"fact_ep{episode_number}"],
+            }
+        ],
+        "introduced_clue_ids": [],
+        "resolved_clue_ids": [],
+        "satisfied_obligation_ids": [f"obligation_ep{episode_number}"],
+        "evidence": [
+            {"target_id": f"fact_ep{episode_number}", "excerpt": f"事实{episode_number}"},
+            {
+                "target_id": f"obligation_ep{episode_number}",
+                "excerpt": f"钩子{episode_number}",
+            },
+        ],
+        "handoff": f"第{episode_number}集结束",
+    }
+
+
 def _successful_responses() -> list[AIMessage]:
+    contract = _story_contract()
     stages = [
         (
             "selecting_l0_variant",
@@ -127,6 +219,7 @@ def _successful_responses() -> list[AIMessage]:
                 "content": "分集大纲",
                 "episode_count": 1,
                 "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+                "story_contract": contract.model_dump(mode="json"),
             },
         ),
         (
@@ -136,7 +229,8 @@ def _successful_responses() -> list[AIMessage]:
             {
                 "stage": "generating_episode_scripts",
                 "episode_number": 1,
-                "content": "分集剧本",
+                "content": "事实1\n钩子1",
+                "state_delta": _state_delta(contract, 1),
             },
         ),
         (
@@ -177,6 +271,24 @@ def _successful_responses() -> list[AIMessage]:
         )
         responses.append(_tool_call(schema, payload, index + 1))
         index += 2
+        if stage == "generating_episode_outline":
+            responses.append(
+                _tool_call(
+                    "CanonReviewerResult",
+                    {"passed": True, "evidence": "合同一致", "issues": []},
+                    index,
+                )
+            )
+            index += 1
+        if stage == "generating_episode_scripts":
+            responses.append(
+                _tool_call(
+                    "EpisodeReviewerResult",
+                    {"passed": True, "evidence": "分集一致", "issues": []},
+                    index,
+                )
+            )
+            index += 1
     responses.append(
         _tool_call(
             "WorkflowCompletion",
@@ -198,7 +310,11 @@ def _episode_hook_kwargs(
         attempts.append(plan.episode_number)
         return 1
 
-    async def commit_episode(episode_number: int, content: str) -> EpisodeDraft:
+    async def commit_episode(
+        episode_number: int,
+        content: str,
+        episode_lock=None,
+    ) -> EpisodeDraft:
         existing = committed.get(episode_number)
         content_hash = hashlib.sha256(content.encode()).hexdigest()
         if existing is not None:
@@ -209,6 +325,12 @@ def _episode_hook_kwargs(
             content=content,
             content_sha256=content_hash,
             completed_at=datetime(2026, 7, 31, tzinfo=UTC),
+            contract_sha256=(episode_lock.contract_sha256 if episode_lock else None),
+            state_delta=(episode_lock.state_delta if episode_lock else None),
+            series_state=(episode_lock.series_state if episode_lock else None),
+            series_state_sha256=(episode_lock.series_state_sha256 if episode_lock else None),
+            semantic_review=(episode_lock.semantic_review if episode_lock else None),
+            repair_rounds=(episode_lock.repair_rounds if episode_lock else None),
         )
         committed[episode_number] = draft
         return draft
@@ -275,9 +397,28 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "future dialogue counts" in _STORY_ARCHITECT_PROMPT
     assert "episode-specific action" in _EPISODE_PLANNER_PROMPT
     assert "dates, countdowns, amounts, counts, and arithmetic" in _EPISODE_PLANNER_PROMPT
+    assert "/workspace/approved-checkpoints.json" in _EPISODE_PLANNER_PROMPT
+    assert "new_information_fact_ids must exactly equal" in _EPISODE_PLANNER_PROMPT
     assert "exact dialogue-count claims" in _SCRIPT_WRITER_PROMPT
     assert "Every upstream commitment must appear" in _SCRIPT_WRITER_PROMPT
     assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
+
+
+def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> None:
+    assert _SPECIALIST_SKILL_SOURCES == {
+        "canon_reviewer": ["/skills/canon-review"],
+        "canon_repair": ["/skills/continuity-repair"],
+        "episode_reviewer": ["/skills/episode-continuity-review"],
+        "episode_repair": ["/skills/continuity-repair"],
+    }
+    assert set(load_agent_skill_files()) == {
+        "/skills/canon-review/SKILL.md",
+        "/skills/episode-continuity-review/SKILL.md",
+        "/skills/continuity-repair/SKILL.md",
+    }
+    assert not {"story_architect", "episode_planner", "script_writer", "quality_reviewer"} & set(
+        _SPECIALIST_SKILL_SOURCES
+    )
 
 
 def test_calculate_arithmetic_preserves_exact_decimal_result() -> None:
@@ -329,7 +470,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             **episode_hooks,
         )
 
-        assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
+        assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
         assert [stage for kind, stage in events if kind == "before"] == [
             "selecting_l0_variant",
             "generating_story_outline",
@@ -380,6 +521,122 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    planner_payload = responses[9].tool_calls[0]["args"]
+    responses[10] = _tool_call(
+        "CanonReviewerResult",
+        {
+            "passed": False,
+            "evidence": "合同遗漏一项上游承诺",
+            "issues": [
+                {
+                    "code": "missing_commitment",
+                    "message": "必须补齐承诺",
+                    "contract_refs": [],
+                    "script_excerpt": None,
+                }
+            ],
+        },
+        10,
+    )
+    responses.insert(11, _tool_call("EpisodePlannerResult", planner_payload, 101))
+    responses.insert(
+        12,
+        _tool_call(
+            "CanonReviewerResult",
+            {"passed": True, "evidence": "修复后合同一致", "issues": []},
+            102,
+        ),
+    )
+    approved: dict[InternalStage, dict[str, Any]] = {}
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
+        approved[stage] = payload
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+        await workflow.execute(
+            thread_id="contract-repair-thread",
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+            **_episode_hook_kwargs()[0],
+        )
+
+    outline = approved[InternalStage.GENERATING_EPISODE_OUTLINE]
+    assert outline["contract_repair_rounds"] == 1
+    assert outline["contract_review"]["passed"] is True
+    assert len(outline["story_contract_sha256"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: Path) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    writer_payload = responses[12].tool_calls[0]["args"]
+    failed_review = {
+        "passed": False,
+        "evidence": "人物知识状态仍不公平",
+        "issues": [
+            {
+                "code": "knowledge_unfairness",
+                "message": "视点人物已经知道该事实",
+                "contract_refs": ["fact_ep1"],
+                "script_excerpt": "事实1",
+            }
+        ],
+    }
+    responses[13] = _tool_call("EpisodeReviewerResult", failed_review, 13)
+    responses.insert(14, _tool_call("ScriptWriterResult", writer_payload, 201))
+    responses.insert(15, _tool_call("EpisodeReviewerResult", failed_review, 202))
+    responses.insert(16, _tool_call("ScriptWriterResult", writer_payload, 203))
+    responses.insert(17, _tool_call("EpisodeReviewerResult", failed_review, 204))
+    approved: list[InternalStage] = []
+    episode_hooks, episode_attempts = _episode_hook_kwargs()
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+        with pytest.raises(ContentReviewRejectedError) as error:
+            await workflow.execute(
+                thread_id="episode-repair-limit-thread",
+                story="故事",
+                requirements="要求",
+                persona_files={"/persona/project.md": "规则"},
+                before_stage=before_stage,
+                approve_stage=approve_stage,
+                **episode_hooks,
+            )
+
+    assert error.value.episode_number == 1
+    assert error.value.repair_rounds == 2
+    assert episode_attempts == [1]
+    assert InternalStage.GENERATING_EPISODE_SCRIPTS not in approved
+
+
+@pytest.mark.asyncio
 async def test_structured_output_validation_error_is_corrected_within_stage(
     tmp_path: Path,
 ) -> None:
@@ -427,7 +684,7 @@ async def test_structured_output_validation_error_is_corrected_within_stage(
             **_episode_hook_kwargs()[0],
         )
 
-    assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
+    assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
     assert attempted.count(InternalStage.SELECTING_L0_VARIANT) == 1
     assert approved[0] is InternalStage.SELECTING_L0_VARIANT
 
@@ -677,7 +934,7 @@ async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> Non
 async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    responses[13] = _tool_call(
+    responses[15] = _tool_call(
         "QualityReviewerResult",
         {
             "stage": "accepting_l0",
@@ -685,7 +942,7 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
             "evidence": "成品没有通过 L0 闸门。",
             "feedback_handling": [],
         },
-        13,
+        15,
     )
     approved: list[InternalStage] = []
 
@@ -751,7 +1008,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
 
     monkeypatch.setattr(ToolCallingFakeModel, "_generate", capture_reviewer_reads)
     responses = _successful_responses()
-    responses[15] = _tool_call(
+    responses[17] = _tool_call(
         "QualityReviewerResult",
         {
             "stage": "accepting_l4",
@@ -759,10 +1016,10 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
             "evidence": "成品没有通过 L4 闸门。",
             "feedback_handling": [],
         },
-        15,
+        17,
     )
     responses.insert(
-        15,
+        17,
         _tool_call(
             "read_file",
             {"file_path": "/workspace/episode_scripts.md"},
@@ -770,7 +1027,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
         ),
     )
     responses.insert(
-        16,
+        18,
         _tool_call(
             "read_file",
             {"file_path": "/workspace/approved-checkpoints.json"},
@@ -810,7 +1067,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
             )
 
     assert not any("not found" in content for content in reviewer_reads)
-    assert any("第 1 集" in content and "分集剧本" in content for content in reviewer_reads)
+    assert any("第 1 集" in content and "事实1" in content for content in reviewer_reads)
     assert any("generating_episode_scripts" in content for content in reviewer_reads)
     assert not any("旧工作区剧本" in content for content in reviewer_reads)
     reviewer_reads.clear()
@@ -823,7 +1080,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        resumed_responses = _successful_responses()[14:]
+        resumed_responses = _successful_responses()[16:]
         resumed_responses.insert(
             1,
             _tool_call(
@@ -873,10 +1130,10 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
     assert resumed_attempts == [InternalStage.ACCEPTING_L4]
     assert resumed_episode_attempts == []
     assert not any("not found" in content for content in reviewer_reads)
-    assert any("第 1 集" in content and "分集剧本" in content for content in reviewer_reads)
+    assert any("第 1 集" in content and "事实1" in content for content in reviewer_reads)
     assert any("generating_episode_scripts" in content for content in reviewer_reads)
     assert not any("旧工作区剧本" in content for content in reviewer_reads)
-    assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
+    assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
 
 
 @pytest.mark.asyncio
@@ -937,7 +1194,7 @@ async def test_out_of_order_stage_is_rejected_without_attempt_and_can_recover(
         InternalStage.ACCEPTING_L0,
         InternalStage.ACCEPTING_L4,
     ]
-    assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
+    assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
     assert attempted == [
         stage for stage in expected if stage is not InternalStage.GENERATING_EPISODE_SCRIPTS
     ]
@@ -1018,7 +1275,7 @@ async def test_restart_reuses_thread_checkpoint_and_skips_approved_stage(
         checkpoint = await saver.aget_tuple({"configurable": {"thread_id": "restart-thread"}})
 
     assert checkpoint is not None
-    assert result.content_package.episode_scripts == "第 1 集\n分集剧本"
+    assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
     assert first_stage not in resumed_attempts
     assert resumed_attempts == [
         InternalStage.GENERATING_STORY_OUTLINE,
@@ -1214,4 +1471,19 @@ def test_virtual_permissions_deny_persona_writes_and_unmatched_paths() -> None:
         ("/workspace", "/workspace/**"),
         "allow",
     ) in rules
+    assert not any("/skills" in paths for _, paths, _ in rules)
     assert (("read", "write"), ("/**",), "deny") in rules
+
+    skilled_rules = [
+        (tuple(rule.operations), tuple(rule.paths), rule.mode) for rule in SKILLED_WRITE_PERMISSIONS
+    ]
+    assert (
+        ("read",),
+        ("/persona", "/persona/**", "/skills", "/skills/**"),
+        "allow",
+    ) in skilled_rules
+    assert (
+        ("write",),
+        ("/persona", "/persona/**", "/skills", "/skills/**"),
+        "deny",
+    ) in skilled_rules
