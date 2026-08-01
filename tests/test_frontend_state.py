@@ -736,6 +736,149 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
+def test_completed_stage_controls_open_their_persisted_artifacts() -> None:
+    root = Path(__file__).parents[1]
+    script_path = root / "src" / "pengine" / "web" / "app.js"
+
+    assertions = """
+function button(key, group) {
+  return {
+    id: `${group}-${key}`,
+    dataset: { [group]: key },
+    attrs: {},
+    hidden: false,
+    disabled: false,
+    tabIndex: 0,
+    number: { textContent: "" },
+    setAttribute(name, value) { this.attrs[name] = value; },
+    removeAttribute(name) { delete this.attrs[name]; },
+    querySelector(selector) { return selector === "span" ? this.number : null; },
+  };
+}
+const stageItems = USER_STAGES.map(([stage]) => button(stage, "stage"));
+const artifactButtons = [
+  button("direction", "artifact"),
+  button("story_outline", "artifact"),
+  button("character_biographies", "artifact"),
+  button("relationship_logic", "artifact"),
+  button("episode_outline", "artifact"),
+  button("episode_scripts", "artifact"),
+];
+Object.assign(elements, {
+  "run-progress": { hidden: true },
+  "progress-kind": { textContent: "" },
+  "progress-title": { textContent: "" },
+  "progress-elapsed": { textContent: "" },
+  "progress-stages": { querySelectorAll() { return stageItems; } },
+  "review-progress": { hidden: true },
+  "review-l0": { textContent: "" },
+  "review-l4": { textContent: "" },
+  "run-controls": { hidden: true },
+  "run-control-title": { textContent: "" },
+  "run-control-description": { textContent: "" },
+  "continue-run": { hidden: false, disabled: false },
+  "end-run": { hidden: false, disabled: false },
+  "run-control-message": { textContent: "" },
+  "result-workspace": { hidden: true, dataset: {} },
+  "revision-desk": { hidden: false },
+  "version-initial": button("initial", "version"),
+  "version-revision": button("revision", "version"),
+  "version-tabs": {
+    querySelectorAll() { return [elements["version-initial"], elements["version-revision"]]; },
+  },
+  "version-note": { textContent: "" },
+  "artifact-tabs": {
+    querySelectorAll() { return artifactButtons; },
+    querySelector(selector) {
+      const match = selector.match(/data-artifact="([^"]+)"/);
+      return match ? artifactButtons.find((item) => item.dataset.artifact === match[1]) : null;
+    },
+  },
+  "artifact-panel": { setAttribute() {}, focus() {} },
+  "artifact-overline": { textContent: "" },
+  "artifact-title": { textContent: "" },
+  "artifact-version-mark": { textContent: "" },
+  "episode-navigator": { hidden: true },
+  "episode-progress-summary": { textContent: "" },
+  "episode-tabs": { replaceChildren() {} },
+  "episode-content": { textContent: "", setAttribute() {}, removeAttribute() {} },
+  "artifact-content": { hidden: false, textContent: "" },
+});
+state.workspaceView = "progress";
+state.activeVersion = "initial";
+state.activeArtifact = "direction";
+state.creation = {
+  initial: {
+    state: "running",
+    progress: {
+      current_stage: "generating_character_biographies",
+      completed_stages: ["determining_direction", "generating_story_outline"],
+      elapsed_seconds: 4,
+      recovery_state: "none",
+      recovery_reason: "none",
+      final_review: { l0: "pending", l4: "pending" },
+      can_continue: false,
+      can_end: false,
+    },
+    drafts: {
+      artifacts: [
+        {
+          stage: "determining_direction",
+          selected_l0_variant: "归返",
+          selection_rationale: "匹配故事母题。",
+        },
+        { stage: "generating_story_outline", content: "已提交故事大纲" },
+      ],
+    },
+  },
+  revision: { state: "unavailable" },
+};
+renderProgress();
+if (stageItems[0].disabled || stageItems[1].disabled) {
+  throw new Error("persisted stages were not selectable");
+}
+if (stageItems[2].disabled !== true || stageItems[6].disabled !== true) {
+  throw new Error("unpersisted stages became selectable");
+}
+handleStageClick({ target: { closest() { return stageItems[1]; } } });
+if (state.activeArtifact !== "story_outline") {
+  throw new Error("stage selection did not choose its artifact");
+}
+if (elements["result-workspace"].hidden) {
+  throw new Error("stage selection did not open the creation reader");
+}
+if (elements["artifact-content"].textContent !== "已提交故事大纲") {
+  throw new Error("stage selection did not render persisted content");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}} }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(() => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_live_drafts_render_in_the_creation_scene_but_not_the_formal_reader() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"
