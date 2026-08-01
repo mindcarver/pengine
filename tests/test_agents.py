@@ -403,6 +403,8 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "exact dialogue-count claims" in _SCRIPT_WRITER_PROMPT
     assert "Every upstream commitment must appear" in _SCRIPT_WRITER_PROMPT
     assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
+    assert "grandfathered pre-contract run" in _SCRIPT_WRITER_PROMPT
+    assert "return null state_delta" in _SCRIPT_WRITER_PROMPT
 
 
 def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> None:

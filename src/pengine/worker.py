@@ -483,7 +483,8 @@ class Worker:
         if episode_number > len(refreshed.episode_plans):
             return False
         attempts = await self.repository.get_episode_attempt_counts(work.run_id)
-        if attempts.get(episode_number, 0) >= 3:
+        attempt_count = attempts.get(episode_number, 0)
+        if attempt_count == 0 or attempt_count >= 3:
             return False
         safe_message = _episode_error_message(exc)
         await self.repository.pause_episode_error(

@@ -1558,6 +1558,33 @@ async def test_episode_execution_error_pauses_and_continues_only_unfinished_epis
     assert await repository.get_episode_drafts(resumed.run_id) == [first]
 
 
+async def test_episode_error_pause_requires_a_recorded_writer_attempt(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    _, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        {
+            "stage": "generating_episode_outline",
+            "content": "单集分集大纲",
+            "episode_count": 1,
+            "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        },
+    )
+
+    with pytest.raises(DomainError) as missing_attempt:
+        await repository.pause_episode_error(
+            lease.run_id,
+            episode_number=1,
+            safe_message="当前集遇到可恢复错误。",
+        )
+
+    assert missing_attempt.value.code == "episode_attempt_required"
+
+
 async def test_schema_v6_recovers_legacy_failed_episode_without_replacing_drafts(
     repository,
     persona,

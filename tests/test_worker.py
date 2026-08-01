@@ -11,7 +11,7 @@ import pytest
 from langgraph.errors import GraphRecursionError
 from persona_factory import create_persona_package
 
-from pengine.agents import EpisodeTimeoutError, QualityGateRejectedError
+from pengine.agents import AgentProtocolError, EpisodeTimeoutError, QualityGateRejectedError
 from pengine.config import Settings
 from pengine.errors import DomainError
 from pengine.personas import PersonaCatalog
@@ -333,6 +333,22 @@ class EpisodeArithmeticErrorOnceWorkflow(DeterministicWorkflow):
         )
 
 
+class PreAttemptEpisodeProtocolErrorWorkflow(DeterministicWorkflow):
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        async def fail_before_attempt(_: EpisodePlan) -> int:
+            raise AgentProtocolError(
+                "Episode outline cannot start writing",
+                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            )
+
+        return await super().execute(
+            **{
+                **kwargs,
+                "before_episode": fail_before_attempt,
+            }
+        )
+
+
 class QualityRejectedThenPassedWorkflow(DeterministicWorkflow):
     def __init__(self) -> None:
         super().__init__()
@@ -638,6 +654,38 @@ async def test_worker_pauses_arithmetic_error_and_resumes_only_failed_episode(
         ).fetchone()
     assert row is not None
     assert await repository.get_episode_attempt_counts(UUID(row["id"])) == {1: 1, 2: 2}
+
+
+@pytest.mark.asyncio
+async def test_worker_fails_closed_when_episode_error_precedes_writer_attempt(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "pre-attempt-episode-error",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=PreAttemptEpisodeProtocolErrorWorkflow(),
+        worker_id="pre-attempt-episode-error-worker",
+    )
+
+    assert await worker.run_once() is True
+    failed = await repository.get_creation(accepted.creation_id)
+
+    assert failed is not None
+    assert failed.initial.state == "failed"
+    assert failed.initial.failure.code == "structured_output_invalid"
+    assert failed.initial.progress.can_continue is False
+    assert failed.initial.progress.can_end is False
 
 
 @pytest.mark.asyncio

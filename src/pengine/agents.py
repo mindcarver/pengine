@@ -141,9 +141,13 @@ _EPISODE_PLANNER_PROMPT = (
 )
 
 _SCRIPT_WRITER_PROMPT = (
-    "Read /workspace/story_contract.json and /workspace/series_state.json. Use the "
-    "requested single episode plan and persona rules without changing the locked "
-    "episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
+    "If the task explicitly identifies a grandfathered pre-contract run, the contract "
+    "and series-state files are absent by design: do not read or invent them, preserve "
+    "every approved upstream artifact and committed earlier episode, and return null "
+    "state_delta. Otherwise, read /workspace/story_contract.json and "
+    "/workspace/series_state.json and return a state_delta bound to the supplied contract "
+    "hash. Use the requested single episode plan and persona rules without changing any "
+    "locked episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
     "returning, reread every approved upstream artifact and audit this episode "
     "against them. "
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
@@ -152,9 +156,8 @@ _SCRIPT_WRITER_PROMPT = (
     "for every derived numeric claim and copy its exact result. The tool accepts "
     "decimal operands only: convert clock times to elapsed minutes before subtracting "
     "them (for example, 22:50 becomes 1370 and 22:20 becomes 1340). Never round a "
-    "non-integral division unless the script states the rounding rule. Return "
-    "the script plus a structured state_delta bound to the supplied contract "
-    "hash. Every required fact, clue event, and episode obligation must cite a verbatim "
+    "non-integral division unless the script states the rounding rule. Every required "
+    "fact, clue event, and episode obligation must cite a verbatim "
     "excerpt that exists in the script. Return only the structured episode-script "
     "result for the requested episode number."
 )

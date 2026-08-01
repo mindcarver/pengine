@@ -551,7 +551,7 @@ WHERE execution_state = 'failed'
       FROM episode_attempts
       WHERE episode_attempts.run_id = run_progress.run_id
         AND episode_attempts.episode_number = run_progress.current_episode
-  ) < 3;
+  ) BETWEEN 1 AND 2;
 
 UPDATE runs
 SET state = 'running',
@@ -1751,6 +1751,28 @@ class Repository:
                 raise DomainError(
                     "episode_not_planned",
                     "The episode is not in the approved outline.",
+                    409,
+                )
+            attempt = await self._fetchone(
+                connection,
+                """
+                SELECT COUNT(*) AS attempt_count
+                FROM episode_attempts
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (str(run_id), episode_number),
+            )
+            attempt_count = int(attempt["attempt_count"]) if attempt is not None else 0
+            if attempt_count == 0:
+                raise DomainError(
+                    "episode_attempt_required",
+                    "An episode error requires a recorded writer attempt.",
+                    409,
+                )
+            if attempt_count >= MAX_EPISODE_ATTEMPTS:
+                raise DomainError(
+                    "attempts_exhausted",
+                    "The episode attempt limit has been exhausted.",
                     409,
                 )
             await connection.execute(
