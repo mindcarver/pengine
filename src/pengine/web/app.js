@@ -717,14 +717,21 @@ function renderCreation() {
     const showWorkspace = renderWorkspace();
     const relayInterrupted = initial.progress.recovery_reason === "relay_interruption";
     const contentRejected = initial.progress.recovery_reason === "content_rejected";
+    const episodeError = initial.progress.recovery_reason === "episode_error";
+    const episodeNumber = initial.pause?.episode_number || initial.progress.episodes?.current;
+    const retainedEpisodes = initial.progress.episodes?.completed || 0;
     showWaiting(
       "任务已暂停",
-      contentRejected
+      episodeError
+        ? `第 ${episodeNumber} 集生成遇到可恢复错误`
+        : contentRejected
         ? "内容一致性审查连续修复后仍未通过"
         : relayInterrupted
           ? "当前阶段再次发生网络 / Relay 中断"
           : "当前阶段再次超过整体运行时限",
-      contentRejected
+      episodeError
+        ? `${initial.pause?.message || "当前集生成遇到可恢复错误。"} 已完成的 ${retainedEpisodes} 集已保留，请在上方从第 ${episodeNumber} 集继续或结束任务。`
+        : contentRejected
         ? "审查证据已保留。请在上方选择继续重新生成当前未锁内容，或结束本次任务；锁定内容不会改变。"
         : "请在上方选择继续当前阶段，或结束本次任务；已完成阶段、分集草稿与已运行时长均已保留。",
       { showWorkspace },
@@ -837,16 +844,26 @@ function renderProgress() {
   elements["run-controls"].hidden = !controllable;
   const relayInterrupted = progress.recovery_reason === "relay_interruption";
   const contentRejected = progress.recovery_reason === "content_rejected";
-  elements["run-control-title"].textContent = contentRejected
+  const episodeError = progress.recovery_reason === "episode_error";
+  const episodeNumber = run.pause?.episode_number || progress.episodes?.current;
+  const retainedEpisodes = progress.episodes?.completed || 0;
+  elements["run-control-title"].textContent = episodeError
+    ? `第 ${episodeNumber} 集可继续`
+    : contentRejected
     ? "内容一致性审查已完成两轮修复"
     : relayInterrupted
       ? "本阶段已两次发生网络 / Relay 中断"
       : "本阶段已两次超过整体运行时限";
-  elements["run-control-description"].textContent = contentRejected
+  elements["run-control-description"].textContent = episodeError
+    ? `${run.pause?.message || "当前集生成遇到可恢复错误。"} 已完成的 ${retainedEpisodes} 集不会重新生成。`
+    : contentRejected
     ? `${run.pause?.message || "当前内容仍与锁定合同冲突。"} 可重新生成当前未锁内容，或结束本次任务。`
     : relayInterrupted
       ? "可从当前未批准阶段继续；已完成阶段、时长和已提交草稿不会重新生成或丢失，也可以结束本次任务。"
       : "可从当前未批准阶段继续，已完成阶段不会重新生成；也可以结束本次任务。";
+  elements["continue-run"].textContent = episodeError
+    ? `从第 ${episodeNumber} 集继续`
+    : "继续创作";
   elements["continue-run"].hidden = !progress.can_continue;
   elements["continue-run"].disabled = state.runControlBusy || !progress.can_continue;
   elements["end-run"].hidden = !progress.can_end;

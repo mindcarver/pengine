@@ -27,6 +27,7 @@ from pengine.agents import (
     StageGuardMiddleware,
     StoryArchitectResult,
     WorkflowCompletion,
+    _arithmetic_tool,
     _calculate_arithmetic,
     _supervisor_prompt,
 )
@@ -429,6 +430,13 @@ def test_calculate_arithmetic_preserves_exact_decimal_result() -> None:
     )
 
 
+def test_calculate_arithmetic_returns_correction_for_clock_time_operands() -> None:
+    result = _arithmetic_tool().invoke({"left": "22:50", "operation": "subtract", "right": "22:20"})
+
+    assert "Operands must be decimal numbers" in result
+    assert "convert clock times to elapsed minutes" in result
+
+
 @pytest.mark.parametrize("operand", ["NaN", "Infinity", "1e1000000"])
 def test_calculate_arithmetic_rejects_non_finite_or_unbounded_operands(
     operand: str,
@@ -822,6 +830,111 @@ async def test_wrong_stage_result_is_not_corrected() -> None:
 
     assert attempted == [InternalStage.GENERATING_EPISODE_OUTLINE]
     assert handler_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_episode_recovery_skips_committed_draft_without_requiring_new_contract() -> (
+    None
+):
+    first_content = "第一集不可替换剧本"
+    first = EpisodeDraft(
+        episode_number=1,
+        content=first_content,
+        content_sha256=hashlib.sha256(first_content.encode()).hexdigest(),
+        completed_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    approved_payloads = {
+        InternalStage.GENERATING_EPISODE_OUTLINE: {
+            "stage": "generating_episode_outline",
+            "content": "两集旧版分集大纲",
+            "episode_count": 2,
+            "episodes": [
+                {"episode_number": 1, "plan": "第一集计划"},
+                {"episode_number": 2, "plan": "第二集计划"},
+            ],
+        }
+    }
+    attempts: list[int] = []
+    commits: list[tuple[int, str, object | None]] = []
+    approved: dict[InternalStage, dict[str, Any]] = {}
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
+        approved[stage] = payload
+
+    async def before_episode(plan: EpisodePlan) -> int:
+        attempts.append(plan.episode_number)
+        return 2
+
+    async def commit_episode(
+        episode_number: int,
+        content: str,
+        episode_lock=None,
+    ) -> EpisodeDraft:
+        commits.append((episode_number, content, episode_lock))
+        return EpisodeDraft(
+            episode_number=episode_number,
+            content=content,
+            content_sha256=hashlib.sha256(content.encode()).hexdigest(),
+            completed_at=datetime(2026, 8, 1, tzinfo=UTC),
+        )
+
+    async def assemble_episode_scripts() -> str:
+        return "第 1 集\n第一集不可替换剧本\n\n---\n\n第 2 集\n第二集恢复剧本"
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages={
+            InternalStage.SELECTING_L0_VARIANT,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+            InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+        },
+        approved_payloads=approved_payloads,
+        episode_drafts=[first],
+        before_episode=before_episode,
+        commit_episode=commit_episode,
+        assemble_episode_scripts=assemble_episode_scripts,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] write scripts",
+                "subagent_type": "script_writer",
+            },
+            "id": "call-legacy-episode",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+
+    async def handler(episode_request: ToolCallRequest) -> ToolMessage:
+        assert "[episode=2]" in episode_request.tool_call["args"]["description"]
+        assert "/workspace/episodes/ep1.md" in episode_request.state["files"]
+        assert "/workspace/story_contract.json" not in episode_request.state["files"]
+        return ToolMessage(
+            content=(
+                '{"stage":"generating_episode_scripts","episode_number":2,'
+                '"content":"第二集恢复剧本"}'
+            ),
+            tool_call_id="call-legacy-episode",
+        )
+
+    await middleware.awrap_tool_call(request, handler)
+
+    assert attempts == [2]
+    assert commits == [(2, "第二集恢复剧本", None)]
+    assert approved[InternalStage.GENERATING_EPISODE_SCRIPTS] == {
+        "stage": "generating_episode_scripts",
+        "content": "第 1 集\n第一集不可替换剧本\n\n---\n\n第 2 集\n第二集恢复剧本",
+    }
 
 
 @pytest.mark.asyncio

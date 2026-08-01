@@ -919,6 +919,7 @@ async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_draf
             DELETE FROM pengine_schema WHERE version = 4;
             DELETE FROM pengine_schema WHERE version = 5;
             DELETE FROM pengine_schema WHERE version = 6;
+            DELETE FROM pengine_schema WHERE version = 7;
             """
         )
         await connection.execute(
@@ -1474,6 +1475,160 @@ async def test_failed_run_keeps_committed_episode_drafts(
     assert failed.initial.drafts.episodes == [draft]
 
 
+async def test_episode_execution_error_pauses_and_continues_only_unfinished_episode(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        {
+            "stage": "generating_episode_outline",
+            "content": "两集分集大纲",
+            "episode_count": 2,
+            "episodes": [
+                {"episode_number": 1, "plan": "第一集计划"},
+                {"episode_number": 2, "plan": "第二集计划"},
+            ],
+        },
+    )
+    await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
+    first = await repository.commit_episode_draft(
+        lease.run_id,
+        1,
+        "第一集不可替换剧本",
+        now=NOW + timedelta(seconds=1),
+    )
+    await repository.record_episode_attempt(
+        lease.run_id,
+        2,
+        now=NOW + timedelta(seconds=2),
+    )
+
+    await repository.pause_episode_error(
+        lease.run_id,
+        episode_number=2,
+        safe_message=(
+            "算术工具收到非十进制参数。需要先把时刻换算为当日经过分钟数后再计算；"
+            "已完成分集不受影响。"
+        ),
+        now=NOW + timedelta(seconds=3),
+    )
+
+    paused = await repository.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert paused is not None
+    assert paused.initial.state == "paused"
+    assert paused.initial.pause.code == "episode_error"
+    assert paused.initial.pause.episode_number == 2
+    assert "非十进制参数" in paused.initial.pause.message
+    assert paused.initial.progress.episodes.model_dump() == {
+        "total": 2,
+        "completed": 1,
+        "current": 2,
+    }
+    assert paused.initial.progress.can_continue is True
+    assert paused.initial.drafts.episodes == [first]
+
+    continued = await repository.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-episode-error",
+        now=NOW + timedelta(seconds=4),
+    )
+    assert continued.run_state == "queued"
+    resumed = await repository.lease_next_job(
+        "worker-2",
+        30,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert resumed is not None and resumed.run_id == lease.run_id
+    assert (
+        await repository.record_episode_attempt(
+            resumed.run_id,
+            2,
+            now=NOW + timedelta(seconds=5),
+        )
+        == 2
+    )
+    assert await repository.get_episode_drafts(resumed.run_id) == [first]
+
+
+async def test_schema_v6_recovers_legacy_failed_episode_without_replacing_drafts(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        {
+            "stage": "generating_episode_outline",
+            "content": "两集旧版分集大纲",
+            "episode_count": 2,
+            "episodes": [
+                {"episode_number": 1, "plan": "第一集计划"},
+                {"episode_number": 2, "plan": "第二集计划"},
+            ],
+        },
+    )
+    await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
+    first = await repository.commit_episode_draft(
+        lease.run_id,
+        1,
+        "旧版第一集不可替换剧本",
+        now=NOW + timedelta(seconds=1),
+    )
+    await repository.record_episode_attempt(
+        lease.run_id,
+        2,
+        now=NOW + timedelta(seconds=2),
+    )
+    await repository.fail_run(
+        lease.run_id,
+        RunFailure(
+            code="internal_error",
+            message="The workflow failed safely.",
+            failed_stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            attempt_count=1,
+        ),
+        now=NOW + timedelta(seconds=3),
+    )
+    async with repository._connection() as connection:
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
+        await connection.commit()
+
+    restarted = Repository(repository.database_path)
+    await restarted.initialize()
+    recovered = await restarted.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    assert recovered is not None
+    assert recovered.initial.state == "paused"
+    assert recovered.initial.pause.code == "episode_error"
+    assert recovered.initial.pause.episode_number == 2
+    assert "旧版本" in recovered.initial.pause.message
+    assert recovered.initial.progress.can_continue is True
+    assert recovered.initial.drafts.episodes == [first]
+    assert await restarted.get_episode_attempt_counts(lease.run_id) == {1: 1, 2: 1}
+
+    continued = await restarted.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-migrated-episode",
+        now=NOW + timedelta(seconds=5),
+    )
+    assert continued.run_state == "queued"
+    assert await restarted.get_episode_drafts(lease.run_id) == [first]
+
+
 async def test_schema_v1_database_is_backfilled_without_losing_creation(
     repository,
     persona,
@@ -1492,6 +1647,7 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 4")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.execute("DROP TABLE episode_timeouts")
         await connection.execute("DROP TABLE episode_attempts")
@@ -1533,6 +1689,7 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 4")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.commit()
 
@@ -1602,6 +1759,7 @@ async def test_schema_v4_recovery_rows_gain_the_timeout_reason_without_losing_dr
         await connection.execute("DROP TABLE content_rejections")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
         await connection.commit()
 
     await repository.initialize()

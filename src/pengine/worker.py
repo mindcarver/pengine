@@ -448,6 +448,8 @@ class Worker:
                     interruption.retry_delay_seconds,
                 )
                 return
+            if await self._pause_recoverable_episode_error(work, failure_stage, exc):
+                return
             failure = await self._safe_failure(work.run_id, failure_stage, exc)
             await self.repository.fail_run(work.run_id, failure)
             logger.warning(
@@ -457,6 +459,46 @@ class Worker:
                 failure.failed_stage.value,
                 failure.code,
             )
+
+    async def _pause_recoverable_episode_error(
+        self,
+        work: RunWorkItem,
+        stage: InternalStage,
+        exc: Exception,
+    ) -> bool:
+        if stage is not InternalStage.GENERATING_EPISODE_SCRIPTS or isinstance(
+            exc,
+            (
+                CheckpointUnavailableError,
+                PersonaPackageError,
+                DomainError,
+                GraphRecursionError,
+                RelayError,
+                sqlite3.Error,
+            ),
+        ):
+            return False
+        refreshed = await self.repository.get_run_work_item(work.run_id)
+        episode_number = len(refreshed.episode_drafts) + 1
+        if episode_number > len(refreshed.episode_plans):
+            return False
+        attempts = await self.repository.get_episode_attempt_counts(work.run_id)
+        if attempts.get(episode_number, 0) >= 3:
+            return False
+        safe_message = _episode_error_message(exc)
+        await self.repository.pause_episode_error(
+            work.run_id,
+            episode_number=episode_number,
+            safe_message=safe_message,
+        )
+        logger.warning(
+            "episode execution paused run_id=%s creation_id=%s episode=%s error_type=%s",
+            work.run_id,
+            work.creation_id,
+            episode_number,
+            type(exc).__name__,
+        )
+        return True
 
     async def _recover_relay_interruption(
         self,
@@ -691,3 +733,14 @@ def _classify_failure(exc: Exception) -> tuple[str, str]:
         relay_error = classify_relay_exception(exc)
         return relay_error.code, relay_error.safe_message
     return "internal_error", "The workflow failed safely."
+
+
+def _episode_error_message(exc: Exception) -> str:
+    if isinstance(exc, ValueError) and "decimal numbers" in str(exc):
+        return (
+            "算术工具收到非十进制参数。需要先把时刻换算为当日经过分钟数后再计算；"
+            "已完成分集不受影响。"
+        )
+    if isinstance(exc, AgentProtocolError):
+        return "当前集代理返回了无效的结构化结果。已完成分集不受影响；继续时只会重试当前集。"
+    return "当前集遇到可恢复的执行错误。已完成分集不受影响；继续时只会重试当前集。"

@@ -1778,7 +1778,8 @@
             "enum": [
               "run_timeout",
               "relay_interruption",
-              "content_rejected"
+              "content_rejected",
+              "episode_error"
             ],
             "title": "Code",
             "default": "run_timeout"
@@ -1870,7 +1871,8 @@
               "none",
               "run_timeout",
               "relay_interruption",
-              "content_rejected"
+              "content_rejected",
+              "episode_error"
             ],
             "title": "Recovery Reason"
           },

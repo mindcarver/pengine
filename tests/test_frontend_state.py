@@ -704,6 +704,29 @@ if (!elements["run-control-description"].textContent.includes("人物知识状�
   throw new Error("content rejection did not expose review evidence");
 }
 
+state.creation.revision.progress.recovery_reason = "episode_error";
+state.creation.revision.progress.current_stage = "generating_episode_scripts";
+state.creation.revision.progress.episodes = { total: 10, completed: 7, current: 8 };
+state.creation.revision.pause = {
+  code: "episode_error",
+  message: "算术工具收到非十进制参数。",
+  stage: "generating_episode_scripts",
+  episode_number: 8,
+};
+renderProgress();
+if (elements["run-control-title"].textContent !== "第 8 集可继续") {
+  throw new Error("episode error did not identify the resumable episode");
+}
+if (!elements["run-control-description"].textContent.includes("非十进制参数")) {
+  throw new Error("episode error hid its safe cause");
+}
+if (!elements["run-control-description"].textContent.includes("已完成的 7 集不会重新生成")) {
+  throw new Error("episode error did not preserve completed drafts");
+}
+if (elements["continue-run"].textContent !== "从第 8 集继续") {
+  throw new Error("episode error exposed the wrong continuation action");
+}
+
 state.creation.revision.state = "auto_resuming";
 state.creation.revision.progress.recovery_reason = "relay_interruption";
 state.creation.revision.progress.can_continue = false;

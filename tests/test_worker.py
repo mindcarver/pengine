@@ -304,6 +304,35 @@ class TimeoutAfterFirstEpisodeWorkflow(DeterministicWorkflow):
         )
 
 
+class EpisodeArithmeticErrorOnceWorkflow(DeterministicWorkflow):
+    def __init__(self) -> None:
+        super().__init__(episode_count=2)
+        self.calls = 0
+        self.retry_drafts: list[int] = []
+
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        self.calls += 1
+        if self.calls > 1:
+            self.retry_drafts = [draft.episode_number for draft in kwargs["episode_drafts"]]
+            return await super().execute(**kwargs)
+
+        before_episode = kwargs["before_episode"]
+        assert before_episode is not None
+
+        async def fail_on_second_episode(plan: EpisodePlan) -> int:
+            attempt = await before_episode(plan)
+            if plan.episode_number == 2:
+                raise ValueError("Operands must be decimal numbers")
+            return attempt
+
+        return await super().execute(
+            **{
+                **kwargs,
+                "before_episode": fail_on_second_episode,
+            }
+        )
+
+
 class QualityRejectedThenPassedWorkflow(DeterministicWorkflow):
     def __init__(self) -> None:
         super().__init__()
@@ -556,6 +585,59 @@ async def test_worker_resumes_the_first_unfinished_episode_after_a_relay_interru
     assert completed.initial.state == "succeeded"
     assert workflow.retry_drafts == [1]
     assert workflow.writer_commits == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_worker_pauses_arithmetic_error_and_resumes_only_failed_episode(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "episode-arithmetic-recovery",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = EpisodeArithmeticErrorOnceWorkflow()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="episode-arithmetic-recovery-worker",
+    )
+
+    assert await worker.run_once() is True
+    paused = await repository.get_creation(accepted.creation_id)
+    assert paused is not None
+    assert paused.initial.state == "paused"
+    assert paused.initial.pause.code == "episode_error"
+    assert paused.initial.pause.episode_number == 2
+    assert "非十进制参数" in paused.initial.pause.message
+    assert [draft.episode_number for draft in paused.initial.drafts.episodes] == [1]
+
+    await repository.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-arithmetic-episode",
+    )
+    assert await worker.run_once() is True
+    completed = await repository.get_creation(accepted.creation_id)
+    assert completed is not None
+    assert completed.initial.state == "succeeded"
+    assert workflow.retry_drafts == [1]
+    async with repository._connection() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+                (str(accepted.creation_id),),
+            )
+        ).fetchone()
+    assert row is not None
+    assert await repository.get_episode_attempt_counts(UUID(row["id"])) == {1: 1, 2: 2}
 
 
 @pytest.mark.asyncio
