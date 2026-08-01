@@ -676,7 +676,7 @@ function renderCreation() {
     showWaiting(
       "任务已排队",
       "编辑部已收到你的故事",
-      "本页会持续查询本地服务；成品通过审核前，不会开启文稿阅览。",
+      "本页会持续查询本地服务；已提交草稿会在下方保持可读，成品通过审核前不会开启成品阅览。",
       { showWorkspace },
     );
     return;
@@ -687,7 +687,7 @@ function renderCreation() {
     showWaiting(
       "任务创作中",
       "编辑部正在处理当前阶段",
-      "上方阶段与已运行时长均来自本地服务；成品审核通过前不会展示文稿。",
+      "上方阶段与已运行时长均来自本地服务；已完成阶段和已提交分集草稿可在下方查看。",
       { showWorkspace },
     );
     return;
@@ -700,8 +700,8 @@ function renderCreation() {
       relayInterrupted ? "网络 / Relay 暂时中断 · 自动恢复" : "首次超时 · 自动恢复",
       relayInterrupted ? "正在等待后从已批准检查点继续" : "正在从已批准检查点继续",
       relayInterrupted
-        ? "当前阶段与已运行时长均已保留；未批准阶段将在短暂等待后重新执行。"
-        : "已完成阶段不会重新生成；当前未批准阶段将重新执行。",
+        ? "当前阶段、已运行时长和已提交草稿均已保留；未批准阶段将在短暂等待后重新执行。"
+        : "已完成阶段和已提交草稿不会重新生成；当前未批准阶段将重新执行。",
       { showWorkspace },
     );
     return;
@@ -713,7 +713,7 @@ function renderCreation() {
     showWaiting(
       "任务已暂停",
       relayInterrupted ? "当前阶段再次发生网络 / Relay 中断" : "当前阶段再次超过整体运行时限",
-      "请在上方选择继续当前阶段，或结束本次任务；当前阶段与已运行时长均已保留。",
+      "请在上方选择继续当前阶段，或结束本次任务；已完成阶段、分集草稿与已运行时长均已保留。",
       { showWorkspace },
     );
     return;
@@ -1017,6 +1017,15 @@ function artifactViewsForRun(run) {
   return [...artifacts, ...episodeScriptDraftView(run)];
 }
 
+function visibleArtifactViews(run) {
+  if (state.workspaceView === "progress") {
+    return artifactViewsForRun(run);
+  }
+  return state.workspaceView === "reading" && isFormalRun(run)
+    ? artifactViewsForRun(run)
+    : [];
+}
+
 function episodeScriptDraftView(run) {
   const episodes = run?.progress?.episodes;
   if (!episodes || !Number.isInteger(episodes.total) || episodes.total < 1) {
@@ -1042,23 +1051,19 @@ function draftArtifactContent(draft) {
 }
 
 function renderWorkspace() {
-  if (state.workspaceView !== "reading" || !hasReadableDelivery()) {
-    elements["result-workspace"].hidden = true;
-    return false;
-  }
-  const initialArtifacts = isFormalRun(state.creation.initial)
-    ? artifactViewsForRun(state.creation.initial)
-    : [];
-  const revisionArtifacts = isFormalRun(state.creation.revision)
-    ? artifactViewsForRun(state.creation.revision)
-    : [];
+  const initialArtifacts = visibleArtifactViews(state.creation.initial);
+  const revisionArtifacts = visibleArtifactViews(state.creation.revision);
   if (!initialArtifacts.length && !revisionArtifacts.length) {
     elements["result-workspace"].hidden = true;
     return false;
   }
 
   elements["result-workspace"].hidden = false;
-  elements["revision-desk"].hidden = state.creation.initial.state !== "succeeded";
+  if (elements["result-workspace"].dataset) {
+    elements["result-workspace"].dataset.mode = state.workspaceView;
+  }
+  elements["revision-desk"].hidden =
+    state.workspaceView !== "reading" || state.creation.initial.state !== "succeeded";
   renderVersionControls();
   renderArtifact();
   if (!elements["revision-desk"].hidden) {
@@ -1068,8 +1073,8 @@ function renderWorkspace() {
 }
 
 function renderVersionControls() {
-  const initialAvailable = isFormalRun(state.creation.initial);
-  const revisionAvailable = isFormalRun(state.creation.revision);
+  const initialAvailable = visibleArtifactViews(state.creation.initial).length > 0;
+  const revisionAvailable = visibleArtifactViews(state.creation.revision).length > 0;
   if (state.activeVersion === "initial" && !initialAvailable) {
     state.activeVersion = "revision";
   }
@@ -1101,10 +1106,7 @@ function renderArtifact() {
   const run = state.activeVersion === "revision"
     ? state.creation.revision
     : state.creation.initial;
-  if (!isFormalRun(run)) {
-    return;
-  }
-  const artifacts = artifactViewsForRun(run);
+  const artifacts = visibleArtifactViews(run);
   if (!artifacts.length) {
     return;
   }
@@ -1251,7 +1253,7 @@ function renderRevision() {
   } else if (revision.state === "running") {
     feedbackState = "意见已冻结";
     buttonLabel = "修订创作中";
-    description = "修订正在真实运行。初稿仍可浏览；完成前不会展示假修订稿。";
+    description = "修订正在真实运行。初稿和已提交的修订草稿仍可浏览；未提交内容不会显示。";
     message = "修订创作中。";
   } else if (revision.state === "auto_resuming") {
     feedbackState = "自动恢复中";
