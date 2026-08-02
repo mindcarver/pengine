@@ -153,7 +153,7 @@ class StoryContract(ContinuityModel):
     relationships: list[RelationshipSpec] = Field(default_factory=list)
     facts: list[StoryFact] = Field(min_length=1)
     timeline: list[TimelineEvent] = Field(min_length=1)
-    knowledge_states: list[CharacterKnowledgeState] = Field(min_length=1)
+    knowledge_states: list[CharacterKnowledgeState] = Field(default_factory=list)
     clues: list[ClueSpec] = Field(default_factory=list)
     prohibitions: list[NonEmptyText] = Field(default_factory=list)
     episode_obligations: list[EpisodeObligation] = Field(min_length=1)
@@ -182,6 +182,7 @@ class StoryContract(ContinuityModel):
                 fact_ids,
                 f"initial knowledge for {character.character_id}",
             )
+            character.initial_known_fact_ids = sorted(set(character.initial_known_fact_ids))
         for relationship in self.relationships:
             _require_subset(
                 [relationship.source_character_id, relationship.target_character_id],
@@ -191,18 +192,9 @@ class StoryContract(ContinuityModel):
             if relationship.source_character_id == relationship.target_character_id:
                 raise ValueError("A relationship must connect two different characters")
 
-        numeric_meanings: dict[str, tuple[str, str]] = {}
         for fact in self.facts:
             if fact.first_revealed_episode > self.episode_count:
                 raise ValueError("A fact reveal episode exceeds the contract episode count")
-            if fact.kind in _NUMERIC_KINDS:
-                normalized = str(Decimal(fact.value).normalize())
-                meaning = (fact.kind, fact.unit or "")
-                previous = numeric_meanings.setdefault(normalized, meaning)
-                if previous != meaning:
-                    raise ValueError(
-                        "The same numeric value cannot represent different kinds or units"
-                    )
 
         expected_orders = list(range(1, len(self.timeline) + 1))
         if [event.order for event in self.timeline] != expected_orders:
@@ -221,29 +213,44 @@ class StoryContract(ContinuityModel):
                 raise ValueError("Timeline timestamps contradict their declared order")
             previous_temporal = current_temporal or previous_temporal
 
-        expected_pairs = {
-            (episode, character_id)
-            for episode in range(1, self.episode_count + 1)
-            for character_id in character_ids
-        }
-        actual_pairs = {
-            (state.episode_number, state.character_id) for state in self.knowledge_states
-        }
-        if actual_pairs != expected_pairs or len(actual_pairs) != len(self.knowledge_states):
-            raise ValueError("Knowledge state requires exactly one entry per character and episode")
+        supplied_knowledge: dict[tuple[int, str], CharacterKnowledgeState] = {}
+        for state in self.knowledge_states:
+            if state.episode_number > self.episode_count:
+                raise ValueError("A knowledge state episode exceeds the contract episode count")
+            _require_subset([state.character_id], character_ids, "character knowledge")
+            _require_subset(state.known_fact_ids, fact_ids, "character knowledge")
+            pair = (state.episode_number, state.character_id)
+            if pair in supplied_knowledge:
+                raise ValueError("Duplicate knowledge state entries are not allowed")
+            supplied_knowledge[pair] = state
+
         prior_knowledge = {
-            character.character_id: set(character.initial_known_fact_ids)
+            character.character_id: list(character.initial_known_fact_ids)
             for character in self.characters
         }
-        for state in sorted(
-            self.knowledge_states,
-            key=lambda item: (item.episode_number, item.character_id),
-        ):
-            _require_subset(state.known_fact_ids, fact_ids, "character knowledge")
-            current = set(state.known_fact_ids)
-            if not prior_knowledge[state.character_id].issubset(current):
-                raise ValueError("Character knowledge cannot silently disappear between episodes")
-            prior_knowledge[state.character_id] = current
+        completed_knowledge: list[CharacterKnowledgeState] = []
+        for episode in range(1, self.episode_count + 1):
+            for character in self.characters:
+                character_id = character.character_id
+                supplied = supplied_knowledge.get((episode, character_id))
+                current = (
+                    sorted(set(supplied.known_fact_ids))
+                    if supplied is not None
+                    else list(prior_knowledge[character_id])
+                )
+                if not set(prior_knowledge[character_id]).issubset(current):
+                    raise ValueError(
+                        "Character knowledge cannot silently disappear between episodes"
+                    )
+                completed_knowledge.append(
+                    CharacterKnowledgeState(
+                        episode_number=episode,
+                        character_id=character_id,
+                        known_fact_ids=current,
+                    )
+                )
+                prior_knowledge[character_id] = current
+        self.knowledge_states = completed_knowledge
 
         for clue in self.clues:
             if (
@@ -513,13 +520,9 @@ def validate_episode_candidate(
     issues: list[ReviewIssue] = []
     episode = delta.episode_number
     if delta.contract_sha256 != contract_sha256 or prior_state.contract_sha256 != contract_sha256:
-        issues.append(
-            _issue("contract_hash_mismatch", "The episode does not bind the locked contract")
-        )
+        issues.append(_issue("contract_hash_mismatch", "本集未绑定已锁定的创作合同"))
     if episode != prior_state.locked_through_episode + 1 or episode > contract.episode_count:
-        issues.append(
-            _issue("episode_order_mismatch", "The episode is not the first unlocked episode")
-        )
+        issues.append(_issue("episode_order_mismatch", "本集不是当前首个未锁定集"))
         return issues
 
     expected_facts = {
@@ -529,7 +532,7 @@ def validate_episode_candidate(
         issues.append(
             _issue(
                 "fact_delta_mismatch",
-                "Established facts do not match the locked reveal plan",
+                "本集确立的事实与锁定的揭示计划不一致",
                 sorted(expected_facts),
             )
         )
@@ -544,13 +547,13 @@ def validate_episode_candidate(
     }
     actual_gains = {gain.character_id: set(gain.fact_ids) for gain in delta.knowledge_gains}
     if len(actual_gains) != len(delta.knowledge_gains):
-        issues.append(_issue("duplicate_knowledge_gain", "Knowledge gains repeat a character"))
+        issues.append(_issue("duplicate_knowledge_gain", "人物知识增量出现重复角色"))
     unknown_gain_characters = set(actual_gains) - set(prior_knowledge)
     if unknown_gain_characters:
         issues.append(
             _issue(
                 "unknown_knowledge_character",
-                "Knowledge gains reference a character outside the locked cast",
+                "人物知识增量引用了锁定角色表之外的角色",
                 sorted(unknown_gain_characters),
             )
         )
@@ -562,7 +565,7 @@ def validate_episode_candidate(
             issues.append(
                 _issue(
                     "knowledge_state_mismatch",
-                    f"Knowledge transition differs for {character.character_id}",
+                    f"人物 {character.character_id} 的知识变化与合同不一致",
                     sorted(expected_gain),
                 )
             )
@@ -577,7 +580,7 @@ def validate_episode_candidate(
         issues.append(
             _issue(
                 "clue_introduction_mismatch",
-                "Clue introductions differ from the contract",
+                "线索引入情况与合同不一致",
                 sorted(expected_introduced),
             )
         )
@@ -585,7 +588,7 @@ def validate_episode_candidate(
         issues.append(
             _issue(
                 "clue_resolution_mismatch",
-                "Clue resolutions differ from the contract",
+                "线索解释情况与合同不一致",
                 sorted(expected_resolved),
             )
         )
@@ -597,7 +600,7 @@ def validate_episode_candidate(
         issues.append(
             _issue(
                 "obligation_mismatch",
-                "The episode does not satisfy its locked obligation",
+                "本集未满足锁定的分集义务",
                 [obligation.obligation_id],
             )
         )
@@ -610,7 +613,7 @@ def validate_episode_candidate(
         issues.append(
             _issue(
                 "evidence_coverage_mismatch",
-                "Script evidence does not cover every required fact, clue, and obligation",
+                "剧本证据未覆盖全部必需事实、线索和分集义务",
                 sorted(expected_evidence),
             )
         )
@@ -619,7 +622,7 @@ def validate_episode_candidate(
             issues.append(
                 _issue(
                     "evidence_not_in_script",
-                    f"Evidence for {target_id} is not present verbatim in the script",
+                    f"证据 {target_id} 未逐字出现在剧本中",
                     [target_id],
                 )
             )
@@ -639,7 +642,7 @@ def validate_episode_candidate(
             issues.append(
                 _issue(
                     "uncontracted_time",
-                    f"Script contains uncontracted date or time {token} ({normalized})",
+                    f"剧本包含合同外日期或时间 {token}（{normalized}）",
                 )
             )
 
@@ -666,8 +669,7 @@ def validate_episode_candidate(
             issues.append(
                 _issue(
                     "uncontracted_number",
-                    "Script contains uncontracted measured value "
-                    f"{raw_value}{unit} ({value}{unit})",
+                    f"剧本包含合同外计量值 {raw_value}{unit}（{value}{unit}）",
                 )
             )
 
@@ -678,7 +680,7 @@ def validate_episode_candidate(
             issues.append(
                 _issue(
                     "unknown_speaker",
-                    f"Script introduces speaker {match.group(1)} outside the locked cast",
+                    f"剧本引入了锁定角色表之外的说话人 {match.group(1)}",
                 )
             )
     return issues

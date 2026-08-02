@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -90,6 +92,65 @@ def make_contract(*, numeric_facts: list[dict] | None = None) -> StoryContract:
     )
 
 
+def make_sparse_knowledge_contract(knowledge_states: list[dict]) -> StoryContract:
+    facts = [
+        {
+            "fact_id": f"fact_{number}",
+            "subject": "旧案",
+            "predicate": f"事实{number}",
+            "kind": "text",
+            "value": f"事实{number}",
+            "first_revealed_episode": episode,
+        }
+        for number, episode in (("one", 1), ("two", 2), ("three", 3))
+    ]
+    fact_ids = [fact["fact_id"] for fact in facts]
+    return StoryContract.model_validate(
+        {
+            "version": 1,
+            "episode_count": 3,
+            "characters": [
+                {
+                    "character_id": "alice",
+                    "name": "阿丽",
+                    "role": "调查者",
+                    "initial_known_fact_ids": ["fact_one"],
+                },
+                {
+                    "character_id": "bob",
+                    "name": "阿博",
+                    "role": "证人",
+                    "initial_known_fact_ids": [],
+                },
+            ],
+            "relationships": [],
+            "facts": facts,
+            "timeline": [
+                {
+                    "event_id": "event_one",
+                    "order": 1,
+                    "when": "故事开始",
+                    "participant_ids": ["alice", "bob"],
+                    "fact_ids": fact_ids,
+                }
+            ],
+            "knowledge_states": knowledge_states,
+            "clues": [],
+            "prohibitions": [],
+            "episode_obligations": [
+                {
+                    "obligation_id": f"obligation_{episode}",
+                    "episode_number": episode,
+                    "new_information_fact_ids": [f"fact_{number}"],
+                    "end_hook": f"第{episode}集钩子",
+                    "required_clue_ids": [],
+                }
+                for number, episode in (("one", 1), ("two", 2), ("three", 3))
+            ],
+        }
+    )
+
+
 def make_delta(contract: StoryContract) -> EpisodeStateDelta:
     fact_ids = [fact.fact_id for fact in contract.facts]
     return EpisodeStateDelta(
@@ -121,30 +182,228 @@ def _excerpt_for_fact(fact_id: str) -> str:
     }.get(fact_id, "事实证据")
 
 
-def test_story_contract_rejects_one_number_with_two_semantic_meanings() -> None:
-    duplicate_value = [
+def test_story_contract_allows_same_number_with_distinct_kinds() -> None:
+    same_value = [
         {
-            "fact_id": "tide_reading",
-            "subject": "潮位表",
-            "predicate": "读数",
-            "kind": "measurement",
-            "value": "1378",
-            "unit": "毫米",
+            "fact_id": "current_age",
+            "subject": "林汐",
+            "predicate": "当前年龄",
+            "kind": "count",
+            "value": "26",
+            "unit": "years",
             "first_revealed_episode": 1,
         },
         {
-            "fact_id": "minute_count",
-            "subject": "时间换算",
-            "predicate": "午夜后分钟数",
+            "fact_id": "elapsed_years",
+            "subject": "旧案",
+            "predicate": "距今年数",
             "kind": "duration",
-            "value": "1378",
-            "unit": "分钟",
+            "value": "26",
+            "unit": "years",
             "first_revealed_episode": 1,
         },
     ]
 
-    with pytest.raises(ValidationError, match="different kinds or units"):
-        make_contract(numeric_facts=duplicate_value)
+    contract = make_contract(numeric_facts=same_value)
+
+    assert [(fact.value, fact.unit, fact.kind) for fact in contract.facts] == [
+        ("26", "years", "count"),
+        ("26", "years", "duration"),
+    ]
+
+
+def test_story_contract_completes_fully_sparse_knowledge_matrix() -> None:
+    contract = make_sparse_knowledge_contract([])
+
+    assert [
+        (state.episode_number, state.character_id, state.known_fact_ids)
+        for state in contract.knowledge_states
+    ] == [
+        (1, "alice", ["fact_one"]),
+        (1, "bob", []),
+        (2, "alice", ["fact_one"]),
+        (2, "bob", []),
+        (3, "alice", ["fact_one"]),
+        (3, "bob", []),
+    ]
+    dumped = contract.model_dump(mode="json")
+    assert StoryContract.model_validate(dumped).model_dump(mode="json") == dumped
+
+
+def test_story_contract_completes_partially_sparse_knowledge_matrix() -> None:
+    contract = make_sparse_knowledge_contract(
+        [
+            {
+                "episode_number": 2,
+                "character_id": "alice",
+                "known_fact_ids": ["fact_one", "fact_two"],
+            },
+            {
+                "episode_number": 3,
+                "character_id": "bob",
+                "known_fact_ids": ["fact_three"],
+            },
+        ]
+    )
+
+    assert [
+        (state.episode_number, state.character_id, state.known_fact_ids)
+        for state in contract.knowledge_states
+    ] == [
+        (1, "alice", ["fact_one"]),
+        (1, "bob", []),
+        (2, "alice", ["fact_one", "fact_two"]),
+        (2, "bob", []),
+        (3, "alice", ["fact_one", "fact_two"]),
+        (3, "bob", ["fact_three"]),
+    ]
+
+
+def test_story_contract_canonicalizes_initial_knowledge_fact_order() -> None:
+    payload = make_sparse_knowledge_contract([]).model_dump(mode="json")
+    payload["characters"][0]["initial_known_fact_ids"] = ["fact_two", "fact_one"]
+    payload["knowledge_states"] = []
+    reversed_payload = json.loads(json.dumps(payload))
+    reversed_payload["characters"][0]["initial_known_fact_ids"] = ["fact_one", "fact_two"]
+
+    contract = StoryContract.model_validate(payload)
+    reversed_contract = StoryContract.model_validate(reversed_payload)
+
+    assert contract.characters[0].initial_known_fact_ids == ["fact_one", "fact_two"]
+    assert story_contract_sha256(contract) == story_contract_sha256(reversed_contract)
+
+
+def test_story_contract_canonicalizes_shuffled_dense_knowledge() -> None:
+    shuffled_dense = [
+        {
+            "episode_number": 3,
+            "character_id": "bob",
+            "known_fact_ids": ["fact_three"],
+        },
+        {
+            "episode_number": 1,
+            "character_id": "alice",
+            "known_fact_ids": ["fact_one"],
+        },
+        {
+            "episode_number": 2,
+            "character_id": "bob",
+            "known_fact_ids": [],
+        },
+        {
+            "episode_number": 3,
+            "character_id": "alice",
+            "known_fact_ids": ["fact_two", "fact_one"],
+        },
+        {
+            "episode_number": 1,
+            "character_id": "bob",
+            "known_fact_ids": [],
+        },
+        {
+            "episode_number": 2,
+            "character_id": "alice",
+            "known_fact_ids": ["fact_one", "fact_two"],
+        },
+    ]
+
+    contract = make_sparse_knowledge_contract(shuffled_dense)
+    dumped = contract.model_dump(mode="json")
+    canonical_knowledge = [
+        {
+            "episode_number": 1,
+            "character_id": "alice",
+            "known_fact_ids": ["fact_one"],
+        },
+        {"episode_number": 1, "character_id": "bob", "known_fact_ids": []},
+        {
+            "episode_number": 2,
+            "character_id": "alice",
+            "known_fact_ids": ["fact_one", "fact_two"],
+        },
+        {"episode_number": 2, "character_id": "bob", "known_fact_ids": []},
+        {
+            "episode_number": 3,
+            "character_id": "alice",
+            "known_fact_ids": ["fact_one", "fact_two"],
+        },
+        {
+            "episode_number": 3,
+            "character_id": "bob",
+            "known_fact_ids": ["fact_three"],
+        },
+    ]
+    round_tripped = StoryContract.model_validate(dumped)
+
+    assert dumped["knowledge_states"] == canonical_knowledge
+    assert round_tripped.model_dump(mode="json") == dumped
+    assert story_contract_sha256(round_tripped) == story_contract_sha256(contract)
+
+
+def test_story_contract_rejects_duplicate_sparse_knowledge_pair() -> None:
+    duplicate = {
+        "episode_number": 2,
+        "character_id": "alice",
+        "known_fact_ids": ["fact_one", "fact_two"],
+    }
+
+    with pytest.raises(ValidationError, match="Duplicate knowledge state"):
+        make_sparse_knowledge_contract([duplicate, duplicate])
+
+
+def test_story_contract_rejects_sparse_knowledge_regression() -> None:
+    with pytest.raises(ValidationError, match="cannot silently disappear"):
+        make_sparse_knowledge_contract(
+            [
+                {
+                    "episode_number": 1,
+                    "character_id": "alice",
+                    "known_fact_ids": ["fact_one", "fact_two"],
+                },
+                {
+                    "episode_number": 3,
+                    "character_id": "alice",
+                    "known_fact_ids": ["fact_one"],
+                },
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("knowledge_state", "message"),
+    [
+        (
+            {
+                "episode_number": 1,
+                "character_id": "outsider",
+                "known_fact_ids": [],
+            },
+            "references unknown identifiers",
+        ),
+        (
+            {
+                "episode_number": 1,
+                "character_id": "alice",
+                "known_fact_ids": ["unknown_fact"],
+            },
+            "references unknown identifiers",
+        ),
+        (
+            {
+                "episode_number": 4,
+                "character_id": "alice",
+                "known_fact_ids": ["fact_one"],
+            },
+            "episode exceeds the contract episode count",
+        ),
+    ],
+)
+def test_story_contract_rejects_invalid_sparse_knowledge_entries(
+    knowledge_state: dict,
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        make_sparse_knowledge_contract([knowledge_state])
 
 
 def test_story_contract_hash_and_markdown_projection_are_deterministic() -> None:

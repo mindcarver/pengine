@@ -22,6 +22,7 @@ from pengine.agents import (
 from pengine.config import Settings
 from pengine.continuity import EpisodeLock
 from pengine.errors import DomainError
+from pengine.language import OutputLanguage
 from pengine.personas import PersonaCatalog, PersonaPackageError
 from pengine.relay import (
     RelayError,
@@ -86,6 +87,7 @@ class WorkflowExecutor(Protocol):
         assemble_episode_scripts: EpisodeAssemblyHook | None = None,
         episode_timeout_seconds: float | None = None,
         reset_episode_deadline: EpisodeDeadlineReset | None = None,
+        output_language: OutputLanguage | None = None,
         feedback: str | None = None,
         retrieve_references: ReferenceRetriever | None = None,
     ) -> WorkflowResult: ...
@@ -318,6 +320,7 @@ class Worker:
                     ),
                     episode_timeout_seconds=self.settings.run_timeout_seconds,
                     reset_episode_deadline=reset_episode_deadline,
+                    output_language=work.output_language,
                     feedback=work.frozen_feedback,
                     retrieve_references=retrieve_references,
                 )
@@ -558,7 +561,11 @@ class Worker:
                 selection_rationale=result.selection_rationale,
                 l0_gate=result.l0_gate,
                 l4_gate=result.l4_gate,
-                ownership_statement=("The internal operator retains final ownership and judgment."),
+                ownership_statement=(
+                    "最终创作所有权与判断由内部操作人员保留。"
+                    if work.output_language == "zh-CN"
+                    else "The internal operator retains final ownership and judgment."
+                ),
                 feedback_handling=result.feedback_handling,
             ),
         )
@@ -715,7 +722,7 @@ def _classify_failure(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, RelayError):
         return exc.code, exc.safe_message
     if isinstance(exc, AgentProtocolError):
-        return "structured_output_invalid", "The agent returned invalid structured output."
+        return "structured_output_invalid", exc.safe_message
     if isinstance(exc, QualityGateRejectedError):
         return "quality_gate_rejected", "The final quality gate rejected the generated work."
     if isinstance(exc, ContentReviewRejectedError):

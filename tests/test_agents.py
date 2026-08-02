@@ -7,11 +7,12 @@ from typing import Any
 
 import pytest
 from langchain.agents.middleware.types import ToolCallRequest
+from langchain.agents.structured_output import StructuredOutputValidationError
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from persona_factory import create_persona_package
-from pydantic import Field
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from pengine.agents import (
     _EPISODE_PLANNER_PROMPT,
@@ -21,16 +22,23 @@ from pengine.agents import (
     SKILLED_WRITE_PERMISSIONS,
     VIRTUAL_FILE_PERMISSIONS,
     AgentProtocolError,
+    CanonReviewerResult,
     ContentReviewRejectedError,
     DeepAgentWorkflow,
+    EpisodePlannerResult,
     QualityGateRejectedError,
     QualityReviewerResult,
+    ScriptWriterResult,
     StageGuardMiddleware,
     StoryArchitectResult,
     WorkflowCompletion,
     _arithmetic_tool,
     _calculate_arithmetic,
+    _language_retry_fingerprint,
+    _language_retry_matches,
+    _structured_output_retry_message,
     _supervisor_prompt,
+    _validate_result_language,
 )
 from pengine.config import Settings
 from pengine.continuity import (
@@ -38,6 +46,7 @@ from pengine.continuity import (
     render_story_contract_markdown,
     story_contract_sha256,
 )
+from pengine.language import SIMPLIFIED_CHINESE, language_instruction
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import CreateCreationRequest, EpisodeDraft, EpisodePlan, InternalStage
@@ -399,6 +408,68 @@ def test_supervisor_preserves_persona_episode_baseline_when_request_omits_count(
     assert "Do not invent a different episode count" in normalized
 
 
+def test_supervisor_carries_the_inferred_language_contract() -> None:
+    contract = language_instruction(SIMPLIFIED_CHINESE)
+
+    prompt = _supervisor_prompt(
+        story="一个海边故事",
+        requirements="十集",
+        feedback=None,
+        approved_json="{}",
+        language_contract=contract,
+    )
+
+    assert contract in prompt
+    assert "Output language contract" in prompt
+
+
+def test_structured_output_retry_reports_safe_validation_details() -> None:
+    try:
+        StoryArchitectResult.model_validate(
+            {
+                "stage": "generating_story_outline",
+                "content": None,
+            }
+        )
+    except ValidationError as error:
+        message = _structured_output_retry_message(error)
+    else:
+        raise AssertionError("The invalid story result unexpectedly validated")
+
+    assert "Correct these validation errors" in message
+    assert "Story artifact stages require only content" in message
+    assert "input_value" not in message
+
+
+def test_structured_output_retry_does_not_echo_model_input_or_custom_error_values() -> None:
+    secret = "SECRET-API-KEY"
+
+    class LeakyResult(BaseModel):
+        token: str
+
+        @field_validator("token")
+        @classmethod
+        def reject_token(cls, value: str) -> str:
+            raise ValueError(f"forbidden value {value}")
+
+    try:
+        LeakyResult.model_validate({"token": secret})
+    except ValidationError as source:
+        error = StructuredOutputValidationError(
+            "LeakyResult",
+            source,
+            AIMessage(content=f"relay https://secret.example/?key={secret}"),
+        )
+    else:
+        raise AssertionError("The leaky result unexpectedly validated")
+
+    message = _structured_output_retry_message(error)
+
+    assert "field: value_error" in message
+    assert secret not in message
+    assert "secret.example" not in message
+
+
 def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "future dialogue counts" in _STORY_ARCHITECT_PROMPT
     assert "episode-specific action" in _EPISODE_PLANNER_PROMPT
@@ -408,6 +479,7 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "free-form user request" in _EPISODE_PLANNER_PROMPT
     assert "Never ask the user" in _EPISODE_PLANNER_PROMPT
     assert "Leave genuinely unspecified details out" in _EPISODE_PLANNER_PROMPT
+    assert "Knowledge states are sparse cumulative snapshots" in _EPISODE_PLANNER_PROMPT
     assert "aliases, pronouns, ages, elapsed durations, call participants" in (
         _EPISODE_PLANNER_PROMPT
     )
@@ -920,6 +992,482 @@ async def test_missing_structured_result_fails_after_one_correction(
             )
 
     assert attempted == [InternalStage.SELECTING_L0_VARIANT]
+
+
+@pytest.mark.asyncio
+async def test_chinese_language_mismatch_is_repaired_before_checkpoint() -> None:
+    attempted: list[InternalStage] = []
+    approved: list[dict[str, Any]] = []
+    descriptions: list[str] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(_: InternalStage, payload: dict[str, Any]) -> None:
+        approved.append(payload)
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=selecting_l0_variant] choose the L0 variant",
+                "subagent_type": "story_architect",
+            },
+            "id": "call-language-repair",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(subagent_request: ToolCallRequest) -> ToolMessage:
+        descriptions.append(subagent_request.tool_call["args"]["description"])
+        rationale = (
+            "The daughter actively chooses to uncover the family secret."
+            if len(descriptions) == 1
+            else "女儿主动选择揭开家庭秘密，符合创作内核。"
+        )
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "stage": "selecting_l0_variant",
+                    "content": None,
+                    "selected_l0_variant": "L0-B",
+                    "selection_rationale": rationale,
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-language-repair",
+        )
+
+    await middleware.awrap_tool_call(request, handler)
+
+    assert attempted == [InternalStage.SELECTING_L0_VARIANT]
+    assert len(descriptions) == 2
+    assert all("简体中文" in description for description in descriptions)
+    assert "violated the output language contract" in descriptions[1]
+    assert approved[0]["selection_rationale"].startswith("女儿主动")
+
+
+def test_chinese_language_guard_covers_story_contract_narrative_fields() -> None:
+    contract_payload = _story_contract().model_dump(mode="json")
+    contract_payload["characters"][0]["role"] = "Investigator of a buried family secret"
+    planner_result = EpisodePlannerResult.model_validate(
+        {
+            "stage": "generating_episode_outline",
+            "content": "完整分集大纲。",
+            "episode_count": 1,
+            "episodes": [{"episode_number": 1, "plan": "调查者发现关键证据。"}],
+            "story_contract": contract_payload,
+        }
+    )
+
+    with pytest.raises(AgentProtocolError, match="invalid structured output"):
+        _validate_result_language(
+            planner_result,
+            output_language=SIMPLIFIED_CHINESE,
+            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+        )
+
+
+@pytest.mark.parametrize("unit", ["years", "kg", "km", "USD", "CNY", "m/s"])
+def test_contract_language_guard_allows_character_name_subject_and_typed_unit(
+    unit: str,
+) -> None:
+    contract_payload = _story_contract().model_dump(mode="json")
+    contract_payload["characters"][0]["name"] = "Alice"
+    contract_payload["facts"][0].update(
+        {
+            "subject": "Alice",
+            "predicate": "年龄",
+            "kind": "duration",
+            "value": "10",
+            "unit": unit,
+        }
+    )
+
+    def planner_result() -> EpisodePlannerResult:
+        return EpisodePlannerResult.model_validate(
+            {
+                "stage": "generating_episode_outline",
+                "content": "完整分集大纲。",
+                "episode_count": 1,
+                "episodes": [{"episode_number": 1, "plan": "调查者发现关键证据。"}],
+                "story_contract": contract_payload,
+            }
+        )
+
+    _validate_result_language(
+        planner_result(),
+        output_language=SIMPLIFIED_CHINESE,
+        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+    )
+
+
+def test_language_retry_fingerprint_locks_timeline_and_contract_version() -> None:
+    contract_payload = _story_contract().model_dump(mode="json")
+    contract_payload["timeline"][0]["when"] = "The next morning"
+
+    def planner_result(contract: dict[str, Any]) -> EpisodePlannerResult:
+        return EpisodePlannerResult.model_validate(
+            {
+                "stage": "generating_episode_outline",
+                "content": "完整分集大纲。",
+                "episode_count": 1,
+                "episodes": [{"episode_number": 1, "plan": "调查者发现关键证据。"}],
+                "story_contract": contract,
+            }
+        )
+
+    original = planner_result(contract_payload)
+    translated_payload = json.loads(json.dumps(contract_payload))
+    translated_payload["timeline"][0]["when"] = "次日清晨"
+    translated = planner_result(translated_payload)
+    changed_version_payload = json.loads(json.dumps(translated_payload))
+    changed_version_payload["version"] = 2
+    changed_version = planner_result(changed_version_payload)
+
+    original_fingerprint = _language_retry_fingerprint(original)
+    assert not _language_retry_matches(
+        original_fingerprint,
+        _language_retry_fingerprint(translated),
+    )
+    assert not _language_retry_matches(
+        original_fingerprint,
+        _language_retry_fingerprint(changed_version),
+    )
+
+
+def test_language_retry_allows_variant_label_translation_but_locks_machine_id() -> None:
+    english_label = StoryArchitectResult(
+        stage="selecting_l0_variant",
+        selected_l0_variant="Active Choice",
+        selection_rationale="The protagonist acts first.",
+    )
+    translated_label = StoryArchitectResult(
+        stage="selecting_l0_variant",
+        selected_l0_variant="主动选择",
+        selection_rationale="主角率先行动。",
+    )
+    machine_variant = StoryArchitectResult(
+        stage="selecting_l0_variant",
+        selected_l0_variant="L0-B",
+        selection_rationale="主角率先行动。",
+    )
+    changed_machine_variant = StoryArchitectResult(
+        stage="selecting_l0_variant",
+        selected_l0_variant="L0-C",
+        selection_rationale="主角率先行动。",
+    )
+
+    assert _language_retry_matches(
+        _language_retry_fingerprint(english_label),
+        _language_retry_fingerprint(translated_label),
+    )
+    assert not _language_retry_matches(
+        _language_retry_fingerprint(machine_variant),
+        _language_retry_fingerprint(changed_machine_variant),
+    )
+
+
+def test_chinese_language_guard_covers_script_handoff() -> None:
+    contract = _story_contract()
+    state_delta = _state_delta(contract, 1)
+    state_delta["handoff"] = "The next episode follows the hidden witness."
+    script_result = ScriptWriterResult.model_validate(
+        {
+            "stage": "generating_episode_scripts",
+            "episode_number": 1,
+            "content": "测试人物：事实1。\n门后传来第二次敲击。",
+            "state_delta": state_delta,
+        }
+    )
+
+    with pytest.raises(AgentProtocolError, match="invalid structured output"):
+        _validate_result_language(
+            script_result,
+            output_language=SIMPLIFIED_CHINESE,
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_decision", "repaired_decision"),
+    [(False, True), (True, False)],
+)
+async def test_language_repair_cannot_change_quality_gate_decision(
+    initial_decision: bool,
+    repaired_decision: bool,
+) -> None:
+    descriptions: list[str] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("A changed gate decision must not be approved")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages={
+            InternalStage.SELECTING_L0_VARIANT,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+            InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+            InternalStage.GENERATING_EPISODE_SCRIPTS,
+        },
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=accepting_l0] review the L0 gate",
+                "subagent_type": "quality_reviewer",
+            },
+            "id": "call-gate-language-repair",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(review_request: ToolCallRequest) -> ToolMessage:
+        descriptions.append(review_request.tool_call["args"]["description"])
+        is_repair = len(descriptions) == 2
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "stage": "accepting_l0",
+                    "passed": repaired_decision if is_repair else initial_decision,
+                    "evidence": "审核结论已翻译。" if is_repair else "The L0 review is complete.",
+                    "feedback_handling": [],
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-gate-language-repair",
+        )
+
+    with pytest.raises(AgentProtocolError, match="changed non-language fields"):
+        await middleware.awrap_tool_call(request, handler)
+
+    assert len(descriptions) == 2
+
+
+@pytest.mark.asyncio
+async def test_semantic_review_language_repair_preserves_failed_decision() -> None:
+    descriptions: list[str] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The helper must not approve a stage")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] review contract",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-review-language",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(review_request: ToolCallRequest) -> ToolMessage:
+        descriptions.append(review_request.tool_call["args"]["description"])
+        chinese = len(descriptions) == 2
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "passed": False,
+                    "evidence": "合同遗漏了既定事实。" if chinese else "The contract omits a fact.",
+                    "issues": [
+                        {
+                            "code": "missing_fact",
+                            "message": "必须补齐事实。" if chinese else "The fact must be added.",
+                            "contract_refs": [],
+                            "script_excerpt": None,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-review-language",
+        )
+
+    review = await middleware._invoke_semantic_reviewer(
+        request=request,
+        handler=handler,
+        subagent_type="canon_reviewer",
+        description="Review the contract.",
+        files={},
+        schema=CanonReviewerResult,
+        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+    )
+
+    assert len(descriptions) == 2
+    assert "without changing the review decision" in descriptions[1]
+    assert review.passed is False
+    assert review.evidence == "合同遗漏了既定事实。"
+
+
+@pytest.mark.asyncio
+async def test_semantic_language_repair_cannot_change_review_decision() -> None:
+    calls = 0
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The helper must not approve a stage")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] review contract",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-review-decision-lock",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(_: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        payload = (
+            {"passed": True, "evidence": "合同审核通过。", "issues": []}
+            if calls == 2
+            else {
+                "passed": False,
+                "evidence": "The contract omits a fact.",
+                "issues": [
+                    {
+                        "code": "missing_fact",
+                        "message": "The fact must be added.",
+                        "contract_refs": [],
+                        "script_excerpt": None,
+                    }
+                ],
+            }
+        )
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-review-decision-lock",
+        )
+
+    with pytest.raises(AgentProtocolError, match="changed the semantic review decision"):
+        await middleware._invoke_semantic_reviewer(
+            request=request,
+            handler=handler,
+            subagent_type="canon_reviewer",
+            description="Review the contract.",
+            files={},
+            schema=CanonReviewerResult,
+            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+        )
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_repair_subagent_gets_one_bounded_language_retry() -> None:
+    descriptions: list[str] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The helper must not approve a stage")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] repair contract",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-repair-language",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+    contract_payload = _story_contract().model_dump(mode="json")
+
+    async def handler(repair_request: ToolCallRequest) -> ToolMessage:
+        descriptions.append(repair_request.tool_call["args"]["description"])
+        payload = json.loads(json.dumps(contract_payload))
+        payload["characters"][0]["role"] = (
+            "调查者" if len(descriptions) == 2 else "Investigator of a buried family secret"
+        )
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "stage": "generating_episode_outline",
+                    "content": "完整分集大纲。",
+                    "episode_count": 1,
+                    "episodes": [{"episode_number": 1, "plan": "调查者发现证据。"}],
+                    "story_contract": payload,
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-repair-language",
+        )
+
+    _, payload = await middleware._invoke_repair_subagent(
+        request=request,
+        handler=handler,
+        subagent_type="canon_repair",
+        description="Repair the contract.",
+        files={},
+        schema=EpisodePlannerResult,
+        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+    )
+
+    assert len(descriptions) == 2
+    assert payload["story_contract"]["characters"][0]["role"] == "调查者"
 
 
 @pytest.mark.asyncio
