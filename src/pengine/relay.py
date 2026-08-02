@@ -8,10 +8,12 @@ from typing import Any, Literal
 
 import httpx
 from langchain_anthropic import ChatAnthropic
+from langchain_core.language_models import BaseChatModel
+from langchain_deepseek import ChatDeepSeek
 
 from pengine.config import Settings
 
-_AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash"})
+_AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 
 
 class _SerialChatAnthropic(ChatAnthropic):
@@ -19,6 +21,25 @@ class _SerialChatAnthropic(ChatAnthropic):
         kwargs["parallel_tool_calls"] = False
         kwargs["tool_choice"] = "auto" if self.model in _AUTO_TOOL_CHOICE_MODELS else "any"
         return super().bind_tools(tools, **kwargs)
+
+
+class _SerialChatDeepSeek(ChatDeepSeek):
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
+        # LangChain's ToolStrategy requests "any" for a mixed set of working and
+        # result tools. DeepSeek treats that as "required", which can trap an agent
+        # in repeated working-tool calls. Auto still permits the result tool while
+        # allowing the agent to finish its tool loop.
+        tool_choice = kwargs.get("tool_choice")
+        if isinstance(tool_choice, str) and tool_choice in {"any", "required"}:
+            kwargs["tool_choice"] = "auto"
+        kwargs["parallel_tool_calls"] = False
+        return super().bind_tools(tools, **kwargs)
+
+
+@dataclass(frozen=True, slots=True)
+class RelayAdapter:
+    model: BaseChatModel
+    provider_profile_key: str
 
 
 @dataclass(slots=True)
@@ -39,21 +60,57 @@ class RetryableRelayInterruption:
     retry_delay_seconds: int
 
 
-def build_chat_model(settings: Settings) -> ChatAnthropic:
+def build_relay_adapter(settings: Settings) -> RelayAdapter:
     if not settings.relay_configured:
         raise RelayError(
             code="relay_unavailable",
             safe_message="The model relay is not configured.",
         )
 
-    return _SerialChatAnthropic(
-        model=settings.relay_model_id,
-        base_url=settings.relay_base_url,
-        api_key=settings.relay_api_key,
-        max_retries=0,
-        timeout=settings.model_timeout_seconds,
-        max_tokens=8192,
-        temperature=0,
+    common = {
+        "model": settings.relay_model_id,
+        "base_url": settings.relay_base_url,
+        "api_key": settings.relay_api_key,
+        "max_retries": 0,
+        "timeout": settings.model_timeout_seconds,
+        "temperature": 0,
+    }
+    if settings.relay_adapter == "deepseek":
+        return RelayAdapter(
+            model=_SerialChatDeepSeek(
+                **common,
+                max_tokens=settings.relay_max_output_tokens,
+                extra_body={"thinking": {"type": "disabled"}},
+            ),
+            provider_profile_key="deepseek",
+        )
+    return RelayAdapter(
+        model=_SerialChatAnthropic(
+            **common,
+            max_tokens=settings.relay_max_output_tokens or 8192,
+        ),
+        provider_profile_key="anthropic",
+    )
+
+
+def build_chat_model(settings: Settings) -> BaseChatModel:
+    return build_relay_adapter(settings).model
+
+
+def is_relay_exception(exc: BaseException) -> bool:
+    return any(
+        base.__module__.startswith(("anthropic", "openai", "httpx", "httpcore"))
+        for base in type(exc).__mro__
+    )
+
+
+def is_relay_connection_error(exc: BaseException) -> bool:
+    if _is_retryable_transport(exc):
+        return True
+    return any(
+        base.__module__.startswith(("anthropic", "openai"))
+        and base.__name__ == "APIConnectionError"
+        for base in type(exc).__mro__
     )
 
 
@@ -75,7 +132,7 @@ def retryable_relay_interruption(exc: Exception) -> RetryableRelayInterruption |
         return None
     if _is_retryable_transport(exc):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
-    if _is_anthropic_connection_error(exc) and any(
+    if is_relay_connection_error(exc) and any(
         _is_retryable_transport(candidate) for candidate in _cause_chain(exc)
     ):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
@@ -104,13 +161,6 @@ def _is_retryable_transport(exc: BaseException) -> bool:
     }
 
 
-def _is_anthropic_connection_error(exc: BaseException) -> bool:
-    return any(
-        base.__module__.startswith("anthropic") and base.__name__ == "APIConnectionError"
-        for base in type(exc).__mro__
-    )
-
-
 def _has_tls_configuration_error(exc: BaseException) -> bool:
     return any(
         isinstance(candidate, ssl.SSLCertVerificationError)
@@ -123,7 +173,8 @@ def _is_retryable_status_error(exc: BaseException) -> bool:
         return exc.response.status_code in _RETRYABLE_RELAY_STATUSES
     return (
         any(
-            base.__module__.startswith("anthropic") and base.__name__ == "APIStatusError"
+            base.__module__.startswith(("anthropic", "openai"))
+            and base.__name__ == "APIStatusError"
             for base in type(exc).__mro__
         )
         and getattr(exc, "status_code", None) in _RETRYABLE_RELAY_STATUSES

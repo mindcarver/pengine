@@ -47,3 +47,29 @@ def test_api_key_is_not_revealed_by_settings_repr() -> None:
     settings = Settings(relay_api_key="secret-value")
 
     assert "secret-value" not in repr(settings)
+
+
+def test_anthropic_relay_adapter_is_the_default() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.relay_adapter == "anthropic"
+    assert settings.relay_max_output_tokens is None
+
+
+def test_relay_adapter_and_output_token_override_load_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("PENGINE_RELAY_ADAPTER", "deepseek")
+    monkeypatch.setenv("PENGINE_RELAY_MAX_OUTPUT_TOKENS", "16384")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.relay_adapter == "deepseek"
+    assert settings.relay_max_output_tokens == 16384
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("relay_adapter", "openai"), ("relay_max_output_tokens", 0)],
+)
+def test_invalid_relay_adapter_settings_are_rejected(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})

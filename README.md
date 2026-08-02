@@ -21,7 +21,8 @@
 Pengine V1 是一个带同源 Web 原型的本地短剧创作 Agent。它通过
 [Deep Agents](https://github.com/langchain-ai/deepagents) 与 LangGraph，
 让阶段化专业 Agent 按固定流程协作；业务状态、检查点和交付物全部落在本地
-SQLite，模型请求则通过 Anthropic Messages 兼容 relay 发出。
+SQLite，模型请求则通过可选的 Anthropic Messages 或 DeepSeek OpenAI-compatible
+relay 适配器发出。
 
 Web 原型只服务本机单操作员，并以约 1.8 秒轮询展示后端确认的七阶段进度、
 已运行时长和超时恢复操作；V1 没有身份认证、公共部署、多用户隔离、SSE /
@@ -148,7 +149,8 @@ SHA-256 才会写入业务检查点并锁定。后续每集只读取该合同、
 <h2 align="center">05 · 快速启动</h2>
 
 要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及一个兼容
-Anthropic Messages 的 relay。仓库已内置四套临时原型人格包。
+Anthropic Messages 或 DeepSeek OpenAI chat completions 的 relay。仓库已内置四套
+临时原型人格包。
 这四套人格当前统一采用 6 集原型基线，不代表创作者人格定稿。
 
 ```bash
@@ -163,13 +165,23 @@ PENGINE_PERSONA_ROOT=./personas
 PENGINE_DATA_DIR=./data
 PENGINE_HOST=127.0.0.1
 PENGINE_PORT=8000
+PENGINE_RELAY_ADAPTER=anthropic
 PENGINE_RELAY_BASE_URL=https://your-relay.example
 PENGINE_RELAY_API_KEY=replace-with-your-key
 PENGINE_RELAY_MODEL_ID=your-model-id
+# PENGINE_RELAY_MAX_OUTPUT_TOKENS=16384
 ```
 
 API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localhost`、
-`127.0.0.1` 和 `::1` 可使用 HTTP。密钥不得提交到仓库。
+`127.0.0.1` 和 `::1` 可使用 HTTP。`PENGINE_RELAY_ADAPTER` 默认是 `anthropic`，
+保留原来的 Anthropic Messages 行为和 8192 输出 token 默认值。使用原生 DeepSeek
+适配器时设置为 `deepseek`，并把 `PENGINE_RELAY_BASE_URL` 配成 OpenAI-compatible
+API 根地址（中转通常是 `https://your-relay.example/v1`；DeepSeek 官方地址也可使用
+`https://api.deepseek.com`）。DeepSeek 未设置
+`PENGINE_RELAY_MAX_OUTPUT_TOKENS` 时不由 Pengine 添加输出上限；该可选覆盖也可用于
+Anthropic。Pengine 的阶段交付依赖单一且通过 schema 校验的结构化工具结果，因此
+DeepSeek 适配器使用非 thinking 模式和串行工具调用；混合了资料工具与结果工具的调用
+使用 `auto`，最终结果仍由阶段 schema 校验和限定重试保证。密钥不得提交到仓库。
 
 确认 `PENGINE_PERSONA_ROOT=./personas` 后启动：
 

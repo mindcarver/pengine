@@ -25,8 +25,10 @@ from pengine.errors import DomainError
 from pengine.personas import PersonaCatalog, PersonaPackageError
 from pengine.relay import (
     RelayError,
-    build_chat_model,
+    build_relay_adapter,
     classify_relay_exception,
+    is_relay_connection_error,
+    is_relay_exception,
     retryable_relay_interruption,
 )
 from pengine.repository import LeasedJob, Repository, RunWorkItem
@@ -120,10 +122,12 @@ class Worker:
             self._saver = await self._saver_context.__aenter__()
             await self._saver.setup()
             if self.settings.relay_configured:
+                adapter = build_relay_adapter(self.settings)
                 self.workflow = DeepAgentWorkflow(
-                    model=build_chat_model(self.settings),
+                    model=adapter.model,
                     checkpointer=self._saver,
                     recursion_limit=self.settings.agent_recursion_limit,
+                    provider_profile_key=adapter.provider_profile_key,
                 )
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop(), name="pengine-worker")
@@ -730,7 +734,7 @@ def _classify_failure(exc: Exception) -> tuple[str, str]:
         return "checkpoint_unavailable", "The workflow checkpoint is unavailable."
     if "structuredoutput" in type(exc).__name__.lower():
         return "structured_output_invalid", "The agent returned invalid structured output."
-    if type(exc).__module__.startswith(("anthropic", "httpx", "httpcore")):
+    if is_relay_exception(exc):
         relay_error = classify_relay_exception(exc)
         return relay_error.code, relay_error.safe_message
     return "internal_error", "The workflow failed safely."
@@ -742,10 +746,7 @@ def _episode_error_message(exc: Exception) -> str:
             "算术工具收到非十进制参数。需要先把时刻换算为当日经过分钟数后再计算；"
             "已完成分集不受影响。"
         )
-    if any(
-        base.__module__.startswith("anthropic") and base.__name__ == "APIConnectionError"
-        for base in type(exc).__mro__
-    ):
+    if is_relay_connection_error(exc):
         return "当前集与模型 Relay / 网络连接失败。已完成分集不受影响；继续时只会重试当前集。"
     if isinstance(exc, AgentProtocolError):
         return "当前集代理返回了无效的结构化结果。已完成分集不受影响；继续时只会重试当前集。"

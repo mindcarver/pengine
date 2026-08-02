@@ -8,6 +8,7 @@ from uuid import UUID
 
 import anthropic
 import httpx
+import openai
 import pytest
 from langgraph.errors import GraphRecursionError
 from persona_factory import create_persona_package
@@ -175,9 +176,10 @@ class DeterministicWorkflow:
 
 
 class ProviderFailureWorkflow(DeterministicWorkflow):
-    def __init__(self) -> None:
+    def __init__(self, failure_kind: str = "httpx") -> None:
         super().__init__()
         self.calls = 0
+        self.failure_kind = failure_kind
 
     async def execute(self, **kwargs: Any) -> WorkflowResult:
         self.calls += 1
@@ -195,9 +197,28 @@ class ProviderFailureWorkflow(DeterministicWorkflow):
                 },
             )
         await kwargs["before_stage"](InternalStage.GENERATING_STORY_OUTLINE)
-        raise httpx.ReadTimeout(
-            "vendor-body SECRET-API-KEY SECRET-STORY-CONTENT SECRET-GENERATED-CONTENT"
+        request = httpx.Request(
+            "POST",
+            "https://secret-relay.example/chat/completions?api_key=SECRET-API-KEY",
         )
+        detail = "vendor-body SECRET-STORY-CONTENT SECRET-GENERATED-CONTENT"
+        if self.failure_kind == "openai_connection":
+            try:
+                raise httpx.ReadTimeout(detail, request=request)
+            except httpx.ReadTimeout as cause:
+                raise openai.APIConnectionError(message=detail, request=request) from cause
+        if self.failure_kind == "openai_status":
+            response = httpx.Response(
+                503,
+                headers={"retry-after": "0"},
+                request=request,
+            )
+            raise openai.APIStatusError(
+                detail,
+                response=response,
+                body={"detail": detail},
+            )
+        raise httpx.ReadTimeout(detail, request=request)
 
 
 class BypassWorkflow:
@@ -335,6 +356,10 @@ class EpisodeArithmeticErrorOnceWorkflow(DeterministicWorkflow):
 
 
 class EpisodeConnectionErrorWorkflow(DeterministicWorkflow):
+    def __init__(self, provider: str = "anthropic") -> None:
+        super().__init__()
+        self.provider = provider
+
     async def execute(self, **kwargs: Any) -> WorkflowResult:
         before_episode = kwargs["before_episode"]
         assert before_episode is not None
@@ -349,6 +374,8 @@ class EpisodeConnectionErrorWorkflow(DeterministicWorkflow):
                 try:
                     raise httpx.RemoteProtocolError("SECRET-UPSTREAM-DETAIL", request=request)
                 except httpx.RemoteProtocolError as cause:
+                    if self.provider == "openai":
+                        raise openai.APIConnectionError(request=request) from cause
                     raise anthropic.APIConnectionError(request=request) from cause
             return attempt
 
@@ -716,7 +743,11 @@ async def test_worker_fails_closed_when_episode_error_precedes_writer_attempt(
 
 
 @pytest.mark.asyncio
-async def test_episode_connection_error_reports_safe_relay_cause(tmp_path: Path) -> None:
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+async def test_episode_connection_error_reports_safe_relay_cause(
+    tmp_path: Path,
+    provider: str,
+) -> None:
     settings, catalog, repository, snapshot = await _services(tmp_path)
     accepted = await repository.create_creation(
         "episode-connection-error",
@@ -731,7 +762,7 @@ async def test_episode_connection_error_reports_safe_relay_cause(tmp_path: Path)
         settings=settings,
         repository=repository,
         catalog=catalog,
-        workflow=EpisodeConnectionErrorWorkflow(),
+        workflow=EpisodeConnectionErrorWorkflow(provider),
         worker_id="episode-connection-error-worker",
     )
 
@@ -1069,9 +1100,14 @@ async def test_worker_uses_domain_database_for_langgraph_checkpoints(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["httpx", "openai_connection", "openai_status"],
+)
 async def test_provider_failure_is_safe_and_never_logged(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    failure_kind: str,
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="pengine")
     settings, catalog, repository, snapshot = await _services(tmp_path)
@@ -1084,7 +1120,7 @@ async def test_provider_failure_is_safe_and_never_logged(
         ),
         snapshot.summary,
     )
-    workflow = ProviderFailureWorkflow()
+    workflow = ProviderFailureWorkflow(failure_kind)
     worker = Worker(
         settings=settings,
         repository=repository,
@@ -1136,6 +1172,7 @@ async def test_provider_failure_is_safe_and_never_logged(
         "SECRET-STORY-CONTENT",
         "SECRET-REQUIREMENTS-CONTENT",
         "SECRET-GENERATED-CONTENT",
+        "secret-relay.example",
     ):
         assert sensitive_value not in caplog.text
         assert sensitive_value not in resource.model_dump_json()
