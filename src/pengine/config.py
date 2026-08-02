@@ -1,6 +1,7 @@
 from functools import lru_cache
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator
@@ -18,9 +19,11 @@ class Settings(BaseSettings):
     data_dir: Path = Path("data")
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
+    relay_adapter: Literal["anthropic", "deepseek"] = "anthropic"
     relay_base_url: str | None = None
     relay_api_key: SecretStr | None = None
     relay_model_id: str | None = None
+    relay_max_output_tokens: int | None = Field(default=None, ge=1)
     model_timeout_seconds: float = Field(default=180.0, gt=0)
     run_timeout_seconds: float = Field(default=1800.0, gt=0)
     lease_seconds: int = Field(default=60, ge=5)
