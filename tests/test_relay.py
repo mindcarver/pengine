@@ -117,6 +117,31 @@ def test_deepseek_preserves_named_tool_choice() -> None:
     assert bound.kwargs["parallel_tool_calls"] is False
 
 
+def test_deepseek_structured_output_forces_its_named_result_tool() -> None:
+    class ProbeTool(BaseModel):
+        value: str
+
+    adapter = build_relay_adapter(
+        Settings(
+            relay_adapter="deepseek",
+            relay_base_url="https://relay.example/v1",
+            relay_api_key="secret-value",
+            relay_model_id="deepseek-v4-flash",
+        )
+    )
+
+    structured = adapter.model.with_structured_output(
+        ProbeTool,
+        method="function_calling",
+    )
+
+    assert structured.first.kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "ProbeTool"},
+    }
+    assert structured.first.kwargs["parallel_tool_calls"] is False
+
+
 def test_build_chat_model_requires_serial_tool_calls_and_a_tool_result() -> None:
     class ProbeTool(BaseModel):
         value: str
