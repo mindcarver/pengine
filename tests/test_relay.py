@@ -48,6 +48,22 @@ def test_build_chat_model_requires_serial_tool_calls_and_a_tool_result() -> None
     assert bound.kwargs["tool_choice"]["disable_parallel_tool_use"] is True
 
 
+def test_deepseek_flash_uses_auto_tool_choice_and_serial_tool_calls() -> None:
+    class ProbeTool(BaseModel):
+        value: str
+
+    settings = Settings(
+        relay_base_url="https://relay.example/anthropic",
+        relay_api_key="secret-value",
+        relay_model_id="deepseek-v4-flash",
+    )
+
+    bound = build_chat_model(settings).bind_tools([ProbeTool], tool_choice="any")
+
+    assert bound.kwargs["tool_choice"]["type"] == "auto"
+    assert bound.kwargs["tool_choice"]["disable_parallel_tool_use"] is True
+
+
 def test_build_chat_model_initializes_with_a_socks_proxy(monkeypatch) -> None:
     for variable in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy"):
         monkeypatch.delenv(variable, raising=False)
