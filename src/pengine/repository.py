@@ -25,6 +25,7 @@ from pengine.continuity import (
     story_contract_sha256,
 )
 from pengine.errors import DomainError
+from pengine.language import OutputLanguage, infer_output_language
 from pengine.schemas import (
     AutoResumingRun,
     CreateCreationRequest,
@@ -67,7 +68,7 @@ from pengine.schemas import (
     UserStage,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -664,6 +665,7 @@ class RunWorkItem:
     persona: PersonaSnapshot
     story: str
     requirements: str
+    output_language: OutputLanguage | None
     frozen_feedback: str | None
     stage_attempts: Mapping[InternalStage, int]
     business_checkpoints: Mapping[InternalStage, Any]
@@ -772,7 +774,7 @@ class Repository:
             if row is None:
                 raise RuntimeError("Unsupported pengine SQLite schema version")
             schema_version = int(row[0])
-            if schema_version not in {1, 2, 3, 4, 5, 6, SCHEMA_VERSION}:
+            if schema_version not in set(range(1, SCHEMA_VERSION + 1)):
                 raise RuntimeError("Unsupported pengine SQLite schema version")
             if schema_version == 1:
                 await connection.executescript(_SCHEMA_V2_SQL)
@@ -797,6 +799,47 @@ class Repository:
             if schema_version == 6:
                 await connection.executescript(_SCHEMA_V7_SQL)
                 await connection.commit()
+                schema_version = 7
+            if schema_version == 7:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = await (
+                        await connection.execute("PRAGMA table_info(creations)")
+                    ).fetchall()
+                    if "output_language" not in {column[1] for column in columns}:
+                        await connection.execute(
+                            """
+                            ALTER TABLE creations ADD COLUMN output_language TEXT
+                                CHECK (
+                                    output_language IS NULL OR output_language = 'zh-CN'
+                                )
+                            """
+                        )
+                    rows = await (
+                        await connection.execute(
+                            """
+                            SELECT id, story, requirements
+                            FROM creations
+                            WHERE output_language IS NULL
+                            """
+                        )
+                    ).fetchall()
+                    await connection.executemany(
+                        "UPDATE creations SET output_language = ? WHERE id = ?",
+                        [
+                            (infer_output_language(row["story"], row["requirements"]), row["id"])
+                            for row in rows
+                        ],
+                    )
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (8)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 8
 
     async def setup(self) -> None:
         await self.initialize()
@@ -833,6 +876,7 @@ class Repository:
                 404,
             )
         request_hash = payload_hash or canonical_payload_hash(request)
+        output_language = infer_output_language(request.story, request.requirements)
         timestamp = _timestamp(now or _utc_now())
         scope = "create"
 
@@ -860,8 +904,9 @@ class Repository:
                 """
                 INSERT INTO creations(
                     id, persona_id, persona_display_name, persona_version,
-                    persona_snapshot_sha256, story, requirements, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    persona_snapshot_sha256, story, requirements, output_language,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(new_creation_id),
@@ -871,6 +916,7 @@ class Repository:
                     persona_snapshot.snapshot_sha256,
                     request.story,
                     request.requirements,
+                    output_language,
                     timestamp,
                     timestamp,
                 ),
@@ -3299,6 +3345,7 @@ class Repository:
                     creations.persona_snapshot_sha256,
                     creations.story,
                     creations.requirements,
+                    creations.output_language,
                     frozen_revisions.feedback AS frozen_feedback
                 FROM runs
                 JOIN creations ON creations.id = runs.creation_id
@@ -3326,6 +3373,7 @@ class Repository:
             ),
             story=run["story"],
             requirements=run["requirements"],
+            output_language=run["output_language"],
             frozen_feedback=run["frozen_feedback"],
             stage_attempts=await self.get_stage_attempt_counts(run_id),
             business_checkpoints=await self.get_business_checkpoints(run_id),

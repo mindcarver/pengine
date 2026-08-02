@@ -52,6 +52,7 @@ class DeterministicWorkflow:
         assemble_episode_scripts=None,
         episode_timeout_seconds=None,
         reset_episode_deadline=None,
+        output_language=None,
         feedback=None,
         retrieve_references=None,
     ) -> WorkflowResult:
@@ -61,6 +62,7 @@ class DeterministicWorkflow:
             requirements,
             persona_files,
             episode_timeout_seconds,
+            output_language,
             retrieve_references,
         )
         approved = dict(approved_checkpoints or {})
@@ -479,6 +481,10 @@ async def test_worker_completes_initial_and_one_revision(tmp_path: Path) -> None
     assert initial_resource is not None
     assert initial_resource.initial.state == "succeeded"
     assert initial_resource.initial.result.content_package.story_outline == "故事大纲"
+    assert (
+        initial_resource.initial.result.delivery_report.ownership_statement
+        == "最终创作所有权与判断由内部操作人员保留。"
+    )
     assert initial_resource.revision.state == "available"
 
     await repository.create_or_retry_revision(

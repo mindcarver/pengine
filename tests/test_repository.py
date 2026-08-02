@@ -144,6 +144,7 @@ def locked_outline_payload():
 
 
 async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository) -> None:
+    assert SCHEMA_VERSION == 8
     async with repository._connection() as connection:
         journal = await (await connection.execute("PRAGMA journal_mode")).fetchone()
         foreign_keys = await (await connection.execute("PRAGMA foreign_keys")).fetchone()
@@ -221,6 +222,51 @@ async def test_creation_is_idempotent_and_payload_conflicts(
     async with aiosqlite.connect(repository.database_path) as connection:
         count = await (await connection.execute("SELECT COUNT(*) FROM creations")).fetchone()
     assert count == (1,)
+
+
+async def test_new_creation_freezes_chinese_output_language_for_revisions(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, initial_lease = await create_and_lease_initial(
+        repository,
+        persona,
+        creation_request,
+    )
+
+    initial_work = await repository.get_run_work_item(initial_lease.run_id)
+    assert initial_work.output_language == "zh-CN"
+
+    await repository.succeed_run(initial_lease.run_id, make_delivery(), now=NOW)
+    await repository.create_or_retry_revision(
+        creation_id=accepted.creation_id,
+        idempotency_key="language-revision",
+        request=RevisionRequest(feedback="保持简体中文。"),
+        now=NOW + timedelta(seconds=1),
+    )
+    revision_lease = await repository.lease_next_job(
+        worker_id="language-revision-worker",
+        lease_seconds=30,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert revision_lease is not None
+
+    revision_work = await repository.get_run_work_item(revision_lease.run_id)
+    assert revision_work.output_language == "zh-CN"
+
+
+async def test_new_english_creation_keeps_output_language_unset(repository, persona) -> None:
+    request = CreateCreationRequest(
+        persona_id=persona.persona_id,
+        story="A daughter returns to her seaside hometown.",
+        requirements="Write a contemporary ten-episode short drama.",
+    )
+    _, lease = await create_and_lease_initial(repository, persona, request)
+
+    work = await repository.get_run_work_item(lease.run_id)
+
+    assert work.output_language is None
 
 
 async def test_attempt_is_recorded_before_invocation_and_fourth_is_rejected(
@@ -920,6 +966,8 @@ async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_draf
             DELETE FROM pengine_schema WHERE version = 5;
             DELETE FROM pengine_schema WHERE version = 6;
             DELETE FROM pengine_schema WHERE version = 7;
+            DELETE FROM pengine_schema WHERE version = 8;
+            ALTER TABLE creations DROP COLUMN output_language;
             """
         )
         await connection.execute(
@@ -1628,6 +1676,8 @@ async def test_schema_v6_recovers_legacy_failed_episode_without_replacing_drafts
     )
     async with repository._connection() as connection:
         await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -1656,6 +1706,63 @@ async def test_schema_v6_recovers_legacy_failed_episode_without_replacing_drafts
     assert await restarted.get_episode_drafts(lease.run_id) == [first]
 
 
+async def test_schema_v7_creation_is_backfilled_to_chinese_output_language(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    _, lease = await create_and_lease_initial(repository, persona, creation_request)
+    async with repository._connection() as connection:
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
+        await connection.commit()
+
+    restarted = Repository(repository.database_path)
+    await restarted.initialize()
+    work = await restarted.get_run_work_item(lease.run_id)
+
+    assert work.output_language == "zh-CN"
+    async with restarted._connection() as connection:
+        version = await (
+            await connection.execute("SELECT MAX(version) FROM pengine_schema")
+        ).fetchone()
+        row = await (
+            await connection.execute(
+                "SELECT output_language FROM creations WHERE id = ?",
+                (str(lease.creation_id),),
+            )
+        ).fetchone()
+        with pytest.raises(sqlite3.IntegrityError):
+            await connection.execute(
+                "UPDATE creations SET output_language = 'en-US' WHERE id = ?",
+                (str(lease.creation_id),),
+            )
+
+    assert version[0] == SCHEMA_VERSION
+    assert row[0] == "zh-CN"
+
+
+async def test_schema_v8_migration_resumes_when_column_already_exists(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    _, lease = await create_and_lease_initial(repository, persona, creation_request)
+    async with repository._connection() as connection:
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute(
+            "UPDATE creations SET output_language = NULL WHERE id = ?",
+            (str(lease.creation_id),),
+        )
+        await connection.commit()
+
+    restarted = Repository(repository.database_path)
+    await restarted.initialize()
+    work = await restarted.get_run_work_item(lease.run_id)
+
+    assert work.output_language == "zh-CN"
+
+
 async def test_schema_v1_database_is_backfilled_without_losing_creation(
     repository,
     persona,
@@ -1675,6 +1782,8 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.execute("DROP TABLE episode_timeouts")
         await connection.execute("DROP TABLE episode_attempts")
@@ -1717,6 +1826,8 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.commit()
 
@@ -1787,6 +1898,8 @@ async def test_schema_v4_recovery_rows_gain_the_timeout_reason_without_losing_dr
         await connection.execute("DELETE FROM pengine_schema WHERE version = 5")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
     await repository.initialize()
