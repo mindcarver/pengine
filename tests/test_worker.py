@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import anthropic
 import httpx
 import pytest
 from langgraph.errors import GraphRecursionError
@@ -323,6 +324,32 @@ class EpisodeArithmeticErrorOnceWorkflow(DeterministicWorkflow):
             attempt = await before_episode(plan)
             if plan.episode_number == 2:
                 raise ValueError("Operands must be decimal numbers")
+            return attempt
+
+        return await super().execute(
+            **{
+                **kwargs,
+                "before_episode": fail_on_second_episode,
+            }
+        )
+
+
+class EpisodeConnectionErrorWorkflow(DeterministicWorkflow):
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        before_episode = kwargs["before_episode"]
+        assert before_episode is not None
+
+        async def fail_on_second_episode(plan: EpisodePlan) -> int:
+            attempt = await before_episode(plan)
+            if plan.episode_number == 2:
+                request = httpx.Request(
+                    "POST",
+                    "https://secret-relay.example/messages?api_key=SECRET-KEY",
+                )
+                try:
+                    raise httpx.RemoteProtocolError("SECRET-UPSTREAM-DETAIL", request=request)
+                except httpx.RemoteProtocolError as cause:
+                    raise anthropic.APIConnectionError(request=request) from cause
             return attempt
 
         return await super().execute(
@@ -686,6 +713,39 @@ async def test_worker_fails_closed_when_episode_error_precedes_writer_attempt(
     assert failed.initial.failure.code == "structured_output_invalid"
     assert failed.initial.progress.can_continue is False
     assert failed.initial.progress.can_end is False
+
+
+@pytest.mark.asyncio
+async def test_episode_connection_error_reports_safe_relay_cause(tmp_path: Path) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "episode-connection-error",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=EpisodeConnectionErrorWorkflow(),
+        worker_id="episode-connection-error-worker",
+    )
+
+    assert await worker.run_once() is True
+    paused = await repository.get_creation(accepted.creation_id)
+
+    assert paused is not None
+    assert paused.initial.state == "paused"
+    assert paused.initial.pause.code == "episode_error"
+    assert paused.initial.pause.episode_number == 2
+    assert "Relay / 网络连接失败" in paused.initial.pause.message
+    assert "SECRET" not in paused.initial.pause.message
+    assert "secret-relay.example" not in paused.initial.pause.message
+    assert [draft.episode_number for draft in paused.initial.drafts.episodes] == [1]
 
 
 @pytest.mark.asyncio

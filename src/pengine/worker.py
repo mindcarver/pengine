@@ -742,6 +742,11 @@ def _episode_error_message(exc: Exception) -> str:
             "算术工具收到非十进制参数。需要先把时刻换算为当日经过分钟数后再计算；"
             "已完成分集不受影响。"
         )
+    if any(
+        base.__module__.startswith("anthropic") and base.__name__ == "APIConnectionError"
+        for base in type(exc).__mro__
+    ):
+        return "当前集与模型 Relay / 网络连接失败。已完成分集不受影响；继续时只会重试当前集。"
     if isinstance(exc, AgentProtocolError):
         return "当前集代理返回了无效的结构化结果。已完成分集不受影响；继续时只会重试当前集。"
     return "当前集遇到可恢复的执行错误。已完成分集不受影响；继续时只会重试当前集。"
