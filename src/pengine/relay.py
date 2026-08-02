@@ -11,11 +11,13 @@ from langchain_anthropic import ChatAnthropic
 
 from pengine.config import Settings
 
+_AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash"})
+
 
 class _SerialChatAnthropic(ChatAnthropic):
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
         kwargs["parallel_tool_calls"] = False
-        kwargs["tool_choice"] = "any"
+        kwargs["tool_choice"] = "auto" if self.model in _AUTO_TOOL_CHOICE_MODELS else "any"
         return super().bind_tools(tools, **kwargs)
 
 
