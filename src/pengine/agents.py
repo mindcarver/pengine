@@ -127,8 +127,14 @@ _EPISODE_PLANNER_PROMPT = (
     "calculate_arithmetic for every derived numeric claim. Never round a "
     "non-integral division unless the story states the rounding rule. Include a "
     "contiguous episode list beginning at 1, with one concrete plan for every "
-    "episode, while preserving the readable full outline in content. Compile "
-    "the same approved facts into story_contract. Use unique lowercase snake_case IDs "
+    "episode, while preserving the readable full outline in content. The free-form user request "
+    "is the only required creative input: automatically compile the minimum continuity ledger "
+    "from facts established by the approved artifacts. Never ask the user for character sheets, "
+    "timelines, or evidence tables. Leave genuinely unspecified details out instead of inventing "
+    "them only for validation. Capture established aliases, pronouns, ages, elapsed durations, "
+    "call participants, identity and relationship facts, and canonical clue meanings as typed "
+    "facts or existing structured contract fields. Compile the same approved facts into "
+    "story_contract. Use unique lowercase snake_case IDs "
     "and a closed cast; every relationship, timeline participant, and knowledge entry "
     "must reference that cast. Use ISO dates/times. Numeric facts require exact decimal "
     "values and explicit units, and the same numeric value cannot mean different kinds "
@@ -149,7 +155,10 @@ _SCRIPT_WRITER_PROMPT = (
     "hash. Use the requested single episode plan and persona rules without changing any "
     "locked episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
     "returning, reread every approved upstream artifact and audit this episode "
-    "against them. "
+    "against them. Use canonical contract names in every speaker label, including when a "
+    "parenthetical delivery direction follows the name. Treat established aliases, pronouns, "
+    "ages, elapsed durations, call participants, identity and relationship facts, and clue "
+    "meanings as binding. "
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
     "exact dialogue-count claims, and episode-specific promised actions. Every "
     "upstream commitment must appear in the scripts. Use calculate_arithmetic "
@@ -831,9 +840,12 @@ class StageGuardMiddleware(AgentMiddleware):
                 handler=handler,
                 subagent_type="canon_reviewer",
                 description=(
-                    "Review the proposed story contract against every approved upstream "
-                    "artifact. Fail on contradictions, missing commitments, ambiguous typed "
-                    "numbers, unfair knowledge withholding, or incomplete clue lifecycle."
+                    "Review the proposed minimum continuity ledger against every approved "
+                    "upstream artifact. Fail on contradictions, missing established identity, "
+                    "relationship, alias, pronoun, age, duration, call-participant, clue or causal "
+                    "facts, ambiguous typed numbers, unfair knowledge withholding, or incomplete "
+                    "clue lifecycle. Do not require facts that the upstream artifacts leave "
+                    "genuinely unspecified."
                 ),
                 files={
                     "/workspace/story_contract.json": json.dumps(
@@ -1188,14 +1200,30 @@ class StageGuardMiddleware(AgentMiddleware):
                         handler=handler,
                         subagent_type="episode_reviewer",
                         description=(
-                            f"Review episode {plan.episode_number} against the locked contract, "
-                            "prior series state, viewpoint knowledge, clue fairness, cast, and "
-                            "episode obligation. Return structured evidence only."
+                            f"Review episode {plan.episode_number} and the complete committed "
+                            "series prefix against the locked contract and every approved upstream "
+                            "artifact. Compare identities, relationships, aliases, pronouns, ages, "
+                            "durations, call participants, clue meanings, causal facts, viewpoint "
+                            "knowledge, cast, and episode obligation across all prior scripts and "
+                            "the current candidate. On the final episode this is the whole-series "
+                            "consistency review before script-stage approval. Return structured "
+                            "evidence only."
                         ),
                         files={
                             "/workspace/story_contract.json": contract_json,
                             "/workspace/series_state.json": prior_state.model_dump_json(),
                             "/workspace/candidate_episode.md": parsed.content,
+                            "/workspace/series_prefix.md": "\n\n---\n\n".join(
+                                [
+                                    *(
+                                        f"第 {episode_number} 集\n{draft.content}"
+                                        for episode_number, draft in sorted(
+                                            self.episode_drafts.items()
+                                        )
+                                    ),
+                                    f"第 {plan.episode_number} 集\n{parsed.content}",
+                                ]
+                            ),
                             "/workspace/candidate_state_delta.json": (
                                 parsed.state_delta.model_dump_json()
                             ),

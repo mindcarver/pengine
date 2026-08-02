@@ -19,10 +19,27 @@ Sha256 = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
 _NUMERIC_KINDS = {"duration", "count", "amount", "measurement"}
 _TEMPORAL_KINDS = {"date", "time", "datetime"}
 _TEMPORAL_TOKEN = re.compile(r"\b\d{4}-\d{2}-\d{2}\b|(?<!\d)\d{1,2}:\d{2}(?!\d)")
-_MEASURED_NUMBER = re.compile(
-    r"(?<![\w.])(-?\d+(?:\.\d+)?)\s*(分钟|分|小时|天|元|米|厘米|毫米|岁|人|次|件|集|%)"
+_CHINESE_DIGIT_CHARS = "零〇一二两三四五六七八九"
+_CHINESE_NUMBER_CHARS = f"{_CHINESE_DIGIT_CHARS}十百千万亿点"
+_NUMBER_TEXT = rf"(?:-?\d+(?:\.\d+)?|[{_CHINESE_NUMBER_CHARS}]+)"
+_INTEGER_TEXT = rf"(?:\d+|[{_CHINESE_DIGIT_CHARS}十百千万亿]+)"
+_CHINESE_DATE = re.compile(
+    rf"(?P<year>{_INTEGER_TEXT})年"
+    rf"(?P<month>{_INTEGER_TEXT})月"
+    rf"(?P<day>{_INTEGER_TEXT})[日号]"
 )
-_SPEAKER = re.compile(r"^\s*([A-Za-z\u3400-\u9fff][A-Za-z0-9_·\u3400-\u9fff]{0,15})[：:]")
+_CHINESE_TIME = re.compile(
+    rf"(?P<hour>{_INTEGER_TEXT})点"
+    rf"(?:(?P<minute>{_INTEGER_TEXT})分|整)"
+)
+_MEASURED_NUMBER = re.compile(
+    rf"(?<![A-Za-z0-9_.第{_CHINESE_NUMBER_CHARS}])({_NUMBER_TEXT})\s*"
+    r"(分钟|分|小时|年|天|元|米|厘米|毫米|岁|人|次|件|集|%)"
+)
+_SPEAKER = re.compile(
+    r"^\s*([A-Za-z\u3400-\u9fff][A-Za-z0-9_·\u3400-\u9fff]{0,15})"
+    r"(?:\s*[（(][^）)\r\n]{0,40}[）)])?\s*[：:]"
+)
 _NON_CHARACTER_LABELS = {
     "画面",
     "字幕",
@@ -607,28 +624,50 @@ def validate_episode_candidate(
                 )
             )
 
-    allowed_temporal = {fact.value for fact in contract.facts if fact.kind in _TEMPORAL_KINDS}
-    for token in _TEMPORAL_TOKEN.findall(content):
-        if token not in allowed_temporal:
+    allowed_temporal: set[str] = set()
+    for fact in contract.facts:
+        if fact.kind not in _TEMPORAL_KINDS:
+            continue
+        allowed_temporal.add(fact.value)
+        temporal_value = _parse_temporal(fact.kind, fact.value)
+        if isinstance(temporal_value, datetime):
+            allowed_temporal.add(temporal_value.date().isoformat())
+            allowed_temporal.add(temporal_value.time().isoformat(timespec="minutes"))
+    temporal_tokens = _temporal_tokens(content)
+    for token, normalized, _ in temporal_tokens:
+        if normalized not in allowed_temporal:
             issues.append(
                 _issue(
                     "uncontracted_time",
-                    f"Script contains uncontracted date or time {token}",
+                    f"Script contains uncontracted date or time {token} ({normalized})",
                 )
             )
 
     allowed_measured = {
-        (str(Decimal(fact.value).normalize()), fact.unit or "")
+        (_normalized_decimal(fact.value), fact.unit or "")
         for fact in contract.facts
         if fact.kind in _NUMERIC_KINDS
     }
-    allowed_measured.add((str(episode), "集"))
-    for value, unit in _MEASURED_NUMBER.findall(content):
-        if (str(Decimal(value).normalize()), unit) not in allowed_measured:
+    for fact in contract.facts:
+        if fact.kind not in {"date", "datetime"}:
+            continue
+        temporal_value = _parse_temporal(fact.kind, fact.value)
+        allowed_measured.add((_normalized_decimal(str(temporal_value.year)), "年"))
+    allowed_measured.add((_normalized_decimal(str(episode)), "集"))
+    temporal_spans = [span for _, _, span in temporal_tokens]
+    for match in _MEASURED_NUMBER.finditer(content):
+        if any(_spans_overlap(match.span(), temporal_span) for temporal_span in temporal_spans):
+            continue
+        raw_value, unit = match.groups()
+        value = _normalized_number(raw_value)
+        if value is None:
+            continue
+        if (value, unit) not in allowed_measured:
             issues.append(
                 _issue(
                     "uncontracted_number",
-                    f"Script contains uncontracted measured value {value}{unit}",
+                    "Script contains uncontracted measured value "
+                    f"{raw_value}{unit} ({value}{unit})",
                 )
             )
 
@@ -647,6 +686,105 @@ def validate_episode_candidate(
 
 def _issue(code: str, message: str, refs: list[str] | None = None) -> ReviewIssue:
     return ReviewIssue(code=code, message=message, contract_refs=refs or [])
+
+
+def _temporal_tokens(content: str) -> list[tuple[str, str, tuple[int, int]]]:
+    tokens = [
+        (match.group(0), match.group(0), match.span())
+        for match in _TEMPORAL_TOKEN.finditer(content)
+    ]
+    for match in _CHINESE_DATE.finditer(content):
+        year = _normalized_integer(match.group("year"))
+        month = _normalized_integer(match.group("month"))
+        day = _normalized_integer(match.group("day"))
+        if year is None or month is None or day is None:
+            continue
+        try:
+            normalized = date(year, month, day).isoformat()
+        except ValueError:
+            continue
+        tokens.append((match.group(0), normalized, match.span()))
+    for match in _CHINESE_TIME.finditer(content):
+        hour = _normalized_integer(match.group("hour"))
+        minute = _normalized_integer(match.group("minute")) if match.group("minute") else 0
+        if hour is None or minute is None:
+            continue
+        try:
+            normalized = time(hour, minute).isoformat(timespec="minutes")
+        except ValueError:
+            continue
+        tokens.append((match.group(0), normalized, match.span()))
+    return tokens
+
+
+def _normalized_number(value: str) -> str | None:
+    try:
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", value):
+            return _normalized_decimal(value)
+        if "点" in value:
+            integer, fractional = value.split("点", 1)
+            integer_value = _normalized_integer(integer)
+            if (
+                integer_value is None
+                or not fractional
+                or any(character not in _CHINESE_DIGIT_CHARS for character in fractional)
+            ):
+                return None
+            decimal_digits = "".join(str(_CHINESE_DIGITS[character]) for character in fractional)
+            return _normalized_decimal(f"{integer_value}.{decimal_digits}")
+        integer_value = _normalized_integer(value)
+        return _normalized_decimal(str(integer_value)) if integer_value is not None else None
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _normalized_decimal(value: str) -> str:
+    return str(Decimal(value).normalize())
+
+
+_CHINESE_DIGITS = {
+    character: value
+    for value, characters in enumerate(
+        ("零〇", "一", "二两", "三", "四", "五", "六", "七", "八", "九")
+    )
+    for character in characters
+}
+_CHINESE_SMALL_UNITS = {"十": 10, "百": 100, "千": 1000}
+_CHINESE_LARGE_UNITS = {"万": 10_000, "亿": 100_000_000}
+
+
+def _normalized_integer(value: str) -> int | None:
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    if all(character in _CHINESE_DIGITS for character in value):
+        return int("".join(str(_CHINESE_DIGITS[character]) for character in value))
+    if any(
+        character not in _CHINESE_DIGITS | _CHINESE_SMALL_UNITS | _CHINESE_LARGE_UNITS
+        for character in value
+    ):
+        return None
+
+    total = 0
+    section = 0
+    number = 0
+    for character in value:
+        if character in _CHINESE_DIGITS:
+            number = _CHINESE_DIGITS[character]
+        elif character in _CHINESE_SMALL_UNITS:
+            section += (number or 1) * _CHINESE_SMALL_UNITS[character]
+            number = 0
+        else:
+            section += number
+            total += (section or 1) * _CHINESE_LARGE_UNITS[character]
+            section = 0
+            number = 0
+    return total + section + number
+
+
+def _spans_overlap(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    return left[0] < right[1] and right[0] < left[1]
 
 
 def _unique_ids(values: list[str], label: str) -> set[str]:
