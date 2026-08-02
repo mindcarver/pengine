@@ -1,4 +1,5 @@
 import hashlib
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,7 +33,11 @@ from pengine.agents import (
     _supervisor_prompt,
 )
 from pengine.config import Settings
-from pengine.continuity import StoryContract, story_contract_sha256
+from pengine.continuity import (
+    StoryContract,
+    render_story_contract_markdown,
+    story_contract_sha256,
+)
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import CreateCreationRequest, EpisodeDraft, EpisodePlan, InternalStage
@@ -400,9 +405,17 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "dates, countdowns, amounts, counts, and arithmetic" in _EPISODE_PLANNER_PROMPT
     assert "/workspace/approved-checkpoints.json" in _EPISODE_PLANNER_PROMPT
     assert "new_information_fact_ids must exactly equal" in _EPISODE_PLANNER_PROMPT
+    assert "free-form user request" in _EPISODE_PLANNER_PROMPT
+    assert "Never ask the user" in _EPISODE_PLANNER_PROMPT
+    assert "Leave genuinely unspecified details out" in _EPISODE_PLANNER_PROMPT
+    assert "aliases, pronouns, ages, elapsed durations, call participants" in (
+        _EPISODE_PLANNER_PROMPT
+    )
     assert "exact dialogue-count claims" in _SCRIPT_WRITER_PROMPT
     assert "Every upstream commitment must appear" in _SCRIPT_WRITER_PROMPT
     assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
+    assert "canonical contract names in every speaker label" in _SCRIPT_WRITER_PROMPT
+    assert "call participants" in _SCRIPT_WRITER_PROMPT
     assert "grandfathered pre-contract run" in _SCRIPT_WRITER_PROMPT
     assert "return null state_delta" in _SCRIPT_WRITER_PROMPT
 
@@ -421,6 +434,12 @@ def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> No
     }
     assert not {"story_architect", "episode_planner", "script_writer", "quality_reviewer"} & set(
         _SPECIALIST_SKILL_SOURCES
+    )
+    skill_files = load_agent_skill_files()
+    assert "minimum continuity ledger" in skill_files["/skills/canon-review/SKILL.md"]
+    assert (
+        "complete committed series prefix"
+        in skill_files["/skills/episode-continuity-review/SKILL.md"]
     )
 
 
@@ -598,11 +617,11 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
     writer_payload = responses[12].tool_calls[0]["args"]
     failed_review = {
         "passed": False,
-        "evidence": "人物知识状态仍不公平",
+        "evidence": "人物身份与上游小传不一致",
         "issues": [
             {
-                "code": "knowledge_unfairness",
-                "message": "视点人物已经知道该事实",
+                "code": "identity_drift",
+                "message": "剧本把母亲姓名改成了合同外角色",
                 "contract_refs": ["fact_ep1"],
                 "script_excerpt": "事实1",
             }
@@ -644,6 +663,127 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
     assert error.value.repair_rounds == 2
     assert episode_attempts == [1]
     assert InternalStage.GENERATING_EPISODE_SCRIPTS not in approved
+
+
+@pytest.mark.asyncio
+async def test_last_episode_review_receives_complete_series_prefix_before_approval() -> None:
+    contract = _story_contract(episode_count=2)
+    contract_hash = story_contract_sha256(contract)
+    approved_payloads: dict[InternalStage, dict[str, Any]] = {
+        InternalStage.SELECTING_L0_VARIANT: {
+            "stage": "selecting_l0_variant",
+            "selected_l0_variant": "主动选择",
+            "selection_rationale": "契合故事",
+        },
+        InternalStage.GENERATING_STORY_OUTLINE: {
+            "stage": "generating_story_outline",
+            "content": "故事大纲",
+        },
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
+            "stage": "generating_character_biographies",
+            "content": "人物小传",
+        },
+        InternalStage.GENERATING_RELATIONSHIP_LOGIC: {
+            "stage": "generating_relationship_logic",
+            "content": "关系逻辑",
+        },
+        InternalStage.GENERATING_EPISODE_OUTLINE: {
+            "stage": "generating_episode_outline",
+            "content": "两集分集大纲",
+            "episode_count": 2,
+            "episodes": [
+                {"episode_number": 1, "plan": "第一集计划"},
+                {"episode_number": 2, "plan": "第二集计划"},
+            ],
+            "story_contract": contract.model_dump(mode="json"),
+            "story_contract_sha256": contract_hash,
+            "story_contract_markdown": render_story_contract_markdown(contract, contract_hash),
+            "contract_review": {"passed": True, "evidence": "合同一致", "issues": []},
+            "contract_repair_rounds": 0,
+        },
+    }
+    approved_stages = set(approved_payloads)
+    approvals: dict[InternalStage, dict[str, Any]] = {}
+    episode_hooks, attempts = _episode_hook_kwargs()
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
+        approvals[stage] = payload
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=approved_stages,
+        approved_payloads=approved_payloads,
+        **episode_hooks,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] write scripts",
+                "subagent_type": "script_writer",
+            },
+            "id": "call-series-prefix",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+    reviewed_prefixes: list[set[str]] = []
+    reviewed_prefix_contents: list[str] = []
+
+    async def handler(subagent_request: ToolCallRequest) -> ToolMessage:
+        description = subagent_request.tool_call["args"]["description"]
+        subagent_type = subagent_request.tool_call["args"]["subagent_type"]
+        episode_number = 2 if "episode=2" in description or "episode 2" in description else 1
+        if subagent_type == "script_writer":
+            payload = {
+                "stage": "generating_episode_scripts",
+                "episode_number": episode_number,
+                "content": f"事实{episode_number}\n钩子{episode_number}",
+                "state_delta": _state_delta(contract, episode_number),
+            }
+        else:
+            assert subagent_type == "episode_reviewer"
+            assert "complete committed series prefix" in description
+            for required_check in (
+                "identities",
+                "relationships",
+                "pronouns",
+                "call participants",
+                "clue meanings",
+            ):
+                assert required_check in description
+            reviewed_prefixes.append(set(subagent_request.state["files"]))
+            prefix_file = subagent_request.state["files"]["/workspace/series_prefix.md"]
+            reviewed_prefix_contents.append(prefix_file["content"])
+            payload = {"passed": True, "evidence": "完整前缀一致", "issues": []}
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-series-prefix",
+        )
+
+    await middleware.awrap_tool_call(request, handler)
+
+    assert attempts == [1, 2]
+    assert "/workspace/episodes/ep1.md" not in reviewed_prefixes[0]
+    assert {
+        "/workspace/episodes/ep1.md",
+        "/workspace/candidate_episode.md",
+        "/workspace/story_outline.md",
+        "/workspace/character_biographies.md",
+        "/workspace/relationship_logic.md",
+        "/workspace/episode_outline.md",
+        "/workspace/story_contract.json",
+        "/workspace/series_prefix.md",
+    } <= reviewed_prefixes[1]
+    assert "第 1 集\n事实1" in reviewed_prefix_contents[1]
+    assert "第 2 集\n事实2" in reviewed_prefix_contents[1]
+    assert InternalStage.GENERATING_EPISODE_SCRIPTS in approvals
 
 
 @pytest.mark.asyncio

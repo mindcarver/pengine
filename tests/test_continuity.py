@@ -193,6 +193,174 @@ def test_episode_validation_rejects_uncontracted_time_unknown_speaker_and_missin
     }
 
 
+@pytest.mark.parametrize(
+    "invalid_line",
+    [
+        "陌生人（低声）：其实是二〇一四年十月三日、二十二点整、十一年、十三岁。",
+        "陌生人（低声）：其实是2014年10月3日、22点整、十一年、十三岁。",
+    ],
+)
+def test_episode_validation_normalizes_chinese_continuity_values_and_parenthetical_speakers(
+    invalid_line: str,
+) -> None:
+    contract = make_contract(
+        numeric_facts=[
+            {
+                "fact_id": "event_date",
+                "subject": "旧案",
+                "predicate": "发生日期",
+                "kind": "date",
+                "value": "2015-08-12",
+                "first_revealed_episode": 1,
+            },
+            {
+                "fact_id": "official_time",
+                "subject": "旧案",
+                "predicate": "官方时间",
+                "kind": "time",
+                "value": "22:50",
+                "first_revealed_episode": 1,
+            },
+            {
+                "fact_id": "elapsed_years",
+                "subject": "旧案",
+                "predicate": "距今时长",
+                "kind": "duration",
+                "value": "10",
+                "unit": "年",
+                "first_revealed_episode": 1,
+            },
+            {
+                "fact_id": "current_age",
+                "subject": "林岚",
+                "predicate": "当前年龄",
+                "kind": "count",
+                "value": "26",
+                "unit": "岁",
+                "first_revealed_episode": 1,
+            },
+        ]
+    )
+    contract_hash = story_contract_sha256(contract)
+    prior = initial_series_state(contract, contract_hash)
+    delta = EpisodeStateDelta(
+        episode_number=1,
+        contract_sha256=contract_hash,
+        established_fact_ids=[fact.fact_id for fact in contract.facts],
+        knowledge_gains=[
+            {
+                "character_id": "lin_lan",
+                "fact_ids": [fact.fact_id for fact in contract.facts],
+            }
+        ],
+        satisfied_obligation_ids=["episode_one_obligation"],
+        evidence=[
+            {"target_id": "event_date", "excerpt": "2015-08-12"},
+            {"target_id": "official_time", "excerpt": "22:50"},
+            {"target_id": "elapsed_years", "excerpt": "10年"},
+            {"target_id": "current_age", "excerpt": "26岁"},
+            {"target_id": "episode_one_obligation", "excerpt": "门后传来第二次敲击"},
+        ],
+        handoff="林岚停在门前。",
+    )
+    content = f"林岚：锁定值是2015-08-12、22:50、10年、26岁。\n{invalid_line}\n门后传来第二次敲击"
+
+    issues = validate_episode_candidate(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=prior,
+        content=content,
+        delta=delta,
+    )
+
+    codes = [issue.code for issue in issues]
+    assert "unknown_speaker" in codes
+    assert codes.count("uncontracted_time") == 2
+    assert codes.count("uncontracted_number") == 2
+
+
+def test_episode_validation_accepts_chinese_equivalents_of_locked_values() -> None:
+    contract = make_contract(
+        numeric_facts=[
+            {
+                "fact_id": "event_date",
+                "subject": "旧案",
+                "predicate": "发生日期",
+                "kind": "date",
+                "value": "2015-08-12",
+                "first_revealed_episode": 1,
+            },
+            {
+                "fact_id": "official_time",
+                "subject": "旧案",
+                "predicate": "官方时间",
+                "kind": "time",
+                "value": "22:50",
+                "first_revealed_episode": 1,
+            },
+            {
+                "fact_id": "elapsed_years",
+                "subject": "旧案",
+                "predicate": "距今时长",
+                "kind": "duration",
+                "value": "10",
+                "unit": "年",
+                "first_revealed_episode": 1,
+            },
+            {
+                "fact_id": "current_age",
+                "subject": "林岚",
+                "predicate": "当前年龄",
+                "kind": "count",
+                "value": "26",
+                "unit": "岁",
+                "first_revealed_episode": 1,
+            },
+        ]
+    )
+    contract_hash = story_contract_sha256(contract)
+    prior = initial_series_state(contract, contract_hash)
+    delta = EpisodeStateDelta(
+        episode_number=1,
+        contract_sha256=contract_hash,
+        established_fact_ids=[fact.fact_id for fact in contract.facts],
+        knowledge_gains=[
+            {
+                "character_id": "lin_lan",
+                "fact_ids": [fact.fact_id for fact in contract.facts],
+            }
+        ],
+        satisfied_obligation_ids=["episode_one_obligation"],
+        evidence=[
+            {"target_id": "event_date", "excerpt": "二〇一五年八月十二日"},
+            {"target_id": "official_time", "excerpt": "二十二点五十分"},
+            {"target_id": "elapsed_years", "excerpt": "十年"},
+            {"target_id": "current_age", "excerpt": "二十六岁"},
+            {"target_id": "episode_one_obligation", "excerpt": "门后传来第二次敲击"},
+        ],
+        handoff="林岚停在门前。",
+    )
+    content = (
+        "林岚（低声）：旧案发生在二〇一五年八月十二日二十二点五十分。\n"
+        "林岚：那是十年前，我现在二十六岁。\n"
+        "门后传来第二次敲击"
+    )
+
+    issues = validate_episode_candidate(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=prior,
+        content=content,
+        delta=delta,
+    )
+
+    assert not {
+        "uncontracted_time",
+        "uncontracted_number",
+        "unknown_speaker",
+    } & {issue.code for issue in issues}
+
+
 def test_episode_validation_rejects_knowledge_gain_outside_locked_cast() -> None:
     contract = make_contract()
     contract_hash = story_contract_sha256(contract)
