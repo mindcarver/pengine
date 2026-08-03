@@ -74,6 +74,7 @@ from pengine.language import SIMPLIFIED_CHINESE, language_instruction
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import CreateCreationRequest, EpisodeDraft, EpisodePlan, InternalStage
+from pengine.series_bible import build_series_bible, project_series_bible
 from pengine.skill_assets import load_agent_skill_files
 from pengine.worker import Worker
 
@@ -384,6 +385,7 @@ def _episode_hook_kwargs(
         episode_number: int,
         content: str,
         episode_lock=None,
+        **kwargs,
     ) -> EpisodeDraft:
         existing = committed.get(episode_number)
         content_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -3286,6 +3288,147 @@ async def test_last_episode_review_receives_complete_series_prefix_before_approv
     assert "第 1 集\n事实1" in reviewed_prefix_contents[1]
     assert "第 2 集\n事实2" in reviewed_prefix_contents[1]
     assert InternalStage.GENERATING_EPISODE_SCRIPTS in approvals
+
+
+@pytest.mark.asyncio
+async def test_episode_writer_receives_complete_active_design_and_verbatim_prefix() -> None:
+    """FSW-A2: episode N input carries the full SeriesBible, verbatim scripts 1..N-1,
+    the folded SeriesState, the exact plan/obligation, and bounded WriterNotes."""
+    contract = _story_contract(episode_count=2)
+    contract_hash = story_contract_sha256(contract)
+    summary = project_series_bible(
+        build_series_bible(
+            run_id="run-1",
+            run_kind="initial",
+            l0_variant="主动选择",
+            genre="general",
+            story_outline="故事大纲",
+            character_biographies="人物小传",
+            relationship_logic="关系逻辑",
+            episode_outline="两集分集大纲",
+            story_contract_payload=contract.model_dump(mode="json"),
+        ),
+        is_active=True,
+    )
+    approved_payloads: dict[InternalStage, dict[str, Any]] = {
+        InternalStage.SELECTING_L0_VARIANT: {
+            "stage": "selecting_l0_variant",
+            "selected_l0_variant": "主动选择",
+            "selection_rationale": "契合故事",
+        },
+        InternalStage.GENERATING_STORY_OUTLINE: {
+            "stage": "generating_story_outline",
+            "content": "故事大纲",
+        },
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
+            "stage": "generating_character_biographies",
+            "content": "人物小传",
+        },
+        InternalStage.GENERATING_RELATIONSHIP_LOGIC: {
+            "stage": "generating_relationship_logic",
+            "content": "关系逻辑",
+        },
+        InternalStage.GENERATING_EPISODE_OUTLINE: {
+            "stage": "generating_episode_outline",
+            "content": "两集分集大纲",
+            "episode_count": 2,
+            "episodes": [
+                {"episode_number": 1, "plan": "第一集计划"},
+                {"episode_number": 2, "plan": "第二集计划"},
+            ],
+            "story_contract": contract.model_dump(mode="json"),
+            "story_contract_sha256": contract_hash,
+            "story_contract_markdown": render_story_contract_markdown(contract, contract_hash),
+            "contract_review": {"passed": True, "evidence": "合同一致", "issues": []},
+            "contract_repair_rounds": 0,
+        },
+    }
+    approved_stages = set(approved_payloads)
+    episode_hooks, attempts = _episode_hook_kwargs()
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _stage: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=approved_stages,
+        approved_payloads=approved_payloads,
+        series_bible=summary,
+        **episode_hooks,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] write scripts",
+                "subagent_type": "script_writer",
+            },
+            "id": "call-writer-input",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+    writer_inputs: list[dict[str, Any]] = []
+    writer_descriptions: list[str] = []
+
+    async def handler(subagent_request: ToolCallRequest) -> ToolMessage:
+        description = subagent_request.tool_call["args"]["description"]
+        subagent_type = subagent_request.tool_call["args"]["subagent_type"]
+        episode_number = 2 if "episode=2" in description or "episode 2" in description else 1
+        if subagent_type == "script_writer":
+            writer_inputs.append(dict(subagent_request.state["files"]))
+            writer_descriptions.append(description)
+            payload = {
+                "stage": "generating_episode_scripts",
+                "episode_number": episode_number,
+                "content": f"事实{episode_number}\n钩子{episode_number}",
+                "state_delta": _state_delta(contract, episode_number),
+                "writer_notes": f"第{episode_number}集备忘",
+            }
+        else:
+            assert subagent_type == "episode_reviewer"
+            payload = {"passed": True, "evidence": "完整前缀一致", "issues": []}
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-writer-input",
+        )
+
+    await middleware.awrap_tool_call(request, handler)
+
+    assert attempts == [1, 2]
+    first_input = writer_inputs[0]
+    second_input = writer_inputs[1]
+
+    # Every episode request carries the complete active SeriesBible projections.
+    for key in (
+        "/workspace/series_bible/story_outline.md",
+        "/workspace/series_bible/character_biographies.md",
+        "/workspace/series_bible/relationship_logic.md",
+        "/workspace/series_bible/episode_outline.md",
+    ):
+        assert key in first_input and key in second_input
+    assert second_input["/workspace/series_bible/story_outline.md"]["content"] == "故事大纲"
+    assert second_input["/workspace/series_bible/episode_outline.md"]["content"] == "两集分集大纲"
+    assert "/workspace/story_contract.json" in second_input
+    assert "第二集计划" in writer_descriptions[1]
+
+    # Episode 2 receives script 1 verbatim (never a summary).
+    assert second_input["/workspace/episodes/ep1.md"]["content"] == "事实1\n钩子1"
+
+    # Episode 2 receives the folded SeriesState after episode 1.
+    series_state = json.loads(second_input["/workspace/series_state.json"]["content"])
+    assert series_state["locked_through_episode"] == 1
+    assert series_state["established_fact_ids"] == ["fact_ep1"]
+
+    # Bounded advisory WriterNotes from episode 1 flow forward.
+    assert second_input["/workspace/writer_notes.md"]["content"] == "第1集备忘"
+
+
+async def _async_one() -> int:
+    return 1
+
+
+async def _async_none() -> None:
+    return None
 
 
 @pytest.mark.asyncio

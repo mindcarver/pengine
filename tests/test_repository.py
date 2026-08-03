@@ -144,7 +144,7 @@ def locked_outline_payload():
 
 
 async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository) -> None:
-    assert SCHEMA_VERSION == 12
+    assert SCHEMA_VERSION == 13
     async with repository._connection() as connection:
         journal = await (await connection.execute("PRAGMA journal_mode")).fetchone()
         foreign_keys = await (await connection.execute("PRAGMA foreign_keys")).fetchone()
@@ -997,6 +997,7 @@ async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_draf
             DELETE FROM pengine_schema WHERE version = 10;
             DELETE FROM pengine_schema WHERE version = 11;
             DELETE FROM pengine_schema WHERE version = 12;
+            DELETE FROM pengine_schema WHERE version = 13;
             ALTER TABLE creations DROP COLUMN output_language;
             """
         )
@@ -1833,6 +1834,7 @@ async def test_schema_v6_recovers_legacy_failed_episode_without_replacing_drafts
         await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 11")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 12")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -1874,6 +1876,7 @@ async def test_schema_v7_creation_is_backfilled_to_chinese_output_language(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 11")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 12")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -1914,6 +1917,7 @@ async def test_schema_v8_migration_resumes_when_column_already_exists(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 11")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 12")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute(
             "UPDATE creations SET output_language = NULL WHERE id = ?",
             (str(lease.creation_id),),
@@ -1984,6 +1988,7 @@ async def test_schema_v8_content_rejections_migrate_without_losing_rows(
             DELETE FROM pengine_schema WHERE version = 10;
             DELETE FROM pengine_schema WHERE version = 11;
             DELETE FROM pengine_schema WHERE version = 12;
+            DELETE FROM pengine_schema WHERE version = 13;
             """
         )
         await connection.commit()
@@ -2144,6 +2149,7 @@ async def test_schema_v9_repair_limits_migrate_without_losing_pause(
             DELETE FROM pengine_schema WHERE version = 10;
             DELETE FROM pengine_schema WHERE version = 11;
             DELETE FROM pengine_schema WHERE version = 12;
+            DELETE FROM pengine_schema WHERE version = 13;
             """
         )
         await connection.commit()
@@ -2251,6 +2257,7 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 11")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 12")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.execute("DROP TABLE episode_timeouts")
@@ -2299,6 +2306,7 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 11")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 12")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.commit()
@@ -2375,6 +2383,7 @@ async def test_schema_v4_recovery_rows_gain_the_timeout_reason_without_losing_dr
         await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 11")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 12")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -2426,6 +2435,7 @@ async def test_schema_v10_to_v11_preserves_run_progress_and_model_calls(
     async with repository._connection() as connection:
         await connection.execute("DELETE FROM pengine_schema WHERE version = 11")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 12")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.commit()
 
     restarted = Repository(repository.database_path)

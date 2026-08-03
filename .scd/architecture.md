@@ -187,6 +187,36 @@ Issue to start a fresh batch at episode 1.
 The workbench exposes the four familiar projections from the one active candidate
 with an explicit unfinished label; the design package is never formal delivery.
 
+### Versioned episode candidates (script batch)
+
+A unified run writes the complete series as one design-bound script batch of
+immutable episode candidate versions plus one active pointer per episode.
+
+- A **script batch** binds one exact SeriesBible candidate (id, content hash,
+  design epoch) and carries an active pointer per episode. At most one batch is
+  active per run; a design hash/epoch change supersedes the whole prior batch,
+  clears the active projection, and starts a fresh batch at episode 1.
+- An **episode candidate** is immutable and binds the design identity, batch and
+  epoch, episode number, candidate version, predecessor hash, the generation
+  call id, bounded advisory WriterNotes, the state delta, and the folded
+  SeriesState. Rewriting episode N preserves active 1..N-1, supersedes every
+  active candidate N..end, and replays SeriesState strictly from the retained
+  prefix; no fact, knowledge, clue, obligation, or delta from the superseded
+  suffix enters the replayed context.
+- A candidate becomes active only through a transactional/CAS commit that
+  re-validates the exact design binding, the active predecessor pointer, the
+  next version, and deterministic contract/state replay. A failing or late
+  candidate is retained as non-active (or `stale`) evidence with its usage and
+  can never move an active pointer.
+- Every episode request carries the complete active SeriesBible projections,
+  the locked contract, the exact episode plan and obligation, the verbatim
+  active scripts 1..N-1, the folded SeriesState, and bounded WriterNotes. No
+  summary substitutes prior scripts, and WriterNotes are never canonical.
+
+The active candidate projection stays readable through the workbench after a
+refresh or restart; only a complete active batch assembles into the episode
+scripts, which are never formal delivery until the final gate.
+
 ### Delivery
 
 `ContentPackage` contains exactly five creative outputs:

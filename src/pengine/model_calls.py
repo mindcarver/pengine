@@ -165,6 +165,7 @@ class ModelCallContext:
     episode_number: int | None = None
     candidate: str | None = None
     batch: str | None = None
+    call_id: str | None = None
 
     def reset(self) -> None:
         self.run_id = None
@@ -175,6 +176,7 @@ class ModelCallContext:
         self.episode_number = None
         self.candidate = None
         self.batch = None
+        self.call_id = None
 
 
 @dataclass(slots=True)
@@ -235,7 +237,7 @@ def build_started_record(
 ) -> ModelCallRecord:
     now = _utc_now()
     return ModelCallRecord(
-        call_id=new_call_id(),
+        call_id=context.call_id or new_call_id(),
         role=role,
         adapter=adapter,
         provider=provider,

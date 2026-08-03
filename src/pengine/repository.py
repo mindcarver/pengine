@@ -14,7 +14,9 @@ import aiosqlite
 from pydantic import BaseModel
 
 from pengine.continuity import (
+    ContinuityViolation,
     EpisodeLock,
+    EpisodeStateDelta,
     SemanticReview,
     SeriesState,
     StoryContract,
@@ -69,15 +71,23 @@ from pengine.schemas import (
     SucceededRun,
     UserStage,
 )
+from pengine.script_batch import (
+    EpisodeCandidate,
+    ScriptBatchLineage,
+    build_episode_candidate,
+    new_batch_id,
+    new_candidate_id,
+)
 from pengine.series_bible import (
     GlobalDesignReview,
     SeriesBible,
+    SeriesBibleContent,
     SeriesBibleSummary,
     ValidationEvidence,
     project_series_bible,
 )
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -808,6 +818,61 @@ CREATE TABLE IF NOT EXISTS series_bible_lineage (
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (12);
 """
 
+_SCHEMA_V13_SCRIPT_BATCH_SQL = """
+CREATE TABLE IF NOT EXISTS script_batches (
+    batch_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    creation_id TEXT,
+    run_kind TEXT NOT NULL CHECK (run_kind IN ('initial', 'revision')),
+    batch_epoch INTEGER NOT NULL CHECK (batch_epoch >= 1),
+    status TEXT NOT NULL CHECK (status IN ('active', 'superseded')),
+    design_candidate_id TEXT NOT NULL,
+    design_content_hash TEXT NOT NULL,
+    design_epoch INTEGER NOT NULL CHECK (design_epoch >= 1),
+    active_pointers_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    superseded_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS script_batches_one_active
+ON script_batches(run_id) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS episode_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL REFERENCES script_batches(batch_id) ON DELETE CASCADE,
+    batch_epoch INTEGER NOT NULL CHECK (batch_epoch >= 1),
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    design_candidate_id TEXT NOT NULL,
+    design_content_hash TEXT NOT NULL,
+    design_epoch INTEGER NOT NULL CHECK (design_epoch >= 1),
+    episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    content TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    predecessor_candidate_id TEXT,
+    predecessor_sha256 TEXT,
+    call_id TEXT NOT NULL,
+    writer_notes TEXT NOT NULL DEFAULT '',
+    state_delta_json TEXT NOT NULL,
+    series_state_json TEXT NOT NULL,
+    series_state_sha256 TEXT NOT NULL,
+    semantic_review_json TEXT,
+    repair_rounds INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK (
+        status IN ('unvalidated', 'validated', 'active', 'superseded', 'stale')
+    ),
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    superseded_at TEXT,
+    UNIQUE (batch_id, episode_number, version)
+);
+CREATE INDEX IF NOT EXISTS episode_candidates_batch
+ON episode_candidates(batch_id);
+CREATE INDEX IF NOT EXISTS episode_candidates_run
+ON episode_candidates(run_id);
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (13);
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -1188,6 +1253,10 @@ class Repository:
                 await connection.executescript(_SCHEMA_V12_SERIES_BIBLE_SQL)
                 await connection.commit()
                 schema_version = 12
+            if schema_version == 12:
+                await connection.executescript(_SCHEMA_V13_SCRIPT_BATCH_SQL)
+                await connection.commit()
+                schema_version = 13
 
     async def setup(self) -> None:
         await self.initialize()
@@ -3298,6 +3367,741 @@ class Repository:
         if lineage is None or lineage["active_content_hash"] is None:
             return None
         return lineage["active_content_hash"]
+
+    # ------------------------------------------------------------------
+    # Versioned episode candidates and design-bound script batches
+    # ------------------------------------------------------------------
+
+    async def get_script_batch_lineage(self, run_id: UUID) -> ScriptBatchLineage | None:
+        async with self._connection() as connection:
+            row = await self._fetch_script_batch_lineage(connection, run_id)
+        return self._script_batch_lineage_from_row(row) if row is not None else None
+
+    async def get_active_episode_candidates(self, run_id: UUID) -> list[EpisodeCandidate]:
+        """The active candidates in episode order (the active pointer lineage)."""
+        async with self._connection() as connection:
+            batch = await self._fetch_script_batch_lineage(connection, run_id)
+            if batch is None or batch["status"] != "active":
+                return []
+            rows: list[aiosqlite.Row] = []
+            for _episode, candidate_id in sorted(
+                json.loads(batch["active_pointers_json"]).items(),
+                key=lambda item: int(item[0]),
+            ):
+                row = await self._fetch_episode_candidate(connection, run_id, candidate_id)
+                if row is not None:
+                    rows.append(row)
+        return [self._episode_candidate_from_row(row) for row in rows]
+
+    async def get_episode_candidates(self, run_id: UUID) -> list[EpisodeCandidate]:
+        """Every immutable candidate for one run, newest-first evidence."""
+        async with self._connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT *
+                FROM episode_candidates
+                WHERE run_id = ?
+                ORDER BY batch_epoch DESC, episode_number DESC, version DESC
+                """,
+                (str(run_id),),
+            )
+            rows = await cursor.fetchall()
+        return [self._episode_candidate_from_row(row) for row in rows]
+
+    async def first_unfinished_episode(self, run_id: UUID) -> int | None:
+        """The next episode to write in the active batch, or ``None`` when complete."""
+        async with self._connection() as connection:
+            plans = await self._episode_plans(connection, run_id)
+            batch = await self._fetch_script_batch_lineage(connection, run_id)
+            if batch is None or batch["status"] != "active":
+                return plans[0].episode_number if plans else None
+            committed = {int(key) for key in json.loads(batch["active_pointers_json"])}
+        return next(
+            (plan.episode_number for plan in plans if plan.episode_number not in committed),
+            None,
+        )
+
+    async def create_script_batch(
+        self,
+        run_id: UUID,
+        *,
+        design_candidate_id: str,
+        design_content_hash: str,
+        design_epoch: int,
+        now: datetime | None = None,
+    ) -> ScriptBatchLineage:
+        """Create or return the active design-bound script batch for one run.
+
+        When the active design identity changes, the prior active batch and every
+        active candidate are superseded and the active episode projection is reset,
+        starting a fresh batch at episode 1 (FSW-A7).
+        """
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            run = await self._fetchone(
+                connection,
+                "SELECT id, kind, creation_id FROM runs WHERE id = ?",
+                (str(run_id),),
+            )
+            if run is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            prior = await self._fetch_script_batch_lineage(connection, run_id)
+            if prior is not None and prior["status"] == "active":
+                if (
+                    prior["design_candidate_id"] == design_candidate_id
+                    and prior["design_content_hash"] == design_content_hash
+                    and prior["design_epoch"] == design_epoch
+                ):
+                    return self._script_batch_lineage_from_row(prior)
+                await self._supersede_active_batch(connection, run_id, prior, timestamp)
+            batch_epoch = int(prior["batch_epoch"]) + 1 if prior is not None else 1
+            batch_id = new_batch_id()
+            await connection.execute(
+                """
+                INSERT INTO script_batches(
+                    batch_id, run_id, creation_id, run_kind, batch_epoch, status,
+                    design_candidate_id, design_content_hash, design_epoch,
+                    active_pointers_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, '{}', ?)
+                """,
+                (
+                    batch_id,
+                    str(run_id),
+                    str(run["creation_id"]),
+                    run["kind"],
+                    batch_epoch,
+                    design_candidate_id,
+                    design_content_hash,
+                    design_epoch,
+                    timestamp,
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_episode = NULL,
+                    timeout_stage = NULL,
+                    timeout_count = 0,
+                    recovery_reason = 'none',
+                    content_repair_count = NULL,
+                    pause_message = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, str(run_id)),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, str(run["creation_id"])),
+            )
+            stored = await self._fetch_script_batch_lineage(connection, run_id)
+        return self._script_batch_lineage_from_row(stored)
+
+    async def commit_episode_candidate(
+        self,
+        run_id: UUID,
+        *,
+        episode_number: int,
+        content: str,
+        episode_lock: EpisodeLock,
+        call_id: str,
+        writer_notes: str,
+        now: datetime | None = None,
+    ) -> EpisodeCandidate:
+        """Transactional/CAS commit of one immutable episode candidate.
+
+        The candidate is deterministically validated against the retained active
+        prefix and may advance the active pointer only when it binds the current
+        active design batch, matches the active predecessor pointer, and carries
+        the next version. A failing or late candidate never moves a pointer
+        (FSW-A8/A9).
+        """
+        if not content.strip():
+            raise DomainError(
+                "invalid_episode_draft",
+                "An episode draft must contain content.",
+                409,
+            )
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            run = await self._fetchone(
+                connection,
+                "SELECT state, creation_id FROM runs WHERE id = ?",
+                (str(run_id),),
+            )
+            if run is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if run["state"] != "running":
+                raise DomainError("run_not_running", "Workflow run is not running.", 409)
+            batch_row = await self._fetch_script_batch_lineage(connection, run_id)
+            if batch_row is None or batch_row["status"] != "active":
+                raise DomainError(
+                    "episode_batch_missing",
+                    "A design-bound active script batch is required before committing an episode.",
+                    409,
+                )
+            batch = self._script_batch_lineage_from_row(batch_row)
+            active_pointers = json.loads(batch_row["active_pointers_json"])
+            committed = {int(key): value for key, value in active_pointers.items()}
+            plans = await self._episode_plans(connection, run_id)
+            plan_numbers = [plan.episode_number for plan in plans]
+            if episode_number not in plan_numbers:
+                raise DomainError(
+                    "episode_not_planned",
+                    "The episode is not in the approved outline.",
+                    409,
+                )
+            first_unfinished = next(
+                (number for number in plan_numbers if number not in committed),
+                None,
+            )
+            if episode_number != first_unfinished:
+                raise DomainError(
+                    "episode_out_of_order",
+                    "Only the first unfinished episode can be committed.",
+                    409,
+                )
+            contract, contract_hash = await self._design_contract_for_batch(connection, batch)
+            if episode_number == 1:
+                prior_state = initial_series_state(contract, contract_hash)
+                predecessor_id = None
+                predecessor_hash = None
+            else:
+                predecessor_id = committed[episode_number - 1]
+                predecessor_row = await self._fetch_episode_candidate(
+                    connection,
+                    run_id,
+                    predecessor_id,
+                )
+                if predecessor_row is None or predecessor_row["status"] != "active":
+                    raise DomainError(
+                        "episode_predecessor_missing",
+                        "The active predecessor candidate is missing.",
+                        409,
+                    )
+                predecessor_hash = predecessor_row["content_sha256"]
+                prior_state = SeriesState.model_validate_json(predecessor_row["series_state_json"])
+            existing_versions = await self._episode_candidate_versions(
+                connection,
+                batch.batch_id,
+                episode_number,
+            )
+            version = max(existing_versions, default=0) + 1
+            try:
+                candidate = build_episode_candidate(
+                    run_id=str(run_id),
+                    run_kind=batch.run_kind,
+                    batch=batch,
+                    contract=contract,
+                    prior_state=prior_state,
+                    episode_number=episode_number,
+                    version=version,
+                    predecessor_candidate_id=predecessor_id,
+                    predecessor_sha256=predecessor_hash,
+                    content=content,
+                    delta=episode_lock.state_delta,
+                    semantic_review=episode_lock.semantic_review,
+                    repair_rounds=episode_lock.repair_rounds,
+                    call_id=call_id,
+                    writer_notes=writer_notes,
+                    now=_datetime(timestamp),
+                )
+            except ContinuityViolation as exc:
+                raise DomainError(
+                    "episode_candidate_invalid",
+                    exc.evidence,
+                    409,
+                ) from exc
+            await self._insert_episode_candidate(connection, candidate, timestamp)
+            new_pointers = {**active_pointers, str(episode_number): candidate.candidate_id}
+            await connection.execute(
+                """
+                UPDATE script_batches
+                SET active_pointers_json = ?
+                WHERE batch_id = ? AND status = 'active'
+                """,
+                (_json(new_pointers), batch.batch_id),
+            )
+            await connection.execute(
+                """
+                UPDATE episode_candidates
+                SET status = 'active', activated_at = ?
+                WHERE candidate_id = ? AND status = 'unvalidated'
+                """,
+                (timestamp, candidate.candidate_id),
+            )
+            await self._upsert_active_draft_projection(
+                connection,
+                run_id,
+                candidate,
+            )
+            next_unfinished = next(
+                (number for number in plan_numbers if str(number) not in new_pointers),
+                None,
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    current_episode = ?,
+                    timeout_stage = NULL,
+                    timeout_count = 0,
+                    recovery_reason = 'none',
+                    content_repair_count = NULL,
+                    pause_message = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                    next_unfinished,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, str(run["creation_id"])),
+            )
+            stored = await self._fetch_episode_candidate(connection, run_id, candidate.candidate_id)
+        return self._episode_candidate_from_row(stored)
+
+    async def record_stale_episode_candidate(
+        self,
+        run_id: UUID,
+        *,
+        episode_number: int,
+        content: str,
+        episode_lock: EpisodeLock,
+        call_id: str,
+        writer_notes: str,
+        now: datetime | None = None,
+    ) -> EpisodeCandidate:
+        """Retain one generation that did not advance the active pointer as stale evidence.
+
+        A late or superseded generation is stored with its usage lineage and status
+        ``stale`` and can never change any active pointer (FSW-A9).
+        """
+        if not content.strip():
+            raise DomainError(
+                "invalid_episode_draft",
+                "An episode draft must contain content.",
+                409,
+            )
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            batch_row = await self._fetch_script_batch_lineage(connection, run_id)
+            if batch_row is None:
+                raise DomainError(
+                    "episode_batch_missing",
+                    "A design-bound script batch is required to record stale evidence.",
+                    409,
+                )
+            batch = self._script_batch_lineage_from_row(batch_row)
+            existing_versions = await self._episode_candidate_versions(
+                connection,
+                batch.batch_id,
+                episode_number,
+            )
+            version = max(existing_versions, default=0) + 1
+            active_pointers = json.loads(batch_row["active_pointers_json"])
+            predecessor_id = None
+            predecessor_hash = None
+            if episode_number > 1 and str(episode_number - 1) in active_pointers:
+                predecessor_id = active_pointers[str(episode_number - 1)]
+                predecessor_row = await self._fetch_episode_candidate(
+                    connection,
+                    run_id,
+                    predecessor_id,
+                )
+                predecessor_hash = (
+                    predecessor_row["content_sha256"] if predecessor_row is not None else None
+                )
+            candidate = EpisodeCandidate(
+                candidate_id=new_candidate_id(),
+                batch_id=batch.batch_id,
+                batch_epoch=batch.batch_epoch,
+                run_id=str(run_id),
+                design_candidate_id=batch.design_candidate_id,
+                design_content_hash=batch.design_content_hash,
+                design_epoch=batch.design_epoch,
+                episode_number=episode_number,
+                version=version,
+                content=content,
+                content_sha256=_text_hash(content),
+                predecessor_candidate_id=predecessor_id,
+                predecessor_sha256=predecessor_hash,
+                call_id=call_id,
+                writer_notes=writer_notes,
+                state_delta=episode_lock.state_delta,
+                series_state=episode_lock.series_state,
+                series_state_sha256=episode_lock.series_state_sha256,
+                semantic_review=episode_lock.semantic_review,
+                repair_rounds=episode_lock.repair_rounds,
+                status="stale",
+                created_at=_datetime(timestamp),
+            )
+            await self._insert_episode_candidate(connection, candidate, timestamp)
+            stored = await self._fetch_episode_candidate(connection, run_id, candidate.candidate_id)
+        return self._episode_candidate_from_row(stored)
+
+    async def rewrite_episode_suffix(
+        self,
+        run_id: UUID,
+        from_episode: int,
+        *,
+        now: datetime | None = None,
+    ) -> Mapping[str, Any]:
+        """Preserve active 1..N-1, supersede every active candidate N..end, replay state.
+
+        The returned mapping carries the next episode to write, the folded
+        SeriesState replayed strictly from the retained prefix, and the retained
+        prefix candidate list. No event, knowledge, obligation, or state delta from
+        the superseded suffix enters the replayed context (FSW-A5/A6).
+        """
+        if from_episode < 1:
+            raise ValueError("Suffix rewrite requires an episode number >= 1")
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            run = await self._fetchone(
+                connection,
+                "SELECT id, creation_id FROM runs WHERE id = ?",
+                (str(run_id),),
+            )
+            if run is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            batch_row = await self._fetch_script_batch_lineage(connection, run_id)
+            if batch_row is None or batch_row["status"] != "active":
+                raise DomainError(
+                    "episode_batch_missing",
+                    "An active script batch is required for suffix rewrite.",
+                    409,
+                )
+            plans = await self._episode_plans(connection, run_id)
+            plan_numbers = [plan.episode_number for plan in plans]
+            if from_episode not in plan_numbers:
+                raise DomainError(
+                    "episode_not_planned",
+                    "The rewrite target is not in the approved outline.",
+                    409,
+                )
+            active_pointers = json.loads(batch_row["active_pointers_json"])
+            for episode, candidate_id in sorted(active_pointers.items()):
+                if int(episode) >= from_episode:
+                    await connection.execute(
+                        """
+                        UPDATE episode_candidates
+                        SET status = 'superseded', superseded_at = ?
+                        WHERE candidate_id = ? AND status = 'active'
+                        """,
+                        (timestamp, candidate_id),
+                    )
+            new_pointers = {
+                key: value for key, value in active_pointers.items() if int(key) < from_episode
+            }
+            await connection.execute(
+                """
+                UPDATE script_batches
+                SET active_pointers_json = ?
+                WHERE batch_id = ? AND status = 'active'
+                """,
+                (_json(new_pointers), batch_row["batch_id"]),
+            )
+            await connection.execute(
+                """
+                DELETE FROM episode_drafts
+                WHERE run_id = ? AND episode_number >= ?
+                """,
+                (str(run_id), from_episode),
+            )
+            prefix_candidates: list[EpisodeCandidate] = []
+            if from_episode == 1:
+                batch = self._script_batch_lineage_from_row(batch_row)
+                contract, contract_hash = await self._design_contract_for_batch(connection, batch)
+                prior_state = initial_series_state(contract, contract_hash)
+            else:
+                for episode in range(1, from_episode):
+                    candidate_id = new_pointers.get(str(episode))
+                    if candidate_id is None:
+                        raise DomainError(
+                            "episode_predecessor_missing",
+                            "The retained prefix candidate is missing.",
+                            409,
+                        )
+                    row = await self._fetch_episode_candidate(connection, run_id, candidate_id)
+                    if row is None:
+                        raise DomainError(
+                            "episode_predecessor_missing",
+                            "The retained prefix candidate is missing.",
+                            409,
+                        )
+                    prefix_candidates.append(self._episode_candidate_from_row(row))
+                prior_state = prefix_candidates[-1].series_state
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    current_episode = ?,
+                    timeout_stage = NULL,
+                    timeout_count = 0,
+                    recovery_reason = 'none',
+                    content_repair_count = NULL,
+                    pause_message = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                    from_episode,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, str(run["creation_id"])),
+            )
+            updated_batch = await self._fetch_script_batch_lineage(connection, run_id)
+        return {
+            "batch": self._script_batch_lineage_from_row(updated_batch),
+            "next_episode": from_episode,
+            "prior_state": prior_state,
+            "prefix_candidates": prefix_candidates,
+        }
+
+    async def _supersede_active_batch(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+        batch_row: aiosqlite.Row,
+        timestamp: str,
+    ) -> None:
+        await connection.execute(
+            """
+            UPDATE script_batches
+            SET status = 'superseded', superseded_at = ?
+            WHERE batch_id = ? AND status = 'active'
+            """,
+            (timestamp, batch_row["batch_id"]),
+        )
+        await connection.execute(
+            """
+            UPDATE episode_candidates
+            SET status = 'superseded', superseded_at = COALESCE(superseded_at, ?)
+            WHERE batch_id = ? AND status = 'active'
+            """,
+            (timestamp, batch_row["batch_id"]),
+        )
+        await connection.execute(
+            "DELETE FROM episode_drafts WHERE run_id = ?",
+            (str(run_id),),
+        )
+
+    async def _insert_episode_candidate(
+        self,
+        connection: aiosqlite.Connection,
+        candidate: EpisodeCandidate,
+        timestamp: str,
+    ) -> None:
+        await connection.execute(
+            """
+            INSERT INTO episode_candidates(
+                candidate_id, batch_id, batch_epoch, run_id,
+                design_candidate_id, design_content_hash, design_epoch,
+                episode_number, version, content, content_sha256,
+                predecessor_candidate_id, predecessor_sha256, call_id, writer_notes,
+                state_delta_json, series_state_json, series_state_sha256,
+                semantic_review_json, repair_rounds, status, created_at,
+                activated_at, superseded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                candidate.candidate_id,
+                candidate.batch_id,
+                candidate.batch_epoch,
+                candidate.run_id,
+                candidate.design_candidate_id,
+                candidate.design_content_hash,
+                candidate.design_epoch,
+                candidate.episode_number,
+                candidate.version,
+                candidate.content,
+                candidate.content_sha256,
+                candidate.predecessor_candidate_id,
+                candidate.predecessor_sha256,
+                candidate.call_id,
+                candidate.writer_notes,
+                _json(candidate.state_delta),
+                _json(candidate.series_state),
+                candidate.series_state_sha256,
+                _json(candidate.semantic_review) if candidate.semantic_review is not None else None,
+                candidate.repair_rounds,
+                candidate.status,
+                _timestamp(candidate.created_at),
+                _timestamp(candidate.activated_at) if candidate.activated_at is not None else None,
+                (
+                    _timestamp(candidate.superseded_at)
+                    if candidate.superseded_at is not None
+                    else None
+                ),
+            ),
+        )
+
+    async def _upsert_active_draft_projection(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+        candidate: EpisodeCandidate,
+    ) -> None:
+        await connection.execute(
+            """
+            INSERT INTO episode_drafts(
+                run_id, episode_number, content, content_sha256, completed_at,
+                contract_sha256, state_delta_json, series_state_json,
+                series_state_sha256, semantic_review_json, repair_rounds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, episode_number) DO UPDATE SET
+                content = excluded.content,
+                content_sha256 = excluded.content_sha256,
+                completed_at = excluded.completed_at,
+                contract_sha256 = excluded.contract_sha256,
+                state_delta_json = excluded.state_delta_json,
+                series_state_json = excluded.series_state_json,
+                series_state_sha256 = excluded.series_state_sha256,
+                semantic_review_json = excluded.semantic_review_json,
+                repair_rounds = excluded.repair_rounds
+            """,
+            (
+                str(run_id),
+                candidate.episode_number,
+                candidate.content,
+                candidate.content_sha256,
+                _timestamp(candidate.created_at),
+                candidate.state_delta.contract_sha256,
+                _json(candidate.state_delta),
+                _json(candidate.series_state),
+                candidate.series_state_sha256,
+                _json(candidate.semantic_review),
+                candidate.repair_rounds,
+            ),
+        )
+
+    async def _design_contract_for_batch(
+        self,
+        connection: aiosqlite.Connection,
+        batch: ScriptBatchLineage,
+    ) -> tuple[StoryContract, str]:
+        row = await self._fetchone(
+            connection,
+            "SELECT content_json FROM series_bible_candidates WHERE candidate_id = ?",
+            (batch.design_candidate_id,),
+        )
+        if row is None:
+            raise DomainError(
+                "series_bible_candidate_not_found",
+                "The active design candidate is missing.",
+                409,
+            )
+        content = SeriesBibleContent.model_validate(json.loads(row["content_json"]))
+        contract = content.story_contract
+        return contract, story_contract_sha256(contract)
+
+    async def _episode_candidate_versions(
+        self,
+        connection: aiosqlite.Connection,
+        batch_id: str,
+        episode_number: int,
+    ) -> list[int]:
+        cursor = await connection.execute(
+            """
+            SELECT version
+            FROM episode_candidates
+            WHERE batch_id = ? AND episode_number = ?
+            """,
+            (batch_id, episode_number),
+        )
+        return [int(row["version"]) for row in await cursor.fetchall()]
+
+    @staticmethod
+    async def _fetch_script_batch_lineage(
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+    ) -> aiosqlite.Row | None:
+        row = await Repository._fetchone(
+            connection,
+            "SELECT * FROM script_batches WHERE run_id = ? AND status = 'active' LIMIT 1",
+            (str(run_id),),
+        )
+        if row is not None:
+            return row
+        return await Repository._fetchone(
+            connection,
+            "SELECT * FROM script_batches WHERE run_id = ? ORDER BY batch_epoch DESC LIMIT 1",
+            (str(run_id),),
+        )
+
+    @staticmethod
+    async def _fetch_episode_candidate(
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+        candidate_id: str,
+    ) -> aiosqlite.Row | None:
+        return await Repository._fetchone(
+            connection,
+            "SELECT * FROM episode_candidates WHERE run_id = ? AND candidate_id = ?",
+            (str(run_id), candidate_id),
+        )
+
+    @staticmethod
+    def _script_batch_lineage_from_row(row: aiosqlite.Row) -> ScriptBatchLineage:
+        return ScriptBatchLineage(
+            batch_id=row["batch_id"],
+            run_id=row["run_id"],
+            run_kind=row["run_kind"],
+            batch_epoch=int(row["batch_epoch"]),
+            status=row["status"],
+            design_candidate_id=row["design_candidate_id"],
+            design_content_hash=row["design_content_hash"],
+            design_epoch=int(row["design_epoch"]),
+            active_pointers={
+                int(key): value for key, value in json.loads(row["active_pointers_json"]).items()
+            },
+            created_at=_datetime(row["created_at"]),
+            superseded_at=(_datetime(row["superseded_at"]) if row["superseded_at"] else None),
+        )
+
+    @staticmethod
+    def _episode_candidate_from_row(row: aiosqlite.Row) -> EpisodeCandidate:
+        return EpisodeCandidate(
+            candidate_id=row["candidate_id"],
+            batch_id=row["batch_id"],
+            batch_epoch=int(row["batch_epoch"]),
+            run_id=row["run_id"],
+            design_candidate_id=row["design_candidate_id"],
+            design_content_hash=row["design_content_hash"],
+            design_epoch=int(row["design_epoch"]),
+            episode_number=int(row["episode_number"]),
+            version=int(row["version"]),
+            content=row["content"],
+            content_sha256=row["content_sha256"],
+            predecessor_candidate_id=row["predecessor_candidate_id"],
+            predecessor_sha256=row["predecessor_sha256"],
+            call_id=row["call_id"],
+            writer_notes=row["writer_notes"] or "",
+            state_delta=EpisodeStateDelta.model_validate_json(row["state_delta_json"]),
+            series_state=SeriesState.model_validate_json(row["series_state_json"]),
+            series_state_sha256=row["series_state_sha256"],
+            semantic_review=(
+                SemanticReview.model_validate_json(row["semantic_review_json"])
+                if row["semantic_review_json"] is not None
+                else None
+            ),
+            repair_rounds=(int(row["repair_rounds"]) if row["repair_rounds"] is not None else None),
+            status=row["status"],
+            created_at=_datetime(row["created_at"]),
+            activated_at=(_datetime(row["activated_at"]) if row["activated_at"] else None),
+            superseded_at=(_datetime(row["superseded_at"]) if row["superseded_at"] else None),
+        )
 
     async def _fetch_series_bible_candidate(
         self,

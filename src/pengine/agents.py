@@ -29,7 +29,6 @@ from pydantic import Field, JsonValue, ValidationError, field_validator, model_v
 
 from pengine.continuity import (
     ContinuityViolation,
-    EpisodeLock,
     EpisodeStateDelta,
     SemanticReview,
     StoryContract,
@@ -58,6 +57,7 @@ from pengine.schemas import (
     StrictModel,
     WorkflowResult,
 )
+from pengine.series_bible import SeriesBibleSummary
 from pengine.skill_assets import load_agent_skill_files
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,9 @@ StageHook = Callable[[InternalStage], Awaitable[int]]
 CheckpointHook = Callable[[InternalStage, Mapping[str, Any]], Awaitable[None]]
 ReferenceRetriever = Callable[[str], Awaitable[str]]
 EpisodeAttemptHook = Callable[[EpisodePlan], Awaitable[int]]
-EpisodeCommitHook = Callable[[int, str, EpisodeLock | None], Awaitable[EpisodeDraft]]
+# ``commit_episode`` may carry ``call_id`` / ``writer_notes`` keyword arguments
+# used to bind each generation to its immutable episode candidate (FSW-A3).
+EpisodeCommitHook = Callable[..., Awaitable[EpisodeDraft]]
 EpisodeAssemblyHook = Callable[[], Awaitable[str]]
 EpisodeDeadlineReset = Callable[[], Awaitable[None]]
 
@@ -433,6 +435,14 @@ class ScriptWriterResult(StrictModel):
             "series state."
         ),
     )
+    writer_notes: str = Field(
+        default="",
+        description=(
+            "Optional bounded workflow notes for the next episode. Advisory only and never "
+            "canonical; keep them under 500 characters and never replace the verbatim prior "
+            "scripts or SeriesState."
+        ),
+    )
 
     @field_validator("state_delta", mode="before")
     @classmethod
@@ -596,6 +606,16 @@ StoryPatchGenerator = Callable[
 
 class EpisodeReviewerResult(SemanticReview):
     pass
+
+
+def _bounded_writer_notes(prior: str, current: str) -> str:
+    """Accumulate bounded advisory writer notes without ever replacing canon.
+
+    WriterNotes are non-authoritative workflow notes (SDP-5); the accumulated
+    value stays bounded so a long series never grows the context without limit.
+    """
+    combined = "\n".join(part for part in (prior, current) if part)
+    return combined[-2000:]
 
 
 def _merge_episode_reviews(
@@ -2259,6 +2279,7 @@ class StageGuardMiddleware(AgentMiddleware):
         reset_episode_deadline: EpisodeDeadlineReset | None = None,
         generate_outline_patch: OutlinePatchGenerator | None = None,
         generate_story_patch: StoryPatchGenerator | None = None,
+        series_bible: SeriesBibleSummary | None = None,
     ) -> None:
         self.before_stage = before_stage
         self.approve_stage = approve_stage
@@ -2274,6 +2295,7 @@ class StageGuardMiddleware(AgentMiddleware):
         self.reset_episode_deadline = reset_episode_deadline
         self.generate_outline_patch = generate_outline_patch
         self.generate_story_patch = generate_story_patch
+        self.series_bible = series_bible
 
     async def awrap_tool_call(
         self,
@@ -3164,6 +3186,7 @@ class StageGuardMiddleware(AgentMiddleware):
             ) from exc
 
         last_result: ToolMessage | Command[Any] | None = None
+        writer_notes = ""
         for plan in plans:
             if plan.episode_number in self.episode_drafts:
                 continue
@@ -3188,12 +3211,27 @@ class StageGuardMiddleware(AgentMiddleware):
                 f"/workspace/episodes/ep{number}.md": draft.content
                 for number, draft in sorted(self.episode_drafts.items())
             }
+            if self.series_bible is not None:
+                projections = self.series_bible.projections
+                episode_files.update(
+                    {
+                        "/workspace/series_bible/story_outline.md": projections.story_outline,
+                        "/workspace/series_bible/character_biographies.md": (
+                            projections.character_biographies
+                        ),
+                        "/workspace/series_bible/relationship_logic.md": (
+                            projections.relationship_logic
+                        ),
+                        "/workspace/series_bible/episode_outline.md": projections.episode_outline,
+                    }
+                )
             episode_files.update(
                 {
                     "/workspace/story_contract.json": contract_json,
                     "/workspace/story_contract.md": outline["story_contract_markdown"],
                     "/workspace/series_state.json": prior_state.model_dump_json(),
                     "/workspace/previous_episode_handoff.md": prior_state.handoff or "None",
+                    "/workspace/writer_notes.md": writer_notes or "None",
                 }
             )
             episode_request = _request_with_files(
@@ -3302,9 +3340,11 @@ class StageGuardMiddleware(AgentMiddleware):
                         plan.episode_number,
                         parsed.content,
                         episode_lock,
+                        writer_notes=parsed.writer_notes,
                     )
                     self.episode_drafts[plan.episode_number] = committed
                     prior_state = episode_lock.series_state
+                    writer_notes = _bounded_writer_notes(writer_notes, parsed.writer_notes)
                     last_result = result
                     break
                 if repair_rounds >= 2:
@@ -3409,6 +3449,7 @@ class DeepAgentWorkflow:
         output_language: OutputLanguage | None | object = _INFER_OUTPUT_LANGUAGE,
         feedback: str | None = None,
         retrieve_references: ReferenceRetriever | None = None,
+        series_bible: SeriesBibleSummary | None = None,
     ) -> WorkflowResult:
         approved_payloads: dict[InternalStage, Any] = {
             stage: payload for stage, payload in (approved_checkpoints or {}).items()
@@ -3738,6 +3779,7 @@ class DeepAgentWorkflow:
                     reset_episode_deadline=reset_episode_deadline,
                     generate_outline_patch=generate_outline_patch,
                     generate_story_patch=generate_story_patch,
+                    series_bible=series_bible,
                 )
             ],
             subagents=subagents,
