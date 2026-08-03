@@ -68,10 +68,18 @@ from pengine.schemas import (
     UserStage,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
+
+_EXTENDED_REPAIR_STAGES = frozenset(
+    {
+        InternalStage.GENERATING_STORY_OUTLINE,
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+    }
+)
 
 RecoveryReason = Literal[
     "run_timeout",
@@ -575,6 +583,112 @@ WHERE state = 'failed'
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (7);
 """
 
+_SCHEMA_V9_CONTENT_REJECTIONS_SQL = """
+CREATE TABLE content_rejections_v9 (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK (
+        stage IN (
+            'generating_story_outline',
+            'generating_character_biographies',
+            'generating_relationship_logic',
+            'generating_episode_outline',
+            'generating_episode_scripts'
+        )
+    ),
+    episode_number INTEGER,
+    repair_rounds INTEGER NOT NULL CHECK (repair_rounds = 2),
+    evidence TEXT NOT NULL,
+    rejected_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, stage, episode_number, rejected_at),
+    CHECK (
+        (
+            stage = 'generating_episode_scripts'
+            AND episode_number IS NOT NULL
+            AND episode_number >= 1
+        )
+        OR (
+            stage != 'generating_episode_scripts'
+            AND episode_number IS NULL
+        )
+    )
+)
+"""
+
+_SCHEMA_V10_RUN_PROGRESS_SQL = """
+CREATE TABLE run_progress_v10 (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    current_stage TEXT NOT NULL,
+    execution_state TEXT NOT NULL CHECK (
+        execution_state IN (
+            'queued', 'running', 'auto_resuming', 'paused',
+            'quality_rejected', 'ended', 'succeeded', 'failed'
+        )
+    ),
+    elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (elapsed_seconds >= 0),
+    active_started_at TEXT,
+    timeout_stage TEXT,
+    timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+    updated_at TEXT NOT NULL,
+    current_episode INTEGER CHECK (current_episode IS NULL OR current_episode >= 1),
+    recovery_reason TEXT NOT NULL DEFAULT 'none' CHECK (
+        recovery_reason IN (
+            'none', 'run_timeout', 'relay_interruption', 'content_rejected',
+            'episode_error'
+        )
+    ),
+    content_repair_count INTEGER CHECK (
+        content_repair_count IS NULL
+        OR content_repair_count BETWEEN 2 AND 6
+    ),
+    pause_message TEXT
+)
+"""
+
+_SCHEMA_V10_CONTENT_REJECTIONS_SQL = """
+CREATE TABLE content_rejections_v10 (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK (
+        stage IN (
+            'generating_story_outline',
+            'generating_character_biographies',
+            'generating_relationship_logic',
+            'generating_episode_outline',
+            'generating_episode_scripts'
+        )
+    ),
+    episode_number INTEGER,
+    repair_rounds INTEGER NOT NULL,
+    evidence TEXT NOT NULL,
+    rejected_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, stage, episode_number, rejected_at),
+    CHECK (
+        (
+            stage IN (
+                'generating_story_outline',
+                'generating_character_biographies',
+                'generating_relationship_logic'
+            )
+            AND repair_rounds BETWEEN 2 AND 6
+        )
+        OR (
+            stage IN ('generating_episode_outline', 'generating_episode_scripts')
+            AND repair_rounds = 2
+        )
+    ),
+    CHECK (
+        (
+            stage = 'generating_episode_scripts'
+            AND episode_number IS NOT NULL
+            AND episode_number >= 1
+        )
+        OR (
+            stage != 'generating_episode_scripts'
+            AND episode_number IS NULL
+        )
+    )
+)
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -840,6 +954,84 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 8
+            if schema_version == 8:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.execute(_SCHEMA_V9_CONTENT_REJECTIONS_SQL)
+                    await connection.execute(
+                        """
+                        INSERT INTO content_rejections_v9(
+                            run_id, stage, episode_number, repair_rounds,
+                            evidence, rejected_at
+                        )
+                        SELECT
+                            run_id, stage, episode_number, repair_rounds,
+                            evidence, rejected_at
+                        FROM content_rejections
+                        """
+                    )
+                    await connection.execute("DROP TABLE content_rejections")
+                    await connection.execute(
+                        "ALTER TABLE content_rejections_v9 RENAME TO content_rejections"
+                    )
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (9)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 9
+            if schema_version == 9:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.execute("DROP TABLE IF EXISTS run_progress_v10")
+                    await connection.execute(_SCHEMA_V10_RUN_PROGRESS_SQL)
+                    await connection.execute(
+                        """
+                        INSERT INTO run_progress_v10(
+                            run_id, current_stage, execution_state, elapsed_seconds,
+                            active_started_at, timeout_stage, timeout_count, updated_at,
+                            current_episode, recovery_reason, content_repair_count, pause_message
+                        )
+                        SELECT
+                            run_id, current_stage, execution_state, elapsed_seconds,
+                            active_started_at, timeout_stage, timeout_count, updated_at,
+                            current_episode, recovery_reason, content_repair_count, pause_message
+                        FROM run_progress
+                        """
+                    )
+                    await connection.execute("DROP TABLE run_progress")
+                    await connection.execute("ALTER TABLE run_progress_v10 RENAME TO run_progress")
+
+                    await connection.execute("DROP TABLE IF EXISTS content_rejections_v10")
+                    await connection.execute(_SCHEMA_V10_CONTENT_REJECTIONS_SQL)
+                    await connection.execute(
+                        """
+                        INSERT INTO content_rejections_v10(
+                            run_id, stage, episode_number, repair_rounds,
+                            evidence, rejected_at
+                        )
+                        SELECT
+                            run_id, stage, episode_number, repair_rounds,
+                            evidence, rejected_at
+                        FROM content_rejections
+                        """
+                    )
+                    await connection.execute("DROP TABLE content_rejections")
+                    await connection.execute(
+                        "ALTER TABLE content_rejections_v10 RENAME TO content_rejections"
+                    )
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (10)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 10
 
     async def setup(self) -> None:
         await self.initialize()
@@ -1666,14 +1858,22 @@ class Repository:
         now: datetime | None = None,
     ) -> None:
         if stage not in {
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+            InternalStage.GENERATING_RELATIONSHIP_LOGIC,
             InternalStage.GENERATING_EPISODE_OUTLINE,
             InternalStage.GENERATING_EPISODE_SCRIPTS,
         }:
-            raise ValueError("Only contract or episode generation can pause for content review")
-        if repair_rounds != 2 or not evidence.strip():
-            raise ValueError("Content rejection requires two repair rounds and evidence")
+            raise ValueError("Only story text or episode generation can pause for content review")
+        allowed_repair_rounds = set(range(2, 7)) if stage in _EXTENDED_REPAIR_STAGES else {2}
+        if repair_rounds not in allowed_repair_rounds or not evidence.strip():
+            raise ValueError(
+                "Story content rejection requires two to six repair rounds and evidence"
+                if stage in _EXTENDED_REPAIR_STAGES
+                else "Episode content rejection requires two repair rounds and evidence"
+            )
         if (stage is InternalStage.GENERATING_EPISODE_SCRIPTS) != (episode_number is not None):
-            raise ValueError("Episode content rejection requires its episode number")
+            raise ValueError("Episode number is required only for episode script rejection")
         current = now or _utc_now()
         timestamp = _timestamp(current)
         async with self._transaction() as connection:

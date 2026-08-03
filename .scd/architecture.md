@@ -21,14 +21,17 @@ against the same immutable persona snapshot.
 The system is a modular monolith. It binds only to loopback, serves one
 same-origin single-page workbench plus a JSON HTTP API, persists durable state
 in SQLite, and runs one embedded background worker. The worker drives a Deep
-Agents/LangGraph creative runtime through one Anthropic Messages
-API-compatible relay.
+Agents/LangGraph creative runtime through two fixed role routes that share one
+relay URL and API key: Anthropic Messages with `claude-opus-5` for generation
+and creative repair, and DeepSeek OpenAI-compatible chat completions with
+`deepseek-v4-flash` for review.
 
 V1 does not include authentication, multi-user isolation, public deployment,
-multiple model protocols, production persona authoring, automatic persona
-learning, cross-creation writable memory, asynchronous or remote subagents,
-host filesystem or shell access, task listing/export/deletion, streaming
-transport, partial-result preview, or deployment automation.
+operator-selectable model roles or providers, production persona authoring,
+automatic persona learning, cross-creation writable memory, asynchronous or
+remote subagents, host filesystem or shell access, task
+listing/export/deletion, streaming transport, partial-result preview, or
+deployment automation.
 
 ## Domain model
 
@@ -118,14 +121,20 @@ four primary synchronous subagents:
 - `quality_reviewer` produces structured L0/L4 evidence and revision-feedback
   coverage.
 
+The `workflow_supervisor`, `story_architect`, `episode_planner`,
+`script_writer`, direct story/outline patch generators, and `episode_repair`
+always use the generation route. `quality_reviewer`, `canon_reviewer`, and
+`episode_reviewer` always use the review route. Roles cannot be swapped and do
+not fall back to one another.
+
 The episode-outline result also contains a versioned `StoryContract`, which is
 the sole machine-readable source for cast membership, relationships, typed
 facts and units, temporal order, character knowledge, clue lifecycle, and
 per-episode obligations. The service runs deterministic validation and then a
 fresh `canon_reviewer` model review. A failing candidate may be handled by the
-skill-scoped `canon_repair` subagent at most twice. Only a candidate that passes
-both checks is persisted with its canonical Markdown projection and SHA-256 in
-the approved episode-outline checkpoint.
+generation route's structured outline-patch call at most twice. Only a candidate
+that passes both checks is persisted with its canonical Markdown projection and
+SHA-256 in the approved episode-outline checkpoint.
 
 For each episode, `script_writer` returns both script text and a typed
 `EpisodeStateDelta`. Deterministic validation compares them with the locked
@@ -198,7 +207,7 @@ failed.
 | Synchronous subagents | Stage-scoped creative work, skill-scoped canon/continuity review, and repair candidates | Job scheduling, direct database writes, persona mutation, silent lock mutation |
 | Persona loader | Manifest/schema validation, immutable snapshots, read-only virtual context projection, bounded L5/L6 retrieval | Production persona content |
 | LangGraph checkpointer | Thread messages, plans, subagent results, and `StateBackend` scratch checkpoints | Business checkpoints, public run state, revision entitlement |
-| Relay client | Preconfigured `ChatAnthropic`, Anthropic-compatible request/response mapping, explicit timeouts, safe error mapping | Workflow retry policy, API keys at rest |
+| Relay clients | Role-bound `ChatAnthropic` generation and `ChatDeepSeek` review clients sharing one URL/key, explicit timeouts, model-identity audit, safe error mapping | Workflow retry policy, API keys at rest, cross-role fallback |
 | SQLite repository | Authoritative creation, run, attempt, job, feedback, approved-stage, delivery, catalog, and LangGraph checkpoint tables | Persona source-file ownership |
 
 The process uses one worker and processes one creation job at a time. Deep
@@ -408,11 +417,21 @@ duplicate the full field contract.
 - The API binds to `127.0.0.1` by default and has no authentication in V1.
 - The relay receives the user's story, requirements, selected persona content,
   stage outputs needed for continuation, and validation prompts.
-- `base_url`, `api_key`, and `model_id` are deployment configuration.
-- One process-level `ChatAnthropic` instance is constructed from those values
-  and supplied to the supervisor and registered subagents. The relay must support
-  Anthropic Messages tool use. Supervisor and subagent schemas use LangChain
-  `ToolStrategy` rather than provider-native structured-output extensions.
+- `relay_base_url`, `relay_api_key`, `generation_model_id`, and
+  `review_model_id` are deployment configuration. The two role-specific output
+  caps are optional.
+- The worker atomically constructs both process-level clients from the shared
+  URL/key: `ChatAnthropic` with exactly `claude-opus-5` for generation and
+  creative repair, and `ChatDeepSeek` with exactly `deepseek-v4-flash` for
+  review. Missing either route fails closed before workflow execution; neither
+  client is used as fallback for the other.
+- The relay must support Anthropic Messages tool use and DeepSeek
+  OpenAI-compatible tool use at the configured root. Supervisor and subagent
+  schemas use LangChain `ToolStrategy` rather than provider-native
+  structured-output extensions.
+- `PENGINE_RELAY_ADAPTER`, `PENGINE_RELAY_MODEL_ID`, and
+  `PENGINE_RELAY_MAX_OUTPUT_TOKENS` are obsolete, ignored settings; they cannot
+  configure or override either role.
 - The API key is read from the environment, never returned by the API, stored in
   SQLite, written to logs, or committed.
 - Application logs contain identifiers, states, durations, attempt counts, safe
@@ -421,8 +440,9 @@ duplicate the full field contract.
 - Persona paths are resolved below the configured persona root; absolute paths
   and traversal outside that root are rejected.
 - The default Deep Agents general-purpose subagent is disabled. Only the four
-  primary creative subagents and four skill-scoped review/repair subagents are
-  registered.
+  primary subagents and three skill-scoped review/repair subagents are
+  registered; direct story/outline patch generators are bounded structured
+  generation calls, not additional subagents.
 - `FilesystemBackend`, `LocalShellBackend`, sandbox `execute`, asynchronous or
   remote subagents, arbitrary MCP tools, agent-authored skills, and
   cross-creation writable memory are disabled in V1.
@@ -435,14 +455,21 @@ duplicate the full field contract.
 
 ## Reliability and operations
 
-- `ChatAnthropic.max_retries` is zero and no Deep Agents retry middleware is
-  installed. The worker is the sole owner of the three-attempt budget.
+- Both `ChatAnthropic.max_retries` and `ChatDeepSeek.max_retries` are zero, and
+  no Deep Agents retry middleware is installed. The worker is the sole owner of
+  the three-attempt budget.
 - A finite LangGraph recursion limit and a worker-enforced wall-clock deadline
   bound each run attempt. Graph recursion exhaustion fails with its own stable
   error. A wall-clock timeout and an approved relay interruption share the
   one-auto-resume/then-pause policy and never start an unrecorded model call.
-- Provider-specific prompt caching and beta-only Anthropic features remain
-  disabled until the configured relay smoke test proves compatibility.
+- The generation cap defaults to the Opus 5 maximum of 128,000 output tokens.
+  An unset review cap is not supplemented by Pengine. DeepSeek thinking and
+  parallel tool calls are disabled; provider-specific prompt caching and
+  beta-only Anthropic features remain disabled until both configured relay
+  routes pass smoke testing.
+- Every response must report the model ID configured for its role. A missing or
+  mismatched identity is a terminal protocol incompatibility, not a fallback
+  signal.
 - Each POST command requires an `Idempotency-Key`.
 - The same key and request hash replays the original command response; its
   `resource_url` resolves the resource's current state.
@@ -465,10 +492,11 @@ This is a greenfield V1. The HTTP contract, manifest schema, and SQLite schema
 each carry an explicit version.
 
 The implementation must lock exact tested versions of `deepagents`,
-`langchain-anthropic`, `langgraph`, and `langgraph-checkpoint-sqlite`. Upgrading
-any of them is a deliberate compatibility change requiring the supervisor,
-subagent structured-output, permissions, checkpoint-resume, and relay contract
-tests to pass again. V1 does not track prerelease dependency versions.
+`langchain-anthropic`, `langchain-deepseek`, `langgraph`, and
+`langgraph-checkpoint-sqlite`. Upgrading any of them is a deliberate
+compatibility change requiring the supervisor, subagent structured-output,
+permissions, checkpoint-resume, and relay contract tests to pass again. V1 does
+not track prerelease dependency versions.
 
 Compatible additive HTTP changes may stay within V1. The progress fields and
 run-control commands are additive. Breaking HTTP or persona format changes
@@ -494,6 +522,8 @@ Technology feasibility is grounded in the current official contracts:
   <https://docs.langchain.com/oss/python/langgraph/persistence>
 - `ChatAnthropic` supports a preconfigured model client and structured output:
   <https://docs.langchain.com/oss/python/integrations/chat/anthropic>
+- `ChatDeepSeek` supplies the role-bound DeepSeek OpenAI-compatible client:
+  <https://docs.langchain.com/oss/python/integrations/chat/deepseek>
 
 ## Verification boundaries
 
@@ -507,16 +537,18 @@ Implementation evidence must include:
 - isolated SQLite tests for transactions, leases, checkpoints, and attempt
   exhaustion;
 - Deep Agents integration tests proving the persona-bound supervisor invokes
-  only the four named synchronous subagents, returns structured results, and
+  only the seven registered synchronous subagents, routes each subagent and
+  direct repair call to the fixed model role, returns structured results, and
   cannot access host files, shell, MCP, or cross-thread memory;
 - checkpoint tests proving a stopped run resumes the same `thread_id`, approved
   business stages are not regenerated, and a new revision-attempt run uses a
   new thread;
-- fake-relay tests proving `ChatAnthropic` request mapping, tool-use capability,
-  SDK and middleware retries disabled, structured output validation, bounded
-  agent execution, and safe failures;
-- a configured relay smoke test that separately reports external-service
-  evidence;
+- fake-relay tests proving `ChatAnthropic` generation and `ChatDeepSeek` review
+  request mapping, exact role routing, no fallback, tool-use capability, SDK and
+  middleware retries disabled, structured output validation, bounded agent
+  execution, identity auditing, and safe failures;
+- a configured dual-route relay smoke test that separately reports generation
+  and review external-service evidence;
 - at least two real operator-supplied persona packages before claiming
   persona-selection and persona-effect UAT.
 
@@ -529,10 +561,12 @@ quality.
 
 - Modular monolith, FastAPI/Pydantic HTTP layer, direct SQLite repository, one
   embedded worker, and an embedded Deep Agents/LangGraph creative runtime.
-- One persona-bound `workflow_supervisor`, four primary creative subagents, and
-  four skill-scoped canon/continuity review and repair subagents.
-- A preconfigured LangChain `ChatAnthropic` model uses the operator-supplied
-  `base_url`, `api_key`, and `model_id`, with automatic retries disabled.
+- One persona-bound `workflow_supervisor`, four primary subagents, and three
+  skill-scoped canon/continuity review and repair subagents.
+- Two preconfigured LangChain clients share the operator-supplied relay URL/key:
+  `ChatAnthropic` with `claude-opus-5` for generation and creative repair, and
+  `ChatDeepSeek` with `deepseek-v4-flash` for review. Both disable automatic
+  retries; both routes are required and neither falls back to the other.
 - `AsyncSqliteSaver` provides durable per-run thread checkpoints in the same
   local SQLite database. `StateBackend` provides checkpointed thread scratch.
 - V1 memory is thread-scoped only. Cross-creation writable `StoreBackend` memory
@@ -559,6 +593,6 @@ quality.
   <https://github.com/mindcarver/pengine/issues/1>.
 - Four bundled nine-file persona packages are explicitly non-production
   prototypes; creator-confirmed production persona quality remains unverified.
-- The configured relay has exercised real tool-use and structured-output paths,
-  but a complete workbench initial-plus-revision acceptance run for Issue #10
-  remains required.
+- The configured generation and review relay routes have exercised real tool-use
+  and structured-output paths, but a complete workbench initial-plus-revision
+  acceptance run for Issue #10 remains required.

@@ -144,7 +144,7 @@ def locked_outline_payload():
 
 
 async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository) -> None:
-    assert SCHEMA_VERSION == 8
+    assert SCHEMA_VERSION == 10
     async with repository._connection() as connection:
         journal = await (await connection.execute("PRAGMA journal_mode")).fetchone()
         foreign_keys = await (await connection.execute("PRAGMA foreign_keys")).fetchone()
@@ -311,6 +311,30 @@ async def test_approved_checkpoint_is_immutable_and_blocks_regeneration(
     with pytest.raises(DomainError) as approved:
         await repository.record_stage_attempt(lease.run_id, stage)
     assert approved.value.code == "stage_already_approved"
+
+
+async def test_story_checkpoint_persists_sixth_semantic_repair_round(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    _, lease = await create_and_lease_initial(repository, persona, creation_request)
+    stage = InternalStage.GENERATING_STORY_OUTLINE
+    await repository.record_stage_attempt(lease.run_id, stage)
+    payload = {
+        "stage": stage.value,
+        "content": "经六轮语义修订后通过的故事大纲。",
+        "consistency_review": {
+            "passed": True,
+            "evidence": "第六轮修订后角色与时间线一致。",
+            "issues": [],
+        },
+        "consistency_repair_rounds": 6,
+    }
+
+    await repository.approve_business_checkpoint(lease.run_id, stage, payload)
+
+    assert (await repository.get_business_checkpoints(lease.run_id))[stage] == payload
 
 
 async def test_failed_revision_retry_uses_frozen_feedback_and_new_thread(
@@ -967,6 +991,8 @@ async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_draf
             DELETE FROM pengine_schema WHERE version = 6;
             DELETE FROM pengine_schema WHERE version = 7;
             DELETE FROM pengine_schema WHERE version = 8;
+            DELETE FROM pengine_schema WHERE version = 9;
+            DELETE FROM pengine_schema WHERE version = 10;
             ALTER TABLE creations DROP COLUMN output_language;
             """
         )
@@ -1451,6 +1477,17 @@ async def test_content_rejection_pauses_with_evidence_without_consuming_writer_a
     )
     await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
 
+    for repair_rounds in (3, 6):
+        with pytest.raises(ValueError, match="Episode content rejection requires two"):
+            await repository.pause_content_rejection(
+                lease.run_id,
+                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                evidence="分集语义审查仍失败。",
+                repair_rounds=repair_rounds,
+                episode_number=1,
+                now=NOW + timedelta(milliseconds=500),
+            )
+
     await repository.pause_content_rejection(
         lease.run_id,
         stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
@@ -1488,6 +1525,117 @@ async def test_content_rejection_pauses_with_evidence_without_consuming_writer_a
     assert resumed.initial.state == "queued"
     assert resumed.initial.progress.recovery_reason == "none"
     assert await repository.get_episode_attempt_counts(lease.run_id) == {1: 1}
+
+
+@pytest.mark.parametrize("repair_rounds", [3, 6])
+async def test_episode_outline_content_rejection_keeps_two_round_limit(
+    repository,
+    persona,
+    creation_request,
+    repair_rounds,
+) -> None:
+    _, lease = await create_and_lease_initial(repository, persona, creation_request)
+    stage = InternalStage.GENERATING_EPISODE_OUTLINE
+    await repository.record_stage_attempt(lease.run_id, stage, now=NOW)
+
+    with pytest.raises(ValueError, match="Episode content rejection requires two"):
+        await repository.pause_content_rejection(
+            lease.run_id,
+            stage=stage,
+            evidence="分集大纲语义审查仍失败。",
+            repair_rounds=repair_rounds,
+            now=NOW + timedelta(seconds=1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage", "user_stage"),
+    [
+        (InternalStage.GENERATING_STORY_OUTLINE, "generating_story_outline"),
+        (
+            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+            "generating_character_biographies",
+        ),
+        (InternalStage.GENERATING_RELATIONSHIP_LOGIC, "generating_relationships"),
+    ],
+)
+async def test_story_text_content_rejection_pauses_and_continues_without_episode(
+    repository,
+    persona,
+    creation_request,
+    stage,
+    user_stage,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.record_stage_attempt(lease.run_id, stage, now=NOW)
+
+    with pytest.raises(ValueError, match="required only for episode script"):
+        await repository.pause_content_rejection(
+            lease.run_id,
+            stage=stage,
+            evidence="故事文本仍有内容冲突。",
+            repair_rounds=2,
+            episode_number=1,
+            now=NOW + timedelta(seconds=1),
+        )
+
+    with pytest.raises(ValueError, match="Story content rejection requires two to six"):
+        await repository.pause_content_rejection(
+            lease.run_id,
+            stage=stage,
+            evidence="故事文本仍有内容冲突。",
+            repair_rounds=7,
+            now=NOW + timedelta(seconds=1),
+        )
+
+    await repository.pause_content_rejection(
+        lease.run_id,
+        stage=stage,
+        evidence="故事文本仍有内容冲突。",
+        repair_rounds=6,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    paused = await repository.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert paused is not None
+    assert paused.initial.state == "paused"
+    assert paused.initial.pause.code == "content_rejected"
+    assert paused.initial.pause.stage == user_stage
+    assert paused.initial.pause.episode_number is None
+    assert paused.initial.progress.can_continue is True
+    assert await repository.get_stage_attempt_counts(lease.run_id) == {stage: 1}
+    async with repository._connection() as connection:
+        rejection = await (
+            await connection.execute(
+                """
+                SELECT stage, episode_number, repair_rounds, evidence
+                FROM content_rejections
+                WHERE run_id = ?
+                """,
+                (str(lease.run_id),),
+            )
+        ).fetchone()
+    assert paused.initial.pause.content_repair_count == 6
+    assert tuple(rejection) == (stage.value, None, 6, "故事文本仍有内容冲突。")
+
+    continued = await repository.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key=f"continue-after-{stage.value}-review",
+        now=NOW + timedelta(seconds=2),
+    )
+    assert continued.run_state == "queued"
+    resumed = await repository.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert resumed is not None
+    assert resumed.initial.state == "queued"
+    assert resumed.initial.progress.recovery_reason == "none"
+    assert await repository.get_stage_attempt_counts(lease.run_id) == {stage: 1}
 
 
 async def test_failed_run_keeps_committed_episode_drafts(
@@ -1677,6 +1825,8 @@ async def test_schema_v6_recovers_legacy_failed_episode_without_replacing_drafts
     async with repository._connection() as connection:
         await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 9")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -1714,6 +1864,8 @@ async def test_schema_v7_creation_is_backfilled_to_chinese_output_language(
     _, lease = await create_and_lease_initial(repository, persona, creation_request)
     async with repository._connection() as connection:
         await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 9")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -1750,6 +1902,8 @@ async def test_schema_v8_migration_resumes_when_column_already_exists(
     _, lease = await create_and_lease_initial(repository, persona, creation_request)
     async with repository._connection() as connection:
         await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 9")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute(
             "UPDATE creations SET output_language = NULL WHERE id = ?",
             (str(lease.creation_id),),
@@ -1761,6 +1915,302 @@ async def test_schema_v8_migration_resumes_when_column_already_exists(
     work = await restarted.get_run_work_item(lease.run_id)
 
     assert work.output_language == "zh-CN"
+
+
+async def test_schema_v8_content_rejections_migrate_without_losing_rows(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        now=NOW,
+    )
+    await repository.pause_content_rejection(
+        lease.run_id,
+        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+        evidence="旧版合同审查证据必须保留。",
+        repair_rounds=2,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    async with repository._connection() as connection:
+        before = await (
+            await connection.execute(
+                """
+                SELECT run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+                FROM content_rejections
+                WHERE run_id = ?
+                """,
+                (str(lease.run_id),),
+            )
+        ).fetchone()
+        await connection.executescript(
+            """
+            CREATE TABLE content_rejections_v8 (
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                stage TEXT NOT NULL CHECK (
+                    stage IN ('generating_episode_outline', 'generating_episode_scripts')
+                ),
+                episode_number INTEGER CHECK (
+                    episode_number IS NULL OR episode_number >= 1
+                ),
+                repair_rounds INTEGER NOT NULL CHECK (repair_rounds = 2),
+                evidence TEXT NOT NULL,
+                rejected_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, stage, episode_number, rejected_at)
+            );
+            INSERT INTO content_rejections_v8(
+                run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+            )
+            SELECT
+                run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+            FROM content_rejections;
+            DROP TABLE content_rejections;
+            ALTER TABLE content_rejections_v8 RENAME TO content_rejections;
+            DELETE FROM pengine_schema WHERE version = 9;
+            DELETE FROM pengine_schema WHERE version = 10;
+            """
+        )
+        await connection.commit()
+
+    restarted = Repository(repository.database_path)
+    await restarted.initialize()
+
+    async with restarted._connection() as connection:
+        after = await (
+            await connection.execute(
+                """
+                SELECT run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+                FROM content_rejections
+                WHERE run_id = ?
+                """,
+                (str(lease.run_id),),
+            )
+        ).fetchone()
+        version = await (
+            await connection.execute("SELECT MAX(version) FROM pengine_schema")
+        ).fetchone()
+        with pytest.raises(sqlite3.IntegrityError):
+            await connection.execute(
+                """
+                INSERT INTO content_rejections(
+                    run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+                ) VALUES (?, 'generating_story_outline', 1, 2, '无效', ?)
+                """,
+                (str(lease.run_id), (NOW + timedelta(seconds=2)).isoformat()),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            await connection.execute(
+                """
+                INSERT INTO content_rejections(
+                    run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+                ) VALUES (?, 'generating_episode_scripts', NULL, 2, '无效', ?)
+                """,
+                (str(lease.run_id), (NOW + timedelta(seconds=3)).isoformat()),
+            )
+
+    assert tuple(after) == tuple(before)
+    assert version[0] == SCHEMA_VERSION
+    continued = await restarted.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-after-v9-migration",
+        now=NOW + timedelta(seconds=4),
+    )
+    assert continued.run_state == "queued"
+
+
+async def test_schema_v9_repair_limits_migrate_without_losing_pause(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    stage = InternalStage.GENERATING_STORY_OUTLINE
+    await repository.record_stage_attempt(lease.run_id, stage, now=NOW)
+    await repository.pause_content_rejection(
+        lease.run_id,
+        stage=stage,
+        evidence="v9 故事审查证据必须保留。",
+        repair_rounds=2,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    async with repository._connection() as connection:
+        before_rejection = await (
+            await connection.execute(
+                """
+                SELECT run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+                FROM content_rejections
+                WHERE run_id = ?
+                """,
+                (str(lease.run_id),),
+            )
+        ).fetchone()
+        await connection.executescript(
+            """
+            CREATE TABLE run_progress_v9_legacy (
+                run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+                current_stage TEXT NOT NULL,
+                execution_state TEXT NOT NULL CHECK (
+                    execution_state IN (
+                        'queued', 'running', 'auto_resuming', 'paused',
+                        'quality_rejected', 'ended', 'succeeded', 'failed'
+                    )
+                ),
+                elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (elapsed_seconds >= 0),
+                active_started_at TEXT,
+                timeout_stage TEXT,
+                timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+                updated_at TEXT NOT NULL,
+                current_episode INTEGER CHECK (
+                    current_episode IS NULL OR current_episode >= 1
+                ),
+                recovery_reason TEXT NOT NULL DEFAULT 'none' CHECK (
+                    recovery_reason IN (
+                        'none', 'run_timeout', 'relay_interruption', 'content_rejected',
+                        'episode_error'
+                    )
+                ),
+                content_repair_count INTEGER CHECK (
+                    content_repair_count IS NULL OR content_repair_count = 2
+                ),
+                pause_message TEXT
+            );
+            INSERT INTO run_progress_v9_legacy(
+                run_id, current_stage, execution_state, elapsed_seconds,
+                active_started_at, timeout_stage, timeout_count, updated_at,
+                current_episode, recovery_reason, content_repair_count, pause_message
+            )
+            SELECT
+                run_id, current_stage, execution_state, elapsed_seconds,
+                active_started_at, timeout_stage, timeout_count, updated_at,
+                current_episode, recovery_reason, content_repair_count, pause_message
+            FROM run_progress;
+            DROP TABLE run_progress;
+            ALTER TABLE run_progress_v9_legacy RENAME TO run_progress;
+
+            CREATE TABLE content_rejections_v9_legacy (
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                stage TEXT NOT NULL CHECK (
+                    stage IN (
+                        'generating_story_outline',
+                        'generating_character_biographies',
+                        'generating_relationship_logic',
+                        'generating_episode_outline',
+                        'generating_episode_scripts'
+                    )
+                ),
+                episode_number INTEGER,
+                repair_rounds INTEGER NOT NULL CHECK (repair_rounds = 2),
+                evidence TEXT NOT NULL,
+                rejected_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, stage, episode_number, rejected_at),
+                CHECK (
+                    (
+                        stage = 'generating_episode_scripts'
+                        AND episode_number IS NOT NULL
+                        AND episode_number >= 1
+                    )
+                    OR (
+                        stage != 'generating_episode_scripts'
+                        AND episode_number IS NULL
+                    )
+                )
+            );
+            INSERT INTO content_rejections_v9_legacy(
+                run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+            )
+            SELECT
+                run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+            FROM content_rejections;
+            DROP TABLE content_rejections;
+            ALTER TABLE content_rejections_v9_legacy RENAME TO content_rejections;
+            DELETE FROM pengine_schema WHERE version = 10;
+            """
+        )
+        await connection.commit()
+
+    restarted = Repository(repository.database_path)
+    await restarted.initialize()
+
+    migrated = await restarted.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert migrated is not None
+    assert migrated.initial.state == "paused"
+    assert migrated.initial.pause.content_repair_count == 2
+    async with restarted._connection() as connection:
+        after_rejection = await (
+            await connection.execute(
+                """
+                SELECT run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+                FROM content_rejections
+                WHERE run_id = ?
+                """,
+                (str(lease.run_id),),
+            )
+        ).fetchone()
+        version = await (
+            await connection.execute("SELECT MAX(version) FROM pengine_schema")
+        ).fetchone()
+    assert tuple(after_rejection) == tuple(before_rejection)
+    assert version[0] == SCHEMA_VERSION
+
+    await restarted.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-after-v10-migration",
+        now=NOW + timedelta(seconds=3),
+    )
+    resumed_lease = await restarted.lease_next_job(
+        worker_id="worker-after-v10",
+        lease_seconds=30,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert resumed_lease is not None and resumed_lease.run_id == lease.run_id
+    await restarted.pause_content_rejection(
+        lease.run_id,
+        stage=stage,
+        evidence="第六轮故事语义修订后仍有冲突。",
+        repair_rounds=6,
+        now=NOW + timedelta(seconds=4),
+    )
+    paused = await restarted.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert paused is not None
+    assert paused.initial.pause.content_repair_count == 6
+
+    async with restarted._connection() as connection:
+        for repair_rounds in (3, 6):
+            with pytest.raises(sqlite3.IntegrityError):
+                await connection.execute(
+                    """
+                    INSERT INTO content_rejections(
+                        run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+                    ) VALUES (?, 'generating_episode_outline', NULL, ?, '不允许', ?)
+                    """,
+                    (
+                        str(lease.run_id),
+                        repair_rounds,
+                        (NOW + timedelta(seconds=repair_rounds + 2)).isoformat(),
+                    ),
+                )
+        with pytest.raises(sqlite3.IntegrityError):
+            await connection.execute(
+                """
+                INSERT INTO content_rejections(
+                    run_id, stage, episode_number, repair_rounds, evidence, rejected_at
+                ) VALUES (?, 'generating_story_outline', NULL, 7, '超过故事上限', ?)
+                """,
+                (str(lease.run_id), (NOW + timedelta(seconds=10)).isoformat()),
+            )
 
 
 async def test_schema_v1_database_is_backfilled_without_losing_creation(
@@ -1783,6 +2233,8 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 9")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.execute("DROP TABLE episode_timeouts")
@@ -1827,6 +2279,8 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 9")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.commit()
@@ -1899,6 +2353,8 @@ async def test_schema_v4_recovery_rows_gain_the_timeout_reason_without_losing_dr
         await connection.execute("DELETE FROM pengine_schema WHERE version = 6")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 7")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 8")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 9")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 10")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 

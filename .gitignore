@@ -7,8 +7,8 @@ __pycache__/
 .coverage
 htmlcov/
 dist/
+.artifacts/
 data/
 *.db
 *.sqlite
 *.sqlite3
-

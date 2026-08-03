@@ -3,6 +3,7 @@ import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -204,10 +205,12 @@ class ProviderFailureWorkflow(DeterministicWorkflow):
             "https://secret-relay.example/chat/completions?api_key=SECRET-API-KEY",
         )
         detail = "vendor-body SECRET-STORY-CONTENT SECRET-GENERATED-CONTENT"
-        if self.failure_kind == "openai_connection":
+        if self.failure_kind in {"openai_connection", "openai_remote_protocol"}:
             try:
+                if self.failure_kind == "openai_remote_protocol":
+                    raise httpx.RemoteProtocolError(detail, request=request)
                 raise httpx.ReadTimeout(detail, request=request)
-            except httpx.ReadTimeout as cause:
+            except (httpx.ReadTimeout, httpx.RemoteProtocolError) as cause:
                 raise openai.APIConnectionError(message=detail, request=request) from cause
         if self.failure_kind == "openai_status":
             response = httpx.Response(
@@ -454,6 +457,110 @@ async def _services(tmp_path: Path):
     await repository.initialize()
     snapshot = catalog.create_snapshot("test-persona")
     return settings, catalog, repository, snapshot
+
+
+@pytest.mark.asyncio
+async def test_worker_start_injects_distinct_generation_and_review_routes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings, catalog, repository, _ = await _services(tmp_path)
+    settings = Settings(
+        _env_file=None,
+        persona_root=settings.persona_root,
+        data_dir=settings.data_dir,
+        relay_base_url="https://relay.example/v1",
+        relay_api_key="secret-value",
+        generation_model_id="claude-opus-5",
+        review_model_id="deepseek-v4-flash",
+    )
+    generation_model = object()
+    review_model = object()
+    captured: dict[str, Any] = {}
+
+    def fake_build_relay_routes(_: Settings) -> SimpleNamespace:
+        return SimpleNamespace(
+            generation=SimpleNamespace(
+                model=generation_model,
+                provider_profile_key="anthropic-generation",
+            ),
+            review=SimpleNamespace(
+                model=review_model,
+                provider_profile_key="deepseek-review",
+            ),
+        )
+
+    class FakeDeepAgentWorkflow:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("pengine.worker.build_relay_routes", fake_build_relay_routes)
+    monkeypatch.setattr("pengine.worker.DeepAgentWorkflow", FakeDeepAgentWorkflow)
+
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        worker_id="route-injection-worker",
+    )
+
+    try:
+        await worker.start()
+        assert captured["generation_model"] is generation_model
+        assert captured["review_model"] is review_model
+        assert captured["generation_model"] is not captured["review_model"]
+        assert captured["generation_provider_profile_key"] == "anthropic-generation"
+        assert captured["review_provider_profile_key"] == "deepseek-review"
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_route", ["generation", "review"])
+async def test_worker_start_does_not_build_a_workflow_when_a_relay_route_is_missing(
+    tmp_path: Path,
+    monkeypatch,
+    missing_route: str,
+) -> None:
+    settings, catalog, repository, _ = await _services(tmp_path)
+    settings = Settings(
+        _env_file=None,
+        persona_root=settings.persona_root,
+        data_dir=settings.data_dir,
+        relay_base_url="https://relay.example/v1",
+        relay_api_key="secret-value",
+        generation_model_id=None if missing_route == "generation" else "claude-opus-5",
+        review_model_id=None if missing_route == "review" else "deepseek-v4-flash",
+    )
+    routes_built = False
+    workflow_built = False
+
+    def fake_build_relay_routes(_: Settings) -> None:
+        nonlocal routes_built
+        routes_built = True
+
+    class FakeDeepAgentWorkflow:
+        def __init__(self, **_: Any) -> None:
+            nonlocal workflow_built
+            workflow_built = True
+
+    monkeypatch.setattr("pengine.worker.build_relay_routes", fake_build_relay_routes)
+    monkeypatch.setattr("pengine.worker.DeepAgentWorkflow", FakeDeepAgentWorkflow)
+
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        worker_id="route-missing-worker",
+    )
+
+    try:
+        await worker.start()
+        assert routes_built is False
+        assert workflow_built is False
+        assert worker.workflow is None
+    finally:
+        await worker.stop()
 
 
 @pytest.mark.asyncio
@@ -744,13 +851,14 @@ async def test_worker_fails_closed_when_episode_error_precedes_writer_attempt(
     assert failed is not None
     assert failed.initial.state == "failed"
     assert failed.initial.failure.code == "structured_output_invalid"
+    assert failed.initial.failure.message == "模型未返回有效的结构化结果。"
     assert failed.initial.progress.can_continue is False
     assert failed.initial.progress.can_end is False
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
-async def test_episode_connection_error_reports_safe_relay_cause(
+async def test_episode_connection_error_auto_resumes_once_then_pauses_safely(
     tmp_path: Path,
     provider: str,
 ) -> None:
@@ -773,13 +881,36 @@ async def test_episode_connection_error_reports_safe_relay_cause(
     )
 
     assert await worker.run_once() is True
+    recovering = await repository.get_creation(accepted.creation_id)
+
+    assert recovering is not None
+    assert recovering.initial.state == "auto_resuming"
+    assert recovering.initial.progress.recovery_reason == "relay_interruption"
+    assert [draft.episode_number for draft in recovering.initial.drafts.episodes] == [1]
+
+    async with repository._connection() as connection:
+        run = await (
+            await connection.execute(
+                "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+                (str(accepted.creation_id),),
+            )
+        ).fetchone()
+    assert run is not None
+    resumed = await repository.lease_next_job(
+        "episode-connection-recovery-worker",
+        30,
+        now=datetime.now(UTC) + timedelta(seconds=11),
+    )
+    assert resumed is not None
+    assert str(resumed.run_id) == run["id"]
+    await worker._process_job(resumed)
     paused = await repository.get_creation(accepted.creation_id)
 
     assert paused is not None
     assert paused.initial.state == "paused"
-    assert paused.initial.pause.code == "episode_error"
+    assert paused.initial.pause.code == "relay_interruption"
     assert paused.initial.pause.episode_number == 2
-    assert "Relay / 网络连接失败" in paused.initial.pause.message
+    assert "interrupted twice" in paused.initial.pause.message
     assert "SECRET" not in paused.initial.pause.message
     assert "secret-relay.example" not in paused.initial.pause.message
     assert [draft.episode_number for draft in paused.initial.drafts.episodes] == [1]
@@ -853,7 +984,11 @@ async def test_ten_episode_run_resumes_without_a_writer_call_for_committed_draft
     ("error", "expected_code", "expected_state"),
     [
         (GraphRecursionError("recursion exhausted"), "graph_recursion_limit", "failed"),
-        (httpx.RemoteProtocolError("relay protocol mismatch"), "relay_unavailable", "failed"),
+        (
+            httpx.RemoteProtocolError("relay protocol mismatch"),
+            "relay_interruption",
+            "auto_resuming",
+        ),
         (
             RelayError(
                 code="relay_incompatible",
@@ -904,6 +1039,8 @@ async def test_worker_reports_graph_and_quality_failures_separately(
         assert resource.initial.failure.code == expected_code
         assert resource.initial.progress.can_continue is False
         assert resource.initial.progress.can_end is False
+    elif expected_state == "auto_resuming":
+        assert resource.initial.progress.recovery_reason == expected_code
     else:
         assert resource.initial.quality_rejection.code == expected_code
         assert resource.initial.quality_rejection.evidence == "L0 与已批准稿件的核心冲突。"
@@ -1108,7 +1245,7 @@ async def test_worker_uses_domain_database_for_langgraph_checkpoints(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_kind",
-    ["httpx", "openai_connection", "openai_status"],
+    ["httpx", "openai_connection", "openai_remote_protocol", "openai_status"],
 )
 async def test_provider_failure_is_safe_and_never_logged(
     tmp_path: Path,

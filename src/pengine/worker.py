@@ -26,7 +26,7 @@ from pengine.language import OutputLanguage
 from pengine.personas import PersonaCatalog, PersonaPackageError
 from pengine.relay import (
     RelayError,
-    build_relay_adapter,
+    build_relay_routes,
     classify_relay_exception,
     is_relay_connection_error,
     is_relay_exception,
@@ -60,6 +60,18 @@ _ALL_STAGES = (
     *_SPECIALIST_STAGES,
     InternalStage.ASSEMBLING_DELIVERY,
 )
+
+
+def _exception_type_chain(exc: BaseException) -> tuple[str, ...]:
+    types: list[str] = []
+    candidate: BaseException | None = exc
+    seen: set[int] = set()
+    while candidate is not None and id(candidate) not in seen:
+        seen.add(id(candidate))
+        types.append(f"{type(candidate).__module__}.{type(candidate).__name__}")
+        candidate = candidate.__cause__ or candidate.__context__
+    return tuple(types)
+
 
 StageHook = Callable[[InternalStage], Awaitable[int]]
 CheckpointHook = Callable[[InternalStage, Mapping[str, Any]], Awaitable[None]]
@@ -124,12 +136,14 @@ class Worker:
             self._saver = await self._saver_context.__aenter__()
             await self._saver.setup()
             if self.settings.relay_configured:
-                adapter = build_relay_adapter(self.settings)
+                routes = build_relay_routes(self.settings)
                 self.workflow = DeepAgentWorkflow(
-                    model=adapter.model,
+                    generation_model=routes.generation.model,
+                    review_model=routes.review.model,
                     checkpointer=self._saver,
                     recursion_limit=self.settings.agent_recursion_limit,
-                    provider_profile_key=adapter.provider_profile_key,
+                    generation_provider_profile_key=routes.generation.provider_profile_key,
+                    review_provider_profile_key=routes.review.provider_profile_key,
                 )
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop(), name="pengine-worker")
@@ -446,13 +460,14 @@ class Worker:
                 )
                 logger.warning(
                     "relay interruption recovered run_id=%s creation_id=%s stage=%s episode=%s "
-                    "state=%s retry_delay_seconds=%s",
+                    "state=%s retry_delay_seconds=%s error_types=%s",
                     work.run_id,
                     work.creation_id,
                     failure_stage.value,
                     episode_number,
                     recovery_state,
                     interruption.retry_delay_seconds,
+                    _exception_type_chain(exc),
                 )
                 return
             if await self._pause_recoverable_episode_error(work, failure_stage, exc):
@@ -460,11 +475,12 @@ class Worker:
             failure = await self._safe_failure(work.run_id, failure_stage, exc)
             await self.repository.fail_run(work.run_id, failure)
             logger.warning(
-                "workflow run failed run_id=%s creation_id=%s stage=%s code=%s",
+                "workflow run failed run_id=%s creation_id=%s stage=%s code=%s error_types=%s",
                 work.run_id,
                 work.creation_id,
                 failure.failed_stage.value,
                 failure.code,
+                _exception_type_chain(exc),
             )
 
     async def _pause_recoverable_episode_error(
@@ -740,7 +756,7 @@ def _classify_failure(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, sqlite3.Error) or type(exc).__module__.startswith("langgraph.checkpoint"):
         return "checkpoint_unavailable", "The workflow checkpoint is unavailable."
     if "structuredoutput" in type(exc).__name__.lower():
-        return "structured_output_invalid", "The agent returned invalid structured output."
+        return "structured_output_invalid", "模型未返回有效的结构化结果。"
     if is_relay_exception(exc):
         relay_error = classify_relay_exception(exc)
         return relay_error.code, relay_error.safe_message

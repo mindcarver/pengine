@@ -83,9 +83,20 @@ def test_chinese_lock_allows_chinese_with_english_ids_and_proper_names() -> None
     assert not has_obvious_language_mismatch(content, SIMPLIFIED_CHINESE)
 
 
+def test_chinese_lock_excludes_many_stable_ids_from_language_ratio() -> None:
+    content = (
+        "契约 knowledge_states 中 lin_mu（ep6）known_fact_ids 含 fact_keep_secret，"
+        "candidate_state_delta 亦列为林母 knowledge_gain；但林母仅在场景六出现，"
+        "台词仅体现 fact_stay_island，未体现获知不公开真相（fact_keep_secret）。"
+    )
+
+    assert not has_obvious_language_mismatch(content, SIMPLIFIED_CHINESE)
+
+
 def test_chinese_lock_allows_pure_machine_identifiers() -> None:
     assert not has_obvious_language_mismatch("L0-B", SIMPLIFIED_CHINESE)
     assert not has_obvious_language_mismatch("ep_01", SIMPLIFIED_CHINESE)
+    assert not has_obvious_language_mismatch("E10", SIMPLIFIED_CHINESE)
 
 
 def test_chinese_lock_allows_language_neutral_time_and_date_values() -> None:
