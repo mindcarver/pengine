@@ -231,16 +231,26 @@ class RunPause(StrictModel):
     message: NonEmptyText
     stage: UserStage
     timeout_count: int | None = Field(default=None, ge=2)
-    content_repair_count: int | None = Field(default=None, ge=2, le=2)
+    content_repair_count: int | None = Field(default=None, ge=2, le=6)
     episode_number: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def validate_reason_counts(self) -> "RunPause":
         if self.code == "content_rejected":
-            if self.content_repair_count != 2 or self.timeout_count is not None:
+            if (
+                self.content_repair_count is None
+                or not 2 <= self.content_repair_count <= 6
+                or self.timeout_count is not None
+            ):
                 raise ValueError(
-                    "Content rejection requires exactly two content repairs and no timeout count"
+                    "Content rejection requires two to six content repairs and no timeout count"
                 )
+            if self.content_repair_count > 2 and self.stage not in {
+                UserStage.GENERATING_STORY_OUTLINE,
+                UserStage.GENERATING_CHARACTER_BIOGRAPHIES,
+                UserStage.GENERATING_RELATIONSHIPS,
+            }:
+                raise ValueError("Only story creation stages allow more than two content repairs")
         elif self.code == "episode_error":
             if self.timeout_count is not None or self.content_repair_count is not None:
                 raise ValueError("Episode errors do not use timeout or repair counts")

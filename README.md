@@ -21,8 +21,9 @@
 Pengine V1 是一个带同源 Web 原型的本地短剧创作 Agent。它通过
 [Deep Agents](https://github.com/langchain-ai/deepagents) 与 LangGraph，
 让阶段化专业 Agent 按固定流程协作；业务状态、检查点和交付物全部落在本地
-SQLite，模型请求则通过可选的 Anthropic Messages 或 DeepSeek OpenAI-compatible
-relay 适配器发出。
+SQLite。模型请求共用一组 relay URL 与密钥，但按角色固定为两条路由：生成与创作修复
+使用 Anthropic Messages 的 `claude-opus-5`，审核使用 DeepSeek OpenAI-compatible 的
+`deepseek-v4-flash`。
 
 Web 原型只服务本机单操作员，并以约 1.8 秒轮询展示后端确认的七阶段进度、
 已运行时长和超时恢复操作；V1 没有身份认证、公共部署、多用户隔离、SSE /
@@ -51,7 +52,7 @@ WebSocket 或跨项目可写记忆。
                               └────────────┘              └───────┬────────┘
                                                                   │
                                                            ┌──────▼──────┐
-                                                           │  模型中继   │
+                                                           │ 双协议模型中继│
                                                            └─────────────┘
 ```
 
@@ -63,7 +64,7 @@ WebSocket 或跨项目可写记忆。
 | 状态仓库 | 管理创作、运行、任务、反馈、检查点与交付物 |
 | 内嵌任务器 | 租约、重启恢复、阶段尝试预算、工作流调度 |
 | Agent 编排层 | 由监督 Agent 编排同步创作 Agent 与技能化审查/修复子代理 |
-| 模型中继客户端 | 以固定超时和安全错误映射调用模型 |
+| 模型中继客户端 | 共用 URL/密钥，按角色固定调用 Opus 生成路由与 DeepSeek 审核路由 |
 
 系统采用模块化单体：一个进程、一个 Worker、一次处理一个创作任务，不依赖外部
 消息队列或远程 Agent。
@@ -119,6 +120,10 @@ persona/
 - `script_writer`：分集剧本；
 - `quality_reviewer`：L0/L4 验收证据与修订反馈覆盖。
 
+`workflow_supervisor`、三个创作 Agent、故事／分集大纲补丁生成和 `episode_repair`
+固定使用生成路由；`quality_reviewer`、`canon_reviewer` 与 `episode_reviewer` 固定使用
+审核路由。两个角色不互换，也不会在一路失败时回退到另一路。
+
 分集大纲批准前，`episode_planner` 同步产出结构化、带版本的剧情合同。
 确定性校验与加载 `canon-review` skill 的独立审查子代理均通过后，合同及其
 SHA-256 才会写入业务检查点并锁定。后续每集只读取该合同、上一集折叠后的
@@ -148,9 +153,9 @@ SHA-256 才会写入业务检查点并锁定。后续每集只读取该合同、
 
 <h2 align="center">05 · 快速启动</h2>
 
-要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及一个兼容
-Anthropic Messages 或 DeepSeek OpenAI chat completions 的 relay。仓库已内置四套
-临时原型人格包。
+要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及一个能以同一组 URL／密钥
+同时提供 Anthropic Messages 与 DeepSeek OpenAI-compatible chat completions 的 relay。
+仓库已内置四套临时原型人格包。
 这四套人格当前统一采用 6 集原型基线，不代表创作者人格定稿。
 
 ```bash
@@ -165,23 +170,29 @@ PENGINE_PERSONA_ROOT=./personas
 PENGINE_DATA_DIR=./data
 PENGINE_HOST=127.0.0.1
 PENGINE_PORT=8000
-PENGINE_RELAY_ADAPTER=anthropic
-PENGINE_RELAY_BASE_URL=https://your-relay.example
+PENGINE_RELAY_BASE_URL=https://your-relay.example/v1
 PENGINE_RELAY_API_KEY=replace-with-your-key
-PENGINE_RELAY_MODEL_ID=your-model-id
-# PENGINE_RELAY_MAX_OUTPUT_TOKENS=16384
+PENGINE_GENERATION_MODEL_ID=claude-opus-5
+PENGINE_REVIEW_MODEL_ID=deepseek-v4-flash
+PENGINE_GENERATION_MAX_OUTPUT_TOKENS=128000
+# PENGINE_REVIEW_MAX_OUTPUT_TOKENS=...
 ```
 
 API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localhost`、
-`127.0.0.1` 和 `::1` 可使用 HTTP。`PENGINE_RELAY_ADAPTER` 默认是 `anthropic`，
-保留原来的 Anthropic Messages 行为和 8192 输出 token 默认值。使用原生 DeepSeek
-适配器时设置为 `deepseek`，并把 `PENGINE_RELAY_BASE_URL` 配成 OpenAI-compatible
-API 根地址（中转通常是 `https://your-relay.example/v1`；DeepSeek 官方地址也可使用
-`https://api.deepseek.com`）。DeepSeek 未设置
-`PENGINE_RELAY_MAX_OUTPUT_TOKENS` 时不由 Pengine 添加输出上限；该可选覆盖也可用于
-Anthropic。Pengine 的阶段交付依赖单一且通过 schema 校验的结构化工具结果，因此
-DeepSeek 适配器使用非 thinking 模式和串行工具调用；混合了资料工具与结果工具的调用
-使用 `auto`，最终结果仍由阶段 schema 校验和限定重试保证。密钥不得提交到仓库。
+`127.0.0.1` 和 `::1` 可使用 HTTP。`PENGINE_RELAY_BASE_URL` 与
+`PENGINE_RELAY_API_KEY` 同时交给两个客户端；该地址必须同时接受 Anthropic Messages
+和 OpenAI-compatible 请求。`PENGINE_GENERATION_MODEL_ID` 必须是 `claude-opus-5`，
+`PENGINE_REVIEW_MODEL_ID` 必须是 `deepseek-v4-flash`。URL、密钥或任一模型 ID 缺失时，
+工作流会 fail closed，不会降级成单模型，也不会跨角色回退。
+
+生成路由通过 `ChatAnthropic` 调用 Anthropic Messages；
+`PENGINE_GENERATION_MAX_OUTPUT_TOKENS` 默认使用 Opus 5 支持的最大值 128000，且不能
+配置为更大的值。审核路由通过原生
+`ChatDeepSeek` 调用 OpenAI-compatible API，关闭 thinking 并串行调用工具；未设置
+`PENGINE_REVIEW_MAX_OUTPUT_TOKENS` 时 Pengine 不额外添加输出上限。旧的
+`PENGINE_RELAY_ADAPTER`、`PENGINE_RELAY_MODEL_ID` 和
+`PENGINE_RELAY_MAX_OUTPUT_TOKENS` 已不再生效，设置它们不能配置或覆盖任一路由。
+每次响应还必须报告与角色配置一致的模型 ID，否则按协议不兼容失败。密钥不得提交到仓库。
 
 确认 `PENGINE_PERSONA_ROOT=./personas` 后启动：
 
@@ -278,8 +289,9 @@ uv run pytest
 uv build --no-sources
 ```
 
-自动化测试使用非生产人格与确定性假模型，只证明工程行为。真实 relay 的工具调用、
-结构化输出，以及不同真实人格是否产生可辨识差异，仍需单独 UAT。
+自动化测试使用非生产人格与确定性假模型，只证明工程行为。真实双路 relay 的协议、
+工具调用、结构化输出、角色／模型身份审计，以及不同真实人格是否产生可辨识差异，仍需
+按 [`tests/live/README.md`](tests/live/README.md) 单独验收。
 
 更完整的设计依据见 [`.scd/architecture.md`](.scd/architecture.md)；后端边界见
 [Issue #1](https://github.com/mindcarver/pengine/issues/1)，可运行前端原型见

@@ -1,7 +1,6 @@
 from functools import lru_cache
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator
@@ -19,11 +18,12 @@ class Settings(BaseSettings):
     data_dir: Path = Path("data")
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
-    relay_adapter: Literal["anthropic", "deepseek"] = "anthropic"
     relay_base_url: str | None = None
     relay_api_key: SecretStr | None = None
-    relay_model_id: str | None = None
-    relay_max_output_tokens: int | None = Field(default=None, ge=1)
+    generation_model_id: str | None = None
+    generation_max_output_tokens: int = Field(default=128_000, ge=1, le=128_000)
+    review_model_id: str | None = None
+    review_max_output_tokens: int | None = Field(default=None, ge=1)
     model_timeout_seconds: float = Field(default=180.0, gt=0)
     run_timeout_seconds: float = Field(default=1800.0, gt=0)
     lease_seconds: int = Field(default=60, ge=5)
@@ -41,7 +41,26 @@ class Settings(BaseSettings):
 
     @property
     def relay_configured(self) -> bool:
-        return bool(self.relay_base_url and self.relay_api_key and self.relay_model_id)
+        return bool(
+            self.relay_base_url
+            and self.relay_api_key
+            and self.generation_model_id
+            and self.review_model_id
+        )
+
+    @field_validator("generation_model_id")
+    @classmethod
+    def generation_model_must_be_opus_5(cls, value: str | None) -> str | None:
+        if value is not None and value != "claude-opus-5":
+            raise ValueError("generation_model_id must be claude-opus-5")
+        return value
+
+    @field_validator("review_model_id")
+    @classmethod
+    def review_model_must_be_deepseek(cls, value: str | None) -> str | None:
+        if value is not None and value != "deepseek-v4-flash":
+            raise ValueError("review_model_id must be deepseek-v4-flash")
+        return value
 
     @field_validator("host")
     @classmethod

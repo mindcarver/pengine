@@ -1809,7 +1809,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 2.0,
+                "maximum": 6.0,
                 "minimum": 2.0
               },
               {
@@ -2240,7 +2240,8 @@
               "$ref": "#/components/schemas/ScriptEvidence"
             },
             "type": "array",
-            "title": "Evidence"
+            "title": "Evidence",
+            "description": "Verbatim script evidence with exactly one entry per required target_id. target_id values must be unique within this list."
           },
           "handoff": {
             "type": "string",

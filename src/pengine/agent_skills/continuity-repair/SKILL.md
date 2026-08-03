@@ -9,6 +9,15 @@ Use the supplied structured review as a bounded repair list. Preserve all
 approved upstream intent, the locked contract, earlier locked episodes, episode
 count, cast, timeline, typed facts, units, clue lifecycle, and knowledge state.
 
-Change only the supplied unlocked candidate. Address every confirmed issue and
-return the complete required structured result. Never weaken or silently rewrite
-the governing contract.
+Change only the supplied unlocked candidate. Address every confirmed issue.
+When `/workspace/candidate_episode.md` and
+`/workspace/candidate_state_delta.json` are supplied, use them as scratch files
+for the repair and reread them before returning. The structured result is the
+authoritative final candidate: make it complete, internally consistent, and
+aligned with the intended repair rather than stale memory or an earlier draft.
+For an episode repair, always return the complete non-null `state_delta` that
+matches the repaired script, including every required evidence target exactly
+once. Every `state_delta` list contains changes from the current episode only;
+never copy cumulative values from `series_state` into a delta. For a mismatch,
+use the exact expected IDs in the review issue's `contract_refs`.
+Never weaken or silently rewrite the governing contract.

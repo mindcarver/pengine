@@ -28,7 +28,10 @@ _CHINESE_DATE = re.compile(
     rf"(?P<month>{_INTEGER_TEXT})月"
     rf"(?P<day>{_INTEGER_TEXT})[日号]"
 )
+_TIME_PERIODS = ("凌晨", "早上", "上午", "中午", "下午", "傍晚", "晚上", "夜里", "夜间")
+_PM_TIME_PERIODS = {"中午", "下午", "傍晚", "晚上", "夜里", "夜间"}
 _CHINESE_TIME = re.compile(
+    rf"(?:(?P<period>{'|'.join(_TIME_PERIODS)})\s*)?"
     rf"(?P<hour>{_INTEGER_TEXT})点"
     rf"(?:(?P<minute>{_INTEGER_TEXT})分|整)"
 )
@@ -36,9 +39,19 @@ _MEASURED_NUMBER = re.compile(
     rf"(?<![A-Za-z0-9_.第{_CHINESE_NUMBER_CHARS}])({_NUMBER_TEXT})\s*"
     r"(分钟|分|小时|年|天|元|米|厘米|毫米|岁|人|次|件|集|%)"
 )
+_CONVERTIBLE_MEASURED_UNITS = {
+    "分钟": ("clock_duration_minutes", Decimal("1")),
+    "小时": ("clock_duration_minutes", Decimal("60")),
+    "毫米": ("length_millimeters", Decimal("1")),
+    "厘米": ("length_millimeters", Decimal("10")),
+    "米": ("length_millimeters", Decimal("1000")),
+}
 _SPEAKER = re.compile(
     r"^\s*([A-Za-z\u3400-\u9fff][A-Za-z0-9_·\u3400-\u9fff]{0,15})"
     r"(?:\s*[（(][^）)\r\n]{0,40}[）)])?\s*[：:]"
+)
+_SCENE_HEADING = re.compile(
+    r"^(?:场景[零〇一二两三四五六七八九十百\d]+|第[零〇一二两三四五六七八九十百\d]+场)$"
 )
 _NON_CHARACTER_LABELS = {
     "画面",
@@ -72,7 +85,9 @@ class RelationshipSpec(ContinuityModel):
 
 
 class StoryFact(ContinuityModel):
-    fact_id: StableId
+    fact_id: StableId = Field(
+        description="Globally unique across all fact, clue, and obligation IDs."
+    )
     subject: NonEmptyText
     predicate: NonEmptyText
     kind: Literal[
@@ -84,9 +99,25 @@ class StoryFact(ContinuityModel):
         "amount",
         "measurement",
         "text",
-    ]
-    value: NonEmptyText
-    unit: NonEmptyText | None = None
+    ] = Field(
+        description=(
+            "Typed value category. Use date/time/datetime only for ISO-formatted values; "
+            "use text for relative story labels such as day names."
+        )
+    )
+    value: NonEmptyText = Field(
+        description=(
+            "Exact value. Dates use YYYY-MM-DD, times use HH:MM[:SS], datetimes use ISO 8601, "
+            "and numeric kinds use a plain finite decimal without the unit."
+        )
+    )
+    unit: NonEmptyText | None = Field(
+        default=None,
+        description=(
+            "Required for duration/count/amount/measurement; must be null for "
+            "date/time/datetime/text."
+        ),
+    )
     first_revealed_episode: int = Field(ge=1)
 
     @model_validator(mode="after")
@@ -120,7 +151,9 @@ class CharacterKnowledgeState(ContinuityModel):
 
 
 class ClueSpec(ContinuityModel):
-    clue_id: StableId
+    clue_id: StableId = Field(
+        description="Globally unique across all fact, clue, and obligation IDs."
+    )
     description: NonEmptyText
     introduced_episode: int = Field(ge=1)
     explained_episode: int = Field(ge=1)
@@ -139,7 +172,9 @@ class ClueSpec(ContinuityModel):
 
 
 class EpisodeObligation(ContinuityModel):
-    obligation_id: StableId
+    obligation_id: StableId = Field(
+        description="Globally unique across all fact, clue, and obligation IDs."
+    )
     episode_number: int = Field(ge=1)
     new_information_fact_ids: list[StableId] = Field(min_length=1)
     end_hook: NonEmptyText
@@ -171,10 +206,13 @@ class StoryContract(ContinuityModel):
         fact_ids = _unique_ids([item.fact_id for item in self.facts], "fact")
         clue_ids = _unique_ids([item.clue_id for item in self.clues], "clue")
         _unique_ids([item.event_id for item in self.timeline], "timeline event")
-        _unique_ids(
+        obligation_ids = _unique_ids(
             [item.obligation_id for item in self.episode_obligations],
             "episode obligation",
         )
+        evidence_target_ids = [*fact_ids, *clue_ids, *obligation_ids]
+        if len(evidence_target_ids) != len(set(evidence_target_ids)):
+            raise ValueError("Fact, clue, and obligation IDs must be globally unique")
 
         for character in self.characters:
             _require_subset(
@@ -337,8 +375,21 @@ class EpisodeStateDelta(ContinuityModel):
     introduced_clue_ids: list[StableId] = Field(default_factory=list)
     resolved_clue_ids: list[StableId] = Field(default_factory=list)
     satisfied_obligation_ids: list[StableId] = Field(default_factory=list)
-    evidence: list[ScriptEvidence] = Field(default_factory=list)
+    evidence: list[ScriptEvidence] = Field(
+        default_factory=list,
+        description=(
+            "Verbatim script evidence with exactly one entry per required target_id. "
+            "target_id values must be unique within this list."
+        ),
+    )
     handoff: NonEmptyText
+
+    @model_validator(mode="after")
+    def validate_unique_evidence_targets(self) -> EpisodeStateDelta:
+        target_ids = [item.target_id for item in self.evidence]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("Episode evidence target IDs must be unique")
+        return self
 
 
 class CharacterKnowledge(ContinuityModel):
@@ -449,6 +500,48 @@ def initial_series_state(contract: StoryContract, contract_sha256: str) -> Serie
             )
             for character in contract.characters
         ],
+    )
+
+
+def bind_episode_delta_to_contract(
+    *,
+    contract: StoryContract,
+    prior_state: SeriesState,
+    delta: EpisodeStateDelta,
+) -> EpisodeStateDelta:
+    episode = delta.episode_number
+    prior_knowledge = {
+        item.character_id: set(item.known_fact_ids) for item in prior_state.character_knowledge
+    }
+    expected_knowledge = {
+        item.character_id: set(item.known_fact_ids)
+        for item in contract.knowledge_states
+        if item.episode_number == episode
+    }
+    knowledge_gains: list[KnowledgeGain] = []
+    for character in contract.characters:
+        gain = expected_knowledge[character.character_id] - prior_knowledge[character.character_id]
+        if gain:
+            knowledge_gains.append(
+                KnowledgeGain(character_id=character.character_id, fact_ids=sorted(gain))
+            )
+    obligation = next(
+        item for item in contract.episode_obligations if item.episode_number == episode
+    )
+    return delta.model_copy(
+        update={
+            "established_fact_ids": sorted(
+                fact.fact_id for fact in contract.facts if fact.first_revealed_episode == episode
+            ),
+            "knowledge_gains": knowledge_gains,
+            "introduced_clue_ids": sorted(
+                clue.clue_id for clue in contract.clues if clue.introduced_episode == episode
+            ),
+            "resolved_clue_ids": sorted(
+                clue.clue_id for clue in contract.clues if clue.explained_episode == episode
+            ),
+            "satisfied_obligation_ids": [obligation.obligation_id],
+        }
     )
 
 
@@ -630,15 +723,27 @@ def validate_episode_candidate(
     allowed_temporal: set[str] = set()
     for fact in contract.facts:
         if fact.kind not in _TEMPORAL_KINDS:
+            for text_value in (fact.subject, fact.predicate, fact.value):
+                allowed_temporal.update(
+                    normalized for _, normalized, _ in _temporal_tokens(text_value)
+                )
             continue
         allowed_temporal.add(fact.value)
         temporal_value = _parse_temporal(fact.kind, fact.value)
         if isinstance(temporal_value, datetime):
             allowed_temporal.add(temporal_value.date().isoformat())
             allowed_temporal.add(temporal_value.time().isoformat(timespec="minutes"))
+        elif isinstance(temporal_value, date):
+            allowed_temporal.add(temporal_value.isoformat())
+        else:
+            allowed_temporal.add(temporal_value.isoformat(timespec="minutes"))
     temporal_tokens = _temporal_tokens(content)
     for token, normalized, _ in temporal_tokens:
-        if normalized not in allowed_temporal:
+        if normalized not in allowed_temporal and not _matches_unqualified_clock_alias(
+            token,
+            normalized,
+            allowed_temporal,
+        ):
             issues.append(
                 _issue(
                     "uncontracted_time",
@@ -646,17 +751,19 @@ def validate_episode_candidate(
                 )
             )
 
-    allowed_measured = {
-        (_normalized_decimal(fact.value), fact.unit or "")
+    converted_facts = [
+        (fact, converted)
         for fact in contract.facts
         if fact.kind in _NUMERIC_KINDS
-    }
+        and (converted := _converted_measurement(fact.value, fact.unit or "")) is not None
+    ]
+    calendar_year_facts: list[tuple[StoryFact, str]] = []
     for fact in contract.facts:
         if fact.kind not in {"date", "datetime"}:
             continue
         temporal_value = _parse_temporal(fact.kind, fact.value)
-        allowed_measured.add((_normalized_decimal(str(temporal_value.year)), "年"))
-    allowed_measured.add((_normalized_decimal(str(episode)), "集"))
+        normalized_year = _normalized_decimal(str(temporal_value.year))
+        calendar_year_facts.append((fact, normalized_year))
     temporal_spans = [span for _, _, span in temporal_tokens]
     for match in _MEASURED_NUMBER.finditer(content):
         if any(_spans_overlap(match.span(), temporal_span) for temporal_span in temporal_spans):
@@ -665,7 +772,40 @@ def validate_episode_candidate(
         value = _normalized_number(raw_value)
         if value is None:
             continue
-        if (value, unit) not in allowed_measured:
+        is_calendar_year = unit == "年" and Decimal(value) >= 1000
+        converted = _converted_measurement(value, unit)
+        context = _clause_at_span(content, match.span())
+        relevant_exact = {
+            (_normalized_decimal(fact.value), fact.unit or "")
+            for fact in contract.facts
+            if fact.kind in _NUMERIC_KINDS
+            and fact.unit == unit
+            and _fact_anchor_matches(context, fact)
+        }
+        if is_calendar_year and calendar_year_facts:
+            relevant_years = {
+                year for fact, year in calendar_year_facts if _fact_anchor_matches(context, fact)
+            }
+            if relevant_years:
+                allowed = value in relevant_years
+            elif relevant_exact:
+                allowed = (value, unit) in relevant_exact
+            else:
+                continue
+        elif relevant_exact:
+            allowed = (value, unit) in relevant_exact
+        elif converted is not None:
+            relevant_converted = {
+                locked_value
+                for fact, locked_value in converted_facts
+                if locked_value[0] == converted[0] and _fact_anchor_matches(context, fact)
+            }
+            if not relevant_converted:
+                continue
+            allowed = converted in relevant_converted
+        else:
+            continue
+        if not allowed:
             issues.append(
                 _issue(
                     "uncontracted_number",
@@ -676,7 +816,11 @@ def validate_episode_candidate(
     character_names = {character.name for character in contract.characters}
     for line in content.splitlines():
         match = _SPEAKER.match(line)
-        if match and match.group(1) not in character_names | _NON_CHARACTER_LABELS:
+        if (
+            match
+            and match.group(1) not in character_names | _NON_CHARACTER_LABELS
+            and _SCENE_HEADING.fullmatch(match.group(1)) is None
+        ):
             issues.append(
                 _issue(
                     "unknown_speaker",
@@ -707,16 +851,39 @@ def _temporal_tokens(content: str) -> list[tuple[str, str, tuple[int, int]]]:
             continue
         tokens.append((match.group(0), normalized, match.span()))
     for match in _CHINESE_TIME.finditer(content):
+        period = match.group("period")
         hour = _normalized_integer(match.group("hour"))
         minute = _normalized_integer(match.group("minute")) if match.group("minute") else 0
         if hour is None or minute is None:
             continue
+        if period in _PM_TIME_PERIODS and hour < 12:
+            hour += 12
+        elif period == "凌晨" and hour == 12:
+            hour = 0
         try:
             normalized = time(hour, minute).isoformat(timespec="minutes")
         except ValueError:
             continue
         tokens.append((match.group(0), normalized, match.span()))
     return tokens
+
+
+def _matches_unqualified_clock_alias(
+    token: str,
+    normalized: str,
+    allowed_temporal: set[str],
+) -> bool:
+    if "点" not in token or any(period in token for period in _TIME_PERIODS):
+        return False
+    try:
+        parsed = time.fromisoformat(normalized)
+    except ValueError:
+        return False
+    if parsed.hour > 12:
+        return False
+    alternate_hour = parsed.hour + 12 if parsed.hour < 12 else 0
+    alternate = parsed.replace(hour=alternate_hour).isoformat(timespec="minutes")
+    return alternate in allowed_temporal
 
 
 def _normalized_number(value: str) -> str | None:
@@ -742,6 +909,31 @@ def _normalized_number(value: str) -> str | None:
 
 def _normalized_decimal(value: str) -> str:
     return str(Decimal(value).normalize())
+
+
+def _converted_measurement(value: str, unit: str) -> tuple[str, str] | None:
+    conversion = _CONVERTIBLE_MEASURED_UNITS.get(unit)
+    if conversion is None:
+        return None
+    dimension, multiplier = conversion
+    return dimension, _normalized_decimal(str(Decimal(value) * multiplier))
+
+
+def _clause_at_span(content: str, span: tuple[int, int]) -> str:
+    boundaries = "\n\r，。；！？!?"
+    start = max(content.rfind(boundary, 0, span[0]) for boundary in boundaries) + 1
+    ends = [content.find(boundary, span[1]) for boundary in boundaries]
+    end = (
+        min(position for position in ends if position != -1)
+        if any(position != -1 for position in ends)
+        else len(content)
+    )
+    return content[start:end]
+
+
+def _fact_anchor_matches(context: str, fact: StoryFact) -> bool:
+    predicate = fact.predicate.strip()
+    return len(predicate) >= 2 and predicate in context
 
 
 _CHINESE_DIGITS = {

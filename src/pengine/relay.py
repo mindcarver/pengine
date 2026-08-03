@@ -1,3 +1,4 @@
+import logging
 import ssl
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -5,15 +6,22 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from math import ceil
 from typing import Any, Literal
+from uuid import UUID
 
 import httpx
 from langchain_anthropic import ChatAnthropic
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
+from langchain_core.outputs import LLMResult
 from langchain_deepseek import ChatDeepSeek
 
 from pengine.config import Settings
 
 _AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
+# Uvicorn owns the runtime log handlers. This child logger keeps the safe model-call
+# audit at INFO while ensuring it reaches the same server evidence stream.
+_MODEL_CALL_LOGGER = logging.getLogger("uvicorn.error.pengine.model_calls")
+ModelRole = Literal["generation", "review"]
 
 
 class _SerialChatAnthropic(ChatAnthropic):
@@ -27,19 +35,120 @@ class _SerialChatDeepSeek(ChatDeepSeek):
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
         # LangChain's ToolStrategy requests "any" for a mixed set of working and
         # result tools. DeepSeek treats that as "required", which can trap an agent
-        # in repeated working-tool calls. Auto still permits the result tool while
-        # allowing the agent to finish its tool loop.
+        # in repeated working-tool calls. Keep mixed sets on auto, but preserve the
+        # required choice when middleware narrows the call to the one result tool.
         tool_choice = kwargs.get("tool_choice")
-        if isinstance(tool_choice, str) and tool_choice in {"any", "required"}:
+        if len(tools) > 1 and isinstance(tool_choice, str) and tool_choice in {"any", "required"}:
             kwargs["tool_choice"] = "auto"
         kwargs["parallel_tool_calls"] = False
         return super().bind_tools(tools, **kwargs)
 
 
 @dataclass(frozen=True, slots=True)
+class _ModelCallAuditHandler(BaseCallbackHandler):
+    raise_error = True
+    run_inline = True
+
+    role: ModelRole
+    model_id: str
+
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[Any]],
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        del serialized, messages, kwargs
+        _MODEL_CALL_LOGGER.info(
+            "model_call event=start role=%s requested_model_id=%s call_id=%s",
+            self.role,
+            self.model_id,
+            run_id,
+        )
+
+    def on_llm_end(self, response: LLMResult, *, run_id: UUID, **kwargs: Any) -> None:
+        del kwargs
+        response_model_ids = _response_model_ids(response)
+        if response_model_ids != {self.model_id}:
+            _MODEL_CALL_LOGGER.error(
+                "model_call event=identity_mismatch role=%s requested_model_id=%s "
+                "response_model_ids=%s call_id=%s",
+                self.role,
+                self.model_id,
+                sorted(response_model_ids),
+                run_id,
+            )
+            raise RelayError(
+                code="relay_incompatible",
+                safe_message="The relay returned an unexpected model for the configured role.",
+            )
+        _MODEL_CALL_LOGGER.info(
+            "model_call event=end role=%s requested_model_id=%s response_model_id=%s call_id=%s",
+            self.role,
+            self.model_id,
+            self.model_id,
+            run_id,
+        )
+
+    def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        del kwargs
+        _MODEL_CALL_LOGGER.warning(
+            "model_call event=error role=%s requested_model_id=%s call_id=%s "
+            "error_type=%s http_status=%s",
+            self.role,
+            self.model_id,
+            run_id,
+            type(error).__name__,
+            _safe_http_status(error) or "none",
+        )
+
+
+def _response_model_ids(response: LLMResult) -> set[str]:
+    model_ids: set[str] = set()
+    for generation_list in response.generations:
+        for generation in generation_list:
+            message = getattr(generation, "message", None)
+            metadata = getattr(message, "response_metadata", None)
+            if not isinstance(metadata, dict):
+                continue
+            for key in ("model", "model_name"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value:
+                    model_ids.add(value)
+    if isinstance(response.llm_output, dict):
+        for key in ("model", "model_name"):
+            value = response.llm_output.get(key)
+            if isinstance(value, str) and value:
+                model_ids.add(value)
+    return model_ids
+
+
+def _safe_http_status(error: BaseException) -> int | None:
+    for candidate in (error, *_cause_chain(error)):
+        status = getattr(candidate, "status_code", None)
+        if isinstance(status, int):
+            return status
+        response = getattr(candidate, "response", None)
+        response_status = getattr(response, "status_code", None)
+        if isinstance(response_status, int):
+            return response_status
+    return None
+
+
+@dataclass(frozen=True, slots=True)
 class RelayAdapter:
     model: BaseChatModel
+    role: ModelRole
+    model_id: str
     provider_profile_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class RelayRoutes:
+    generation: RelayAdapter
+    review: RelayAdapter
 
 
 @dataclass(slots=True)
@@ -60,41 +169,64 @@ class RetryableRelayInterruption:
     retry_delay_seconds: int
 
 
-def build_relay_adapter(settings: Settings) -> RelayAdapter:
+def build_relay_routes(settings: Settings) -> RelayRoutes:
     if not settings.relay_configured:
         raise RelayError(
             code="relay_unavailable",
-            safe_message="The model relay is not configured.",
+            safe_message="Both generation and review model routes must be configured.",
+        )
+    return RelayRoutes(
+        generation=build_relay_adapter(settings, role="generation"),
+        review=build_relay_adapter(settings, role="review"),
+    )
+
+
+def build_relay_adapter(settings: Settings, *, role: ModelRole) -> RelayAdapter:
+    if role == "generation":
+        model_id = settings.generation_model_id
+        max_output_tokens = settings.generation_max_output_tokens
+    else:
+        model_id = settings.review_model_id
+        max_output_tokens = settings.review_max_output_tokens
+    if not settings.relay_base_url or not settings.relay_api_key or not model_id:
+        raise RelayError(
+            code="relay_unavailable",
+            safe_message=f"The {role} model route is not configured.",
         )
 
     common = {
-        "model": settings.relay_model_id,
+        "model": model_id,
         "base_url": settings.relay_base_url,
         "api_key": settings.relay_api_key,
         "max_retries": 0,
         "timeout": settings.model_timeout_seconds,
         "temperature": 0,
+        "callbacks": [_ModelCallAuditHandler(role=role, model_id=model_id)],
     }
-    if settings.relay_adapter == "deepseek":
+    if role == "review":
         return RelayAdapter(
             model=_SerialChatDeepSeek(
                 **common,
-                max_tokens=settings.relay_max_output_tokens,
+                max_tokens=max_output_tokens,
                 extra_body={"thinking": {"type": "disabled"}},
             ),
+            role=role,
+            model_id=model_id,
             provider_profile_key="deepseek",
         )
     return RelayAdapter(
         model=_SerialChatAnthropic(
             **common,
-            max_tokens=settings.relay_max_output_tokens or 8192,
+            max_tokens=max_output_tokens,
         ),
+        role=role,
+        model_id=model_id,
         provider_profile_key="anthropic",
     )
 
 
-def build_chat_model(settings: Settings) -> BaseChatModel:
-    return build_relay_adapter(settings).model
+def build_chat_model(settings: Settings, *, role: ModelRole) -> BaseChatModel:
+    return build_relay_adapter(settings, role=role).model
 
 
 def is_relay_exception(exc: BaseException) -> bool:
@@ -150,6 +282,7 @@ def _is_retryable_transport(exc: BaseException) -> bool:
             httpx.ReadError,
             httpx.ConnectTimeout,
             httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
         ),
     ):
         return True
@@ -158,6 +291,7 @@ def _is_retryable_transport(exc: BaseException) -> bool:
         "ReadError",
         "ConnectTimeout",
         "ReadTimeout",
+        "RemoteProtocolError",
     }
 
 

@@ -9,7 +9,9 @@ SIMPLIFIED_CHINESE: OutputLanguage = "zh-CN"
 
 _HAN_CHARACTER = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _LATIN_LETTER = re.compile(r"[A-Za-z]")
-_MACHINE_IDENTIFIER = re.compile(r"[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+")
+_MACHINE_IDENTIFIER = re.compile(
+    r"[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+|[A-Za-z]+\d+(?:[_-][A-Za-z0-9]+)*"
+)
 _LANGUAGE_NEUTRAL_NUMBER = re.compile(r"(?=.*\d)[0-9TtZ\s:./+%\-]+")
 _SHORT_ENGLISH_VERDICT = re.compile(
     r"(?:^|[：:\s])(fail(?:ed)?|pass(?:ed)?|no|yes|ok|true|false)[.!。]?\s*$",
@@ -57,15 +59,23 @@ def has_obvious_language_mismatch(text: str, language: OutputLanguage | None) ->
     if _SHORT_ENGLISH_VERDICT.search(stripped):
         return True
 
-    han_count = len(_HAN_CHARACTER.findall(text))
+    language_sample = _MACHINE_IDENTIFIER.sub(
+        lambda match: (
+            ""
+            if "_" in match.group(0) or any(character.isdigit() for character in match.group(0))
+            else match.group(0)
+        ),
+        text,
+    )
+    han_count = len(_HAN_CHARACTER.findall(language_sample))
     if han_count == 0:
         return True
 
-    traditional_count = len(_TRADITIONAL_ONLY_CHARACTER.findall(text))
+    traditional_count = len(_TRADITIONAL_ONLY_CHARACTER.findall(language_sample))
     if traditional_count >= 2 and traditional_count * 3 >= han_count:
         return True
 
-    latin_count = len(_LATIN_LETTER.findall(text))
+    latin_count = len(_LATIN_LETTER.findall(language_sample))
     return (
         latin_count >= _LONG_ENGLISH_TEXT_LETTERS
         and latin_count > han_count * _ENGLISH_DOMINANCE_RATIO
