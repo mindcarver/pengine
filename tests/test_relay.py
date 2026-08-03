@@ -1,10 +1,13 @@
 import ssl
+from uuid import uuid4
 
 import anthropic
 import httpx
 import openai
 import pytest
 from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, LLMResult
 from langchain_deepseek import ChatDeepSeek
 from pydantic import BaseModel, SecretStr
 
@@ -12,8 +15,10 @@ from pengine.config import Settings
 from pengine.relay import (
     MIN_RELAY_RETRY_DELAY_SECONDS,
     RelayError,
+    _ModelCallAuditHandler,
     build_chat_model,
     build_relay_adapter,
+    build_relay_routes,
     classify_relay_exception,
     is_relay_connection_error,
     is_relay_exception,
@@ -21,17 +26,31 @@ from pengine.relay import (
 )
 
 
-def test_build_chat_model_uses_only_operator_connection_fields() -> None:
-    settings = Settings(
-        relay_base_url="https://relay.example/anthropic",
+def _role_settings(
+    *,
+    generation_model_id: str = "claude-opus-5",
+    generation_max_output_tokens: int = 128_000,
+    review_model_id: str = "deepseek-v4-flash",
+    review_max_output_tokens: int | None = None,
+) -> Settings:
+    return Settings(
+        _env_file=None,
+        relay_base_url="https://relay.example/v1",
         relay_api_key="secret-value",
-        relay_model_id="model-id",
+        generation_model_id=generation_model_id,
+        generation_max_output_tokens=generation_max_output_tokens,
+        review_model_id=review_model_id,
+        review_max_output_tokens=review_max_output_tokens,
     )
 
-    model = build_chat_model(settings)
 
-    assert model.model == "model-id"
-    assert model.anthropic_api_url == "https://relay.example/anthropic"
+def test_build_chat_model_uses_only_operator_connection_fields() -> None:
+    settings = _role_settings()
+
+    model = build_chat_model(settings, role="generation")
+
+    assert model.model == "claude-opus-5"
+    assert model.anthropic_api_url == "https://relay.example/v1"
     assert model.max_retries == 0
     assert isinstance(model.anthropic_api_key, SecretStr)
     assert model.anthropic_api_key.get_secret_value() == "secret-value"
@@ -40,16 +59,63 @@ def test_build_chat_model_uses_only_operator_connection_fields() -> None:
 
 def test_build_relay_adapter_preserves_anthropic_defaults() -> None:
     adapter = build_relay_adapter(
-        Settings(
-            relay_base_url="https://relay.example/anthropic",
-            relay_api_key="secret-value",
-            relay_model_id="model-id",
-        )
+        _role_settings(),
+        role="generation",
     )
 
     assert isinstance(adapter.model, ChatAnthropic)
+    assert adapter.role == "generation"
+    assert adapter.model_id == "claude-opus-5"
     assert adapter.provider_profile_key == "anthropic"
-    assert adapter.model.max_tokens == 8192
+    assert adapter.model.max_tokens == 128_000
+
+
+def test_build_relay_routes_keeps_generation_and_review_models_separate() -> None:
+    routes = build_relay_routes(_role_settings())
+
+    assert isinstance(routes.generation.model, ChatAnthropic)
+    assert routes.generation.role == "generation"
+    assert routes.generation.model_id == "claude-opus-5"
+    assert isinstance(routes.review.model, ChatDeepSeek)
+    assert routes.review.role == "review"
+    assert routes.review.model_id == "deepseek-v4-flash"
+    assert routes.generation.model is not routes.review.model
+
+
+def test_model_call_audit_requires_exact_response_model_identity(caplog) -> None:
+    caplog.set_level("INFO", logger="uvicorn.error.pengine.model_calls")
+    handler = _ModelCallAuditHandler(role="generation", model_id="claude-opus-5")
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="ok",
+                        response_metadata={"model": "claude-opus-5"},
+                    )
+                )
+            ]
+        ]
+    )
+
+    handler.on_llm_end(response, run_id=uuid4())
+
+    assert "requested_model_id=claude-opus-5" in caplog.text
+    assert "response_model_id=claude-opus-5" in caplog.text
+
+
+@pytest.mark.parametrize("response_model", [None, "deepseek-v4-flash"])
+def test_model_call_audit_rejects_missing_or_mismatched_response_identity(
+    response_model: str | None,
+) -> None:
+    metadata = {"model_name": response_model} if response_model is not None else {}
+    response = LLMResult(
+        generations=[[ChatGeneration(message=AIMessage(content="bad", response_metadata=metadata))]]
+    )
+    handler = _ModelCallAuditHandler(role="generation", model_id="claude-opus-5")
+
+    with pytest.raises(RelayError, match="unexpected model"):
+        handler.on_llm_end(response, run_id=uuid4())
 
 
 @pytest.mark.parametrize("max_output_tokens", [None, 16384])
@@ -57,16 +123,13 @@ def test_build_relay_adapter_uses_native_deepseek_without_an_implicit_token_cap(
     max_output_tokens: int | None,
 ) -> None:
     adapter = build_relay_adapter(
-        Settings(
-            relay_adapter="deepseek",
-            relay_base_url="https://relay.example/v1",
-            relay_api_key="secret-value",
-            relay_model_id="deepseek-v4-flash",
-            relay_max_output_tokens=max_output_tokens,
-        )
+        _role_settings(review_max_output_tokens=max_output_tokens),
+        role="review",
     )
 
     assert isinstance(adapter.model, ChatDeepSeek)
+    assert adapter.role == "review"
+    assert adapter.model_id == "deepseek-v4-flash"
     assert adapter.provider_profile_key == "deepseek"
     assert adapter.model.model_name == "deepseek-v4-flash"
     assert adapter.model.openai_api_base == "https://relay.example/v1"
@@ -79,21 +142,36 @@ def test_build_relay_adapter_uses_native_deepseek_without_an_implicit_token_cap(
 
 @pytest.mark.parametrize("tool_choice", ["any", "required"])
 def test_deepseek_uses_auto_serial_tools_for_mixed_tool_strategy(tool_choice: str) -> None:
-    class ProbeTool(BaseModel):
+    class WorkTool(BaseModel):
+        value: str
+
+    class ResultTool(BaseModel):
         value: str
 
     adapter = build_relay_adapter(
-        Settings(
-            relay_adapter="deepseek",
-            relay_base_url="https://relay.example/v1",
-            relay_api_key="secret-value",
-            relay_model_id="deepseek-v4-flash",
-        )
+        _role_settings(),
+        role="review",
     )
 
-    bound = adapter.model.bind_tools([ProbeTool], tool_choice=tool_choice)
+    bound = adapter.model.bind_tools([WorkTool, ResultTool], tool_choice=tool_choice)
 
     assert bound.kwargs["tool_choice"] == "auto"
+    assert bound.kwargs["parallel_tool_calls"] is False
+
+
+@pytest.mark.parametrize("tool_choice", ["any", "required"])
+def test_deepseek_requires_the_only_available_result_tool(tool_choice: str) -> None:
+    class ResultTool(BaseModel):
+        value: str
+
+    adapter = build_relay_adapter(
+        _role_settings(),
+        role="review",
+    )
+
+    bound = adapter.model.bind_tools([ResultTool], tool_choice=tool_choice)
+
+    assert bound.kwargs["tool_choice"] == "required"
     assert bound.kwargs["parallel_tool_calls"] is False
 
 
@@ -102,12 +180,8 @@ def test_deepseek_preserves_named_tool_choice() -> None:
         value: str
 
     adapter = build_relay_adapter(
-        Settings(
-            relay_adapter="deepseek",
-            relay_base_url="https://relay.example/v1",
-            relay_api_key="secret-value",
-            relay_model_id="deepseek-v4-flash",
-        )
+        _role_settings(),
+        role="review",
     )
     tool_choice = {"type": "function", "function": {"name": "ProbeTool"}}
 
@@ -122,12 +196,8 @@ def test_deepseek_structured_output_forces_its_named_result_tool() -> None:
         value: str
 
     adapter = build_relay_adapter(
-        Settings(
-            relay_adapter="deepseek",
-            relay_base_url="https://relay.example/v1",
-            relay_api_key="secret-value",
-            relay_model_id="deepseek-v4-flash",
-        )
+        _role_settings(),
+        role="review",
     )
 
     structured = adapter.model.with_structured_output(
@@ -146,34 +216,13 @@ def test_build_chat_model_requires_serial_tool_calls_and_a_tool_result() -> None
     class ProbeTool(BaseModel):
         value: str
 
-    settings = Settings(
-        relay_base_url="https://relay.example/anthropic",
-        relay_api_key="secret-value",
-        relay_model_id="model-id",
-    )
+    settings = _role_settings()
 
-    bound = build_chat_model(settings).bind_tools([ProbeTool], tool_choice="auto")
+    bound = build_chat_model(settings, role="generation").bind_tools(
+        [ProbeTool], tool_choice="auto"
+    )
 
     assert bound.kwargs["tool_choice"]["type"] == "any"
-    assert bound.kwargs["tool_choice"]["disable_parallel_tool_use"] is True
-
-
-@pytest.mark.parametrize("model_id", ["deepseek-v4-flash", "deepseek-v4-pro"])
-def test_deepseek_anthropic_compat_uses_auto_tool_choice_and_serial_calls(
-    model_id: str,
-) -> None:
-    class ProbeTool(BaseModel):
-        value: str
-
-    settings = Settings(
-        relay_base_url="https://relay.example/anthropic",
-        relay_api_key="secret-value",
-        relay_model_id=model_id,
-    )
-
-    bound = build_chat_model(settings).bind_tools([ProbeTool], tool_choice="any")
-
-    assert bound.kwargs["tool_choice"]["type"] == "auto"
     assert bound.kwargs["tool_choice"]["disable_parallel_tool_use"] is True
 
 
@@ -181,28 +230,26 @@ def test_build_chat_model_initializes_with_a_socks_proxy(monkeypatch) -> None:
     for variable in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy"):
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:1080")
-    settings = Settings(
-        relay_base_url="https://relay.example/anthropic",
-        relay_api_key="secret-value",
-        relay_model_id="model-id",
-    )
+    settings = _role_settings()
 
-    assert build_chat_model(settings)._async_client is not None
+    assert build_chat_model(settings, role="generation")._async_client is not None
 
 
 def test_missing_relay_configuration_is_safe(monkeypatch) -> None:
     monkeypatch.setenv("PENGINE_RELAY_BASE_URL", "https://ambient.example/anthropic")
     monkeypatch.setenv("PENGINE_RELAY_API_KEY", "ambient-secret")
-    monkeypatch.setenv("PENGINE_RELAY_MODEL_ID", "ambient-model")
+    monkeypatch.setenv("PENGINE_GENERATION_MODEL_ID", "ambient-generation-model")
+    monkeypatch.setenv("PENGINE_REVIEW_MODEL_ID", "ambient-review-model")
     settings = Settings(
         _env_file=None,
         relay_base_url=None,
         relay_api_key=None,
-        relay_model_id=None,
+        generation_model_id=None,
+        review_model_id=None,
     )
 
     try:
-        build_chat_model(settings)
+        build_chat_model(settings, role="generation")
     except RelayError as exc:
         assert exc.code == "relay_unavailable"
         assert "key" not in exc.safe_message.lower()
@@ -242,6 +289,7 @@ def test_relay_exception_helpers_recognize_supported_connection_errors(error: Ex
         httpx.ReadError("connection reset"),
         httpx.ConnectTimeout("connect timed out"),
         httpx.ReadTimeout("read timed out"),
+        httpx.RemoteProtocolError("server disconnected"),
         ConnectionResetError("connection reset"),
     ],
 )
@@ -320,7 +368,6 @@ def test_retryable_relay_interruption_accepts_openai_status_and_connection_error
         lambda request: httpx.CloseError("close failed", request=request),
         lambda request: httpx.WriteTimeout("write timed out", request=request),
         lambda request: httpx.PoolTimeout("pool timed out", request=request),
-        lambda request: httpx.RemoteProtocolError("protocol failed", request=request),
         lambda request: httpx.HTTPStatusError(
             "unexpected server failure",
             request=request,

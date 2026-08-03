@@ -6,11 +6,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
-from langchain.agents.middleware.types import ToolCallRequest
-from langchain.agents.structured_output import StructuredOutputValidationError
+from langchain.agents import create_agent
+from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
+from langchain.agents.structured_output import (
+    OutputToolBinding,
+    StructuredOutputValidationError,
+    ToolStrategy,
+)
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from persona_factory import create_persona_package
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -27,24 +34,38 @@ from pengine.agents import (
     ContentReviewRejectedError,
     DeepAgentWorkflow,
     EpisodePlannerResult,
+    EpisodeReviewerResult,
     OutlineRepairPatch,
     QualityGateRejectedError,
     QualityReviewerResult,
     ScriptWriterResult,
     StageGuardMiddleware,
     StoryArchitectResult,
+    StoryArtifactRepairPatch,
+    StructuredResultMiddleware,
     WorkflowCompletion,
     _apply_outline_repair_patch,
+    _apply_story_artifact_repair_patch,
     _arithmetic_tool,
     _calculate_arithmetic,
+    _canon_issue_ledger,
     _language_retry_fingerprint,
     _language_retry_matches,
+    _merge_story_canon_reviews,
+    _outline_repair_context,
+    _outline_repair_result,
+    _request_with_canonical_workspace,
+    _story_patch_correction,
+    _story_repair_context,
     _structured_output_retry_message,
+    _structured_result_validation_correction,
     _supervisor_prompt,
+    _validate_outline_repair_patch_targets,
     _validate_result_language,
 )
 from pengine.config import Settings
 from pengine.continuity import (
+    EpisodeStateDelta,
     StoryContract,
     render_story_contract_markdown,
     story_contract_sha256,
@@ -69,6 +90,23 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         self.bound_tool_names.append([_tool_name(tool) for tool in tools])
         self.bound_tool_descriptions.append([getattr(tool, "description", "") for tool in tools])
         return self
+
+
+def _fake_workflow(
+    *,
+    model: ToolCallingFakeModel,
+    checkpointer: Any,
+    recursion_limit: int = 80,
+    provider_profile_key: str = "toolcallingfakemodel",
+) -> DeepAgentWorkflow:
+    return DeepAgentWorkflow(
+        generation_model=model,
+        review_model=model,
+        checkpointer=checkpointer,
+        recursion_limit=recursion_limit,
+        generation_provider_profile_key=provider_profile_key,
+        review_provider_profile_key=provider_profile_key,
+    )
 
 
 def _tool_name(tool: Any) -> str:
@@ -289,6 +327,20 @@ def _successful_responses() -> list[AIMessage]:
         )
         responses.append(_tool_call(schema, payload, index + 1))
         index += 2
+        if stage in {
+            "generating_story_outline",
+            "generating_character_biographies",
+            "generating_relationship_logic",
+        }:
+            for _ in range(2):
+                responses.append(
+                    _tool_call(
+                        "CanonReviewerResult",
+                        {"passed": True, "evidence": "故事工件一致", "issues": []},
+                        index,
+                    )
+                )
+                index += 1
         if stage == "generating_episode_outline":
             responses.append(
                 _tool_call(
@@ -376,8 +428,10 @@ def test_story_architect_schema_exposes_stage_specific_field_contract() -> None:
     assert "selecting_l0_variant" in properties["content"]["description"]
     assert "Must be null" in properties["content"]["description"]
     assert "selecting_l0_variant" in properties["selected_l0_variant"]["description"]
+    assert "do not add an English translation" in (properties["selected_l0_variant"]["description"])
     assert "Must be null" in properties["selected_l0_variant"]["description"]
     assert "selecting_l0_variant" in properties["selection_rationale"]["description"]
+    assert "without an English translation" in (properties["selection_rationale"]["description"])
     assert "Must be null" in properties["selection_rationale"]["description"]
 
 
@@ -396,6 +450,1252 @@ def test_outline_repair_schema_cannot_repeat_the_full_candidate() -> None:
 
     assert set(properties) == {"stage", "content_replacements", "json_edits"}
     assert not {"content", "episode_count", "episodes", "story_contract"} & set(properties)
+
+
+def test_story_repair_schema_is_line_addressed_and_cannot_repeat_the_candidate() -> None:
+    schema = StoryArtifactRepairPatch.model_json_schema()
+    properties = schema["properties"]
+    replacement_ref = properties["line_replacements"]["items"]["$ref"].split("/")[-1]
+    replacement_properties = schema["$defs"][replacement_ref]["properties"]
+
+    assert set(properties) == {"stage", "line_replacements"}
+    assert set(replacement_properties) == {"start_line", "end_line", "replacement"}
+    assert "maxItems" not in properties["line_replacements"]
+    assert "content" not in properties
+
+
+def test_script_writer_schema_requires_non_null_state_delta() -> None:
+    schema = ScriptWriterResult.model_json_schema()
+
+    assert "state_delta" in schema["required"]
+    assert "anyOf" not in schema["properties"]["state_delta"]
+    assert schema["properties"]["state_delta"]["$ref"]
+    assert "complete verbatim screenplay" in schema["properties"]["content"]["description"]
+    assert "completion summary" in schema["properties"]["content"]["description"]
+
+
+def test_script_writer_accepts_json_encoded_state_delta_from_tool_call() -> None:
+    contract = _story_contract()
+    state_delta = _state_delta(contract, 1)
+
+    result = ScriptWriterResult.model_validate(
+        {
+            "stage": "generating_episode_scripts",
+            "episode_number": 1,
+            "content": "第一集完整剧本",
+            "state_delta": json.dumps(state_delta, ensure_ascii=False),
+        }
+    )
+
+    assert result.state_delta.model_dump(mode="json") == state_delta
+
+
+def test_script_writer_tool_binding_accepts_json_encoded_state_delta_without_retry() -> None:
+    contract = _story_contract()
+    state_delta = _state_delta(contract, 1)
+    strategy = ToolStrategy(ScriptWriterResult)
+    binding = OutputToolBinding.from_schema_spec(strategy.schema_specs[0])
+
+    result = binding.parse(
+        {
+            "stage": "generating_episode_scripts",
+            "episode_number": 1,
+            "content": "第一集完整剧本",
+            "state_delta": json.dumps(state_delta, ensure_ascii=False),
+        }
+    )
+
+    assert isinstance(result, ScriptWriterResult)
+    assert result.state_delta.model_dump(mode="json") == state_delta
+
+
+@pytest.mark.parametrize(
+    "encoded", ["{not-json}", "[]", "null", '"text"', '"{\\"episode_number\\": 1}"']
+)
+def test_script_writer_rejects_invalid_json_encoded_state_delta(encoded: str) -> None:
+    with pytest.raises(ValidationError):
+        ScriptWriterResult.model_validate(
+            {
+                "stage": "generating_episode_scripts",
+                "episode_number": 1,
+                "content": "第一集完整剧本",
+                "state_delta": encoded,
+            }
+        )
+
+
+def test_story_artifact_patch_repairs_only_numbered_minimal_lines() -> None:
+    content = (
+        "# 人物关系\n"
+        "程远在海难时二十四岁，比程屿大约六岁。\n"
+        "兄弟二人的年龄差决定了程屿对兄长的依赖，也影响调查中的选择。\n"
+        "其余人物关系与已批准的小传保持不变，并继续约束后续情节与人物行为。"
+    )
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="年龄与人物小传冲突",
+        issues=[
+            {
+                "code": "relative_age_conflict",
+                "message": "候选年龄应与小传的二十二岁、相差两岁一致",
+                "script_excerpt": "程远在海难时二十四岁，比程屿大约六岁。",
+            }
+        ],
+    )
+    patch = StoryArtifactRepairPatch.model_validate(
+        {
+            "stage": "generating_relationship_logic",
+            "line_replacements": [
+                {
+                    "start_line": 2,
+                    "end_line": 2,
+                    "replacement": "程远在海难时二十二岁，比程屿大两岁。",
+                }
+            ],
+        }
+    )
+
+    context = _story_repair_context(
+        stage=InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        content=content,
+        review=review,
+    )
+    repaired = _apply_story_artifact_repair_patch(
+        stage=InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        content=content,
+        patch=patch,
+    )
+
+    assert context["candidate_lines"][0] == {"line_number": 1, "text": "# 人物关系"}
+    assert context["candidate_lines"][1] == {
+        "line_number": 2,
+        "text": "程远在海难时二十四岁，比程屿大约六岁。",
+    }
+    assert context["confirmed_issues"][0]["code"] == "relative_age_conflict"
+    assert "二十二岁，比程屿大两岁" in repaired.content
+    assert "二十四岁" not in repaired.content
+
+
+def test_story_artifact_patch_rejects_invalid_overlapping_or_unchanged_lines() -> None:
+    content = "标题\n年龄冲突。\n关系冲突。\n其余关系文本保持不变并提供足够上下文。"
+    invalid_range = StoryArtifactRepairPatch.model_validate(
+        {
+            "stage": "generating_relationship_logic",
+            "line_replacements": [{"start_line": 9, "end_line": 9, "replacement": "年龄一致。"}],
+        }
+    )
+    overlapping = StoryArtifactRepairPatch.model_validate(
+        {
+            "stage": "generating_relationship_logic",
+            "line_replacements": [
+                {"start_line": 2, "end_line": 3, "replacement": "关系一致。"},
+                {"start_line": 3, "end_line": 3, "replacement": "年龄一致。"},
+            ],
+        }
+    )
+    unchanged = StoryArtifactRepairPatch.model_validate(
+        {
+            "stage": "generating_relationship_logic",
+            "line_replacements": [{"start_line": 2, "end_line": 2, "replacement": "年龄冲突。"}],
+        }
+    )
+
+    with pytest.raises(ValueError, match="story_repair_line_range_invalid"):
+        _apply_story_artifact_repair_patch(
+            stage=InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            content=content,
+            patch=invalid_range,
+        )
+    with pytest.raises(ValueError, match="overlapping_story_line_replacement"):
+        _apply_story_artifact_repair_patch(
+            stage=InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            content=content,
+            patch=overlapping,
+        )
+    with pytest.raises(ValueError, match="story_repair_line_did_not_change"):
+        _apply_story_artifact_repair_patch(
+            stage=InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            content=content,
+            patch=unchanged,
+        )
+
+    correction = _story_patch_correction(
+        ValueError("story_repair_line_range_invalid"),
+        content=content,
+        patch=invalid_range,
+    )
+    assert "Candidate has 4 numbered lines" in correction
+    assert '"start_line": 9' in correction
+
+
+def test_story_artifact_patch_discards_harmless_no_op_alongside_real_repairs() -> None:
+    content = (
+        "# 故事大纲\n"
+        "台风预警在七月二十日晚发布。\n"
+        "林夏必须在封岛前查清旧表来历。\n"
+        "其余人物身份、动机、知识来源、时间线与证物约束均保持不变。"
+    )
+    patch = StoryArtifactRepairPatch.model_validate(
+        {
+            "stage": "generating_story_outline",
+            "line_replacements": [
+                {
+                    "start_line": 2,
+                    "end_line": 2,
+                    "replacement": "台风预警在七月十九日晚发布。",
+                },
+                {
+                    "start_line": 4,
+                    "end_line": 4,
+                    "replacement": "其余人物身份、动机、知识来源、时间线与证物约束均保持不变。",
+                },
+            ],
+        }
+    )
+
+    repaired = _apply_story_artifact_repair_patch(
+        stage=InternalStage.GENERATING_STORY_OUTLINE,
+        content=content,
+        patch=patch,
+    )
+
+    assert "七月十九日晚" in repaired.content
+    assert repaired.content.endswith("其余人物身份、动机、知识来源、时间线与证物约束均保持不变。")
+
+
+def test_story_artifact_patch_enforces_total_old_or_new_line_change_budget() -> None:
+    content = "第一行。\n第二行。\n第三行。\n第四行。"
+    patch = StoryArtifactRepairPatch.model_validate(
+        {
+            "stage": "generating_story_outline",
+            "line_replacements": [
+                {
+                    "start_line": 2,
+                    "end_line": 2,
+                    "replacement": "这是一个长度接近完整候选的新事实插入，不能绕过预算。",
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="story_repair_patch_not_minimal"):
+        _apply_story_artifact_repair_patch(
+            stage=InternalStage.GENERATING_STORY_OUTLINE,
+            content=content,
+            patch=patch,
+        )
+
+
+def test_canon_review_rejects_non_blocking_suggestions_as_issues() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="Canon review issues must contain only blocking contradictions",
+    ):
+        CanonReviewerResult.model_validate(
+            {
+                "passed": False,
+                "evidence": "这里只是偏好建议。",
+                "issues": [
+                    {
+                        "code": "optional_naming",
+                        "message": "这不是逻辑矛盾，仅建议换一个名字，不构成失败。",
+                    }
+                ],
+            }
+        )
+
+
+def _prior_story_review() -> CanonReviewerResult:
+    return CanonReviewerResult(
+        passed=False,
+        evidence="上轮确认人物年龄冲突。",
+        issues=[
+            {
+                "code": "relative_age_conflict",
+                "message": "上游小传为二十二岁。",
+                "script_excerpt": "人物年龄二十四岁。",
+            }
+        ],
+    )
+
+
+def _passing_canon_review_with_closure(
+    prior: CanonReviewerResult,
+    *,
+    status: str | None,
+) -> CanonReviewerResult:
+    closures = []
+    if status is not None:
+        closures = [
+            {
+                "issue_id": _canon_issue_ledger(prior)[0]["issue_id"],
+                "status": status,
+                "evidence": "当前候选已写为二十二岁，并与批准小传一致。",
+            }
+        ]
+    return CanonReviewerResult.model_validate(
+        {
+            "passed": True,
+            "evidence": "本 lens 未发现新的矛盾。",
+            "issues": [],
+            "prior_issue_closures": closures,
+        }
+    )
+
+
+def _resolved_prior_story_closures(request: ToolCallRequest) -> list[dict[str, str]]:
+    previous = request.state.get("files", {}).get("/workspace/previous_story_review.json")
+    if not isinstance(previous, Mapping):
+        return []
+    payload = json.loads(previous["content"])
+    return [
+        {
+            "issue_id": entry["issue_id"],
+            "status": "resolved",
+            "evidence": "完整当前候选已按批准上游修正该冲突。",
+        }
+        for entry in payload["issue_ledger"]
+    ]
+
+
+def test_story_canon_missing_closure_cannot_pass() -> None:
+    prior = _prior_story_review()
+
+    merged = _merge_story_canon_reviews(
+        [
+            _passing_canon_review_with_closure(prior, status=None),
+            _passing_canon_review_with_closure(prior, status=None),
+        ],
+        prior,
+    )
+
+    assert merged.passed is False
+    assert [issue.code for issue in merged.issues] == ["relative_age_conflict"]
+    assert "missing" in merged.evidence
+
+
+def test_story_canon_one_resolved_and_one_missing_cannot_pass() -> None:
+    prior = _prior_story_review()
+
+    merged = _merge_story_canon_reviews(
+        [
+            _passing_canon_review_with_closure(prior, status="resolved"),
+            _passing_canon_review_with_closure(prior, status=None),
+        ],
+        prior,
+    )
+
+    assert merged.passed is False
+    assert [issue.code for issue in merged.issues] == ["relative_age_conflict"]
+
+
+def test_story_canon_both_resolved_allow_prior_issue_to_close() -> None:
+    prior = _prior_story_review()
+
+    merged = _merge_story_canon_reviews(
+        [
+            _passing_canon_review_with_closure(prior, status="resolved"),
+            _passing_canon_review_with_closure(prior, status="resolved"),
+        ],
+        prior,
+    )
+
+    assert merged.passed is True
+    assert merged.issues == []
+
+
+def test_story_canon_unresolved_closure_retains_prior_issue() -> None:
+    prior = _prior_story_review()
+
+    merged = _merge_story_canon_reviews(
+        [
+            _passing_canon_review_with_closure(prior, status="resolved"),
+            _passing_canon_review_with_closure(prior, status="unresolved"),
+        ],
+        prior,
+    )
+
+    assert merged.passed is False
+    assert [issue.code for issue in merged.issues] == ["relative_age_conflict"]
+    assert "unresolved" in merged.evidence
+
+
+@pytest.mark.asyncio
+async def test_story_repair_allows_two_bounded_targeted_patch_corrections() -> None:
+    corrections: list[str | None] = []
+    content = (
+        "- **林守诚（父亲）**：兼岛上唯一修表师。\n"
+        "其余人物身份、关系、时间线与证物约束均保持不变。\n"
+        "本段补充足够上下文，确保修复只触及冲突限定词而不重写整个故事工件。"
+    )
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: Mapping[str, Any]) -> None:
+        return None
+
+    async def generate_story_patch(
+        stage: InternalStage,
+        _: str,
+        __: CanonReviewerResult,
+        ___: int,
+        correction: str | None,
+    ) -> StoryArtifactRepairPatch:
+        corrections.append(correction)
+        line_number = 1 if len(corrections) == 3 else 99
+        return StoryArtifactRepairPatch.model_validate(
+            {
+                "stage": stage.value,
+                "line_replacements": [
+                    {
+                        "start_line": line_number,
+                        "end_line": line_number,
+                        "replacement": "- **林守诚（父亲）**：兼岛上修表师。",
+                    }
+                ],
+            }
+        )
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        generate_story_patch=generate_story_patch,
+    )
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="唯一修表师身份冲突。",
+        issues=[
+            {
+                "code": "only_repairer_conflict",
+                "message": "删除唯一限定词。",
+                "script_excerpt": "林守诚（父亲）：兼岛上唯一修表师。",
+            }
+        ],
+    )
+
+    repaired = await middleware._invoke_story_artifact_repair(
+        stage=InternalStage.GENERATING_STORY_OUTLINE,
+        content=content,
+        review=review,
+        repair_round=1,
+    )
+
+    assert len(corrections) == 3
+    assert corrections[0] is None
+    assert all("Candidate has 3 numbered lines" in value for value in corrections[1:])
+    assert "唯一" not in repaired.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("story repair timed out"),
+        httpx.ReadTimeout(
+            "relay timed out",
+            request=httpx.Request("POST", "https://relay.example/v1/chat/completions"),
+        ),
+    ],
+)
+async def test_story_repair_preserves_transport_failures_without_retry(failure: Exception) -> None:
+    calls = 0
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: Mapping[str, Any]) -> None:
+        return None
+
+    async def unavailable_patch(
+        _: InternalStage,
+        __: str,
+        ___: CanonReviewerResult,
+        ____: int,
+        _____: str | None,
+    ) -> Any:
+        nonlocal calls
+        calls += 1
+        raise failure
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        generate_story_patch=unavailable_patch,
+    )
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="需要修复。",
+        issues=[{"code": "stale_text", "message": "替换旧文字。"}],
+    )
+
+    with pytest.raises(type(failure)) as caught:
+        await middleware._invoke_story_artifact_repair(
+            stage=InternalStage.GENERATING_STORY_OUTLINE,
+            content="原始故事大纲。",
+            review=review,
+            repair_round=1,
+        )
+
+    assert caught.value is failure
+    assert calls == 1
+
+
+def test_canonical_workspace_replaces_stale_story_files_and_preserves_scratch() -> None:
+    request = ToolCallRequest(
+        tool_call={"name": "task", "args": {}, "id": "canonical", "type": "tool_call"},
+        tool=None,
+        state={
+            "files": {
+                "/workspace/story_outline.md": {"content": "旧大纲", "encoding": "utf-8"},
+                "/workspace/character_biographies.md": {
+                    "content": "未批准的旧小传",
+                    "encoding": "utf-8",
+                },
+                "/workspace/scratch.md": {"content": "保留", "encoding": "utf-8"},
+            }
+        },
+        runtime=None,
+    )
+    approved = {
+        InternalStage.SELECTING_L0_VARIANT: {
+            "stage": "selecting_l0_variant",
+            "selected_l0_variant": "主动选择",
+            "selection_rationale": "契合创意",
+            "content": None,
+        },
+        InternalStage.GENERATING_STORY_OUTLINE: {
+            "stage": "generating_story_outline",
+            "content": "已批准大纲",
+            "selected_l0_variant": None,
+            "selection_rationale": None,
+        },
+    }
+
+    normalized = _request_with_canonical_workspace(request, approved)
+    files = normalized.state["files"]
+
+    assert files["/workspace/story_outline.md"]["content"] == "已批准大纲"
+    assert "/workspace/character_biographies.md" not in files
+    assert files["/workspace/scratch.md"]["content"] == "保留"
+    assert "已批准大纲" in files["/workspace/approved-checkpoints.json"]["content"]
+
+
+def test_outline_repair_context_excludes_unrelated_contract_and_frozen_upstream() -> None:
+    contract = _story_contract(episode_count=2).model_dump(mode="json")
+    contract["prohibitions"].append("DO_NOT_SEND_" * 4_000)
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "第一集发现事实一。第二集发现事实二。",
+        "episode_count": 2,
+        "episodes": [
+            {"episode_number": 1, "plan": "第一集计划"},
+            {"episode_number": 2, "plan": "第二集计划"},
+        ],
+        "story_contract": contract,
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="事实一被角色过早知晓。",
+        issues=[
+            {
+                "code": "knowledge_overcommit",
+                "message": "修正所有引用事实一的知识状态。",
+                "contract_refs": ["fact_ep1", "knowledge_states"],
+            }
+        ],
+    )
+
+    context = _outline_repair_context(candidate, review)
+    serialized_context = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+    serialized_candidate = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+    target_by_path = {item["path"]: item for item in context["contract_targets"]}
+
+    assert "frozen_upstream" not in context
+    assert "candidate" not in context
+    assert "DO_NOT_SEND" not in serialized_context
+    assert len(serialized_context) * 2 < len(serialized_candidate)
+    assert context["matched_contract_refs"] == ["fact_ep1"]
+    assert context["matched_collection_scopes"] == ["knowledge_states"]
+    assert context["unmatched_contract_refs"] == []
+    assert context["readable_outline"]["value"] == candidate["content"]
+    assert [item["value"] for item in context["episode_plans"]] == candidate["episodes"]
+    assert set(target_by_path) == {
+        "/story_contract/facts/0",
+        "/story_contract/knowledge_states/0",
+        "/story_contract/knowledge_states/1",
+    }
+    assert target_by_path["/story_contract/facts/0"]["editable"] is False
+    assert target_by_path["/story_contract/knowledge_states/0"]["editable"] is True
+
+
+def test_outline_repair_context_exposes_fact_dependency_closure() -> None:
+    contract = _story_contract(episode_count=2).model_dump(mode="json")
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "第一集只发现刻字，第二集确认事实一。",
+        "episode_count": 2,
+        "episodes": [
+            {"episode_number": 1, "plan": "第一集计划"},
+            {"episode_number": 2, "plan": "第二集计划"},
+        ],
+        "story_contract": contract,
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="事实一被提前到第一集揭示。",
+        issues=[
+            {
+                "code": "premature_reveal",
+                "message": "fact_ep1 应改到第二集揭示并同步义务与知识状态。",
+                "contract_refs": ["fact_ep1"],
+            }
+        ],
+    )
+
+    context = _outline_repair_context(candidate, review)
+    target_by_path = {item["path"]: item for item in context["contract_targets"]}
+
+    assert set(target_by_path) == {
+        "/story_contract/facts/0",
+        "/story_contract/timeline/0",
+        "/story_contract/knowledge_states/0",
+        "/story_contract/knowledge_states/1",
+        "/story_contract/episode_obligations/0",
+        "/story_contract/episode_obligations/1",
+    }
+    assert all(item["editable"] is True for item in target_by_path.values())
+
+
+def test_outline_repair_patch_targets_only_exposed_editable_nodes() -> None:
+    contract = _story_contract().model_dump(mode="json")
+    contract["characters"][0]["initial_known_fact_ids"] = ["fact_ep1"]
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "第一集发现事实一。",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract,
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="知识状态过度承诺。",
+        issues=[
+            {
+                "code": "knowledge_overcommit",
+                "message": "test_character 不应知道 fact_ep1。",
+                "contract_refs": ["fact_ep1", "knowledge_states"],
+            }
+        ],
+    )
+    context = _outline_repair_context(candidate, review)
+    target_by_path = {item["path"]: item for item in context["contract_targets"]}
+    allowed = OutlineRepairPatch.model_validate(
+        {
+            "stage": "generating_episode_outline",
+            "json_edits": [
+                {
+                    "op": "replace",
+                    "path": "/story_contract/knowledge_states/0/known_fact_ids",
+                    "expected": ["fact_ep1"],
+                    "value": [],
+                }
+            ],
+        }
+    )
+    forbidden = OutlineRepairPatch.model_validate(
+        {
+            "stage": "generating_episode_outline",
+            "json_edits": [
+                {
+                    "op": "remove",
+                    "path": "/story_contract/facts/0",
+                    "expected": contract["facts"][0],
+                    "value": None,
+                }
+            ],
+        }
+    )
+
+    assert target_by_path["/story_contract/characters/0"]["editable"] is True
+    _validate_outline_repair_patch_targets(allowed, context)
+    with pytest.raises(ValueError, match="target_not_exposed"):
+        _validate_outline_repair_patch_targets(forbidden, context)
+
+
+def test_outline_repair_result_reports_output_truncation() -> None:
+    raw = AIMessage(content="", response_metadata={"finish_reason": "length"})
+
+    with pytest.raises(AgentProtocolError) as error:
+        _outline_repair_result({"raw": raw, "parsed": None, "parsing_error": None})
+
+    assert "token limit" in str(error.value)
+    assert error.value.safe_message == "分集大纲修复补丁输出被模型截断。"
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_forces_result_after_prose() -> None:
+    class Result(BaseModel):
+        value: str
+
+    calls: list[ModelRequest] = []
+
+    async def handler(request: ModelRequest) -> ModelResponse:
+        calls.append(request)
+        if len(calls) == 1:
+            return ModelResponse(
+                result=[AIMessage(content="I finished the work in prose.")],
+                structured_response=None,
+            )
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="done"),
+        )
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[],
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value="done")
+    assert len(calls) == 2
+    assert calls[1].tools == []
+    assert isinstance(calls[1].messages[-1], HumanMessage)
+    assert "exactly one valid Result tool call" in calls[1].messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_corrects_invalid_forced_result() -> None:
+    class Result(BaseModel):
+        value: str = Field(min_length=1)
+
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(content="The work is complete in prose."),
+            _tool_call("Result", {}, 1),
+            _tool_call("Result", {"value": "done"}, 2),
+        ]
+    )
+    work_tool = StructuredTool.from_function(
+        lambda value: value,
+        name="work",
+        description="A working tool unavailable during structured correction.",
+    )
+    agent = create_agent(
+        model,
+        tools=[work_tool],
+        middleware=[StructuredResultMiddleware()],
+        response_format=ToolStrategy(Result),
+    )
+
+    result = await agent.ainvoke({"messages": [HumanMessage(content="Complete the task.")]})
+
+    assert result["structured_response"] == Result(value="done")
+    assert model.bound_tool_names[-3:] == [
+        ["work", "Result"],
+        ["Result"],
+        ["Result"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_rejects_work_tool_after_forcing_result() -> None:
+    class Result(BaseModel):
+        value: str
+
+    calls: list[ModelRequest] = []
+
+    async def handler(request: ModelRequest) -> ModelResponse:
+        calls.append(request)
+        if len(calls) == 1:
+            return ModelResponse(
+                result=[AIMessage(content="I finished the work in prose.")],
+                structured_response=None,
+            )
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "work",
+                            "args": {"value": "hallucinated"},
+                            "id": "work-after-force",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ],
+            structured_response=None,
+        )
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[],
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    with pytest.raises(AgentProtocolError, match="invalid structured output"):
+        await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert len(calls) == 2
+    assert calls[1].tools == []
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_removes_work_tools_after_schema_error() -> None:
+    class Result(BaseModel):
+        value: str
+
+    error_message = ToolMessage(
+        content="Correct the schema.",
+        tool_call_id="result-call",
+        name="Result",
+    )
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[error_message],
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        assert candidate.tools == []
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="corrected"),
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value="corrected")
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_reconstructs_safe_validation_details() -> None:
+    valid_args = {
+        "stage": "generating_episode_outline",
+        "content": "分集大纲",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": _story_contract().model_dump(mode="json"),
+    }
+    invalid_args = copy.deepcopy(valid_args)
+    invalid_args["story_contract"]["facts"][0]["unit"] = "次"
+    invalid_message = _tool_call("EpisodePlannerResult", invalid_args, 77)
+    generic_error = ToolMessage(
+        content=(
+            "Return exactly one valid structured result tool call for the requested stage. "
+            "Do not return the result as prose."
+        ),
+        tool_call_id="call-77",
+        name="EpisodePlannerResult",
+    )
+    response_format = ToolStrategy(EpisodePlannerResult)
+    correction = _structured_result_validation_correction(
+        response_format,
+        [invalid_message, generic_error],
+    )
+
+    assert correction is not None
+    assert "Non-numeric facts cannot declare a unit" in correction.content
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[invalid_message, generic_error],
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=response_format,
+    )
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        assert candidate.tools == []
+        assert isinstance(candidate.messages[-1], HumanMessage)
+        assert "Non-numeric facts cannot declare a unit" in candidate.messages[-1].content
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=EpisodePlannerResult.model_validate(valid_args),
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert isinstance(response.structured_response, EpisodePlannerResult)
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_preserves_validation_details_after_prose() -> None:
+    valid_args = {
+        "stage": "generating_episode_outline",
+        "content": "分集大纲",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": _story_contract().model_dump(mode="json"),
+    }
+    invalid_args = copy.deepcopy(valid_args)
+    invalid_args["story_contract"]["facts"][0]["unit"] = "次"
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[
+            _tool_call("EpisodePlannerResult", invalid_args, 78),
+            ToolMessage(
+                content="Return a valid structured result.",
+                tool_call_id="call-78",
+                name="EpisodePlannerResult",
+            ),
+        ],
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=ToolStrategy(EpisodePlannerResult),
+    )
+    calls: list[ModelRequest] = []
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        calls.append(candidate)
+        if len(calls) == 1:
+            assert "Non-numeric facts cannot declare a unit" in candidate.messages[-1].content
+            return ModelResponse(
+                result=[AIMessage(content="I corrected it in prose.")],
+                structured_response=None,
+            )
+        assert any(
+            isinstance(message, HumanMessage)
+            and "Non-numeric facts cannot declare a unit" in message.content
+            for message in candidate.messages
+        )
+        assert any(
+            isinstance(message, AIMessage) and message.content == "I corrected it in prose."
+            for message in candidate.messages
+        )
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=EpisodePlannerResult.model_validate(valid_args),
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert isinstance(response.structured_response, EpisodePlannerResult)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_allows_layered_schema_corrections() -> None:
+    class Result(BaseModel):
+        value: str
+
+    messages: list[AIMessage | ToolMessage] = []
+    for index in range(2):
+        messages.extend(
+            [
+                _tool_call("Result", {"value": "invalid"}, index),
+                ToolMessage(
+                    content=f"Correct schema layer {index + 1}.",
+                    tool_call_id=f"call-{index}",
+                    name="Result",
+                ),
+            ]
+        )
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=messages,
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        assert candidate.tools == []
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="corrected"),
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value="corrected")
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_budgets_errors_by_assistant_turn() -> None:
+    class Result(BaseModel):
+        value: int
+
+    first_turn = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "Result",
+                "args": {"value": "invalid-a"},
+                "id": "first-a",
+                "type": "tool_call",
+            },
+            {
+                "name": "Result",
+                "args": {"value": "invalid-b"},
+                "id": "first-b",
+                "type": "tool_call",
+            },
+        ],
+    )
+    second_turn = _tool_call("Result", {"value": "invalid-c"}, 3)
+    messages: list[AIMessage | ToolMessage] = [
+        first_turn,
+        ToolMessage(content="Correct schema.", tool_call_id="first-a", name="Result"),
+        ToolMessage(content="Correct schema.", tool_call_id="first-b", name="Result"),
+        second_turn,
+        ToolMessage(content="Correct schema.", tool_call_id="call-3", name="Result"),
+    ]
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=messages,
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        assert candidate.tools == []
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value=7),
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value=7)
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_stops_after_three_schema_errors() -> None:
+    class Result(BaseModel):
+        value: str
+
+    messages: list[AIMessage | ToolMessage] = []
+    for index in range(3):
+        messages.extend(
+            [
+                _tool_call("Result", {"value": "invalid"}, index),
+                ToolMessage(
+                    content=f"Correct schema layer {index + 1}.",
+                    tool_call_id=f"call-{index}",
+                    name="Result",
+                ),
+            ]
+        )
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=messages,
+        tools=[],
+        response_format=ToolStrategy(Result),
+    )
+
+    async def handler(_: ModelRequest) -> ModelResponse:
+        raise AssertionError("The exhausted request must not call the model again")
+
+    with pytest.raises(AgentProtocolError, match="invalid structured output") as error:
+        await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert error.value.safe_message == "模型未返回有效的结构化结果。"
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_stops_repeated_work_tool_loop() -> None:
+    class Result(BaseModel):
+        value: str
+
+    messages: list[AIMessage | ToolMessage] = []
+    for index in range(3):
+        tool_call_id = f"work-{index}"
+        messages.extend(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_todos",
+                            "args": {"todos": [{"content": "完成大纲", "status": "pending"}]},
+                            "id": tool_call_id,
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                ToolMessage(
+                    content="Todo list updated.",
+                    tool_call_id=tool_call_id,
+                    name="write_todos",
+                ),
+            ]
+        )
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=messages,
+        tools=[{"type": "function", "function": {"name": "write_todos"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        assert candidate.tools == []
+        assert isinstance(candidate.messages[-1], HumanMessage)
+        assert "repeated without progress" in candidate.messages[-1].content
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="done"),
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value="done")
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_stops_alternating_work_tool_loop() -> None:
+    class Result(BaseModel):
+        value: str
+
+    messages: list[AIMessage | ToolMessage] = []
+    for index, left in enumerate(("9", "26", "9", "26", "9")):
+        tool_call_id = f"arithmetic-{index}"
+        messages.extend(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "calculate_arithmetic",
+                            "args": {"left": left, "operation": "add", "right": "1"},
+                            "id": tool_call_id,
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                ToolMessage(
+                    content=str(int(left) + 1),
+                    tool_call_id=tool_call_id,
+                    name="calculate_arithmetic",
+                ),
+            ]
+        )
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=messages,
+        tools=[{"type": "function", "function": {"name": "calculate_arithmetic"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        assert candidate.tools == []
+        assert isinstance(candidate.messages[-1], HumanMessage)
+        assert "working-tool loop was detected" in candidate.messages[-1].content
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="done"),
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value="done")
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_stops_after_work_tool_turn_budget() -> None:
+    class Result(BaseModel):
+        value: str
+
+    messages = [
+        _tool_call("read_file", {"file_path": f"/workspace/review-{index}.md"}, index)
+        for index in range(24)
+    ]
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=messages,
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        assert candidate.tools == []
+        assert isinstance(candidate.messages[-1], HumanMessage)
+        assert "working-tool turn budget is exhausted" in candidate.messages[-1].content
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="done"),
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value="done")
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_allows_normal_multi_tool_review() -> None:
+    class Result(BaseModel):
+        value: str
+
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {"file_path": f"/workspace/review-{turn}-{call}.md"},
+                    "id": f"review-{turn}-{call}",
+                    "type": "tool_call",
+                }
+                for call in range(3)
+            ],
+        )
+        for turn in range(8)
+    ]
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=messages,
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        assert candidate.tools == request.tools
+        assert candidate.messages == request.messages
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="done"),
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value="done")
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_keeps_only_langchain_result_tool() -> None:
+    class Result(BaseModel):
+        value: str
+
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(content="The work is complete in prose."),
+            _tool_call("Result", {"value": "done"}, 1),
+        ]
+    )
+    work_tool = StructuredTool.from_function(
+        lambda value: value,
+        name="work",
+        description="A working tool that must not be available during forced completion.",
+    )
+    agent = create_agent(
+        model,
+        tools=[work_tool],
+        middleware=[StructuredResultMiddleware()],
+        response_format=ToolStrategy(Result),
+    )
+
+    result = await agent.ainvoke({"messages": [HumanMessage(content="Complete the task.")]})
+
+    assert result["structured_response"] == Result(value="done")
+    assert model.bound_tool_names[-2] == ["work", "Result"]
+    assert model.bound_tool_names[-1] == ["Result"]
 
 
 def test_outline_repair_patch_applies_only_guarded_minimal_edits() -> None:
@@ -738,6 +2038,37 @@ def test_structured_output_retry_reports_safe_validation_details() -> None:
     assert "input_value" not in message
 
 
+def test_structured_output_retry_reports_safe_temporal_format_errors() -> None:
+    invalid = _story_contract().model_dump(mode="json")
+    invalid["facts"][0].update(kind="date", value="第0天", unit=None)
+
+    try:
+        StoryContract.model_validate(invalid)
+    except ValidationError as error:
+        message = _structured_output_retry_message(error)
+    else:
+        raise AssertionError("The invalid temporal fact unexpectedly validated")
+
+    assert "facts.0: Invalid date value" in message
+    assert "第0天" not in message
+
+
+def test_structured_output_retry_reports_duplicate_evidence_targets_safely() -> None:
+    contract = _story_contract()
+    invalid = _state_delta(contract, 1)
+    invalid["evidence"].append(dict(invalid["evidence"][0]))
+
+    try:
+        EpisodeStateDelta.model_validate(invalid)
+    except ValidationError as error:
+        message = _structured_output_retry_message(error)
+    else:
+        raise AssertionError("The duplicate evidence targets unexpectedly validated")
+
+    assert "Episode evidence target IDs must be unique" in message
+    assert "事实1" not in message
+
+
 def test_structured_output_retry_does_not_echo_model_input_or_custom_error_values() -> None:
     secret = "SECRET-API-KEY"
 
@@ -769,6 +2100,7 @@ def test_structured_output_retry_does_not_echo_model_input_or_custom_error_value
 
 def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "future dialogue counts" in _STORY_ARCHITECT_PROMPT
+    assert "Never append an English translation" in _STORY_ARCHITECT_PROMPT
     assert "episode-specific action" in _EPISODE_PLANNER_PROMPT
     assert "dates, countdowns, amounts, counts, and arithmetic" in _EPISODE_PLANNER_PROMPT
     assert "/workspace/approved-checkpoints.json" in _EPISODE_PLANNER_PROMPT
@@ -785,8 +2117,8 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
     assert "canonical contract names in every speaker label" in _SCRIPT_WRITER_PROMPT
     assert "call participants" in _SCRIPT_WRITER_PROMPT
-    assert "grandfathered pre-contract run" in _SCRIPT_WRITER_PROMPT
-    assert "return null state_delta" in _SCRIPT_WRITER_PROMPT
+    assert "complete non-null state_delta" in _SCRIPT_WRITER_PROMPT
+    assert "grandfathered pre-contract run" not in _SCRIPT_WRITER_PROMPT
 
 
 def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> None:
@@ -835,6 +2167,65 @@ def test_calculate_arithmetic_rejects_non_finite_or_unbounded_operands(
 
 
 @pytest.mark.asyncio
+async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class RoutingCaptured(Exception):
+        pass
+
+    captured: dict[str, Any] = {}
+
+    def capture_agent(**kwargs: Any) -> None:
+        captured.update(kwargs)
+        raise RoutingCaptured
+
+    monkeypatch.setattr("pengine.agents.create_deep_agent", capture_agent)
+    generation_model = ToolCallingFakeModel(responses=[])
+    review_model = ToolCallingFakeModel(responses=[])
+    database = tmp_path / "routing-checkpoints.sqlite3"
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("No stage should run during topology capture")
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = DeepAgentWorkflow(
+            generation_model=generation_model,
+            review_model=review_model,
+            checkpointer=saver,
+            generation_provider_profile_key="toolcallingfakemodel",
+            review_provider_profile_key="toolcallingfakemodel",
+        )
+        with pytest.raises(RoutingCaptured):
+            await workflow.execute(
+                thread_id="routing-thread",
+                story="一句创意。",
+                requirements="生成短剧。",
+                persona_files={"/persona/project.md": "规则"},
+                before_stage=before_stage,
+                approve_stage=approve_stage,
+            )
+
+    assert captured["model"] is generation_model
+    subagent_models = {spec["name"]: spec["model"] for spec in captured["subagents"]}
+    assert {name for name, model in subagent_models.items() if model is generation_model} == {
+        "story_architect",
+        "episode_planner",
+        "script_writer",
+        "episode_repair",
+    }
+    assert {name for name, model in subagent_models.items() if model is review_model} == {
+        "quality_reviewer",
+        "canon_reviewer",
+        "episode_reviewer",
+    }
+
+
+@pytest.mark.asyncio
 async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     events: list[tuple[str, str]] = []
@@ -849,7 +2240,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
         model = ToolCallingFakeModel(responses=_successful_responses())
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=model,
             checkpointer=saver,
             recursion_limit=40,
@@ -918,10 +2309,501 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval() -> None:
+    approved_payloads: dict[InternalStage, Any] = {
+        InternalStage.SELECTING_L0_VARIANT: {
+            "stage": "selecting_l0_variant",
+            "content": None,
+            "selected_l0_variant": "主动选择",
+            "selection_rationale": "契合创意",
+        },
+        InternalStage.GENERATING_STORY_OUTLINE: {
+            "stage": "generating_story_outline",
+            "content": "程远海难时二十二岁，程屿二十岁。",
+            "selected_l0_variant": None,
+            "selection_rationale": None,
+        },
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
+            "stage": "generating_character_biographies",
+            "content": "程远二十二岁，比程屿大两岁。",
+            "selected_l0_variant": None,
+            "selection_rationale": None,
+        },
+    }
+    frozen_upstream = copy.deepcopy(approved_payloads)
+    approvals: list[tuple[InternalStage, dict[str, Any]]] = []
+    review_calls = 0
+    patch_calls = 0
+
+    async def before_stage(stage: InternalStage) -> int:
+        assert stage is InternalStage.GENERATING_RELATIONSHIP_LOGIC
+        return 1
+
+    async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
+        approvals.append((stage, payload))
+        approved_payloads[stage] = payload
+
+    async def generate_story_patch(
+        stage: InternalStage,
+        content: str,
+        review: CanonReviewerResult,
+        repair_round: int,
+        correction: str | None,
+    ) -> StoryArtifactRepairPatch:
+        nonlocal patch_calls
+        patch_calls += 1
+        assert stage is InternalStage.GENERATING_RELATIONSHIP_LOGIC
+        assert repair_round == 1
+        assert correction is None
+        assert {issue.code for issue in review.issues} == {
+            "relative_age_conflict",
+            "call_participant_conflict",
+        }
+        assert "二十四岁" in content
+        return StoryArtifactRepairPatch.model_validate(
+            {
+                "stage": stage.value,
+                "line_replacements": [
+                    {
+                        "start_line": 1,
+                        "end_line": 1,
+                        "replacement": "程远二十二岁，比程屿大两岁。",
+                    },
+                    {
+                        "start_line": 2,
+                        "end_line": 2,
+                        "replacement": "通话记录确认电话对象写成程屿。",
+                    },
+                ],
+            }
+        )
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(approved_payloads),
+        approved_payloads=approved_payloads,
+        generate_story_patch=generate_story_patch,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_relationship_logic] write relationships",
+                "subagent_type": "story_architect",
+            },
+            "id": "story-consistency",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+
+    async def handler(candidate: ToolCallRequest) -> ToolMessage:
+        nonlocal review_calls
+        subagent_type = candidate.tool_call["args"]["subagent_type"]
+        if subagent_type == "story_architect":
+            payload = {
+                "stage": "generating_relationship_logic",
+                "content": (
+                    "程远二十四岁，比程屿大六岁。电话对象写成周砚。\n"
+                    "通话记录确认电话对象写成周砚。\n"
+                    "两人的年龄关系影响程屿对兄长的依赖和调查选择，并约束后续全部情节。\n"
+                    "其余人物身份、秘密来源、证物链和时间线均保持已批准版本。"
+                ),
+                "selected_l0_variant": None,
+                "selection_rationale": None,
+            }
+        else:
+            assert subagent_type == "canon_reviewer"
+            review_calls += 1
+            current = candidate.state["files"]["/workspace/current_story_candidate.md"]["content"]
+            if review_calls <= 2:
+                assert "二十四岁" in current
+                if review_calls == 1:
+                    payload = {
+                        "passed": False,
+                        "evidence": "关系稿年龄与人物小传冲突",
+                        "issues": [
+                            {
+                                "code": "relative_age_conflict",
+                                "message": "权威小传为二十二岁、相差两岁",
+                                "script_excerpt": "程远二十四岁，比程屿大六岁。",
+                            }
+                        ],
+                    }
+                else:
+                    payload = {
+                        "passed": False,
+                        "evidence": "通话对象与上游冲突",
+                        "issues": [
+                            {
+                                "code": "call_participant_conflict",
+                                "message": "权威通话对象为程屿",
+                                "script_excerpt": "电话对象写成周砚。",
+                            }
+                        ],
+                    }
+            else:
+                assert "二十二岁" in current
+                assert "电话对象写成程屿" in current
+                payload = {"passed": True, "evidence": "故事工件一致", "issues": []}
+            payload["prior_issue_closures"] = _resolved_prior_story_closures(candidate)
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id=candidate.tool_call["id"],
+            name="task",
+        )
+
+    await middleware.awrap_tool_call(request, handler)
+
+    assert review_calls == 4
+    assert patch_calls == 1
+    assert (
+        approved_payloads | {key: value for key, value in frozen_upstream.items()}
+        == approved_payloads
+    )
+    assert all(approved_payloads[stage] == payload for stage, payload in frozen_upstream.items())
+    assert len(approvals) == 1
+    stage, repaired = approvals[0]
+    assert stage is InternalStage.GENERATING_RELATIONSHIP_LOGIC
+    assert repaired["consistency_review"]["passed"] is True
+    assert repaired["consistency_repair_rounds"] == 1
+    assert "二十二岁，比程屿大两岁" in repaired["content"]
+    assert "电话对象写成程屿" in repaired["content"]
+
+
+@pytest.mark.asyncio
+async def test_story_consistency_uses_backstop_and_sixth_repair_round() -> None:
+    approvals: list[tuple[InternalStage, dict[str, Any]]] = []
+    approved_payloads: dict[InternalStage, Any] = {
+        InternalStage.SELECTING_L0_VARIANT: {
+            "stage": "selecting_l0_variant",
+            "content": None,
+            "selected_l0_variant": "主动选择",
+            "selection_rationale": "契合创意",
+        }
+    }
+    review_calls = 0
+    patch_calls = 0
+    backstop_calls = 0
+
+    async def before_stage(stage: InternalStage) -> int:
+        assert stage is InternalStage.GENERATING_STORY_OUTLINE
+        return 1
+
+    async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
+        approvals.append((stage, payload))
+        approved_payloads[stage] = payload
+
+    async def generate_story_patch(
+        stage: InternalStage,
+        content: str,
+        review: CanonReviewerResult,
+        repair_round: int,
+        correction: str | None,
+    ) -> StoryArtifactRepairPatch:
+        nonlocal patch_calls
+        patch_calls += 1
+        assert stage is InternalStage.GENERATING_STORY_OUTLINE
+        assert correction is None
+        issue_codes = {issue.code for issue in review.issues}
+        if repair_round == 1:
+            assert issue_codes == {"call_participant_conflict"}
+            assert "电话打给周砚" in content
+            return StoryArtifactRepairPatch.model_validate(
+                {
+                    "stage": stage.value,
+                    "line_replacements": [
+                        {
+                            "start_line": 1,
+                            "end_line": 1,
+                            "replacement": ("电话改为打给程屿后，陈伯一直知情并准备在终局作证。"),
+                        }
+                    ],
+                }
+            )
+        if repair_round == 2:
+            assert issue_codes == {"knowledge_source_gap", "testimony_basis_gap"}
+            assert "陈伯一直知情并准备在终局作证" in content
+            return StoryArtifactRepairPatch.model_validate(
+                {
+                    "stage": stage.value,
+                    "line_replacements": [
+                        {
+                            "start_line": 1,
+                            "end_line": 1,
+                            "replacement": (
+                                "电话改为打给程屿；陈伯因保管周远的值班记录与手记而知情，"
+                                "并据此在终局作证。"
+                            ),
+                        }
+                    ],
+                }
+            )
+        if repair_round == 3:
+            assert issue_codes == {"repeated_knowledge_source_gap"}
+            assert "人物摘要仍称陈伯一直知情" in content
+            return StoryArtifactRepairPatch.model_validate(
+                {
+                    "stage": stage.value,
+                    "line_replacements": [
+                        {
+                            "start_line": 2,
+                            "end_line": 2,
+                            "replacement": (
+                                "人物摘要同步说明陈伯因保管周远的值班记录与手记而知情。"
+                            ),
+                        }
+                    ],
+                }
+            )
+        if repair_round == 4:
+            assert issue_codes == {"relationship_summary_knowledge_gap"}
+            assert "关系摘要仍称陈伯一直知情" in content
+            return StoryArtifactRepairPatch.model_validate(
+                {
+                    "stage": stage.value,
+                    "line_replacements": [
+                        {
+                            "start_line": 3,
+                            "end_line": 3,
+                            "replacement": (
+                                "关系摘要同步说明陈伯因保管周远的值班记录与手记而知情。"
+                            ),
+                        }
+                    ],
+                }
+            )
+        if repair_round == 5:
+            assert issue_codes == {"ending_summary_knowledge_gap"}
+            assert "结局摘要仍称陈伯一直知情" in content
+            return StoryArtifactRepairPatch.model_validate(
+                {
+                    "stage": stage.value,
+                    "line_replacements": [
+                        {
+                            "start_line": 4,
+                            "end_line": 4,
+                            "replacement": (
+                                "结局摘要同步说明陈伯因保管周远的值班记录与手记而知情。"
+                            ),
+                        }
+                    ],
+                }
+            )
+        assert repair_round == 6
+        assert issue_codes == {"evidence_summary_knowledge_gap"}
+        assert "证物摘要仍称陈伯一直知情" in content
+        return StoryArtifactRepairPatch.model_validate(
+            {
+                "stage": stage.value,
+                "line_replacements": [
+                    {
+                        "start_line": 5,
+                        "end_line": 5,
+                        "replacement": ("证物摘要同步说明陈伯因保管周远的值班记录与手记而知情。"),
+                    }
+                ],
+            }
+        )
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(approved_payloads),
+        approved_payloads=approved_payloads,
+        generate_story_patch=generate_story_patch,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_story_outline] write story outline",
+                "subagent_type": "story_architect",
+            },
+            "id": "story-backstop",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+
+    async def handler(candidate: ToolCallRequest) -> ToolMessage:
+        nonlocal review_calls, backstop_calls
+        subagent_type = candidate.tool_call["args"]["subagent_type"]
+        if subagent_type == "story_architect":
+            payload = {
+                "stage": "generating_story_outline",
+                "content": (
+                    "电话打给周砚后，陈伯决定在终局作证。\n"
+                    "人物摘要仍称陈伯一直知情并准备在终局作证。\n"
+                    "关系摘要仍称陈伯一直知情并准备在终局作证。\n"
+                    "结局摘要仍称陈伯一直知情并准备在终局作证。\n"
+                    "证物摘要仍称陈伯一直知情并准备在终局作证。\n"
+                    "林夏仍按已批准动机追查父亲承担责任的原因。\n"
+                    "旧表、值班记录与救援站构成贯穿全剧的既有证物链。\n"
+                    "其余人物身份、时间线与结局选择保持上游版本。"
+                ),
+                "selected_l0_variant": None,
+                "selection_rationale": None,
+            }
+        else:
+            assert subagent_type == "canon_reviewer"
+            description = candidate.tool_call["args"]["description"]
+            current = candidate.state["files"]["/workspace/current_story_candidate.md"]["content"]
+            if "convergence backstop" in description:
+                backstop_calls += 1
+                if backstop_calls == 1:
+                    assert "陈伯一直知情并准备在终局作证" in current
+                    payload = {
+                        "passed": False,
+                        "evidence": "终局作证依据仍未闭合",
+                        "issues": [
+                            {
+                                "code": "testimony_basis_gap",
+                                "message": "必须补出陈伯为何能作证的既有记录来源。",
+                                "script_excerpt": "陈伯一直知情并准备在终局作证。",
+                            }
+                        ],
+                    }
+                else:
+                    assert backstop_calls == 2
+                    assert "陈伯因保管周远的值班记录与手记而知情" in current
+                    payload = {
+                        "passed": True,
+                        "evidence": "收敛复核未发现新增矛盾",
+                        "issues": [],
+                    }
+            else:
+                review_calls += 1
+                if review_calls == 1:
+                    payload = {
+                        "passed": False,
+                        "evidence": "通话对象与上游冲突",
+                        "issues": [
+                            {
+                                "code": "call_participant_conflict",
+                                "message": "权威通话对象为程屿。",
+                                "script_excerpt": "电话打给周砚后，陈伯决定在终局作证。",
+                            }
+                        ],
+                    }
+                elif review_calls == 2:
+                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
+                elif review_calls == 3:
+                    assert "电话改为打给程屿后，陈伯一直知情并准备在终局作证。" in current
+                    payload = {
+                        "passed": False,
+                        "evidence": "知情来源缺口",
+                        "issues": [
+                            {
+                                "code": "knowledge_source_gap",
+                                "message": "必须补出陈伯如何得知真相的既有来源。",
+                                "script_excerpt": "陈伯一直知情并准备在终局作证。",
+                            }
+                        ],
+                    }
+                elif review_calls == 4:
+                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
+                elif review_calls == 5:
+                    assert "值班记录与手记" in current
+                    assert "人物摘要仍称陈伯一直知情" in current
+                    payload = {
+                        "passed": False,
+                        "evidence": "重复摘要仍缺少知情来源",
+                        "issues": [
+                            {
+                                "code": "repeated_knowledge_source_gap",
+                                "message": "第二行也必须同步写明陈伯知情的既有记录来源。",
+                                "script_excerpt": "人物摘要仍称陈伯一直知情",
+                            }
+                        ],
+                    }
+                elif review_calls == 6:
+                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
+                elif review_calls == 7:
+                    assert "值班记录与手记" in current
+                    assert "关系摘要仍称陈伯一直知情" in current
+                    payload = {
+                        "passed": False,
+                        "evidence": "关系摘要仍缺少知情来源",
+                        "issues": [
+                            {
+                                "code": "relationship_summary_knowledge_gap",
+                                "message": "第三行也必须同步写明陈伯知情的既有记录来源。",
+                                "script_excerpt": "关系摘要仍称陈伯一直知情",
+                            }
+                        ],
+                    }
+                elif review_calls == 8:
+                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
+                elif review_calls == 9:
+                    assert "值班记录与手记" in current
+                    assert "结局摘要仍称陈伯一直知情" in current
+                    payload = {
+                        "passed": False,
+                        "evidence": "结局摘要仍缺少知情来源",
+                        "issues": [
+                            {
+                                "code": "ending_summary_knowledge_gap",
+                                "message": "第四行也必须同步写明陈伯知情的既有记录来源。",
+                                "script_excerpt": "结局摘要仍称陈伯一直知情",
+                            }
+                        ],
+                    }
+                elif review_calls == 10:
+                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
+                elif review_calls == 11:
+                    assert "值班记录与手记" in current
+                    assert "证物摘要仍称陈伯一直知情" in current
+                    payload = {
+                        "passed": False,
+                        "evidence": "证物摘要仍缺少知情来源",
+                        "issues": [
+                            {
+                                "code": "evidence_summary_knowledge_gap",
+                                "message": "第五行也必须同步写明陈伯知情的既有记录来源。",
+                                "script_excerpt": "证物摘要仍称陈伯一直知情",
+                            }
+                        ],
+                    }
+                elif review_calls == 12:
+                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
+                else:
+                    assert "值班记录与手记" in current
+                    assert "人物摘要仍称陈伯一直知情" not in current
+                    assert "关系摘要仍称陈伯一直知情" not in current
+                    assert "结局摘要仍称陈伯一直知情" not in current
+                    assert "证物摘要仍称陈伯一直知情" not in current
+                    payload = {"passed": True, "evidence": "故事工件一致", "issues": []}
+            payload["prior_issue_closures"] = _resolved_prior_story_closures(candidate)
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id=candidate.tool_call["id"],
+            name="task",
+        )
+
+    await middleware.awrap_tool_call(request, handler)
+
+    assert review_calls == 14
+    assert backstop_calls == 2
+    assert patch_calls == 6
+    assert len(approvals) == 1
+    stage, repaired = approvals[0]
+    assert stage is InternalStage.GENERATING_STORY_OUTLINE
+    assert repaired["consistency_review"]["passed"] is True
+    assert repaired["consistency_repair_rounds"] == 6
+    assert "值班记录与手记" in repaired["content"]
+
+
+@pytest.mark.asyncio
 async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    responses[10] = _tool_call(
+    responses[16] = _tool_call(
         "CanonReviewerResult",
         {
             "passed": False,
@@ -935,10 +2817,10 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
                 }
             ],
         },
-        10,
+        16,
     )
     responses.insert(
-        11,
+        17,
         _tool_call(
             "OutlineRepairPatch",
             {
@@ -950,7 +2832,7 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
         ),
     )
     responses.insert(
-        12,
+        18,
         _tool_call(
             "CanonReviewerResult",
             {"passed": True, "evidence": "修复后合同一致", "issues": []},
@@ -967,7 +2849,7 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -993,24 +2875,24 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
 async def test_contract_repair_stops_after_one_invalid_patch_correction(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    responses[10] = _tool_call(
+    responses[16] = _tool_call(
         "CanonReviewerResult",
         {
             "passed": False,
             "evidence": "合同遗漏一项上游承诺",
             "issues": [{"code": "missing_commitment", "message": "必须补齐承诺"}],
         },
-        10,
+        16,
     )
     invalid_patch = {
         "stage": "generating_episode_outline",
         "content_replacements": [],
         "json_edits": [],
     }
-    responses.insert(11, _tool_call("OutlineRepairPatch", invalid_patch, 101))
-    responses.insert(12, _tool_call("OutlineRepairPatch", invalid_patch, 102))
+    responses.insert(17, _tool_call("OutlineRepairPatch", invalid_patch, 101))
+    responses.insert(18, _tool_call("OutlineRepairPatch", invalid_patch, 102))
     responses.insert(
-        13,
+        19,
         _tool_call(
             "OutlineRepairPatch",
             {
@@ -1030,7 +2912,7 @@ async def test_contract_repair_stops_after_one_invalid_patch_correction(tmp_path
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -1152,7 +3034,7 @@ async def test_outline_canon_review_receives_structured_episode_plans() -> None:
 async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    writer_payload = responses[12].tool_calls[0]["args"]
+    writer_payload = responses[18].tool_calls[0]["args"]
     failed_review = {
         "passed": False,
         "evidence": "人物身份与上游小传不一致",
@@ -1165,11 +3047,11 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
             }
         ],
     }
-    responses[13] = _tool_call("EpisodeReviewerResult", failed_review, 13)
-    responses.insert(14, _tool_call("ScriptWriterResult", writer_payload, 201))
-    responses.insert(15, _tool_call("EpisodeReviewerResult", failed_review, 202))
-    responses.insert(16, _tool_call("ScriptWriterResult", writer_payload, 203))
-    responses.insert(17, _tool_call("EpisodeReviewerResult", failed_review, 204))
+    responses[19] = _tool_call("EpisodeReviewerResult", failed_review, 19)
+    responses.insert(20, _tool_call("ScriptWriterResult", writer_payload, 201))
+    responses.insert(21, _tool_call("EpisodeReviewerResult", failed_review, 202))
+    responses.insert(22, _tool_call("ScriptWriterResult", writer_payload, 203))
+    responses.insert(23, _tool_call("EpisodeReviewerResult", failed_review, 204))
     approved: list[InternalStage] = []
     episode_hooks, episode_attempts = _episode_hook_kwargs()
 
@@ -1181,7 +3063,7 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -1201,6 +3083,88 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
     assert error.value.repair_rounds == 2
     assert episode_attempts == [1]
     assert InternalStage.GENERATING_EPISODE_SCRIPTS not in approved
+
+
+@pytest.mark.asyncio
+async def test_episode_repair_receives_deterministic_and_semantic_issues_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    repaired_writer_payload = copy.deepcopy(responses[18].tool_calls[0]["args"])
+    invalid_writer_payload = copy.deepcopy(repaired_writer_payload)
+    invalid_writer_payload["content"] = "钩子1"
+    responses[18] = _tool_call("ScriptWriterResult", invalid_writer_payload, 18)
+    responses[19] = _tool_call(
+        "EpisodeReviewerResult",
+        {
+            "passed": False,
+            "evidence": "人物身份发生漂移",
+            "issues": [
+                {
+                    "code": "identity_drift",
+                    "message": "人物身份与上游不一致",
+                    "script_excerpt": "钩子1",
+                }
+            ],
+        },
+        19,
+    )
+    responses.insert(20, _tool_call("ScriptWriterResult", repaired_writer_payload, 201))
+    responses.insert(
+        21,
+        _tool_call(
+            "EpisodeReviewerResult",
+            {"passed": True, "evidence": "修复后分集一致", "issues": []},
+            202,
+        ),
+    )
+    captured_files: list[Mapping[str, str]] = []
+    original_repair = StageGuardMiddleware._invoke_repair_subagent
+
+    async def capture_repair(
+        middleware: StageGuardMiddleware,
+        **kwargs: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        captured_files.append(kwargs["files"])
+        return await original_repair(middleware, **kwargs)
+
+    monkeypatch.setattr(StageGuardMiddleware, "_invoke_repair_subagent", capture_repair)
+    approved: list[InternalStage] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = _fake_workflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+        await workflow.execute(
+            thread_id="merged-episode-review-thread",
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+            **_episode_hook_kwargs()[0],
+        )
+
+    review = json.loads(captured_files[0]["/workspace/episode_review.json"])
+    assert {issue["code"] for issue in review["issues"]} >= {
+        "evidence_not_in_script",
+        "identity_drift",
+    }
+    assert captured_files[0]["/workspace/current_episode_plan.md"] == "第一集计划"
+    obligation = json.loads(captured_files[0]["/workspace/current_episode_obligation.json"])
+    assert obligation["end_hook"] == "钩子1"
+    assert InternalStage.GENERATING_EPISODE_SCRIPTS in approved
 
 
 @pytest.mark.asyncio
@@ -1355,7 +3319,7 @@ async def test_structured_output_validation_error_is_corrected_within_stage(
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses),
             checkpointer=saver,
             recursion_limit=40,
@@ -1378,6 +3342,65 @@ async def test_structured_output_validation_error_is_corrected_within_stage(
 
 
 @pytest.mark.asyncio
+async def test_contract_episode_missing_state_delta_is_corrected_within_stage(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    script_result_index = next(
+        index
+        for index, message in enumerate(responses)
+        if message.tool_calls and message.tool_calls[0]["name"] == "ScriptWriterResult"
+    )
+    responses.insert(
+        script_result_index,
+        _tool_call(
+            "ScriptWriterResult",
+            {
+                "stage": "generating_episode_scripts",
+                "episode_number": 1,
+                "content": "事实1\n钩子1",
+                "state_delta": None,
+            },
+            99,
+        ),
+    )
+    attempted: list[InternalStage] = []
+    approved: list[InternalStage] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    episode_hooks, episode_attempts = _episode_hook_kwargs()
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = _fake_workflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            recursion_limit=40,
+            provider_profile_key="toolcallingfakemodel",
+        )
+
+        result = await workflow.execute(
+            thread_id="missing-state-delta-retry-thread",
+            story="故事",
+            requirements="按人格设定完成完整交付。",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+            **episode_hooks,
+        )
+
+    assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
+    assert episode_attempts == [1]
+    assert InternalStage.GENERATING_EPISODE_SCRIPTS in approved
+
+
+@pytest.mark.asyncio
 async def test_missing_structured_result_is_corrected_once_within_stage(
     tmp_path: Path,
 ) -> None:
@@ -1396,7 +3419,7 @@ async def test_missing_structured_result_is_corrected_once_within_stage(
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses),
             checkpointer=saver,
             recursion_limit=40,
@@ -1439,7 +3462,7 @@ async def test_missing_structured_result_fails_after_one_correction(
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses),
             checkpointer=saver,
             recursion_limit=40,
@@ -1578,7 +3601,7 @@ def test_contract_language_guard_allows_character_name_subject_and_typed_unit(
     )
 
 
-def test_language_retry_fingerprint_locks_timeline_and_contract_version() -> None:
+def test_language_retry_translates_relative_timeline_but_locks_contract_version() -> None:
     contract_payload = _story_contract().model_dump(mode="json")
     contract_payload["timeline"][0]["when"] = "The next morning"
 
@@ -1601,8 +3624,15 @@ def test_language_retry_fingerprint_locks_timeline_and_contract_version() -> Non
     changed_version_payload["version"] = 2
     changed_version = planner_result(changed_version_payload)
 
+    with pytest.raises(AgentProtocolError, match="invalid structured output"):
+        _validate_result_language(
+            original,
+            output_language=SIMPLIFIED_CHINESE,
+            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+        )
+
     original_fingerprint = _language_retry_fingerprint(original)
-    assert not _language_retry_matches(
+    assert _language_retry_matches(
         original_fingerprint,
         _language_retry_fingerprint(translated),
     )
@@ -1633,6 +3663,21 @@ def test_language_retry_allows_variant_label_translation_but_locks_machine_id() 
         selected_l0_variant="L0-C",
         selection_rationale="主角率先行动。",
     )
+    bilingual_label = StoryArchitectResult(
+        stage="selecting_l0_variant",
+        selected_l0_variant="克制情感悬疑（Restrained Emotional Suspense）",
+        selection_rationale="主角率先行动。",
+    )
+    stripped_label = StoryArchitectResult(
+        stage="selecting_l0_variant",
+        selected_l0_variant="克制情感悬疑",
+        selection_rationale="主角率先行动。",
+    )
+    changed_choice = StoryArchitectResult(
+        stage="selecting_l0_variant",
+        selected_l0_variant="爆笑荒诞喜剧",
+        selection_rationale="主角率先行动。",
+    )
 
     assert _language_retry_matches(
         _language_retry_fingerprint(english_label),
@@ -1642,6 +3687,137 @@ def test_language_retry_allows_variant_label_translation_but_locks_machine_id() 
         _language_retry_fingerprint(machine_variant),
         _language_retry_fingerprint(changed_machine_variant),
     )
+    assert _language_retry_matches(
+        _language_retry_fingerprint(bilingual_label),
+        _language_retry_fingerprint(stripped_label),
+    )
+    assert not _language_retry_matches(
+        _language_retry_fingerprint(bilingual_label),
+        _language_retry_fingerprint(changed_choice),
+    )
+
+
+def test_episode_language_retry_locks_already_chinese_creative_fields() -> None:
+    contract_payload = _story_contract().model_dump(mode="json")
+    contract_payload["characters"][0]["role"] = "Investigator"
+
+    def planner_result(contract: dict[str, Any], plan: str = "调查者发现证据。") -> Any:
+        return EpisodePlannerResult.model_validate(
+            {
+                "stage": "generating_episode_outline",
+                "content": "完整分集大纲。",
+                "episode_count": 1,
+                "episodes": [{"episode_number": 1, "plan": plan}],
+                "story_contract": contract,
+            }
+        )
+
+    translated_payload = json.loads(json.dumps(contract_payload))
+    translated_payload["characters"][0]["role"] = "调查者"
+    original = planner_result(contract_payload)
+    translated = planner_result(translated_payload)
+
+    assert _language_retry_matches(
+        _language_retry_fingerprint(original),
+        _language_retry_fingerprint(translated),
+    )
+    assert not _language_retry_matches(
+        _language_retry_fingerprint(original),
+        _language_retry_fingerprint(planner_result(translated_payload, plan="主角放弃调查。")),
+    )
+
+    changed_fact = json.loads(json.dumps(translated_payload))
+    changed_fact["facts"][0]["predicate"] = "从未发生"
+    changed_fact["facts"][0]["value"] = "改写后的事实"
+    assert not _language_retry_matches(
+        _language_retry_fingerprint(original),
+        _language_retry_fingerprint(planner_result(changed_fact)),
+    )
+
+
+def test_chinese_language_guard_rejects_bilingual_l0_variant_title() -> None:
+    result = StoryArchitectResult(
+        stage="selecting_l0_variant",
+        selected_l0_variant="克制情感悬疑（Restrained Emotional Suspense）",
+        selection_rationale="以人物关系推动真相揭晓。",
+    )
+
+    with pytest.raises(AgentProtocolError) as error:
+        _validate_result_language(
+            result,
+            output_language=SIMPLIFIED_CHINESE,
+            stage=InternalStage.SELECTING_L0_VARIANT,
+        )
+
+    assert "remove every appended English translation" in (error.value.repair_instruction or "")
+
+
+@pytest.mark.asyncio
+async def test_l0_language_retry_receives_exact_result_and_translates_only() -> None:
+    descriptions: list[str] = []
+    captured_source: list[dict[str, Any]] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The helper must not approve a stage")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=selecting_l0_variant] select L0",
+                "subagent_type": "story_architect",
+            },
+            "id": "call-l0-language",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(language_request: ToolCallRequest) -> ToolMessage:
+        descriptions.append(language_request.tool_call["args"]["description"])
+        if len(descriptions) == 1:
+            payload = {
+                "stage": "selecting_l0_variant",
+                "content": None,
+                "selected_l0_variant": "克制情感悬疑（Restrained Emotional Suspense）",
+                "selection_rationale": "用人物关系推动真相揭晓。",
+            }
+        else:
+            files = language_request.state["files"]
+            source = json.loads(files["/workspace/result_to_translate.json"]["content"])
+            captured_source.append(source)
+            payload = {
+                **source,
+                "selected_l0_variant": "克制情感悬疑",
+            }
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-l0-language",
+        )
+
+    _, payload = await middleware._call_structured_stage(
+        InternalStage.SELECTING_L0_VARIANT,
+        request,
+        handler,
+        request.tool_call["args"],
+    )
+
+    assert len(descriptions) == 2
+    assert "translate only" in descriptions[1]
+    assert "do not make a new creative choice" in descriptions[1]
+    assert captured_source[0]["selected_l0_variant"].endswith("（Restrained Emotional Suspense）")
+    assert payload["selected_l0_variant"] == "克制情感悬疑"
 
 
 def test_chinese_language_guard_covers_script_handoff() -> None:
@@ -1766,6 +3942,11 @@ async def test_semantic_review_language_repair_preserves_failed_decision() -> No
     async def handler(review_request: ToolCallRequest) -> ToolMessage:
         descriptions.append(review_request.tool_call["args"]["description"])
         chinese = len(descriptions) == 2
+        if chinese:
+            source = review_request.state["files"]["/workspace/review_to_translate.json"]
+            original_review = json.loads(source["content"])
+            assert original_review["passed"] is False
+            assert original_review["evidence"] == "The contract omits a fact."
         return ToolMessage(
             content=json.dumps(
                 {
@@ -1797,8 +3978,81 @@ async def test_semantic_review_language_repair_preserves_failed_decision() -> No
 
     assert len(descriptions) == 2
     assert "without changing the review decision" in descriptions[1]
+    assert "do not perform a new review" in descriptions[1]
     assert review.passed is False
     assert review.evidence == "合同遗漏了既定事实。"
+
+
+@pytest.mark.asyncio
+async def test_semantic_review_allows_chinese_issue_with_many_stable_ids() -> None:
+    calls = 0
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The helper must not approve a stage")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] review episode",
+                "subagent_type": "script_writer",
+            },
+            "id": "call-review-stable-ids",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(_: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "passed": False,
+                    "evidence": "本集仍有连续性问题。",
+                    "issues": [
+                        {
+                            "code": "missing_locked_beats",
+                            "message": (
+                                "fact_keep_secret、fact_station_deadline、clue_old_watch、"
+                                "clue_rescue_log、obligation_ep6、lin_xia、chen_station、E6 "
+                                "均未按合同兑现。"
+                            ),
+                            "contract_refs": ["fact_keep_secret", "obligation_ep6"],
+                            "script_excerpt": None,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-review-stable-ids",
+        )
+
+    review = await middleware._invoke_semantic_reviewer(
+        request=request,
+        handler=handler,
+        subagent_type="episode_reviewer",
+        description="Review the episode.",
+        files={},
+        schema=EpisodeReviewerResult,
+        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+    )
+
+    assert calls == 1
+    assert review.passed is False
+    assert review.issues[0].code == "missing_locked_beats"
 
 
 @pytest.mark.asyncio
@@ -1982,8 +4236,55 @@ async def test_outline_repair_fails_after_one_correction_with_safe_chinese_messa
 
 
 @pytest.mark.asyncio
+async def test_outline_repair_preserves_relay_errors_for_worker_recovery() -> None:
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        return None
+
+    request = httpx.Request("POST", "https://relay.example/v1/chat/completions")
+
+    async def unavailable_patch(
+        _: Mapping[str, Any],
+        __: CanonReviewerResult,
+        ___: int,
+        ____: str | None,
+    ) -> Any:
+        raise httpx.ReadTimeout("relay timed out", request=request)
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        generate_outline_patch=unavailable_patch,
+    )
+    contract = _story_contract()
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "分集大纲",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract.model_dump(mode="json"),
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="需要修复。",
+        issues=[{"code": "stale_text", "message": "替换旧文字。"}],
+    )
+
+    with pytest.raises(httpx.ReadTimeout):
+        await middleware._invoke_outline_repair(
+            candidate=candidate,
+            review=review,
+            repair_round=1,
+        )
+
+
+@pytest.mark.asyncio
 async def test_repair_subagent_gets_one_bounded_language_retry() -> None:
     descriptions: list[str] = []
+    captured_source: list[dict[str, Any]] = []
 
     async def before_stage(_: InternalStage) -> int:
         return 1
@@ -2015,21 +4316,24 @@ async def test_repair_subagent_gets_one_bounded_language_retry() -> None:
 
     async def handler(repair_request: ToolCallRequest) -> ToolMessage:
         descriptions.append(repair_request.tool_call["args"]["description"])
-        payload = json.loads(json.dumps(contract_payload))
-        payload["characters"][0]["role"] = (
-            "调查者" if len(descriptions) == 2 else "Investigator of a buried family secret"
-        )
+        if len(descriptions) == 1:
+            result_payload = {
+                "stage": "generating_episode_outline",
+                "content": "完整分集大纲。",
+                "episode_count": 1,
+                "episodes": [{"episode_number": 1, "plan": "调查者发现证据。"}],
+                "story_contract": json.loads(json.dumps(contract_payload)),
+            }
+            result_payload["story_contract"]["characters"][0]["role"] = (
+                "Investigator of a buried family secret"
+            )
+        else:
+            files = repair_request.state["files"]
+            result_payload = json.loads(files["/workspace/result_to_translate.json"]["content"])
+            captured_source.append(json.loads(json.dumps(result_payload)))
+            result_payload["story_contract"]["characters"][0]["role"] = "调查者"
         return ToolMessage(
-            content=json.dumps(
-                {
-                    "stage": "generating_episode_outline",
-                    "content": "完整分集大纲。",
-                    "episode_count": 1,
-                    "episodes": [{"episode_number": 1, "plan": "调查者发现证据。"}],
-                    "story_contract": payload,
-                },
-                ensure_ascii=False,
-            ),
+            content=json.dumps(result_payload, ensure_ascii=False),
             tool_call_id="call-repair-language",
         )
 
@@ -2044,7 +4348,134 @@ async def test_repair_subagent_gets_one_bounded_language_retry() -> None:
     )
 
     assert len(descriptions) == 2
+    assert "Read /workspace/result_to_translate.json" in descriptions[1]
+    assert "Do not perform a new repair" in descriptions[1]
+    assert captured_source[0]["story_contract"]["characters"][0]["role"].startswith("Investigator")
     assert payload["story_contract"]["characters"][0]["role"] == "调查者"
+
+
+@pytest.mark.asyncio
+async def test_episode_repair_corrects_missing_state_delta_once() -> None:
+    descriptions: list[str] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The helper must not approve a stage")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] repair episode 1",
+                "subagent_type": "episode_repair",
+            },
+            "id": "call-repair-state",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+    contract = _story_contract()
+
+    async def handler(repair_request: ToolCallRequest) -> ToolMessage:
+        descriptions.append(repair_request.tool_call["args"]["description"])
+        if len(descriptions) == 2:
+            assert "state_delta: missing" in descriptions[-1]
+        payload = {
+            "stage": "generating_episode_scripts",
+            "episode_number": 1,
+            "content": "事实1\n钩子1",
+        }
+        if len(descriptions) == 2:
+            payload["state_delta"] = _state_delta(contract, 1)
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-repair-state",
+        )
+
+    _, payload = await middleware._invoke_repair_subagent(
+        request=request,
+        handler=handler,
+        subagent_type="episode_repair",
+        description="Repair episode 1.",
+        files={},
+        schema=ScriptWriterResult,
+        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+        expected_episode_number=1,
+    )
+
+    assert len(descriptions) == 2
+    assert payload["state_delta"] == _state_delta(contract, 1)
+
+
+@pytest.mark.asyncio
+async def test_episode_repair_fails_after_repeated_missing_state_delta() -> None:
+    calls = 0
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The helper must not approve a stage")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] repair episode 1",
+                "subagent_type": "episode_repair",
+            },
+            "id": "call-repair-state-fail",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(_: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "stage": "generating_episode_scripts",
+                    "episode_number": 1,
+                    "content": "事实1\n钩子1",
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-repair-state-fail",
+        )
+
+    with pytest.raises(AgentProtocolError, match="invalid structured output"):
+        await middleware._invoke_repair_subagent(
+            request=request,
+            handler=handler,
+            subagent_type="episode_repair",
+            description="Repair episode 1.",
+            files={},
+            schema=ScriptWriterResult,
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            expected_episode_number=1,
+        )
+
+    assert calls == 2
 
 
 @pytest.mark.asyncio
@@ -2097,111 +4528,6 @@ async def test_wrong_stage_result_is_not_corrected() -> None:
 
     assert attempted == [InternalStage.GENERATING_EPISODE_OUTLINE]
     assert handler_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_legacy_episode_recovery_skips_committed_draft_without_requiring_new_contract() -> (
-    None
-):
-    first_content = "第一集不可替换剧本"
-    first = EpisodeDraft(
-        episode_number=1,
-        content=first_content,
-        content_sha256=hashlib.sha256(first_content.encode()).hexdigest(),
-        completed_at=datetime(2026, 8, 1, tzinfo=UTC),
-    )
-    approved_payloads = {
-        InternalStage.GENERATING_EPISODE_OUTLINE: {
-            "stage": "generating_episode_outline",
-            "content": "两集旧版分集大纲",
-            "episode_count": 2,
-            "episodes": [
-                {"episode_number": 1, "plan": "第一集计划"},
-                {"episode_number": 2, "plan": "第二集计划"},
-            ],
-        }
-    }
-    attempts: list[int] = []
-    commits: list[tuple[int, str, object | None]] = []
-    approved: dict[InternalStage, dict[str, Any]] = {}
-
-    async def before_stage(_: InternalStage) -> int:
-        return 1
-
-    async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
-        approved[stage] = payload
-
-    async def before_episode(plan: EpisodePlan) -> int:
-        attempts.append(plan.episode_number)
-        return 2
-
-    async def commit_episode(
-        episode_number: int,
-        content: str,
-        episode_lock=None,
-    ) -> EpisodeDraft:
-        commits.append((episode_number, content, episode_lock))
-        return EpisodeDraft(
-            episode_number=episode_number,
-            content=content,
-            content_sha256=hashlib.sha256(content.encode()).hexdigest(),
-            completed_at=datetime(2026, 8, 1, tzinfo=UTC),
-        )
-
-    async def assemble_episode_scripts() -> str:
-        return "第 1 集\n第一集不可替换剧本\n\n---\n\n第 2 集\n第二集恢复剧本"
-
-    middleware = StageGuardMiddleware(
-        before_stage=before_stage,
-        approve_stage=approve_stage,
-        approved_stages={
-            InternalStage.SELECTING_L0_VARIANT,
-            InternalStage.GENERATING_STORY_OUTLINE,
-            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-            InternalStage.GENERATING_RELATIONSHIP_LOGIC,
-            InternalStage.GENERATING_EPISODE_OUTLINE,
-        },
-        approved_payloads=approved_payloads,
-        episode_drafts=[first],
-        before_episode=before_episode,
-        commit_episode=commit_episode,
-        assemble_episode_scripts=assemble_episode_scripts,
-    )
-    request = ToolCallRequest(
-        tool_call={
-            "name": "task",
-            "args": {
-                "description": "[stage=generating_episode_scripts] write scripts",
-                "subagent_type": "script_writer",
-            },
-            "id": "call-legacy-episode",
-            "type": "tool_call",
-        },
-        tool=None,
-        state={"files": {}},
-        runtime=None,
-    )
-
-    async def handler(episode_request: ToolCallRequest) -> ToolMessage:
-        assert "[episode=2]" in episode_request.tool_call["args"]["description"]
-        assert "/workspace/episodes/ep1.md" in episode_request.state["files"]
-        assert "/workspace/story_contract.json" not in episode_request.state["files"]
-        return ToolMessage(
-            content=(
-                '{"stage":"generating_episode_scripts","episode_number":2,'
-                '"content":"第二集恢复剧本"}'
-            ),
-            tool_call_id="call-legacy-episode",
-        )
-
-    await middleware.awrap_tool_call(request, handler)
-
-    assert attempts == [2]
-    assert commits == [(2, "第二集恢复剧本", None)]
-    assert approved[InternalStage.GENERATING_EPISODE_SCRIPTS] == {
-        "stage": "generating_episode_scripts",
-        "content": "第 1 集\n第一集不可替换剧本\n\n---\n\n第 2 集\n第二集恢复剧本",
-    }
 
 
 @pytest.mark.asyncio
@@ -2290,7 +4616,7 @@ async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> Non
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=model,
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -2314,7 +4640,7 @@ async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> Non
 async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    responses[15] = _tool_call(
+    responses[21] = _tool_call(
         "QualityReviewerResult",
         {
             "stage": "accepting_l0",
@@ -2322,7 +4648,7 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
             "evidence": "成品没有通过 L0 闸门。",
             "feedback_handling": [],
         },
-        15,
+        21,
     )
     approved: list[InternalStage] = []
 
@@ -2334,7 +4660,7 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -2388,7 +4714,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
 
     monkeypatch.setattr(ToolCallingFakeModel, "_generate", capture_reviewer_reads)
     responses = _successful_responses()
-    responses[17] = _tool_call(
+    responses[23] = _tool_call(
         "QualityReviewerResult",
         {
             "stage": "accepting_l4",
@@ -2396,10 +4722,10 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
             "evidence": "成品没有通过 L4 闸门。",
             "feedback_handling": [],
         },
-        17,
+        23,
     )
     responses.insert(
-        17,
+        23,
         _tool_call(
             "read_file",
             {"file_path": "/workspace/episode_scripts.md"},
@@ -2407,7 +4733,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
         ),
     )
     responses.insert(
-        18,
+        24,
         _tool_call(
             "read_file",
             {"file_path": "/workspace/approved-checkpoints.json"},
@@ -2426,7 +4752,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -2460,7 +4786,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        resumed_responses = _successful_responses()[16:]
+        resumed_responses = _successful_responses()[22:]
         resumed_responses.insert(
             1,
             _tool_call(
@@ -2477,7 +4803,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
                 103,
             ),
         )
-        resumed_workflow = DeepAgentWorkflow(
+        resumed_workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=resumed_responses),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -2548,7 +4874,7 @@ async def test_out_of_order_stage_is_rejected_without_attempt_and_can_recover(
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=model,
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -2605,7 +4931,7 @@ async def test_restart_reuses_thread_checkpoint_and_skips_approved_stage(
     )
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        workflow = DeepAgentWorkflow(
+        workflow = _fake_workflow(
             model=interrupted_model,
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -2636,7 +4962,7 @@ async def test_restart_reuses_thread_checkpoint_and_skips_approved_stage(
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        resumed_workflow = DeepAgentWorkflow(
+        resumed_workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses[2:]),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -2706,7 +5032,7 @@ async def test_restarted_worker_resumes_same_run_and_thread(
 
     async with AsyncSqliteSaver.from_conn_string(str(settings.database_path)) as saver:
         await saver.setup()
-        interrupted_workflow = DeepAgentWorkflow(
+        interrupted_workflow = _fake_workflow(
             model=ToolCallingFakeModel(
                 responses=[
                     *responses[:2],
@@ -2737,7 +5063,7 @@ async def test_restarted_worker_resumes_same_run_and_thread(
 
     async with AsyncSqliteSaver.from_conn_string(str(settings.database_path)) as saver:
         await saver.setup()
-        resumed_workflow = DeepAgentWorkflow(
+        resumed_workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses[2:]),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
@@ -2819,7 +5145,7 @@ async def test_recovered_run_fails_safely_when_thread_checkpoint_is_missing(
             settings=settings,
             repository=repository,
             catalog=catalog,
-            workflow=DeepAgentWorkflow(
+            workflow=_fake_workflow(
                 model=model,
                 checkpointer=saver,
                 provider_profile_key="toolcallingfakemodel",

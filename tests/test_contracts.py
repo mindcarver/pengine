@@ -107,7 +107,7 @@ def test_openapi_exposes_recovery_reasons_and_pause_evidence() -> None:
         "episode_error",
     ]
     assert schemas["RunPause"]["properties"]["content_repair_count"]["anyOf"] == [
-        {"type": "integer", "maximum": 2.0, "minimum": 2.0},
+        {"type": "integer", "maximum": 6.0, "minimum": 2.0},
         {"type": "null"},
     ]
     assert schemas["EpisodeDraft"]["properties"]["state_delta"]["anyOf"][0] == {
@@ -140,6 +140,22 @@ def test_pause_counts_cannot_mix_transport_and_content_recovery() -> None:
         episode_number=1,
     )
     assert content_pause.timeout_count is None
+
+    max_story_content_pause = RunPause(
+        code="content_rejected",
+        message="Story consistency review still failed.",
+        stage=UserStage.GENERATING_STORY_OUTLINE,
+        content_repair_count=6,
+    )
+    assert max_story_content_pause.content_repair_count == 6
+
+    with pytest.raises(ValidationError):
+        RunPause(
+            code="content_rejected",
+            message="Story consistency review still failed.",
+            stage=UserStage.GENERATING_STORY_OUTLINE,
+            content_repair_count=7,
+        )
 
     with pytest.raises(ValidationError):
         RunPause(

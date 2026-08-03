@@ -49,27 +49,75 @@ def test_api_key_is_not_revealed_by_settings_repr() -> None:
     assert "secret-value" not in repr(settings)
 
 
-def test_anthropic_relay_adapter_is_the_default() -> None:
+def test_role_specific_model_routes_are_required_by_default() -> None:
     settings = Settings(_env_file=None)
 
-    assert settings.relay_adapter == "anthropic"
-    assert settings.relay_max_output_tokens is None
+    assert settings.generation_max_output_tokens == 128_000
+    assert settings.review_max_output_tokens is None
+    assert settings.relay_configured is False
 
 
-def test_relay_adapter_and_output_token_override_load_from_environment(monkeypatch) -> None:
-    monkeypatch.setenv("PENGINE_RELAY_ADAPTER", "deepseek")
-    monkeypatch.setenv("PENGINE_RELAY_MAX_OUTPUT_TOKENS", "16384")
+def test_role_specific_model_routes_load_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("PENGINE_RELAY_BASE_URL", "https://relay.example/v1")
+    monkeypatch.setenv("PENGINE_RELAY_API_KEY", "secret-value")
+    monkeypatch.setenv("PENGINE_GENERATION_MODEL_ID", "claude-opus-5")
+    monkeypatch.setenv("PENGINE_GENERATION_MAX_OUTPUT_TOKENS", "32000")
+    monkeypatch.setenv("PENGINE_REVIEW_MODEL_ID", "deepseek-v4-flash")
+    monkeypatch.setenv("PENGINE_REVIEW_MAX_OUTPUT_TOKENS", "12000")
 
     settings = Settings(_env_file=None)
 
-    assert settings.relay_adapter == "deepseek"
-    assert settings.relay_max_output_tokens == 16384
+    assert settings.generation_model_id == "claude-opus-5"
+    assert settings.generation_max_output_tokens == 32000
+    assert settings.review_model_id == "deepseek-v4-flash"
+    assert settings.review_max_output_tokens == 12000
+    assert settings.relay_configured is True
+
+
+@pytest.mark.parametrize(
+    ("generation_model_id", "review_model_id"),
+    [(None, "deepseek-v4-flash"), ("claude-opus-5", None)],
+)
+def test_both_model_roles_are_required(
+    generation_model_id: str | None,
+    review_model_id: str | None,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        relay_base_url="https://relay.example/v1",
+        relay_api_key="secret-value",
+        generation_model_id=generation_model_id,
+        review_model_id=review_model_id,
+    )
+
+    assert settings.relay_configured is False
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("relay_adapter", "openai"), ("relay_max_output_tokens", 0)],
+    [
+        ("generation_model_id", "claude-sonnet-5"),
+        ("generation_model_id", "deepseek-v4-pro"),
+        ("review_model_id", "claude-opus-5"),
+    ],
+)
+def test_model_families_cannot_be_swapped(field: str, value: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("generation_max_output_tokens", 0),
+        ("review_max_output_tokens", 0),
+    ],
 )
 def test_invalid_relay_adapter_settings_are_rejected(field: str, value: object) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field: value})
+
+
+def test_generation_output_cannot_exceed_opus_5_maximum() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, generation_max_output_tokens=128_001)
