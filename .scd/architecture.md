@@ -470,6 +470,24 @@ duplicate the full field contract.
 - Every response must report the model ID configured for its role. A missing or
   mismatched identity is a terminal protocol incompatibility, not a fallback
   signal.
+- Every real model request is preflighted at the common outbound-call boundary
+  against the route's verified context window
+  (`generation_context_limit_tokens` / `review_context_limit_tokens`). The
+  estimate covers the actual serialized system prompt, messages, tools/schema,
+  complete canonical context, and the requested output reserve. If the request
+  cannot fit, or the route has no trustworthy verified limit, no request is
+  dispatched: the call is recorded as `preflight_blocked` and the run pauses
+  (`context_budget`) with prior approved work unchanged.
+- Every attempted call (generation, review, repair, and blocked attempts) is
+  recorded with a unique `call_id`, role, adapter/provider/model, stage,
+  episode, candidate and batch lineage, estimated input/output totals, verified
+  limit, provider-reported input/output/cache usage (or explicit
+  `unavailable`), duration, finish reason, and outcome. Records are written
+  immediately to the SQLite `model_calls` table, emitted as structured logs,
+  exposed on the creation resource (`RunProgress.model_calls`), and rendered in
+  the workbench. Provider actual usage is never inferred or backfilled from
+  estimates; failed, timed-out, superseded, stale, and preflight-blocked calls
+  keep their own classifications in per-round and run totals.
 - Each POST command requires an `Idempotency-Key`.
 - The same key and request hash replays the original command response; its
   `resource_url` resolves the resource's current state.

@@ -162,6 +162,7 @@ async def test_persona_creation_and_query_contract(tmp_path: Path) -> None:
                 "recovery_reason": "none",
                 "final_review": {"l0": "pending", "l4": "pending"},
                 "episodes": None,
+                "model_calls": [],
                 "can_continue": False,
                 "can_end": False,
             },

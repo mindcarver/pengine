@@ -176,6 +176,10 @@ PENGINE_GENERATION_MODEL_ID=claude-opus-5
 PENGINE_REVIEW_MODEL_ID=deepseek-v4-flash
 PENGINE_GENERATION_MAX_OUTPUT_TOKENS=128000
 # PENGINE_REVIEW_MAX_OUTPUT_TOKENS=...
+# 已验证的上下文窗口（tokens）。预检会把完整序列化请求 + 保留输出与此上限比较；
+# 未设置时 fail closed，任何真实模型请求都不会发出。
+PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS=200000
+PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS=64000
 ```
 
 API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localhost`、
@@ -193,6 +197,22 @@ API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localho
 `PENGINE_RELAY_ADAPTER`、`PENGINE_RELAY_MODEL_ID` 和
 `PENGINE_RELAY_MAX_OUTPUT_TOKENS` 已不再生效，设置它们不能配置或覆盖任一路由。
 每次响应还必须报告与角色配置一致的模型 ID，否则按协议不兼容失败。密钥不得提交到仓库。
+
+### 模型上下文预算与用量观测
+
+每次真实模型请求发出前，Pengine 都会把**实际序列化**的 system prompt、messages、
+tools/schema 与完整规范上下文，加上该路由的**保留输出**，估算为 token 数并与该路由
+**已验证的上下文上限**（`PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS` /
+`PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS`）比较。超出上限、或该路由没有可信的已验证上限时，
+请求**不会发出**，任务会安全暂停（`context_budget`），已批准内容与已提交草稿保持不变。
+估计值与 provider 实际用量是两个独立字段：provider 报告 input/output/cache 用量时按原值
+持久化；缺失时显示为 `unavailable`，绝不从估计值回填。
+
+每次尝试的调用（生成、审核、修复、被预检拦截的尝试）都会以唯一的 `call_id` 记录角色、
+adapter/provider/model、阶段、分集、候选与批次血缘，以及估计值、实际或不可用用量、
+耗时、结束原因与结果，并同时写入结构化日志、SQLite 的 `model_calls` 表、创作资源
+（`RunProgress.model_calls`）与工作台用量面板；失败、超时、被取代、过期与被拦截的调用
+都保留各自的分类并计入本轮与整轮合计。
 
 确认 `PENGINE_PERSONA_ROOT=./personas` 后启动：
 

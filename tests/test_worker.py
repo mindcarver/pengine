@@ -18,7 +18,7 @@ from pengine.agents import AgentProtocolError, EpisodeTimeoutError, QualityGateR
 from pengine.config import Settings
 from pengine.errors import DomainError
 from pengine.personas import PersonaCatalog
-from pengine.relay import RelayError
+from pengine.relay import PreflightBlockedError, RelayError
 from pengine.repository import Repository
 from pengine.schemas import (
     ContentPackage,
@@ -438,6 +438,68 @@ class QualityRejectedThenPassedWorkflow(DeterministicWorkflow):
             return await before_stage(stage)
 
         return await super().execute(**{**kwargs, "before_stage": capture_retry_stage})
+
+
+class PreflightBlockedWorkflow:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def execute(
+        self,
+        *,
+        thread_id: str,
+        story: str,
+        requirements: str,
+        persona_files,
+        before_stage,
+        approve_stage,
+        approved_checkpoints=None,
+        episode_drafts=None,
+        before_episode=None,
+        commit_episode=None,
+        assemble_episode_scripts=None,
+        episode_timeout_seconds=None,
+        reset_episode_deadline=None,
+        output_language=None,
+        feedback=None,
+        retrieve_references=None,
+    ) -> WorkflowResult:
+        del (
+            thread_id,
+            story,
+            requirements,
+            persona_files,
+            episode_drafts,
+            before_episode,
+            commit_episode,
+            assemble_episode_scripts,
+            episode_timeout_seconds,
+            reset_episode_deadline,
+            output_language,
+            feedback,
+            retrieve_references,
+        )
+        self.calls += 1
+        approved = dict(approved_checkpoints or {})
+        if InternalStage.SELECTING_L0_VARIANT not in approved:
+            await before_stage(InternalStage.SELECTING_L0_VARIANT)
+            await approve_stage(
+                InternalStage.SELECTING_L0_VARIANT,
+                {
+                    "stage": "selecting_l0_variant",
+                    "selected_l0_variant": "主动选择",
+                    "selection_rationale": "符合测试故事",
+                },
+            )
+        await before_stage(InternalStage.GENERATING_STORY_OUTLINE)
+        raise PreflightBlockedError(
+            role="generation",
+            model_id="claude-opus-5",
+            stage="generating_story_outline",
+            episode_number=None,
+            required_tokens=2_000_000,
+            verified_limit_tokens=200_000,
+        )
 
 
 class RaisingWorkflow:
@@ -1114,6 +1176,122 @@ async def test_quality_rejection_retries_only_missing_final_gates_on_the_same_ru
         InternalStage.GENERATING_EPISODE_SCRIPTS,
     }
     assert workflow.retry_stages == [InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4]
+
+
+@pytest.mark.asyncio
+async def test_worker_pauses_on_context_preflight_block_without_losing_prior_work(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "context-budget-pause",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个离乡的人回家处理旧屋。",
+            requirements="创作一部当代短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = PreflightBlockedWorkflow()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="context-budget-pause-worker",
+    )
+
+    assert await worker.run_once() is True
+    resource = await repository.get_creation(accepted.creation_id)
+
+    assert resource is not None
+    assert resource.initial.state == "paused"
+    assert resource.initial.pause.code == "context_budget"
+    assert "verified context limit" in resource.initial.pause.message
+    assert resource.initial.pause.stage.value == "generating_story_outline"
+    assert resource.initial.progress.recovery_reason == "context_budget"
+    # Prior approved work is unchanged and the run can be continued.
+    assert resource.initial.drafts.artifacts[0].selected_l0_variant == "主动选择"
+    assert resource.initial.progress.can_continue is True
+    assert workflow.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_paused_resource_exposes_blocked_model_call_lineage(tmp_path: Path) -> None:
+    """The paused resource and workbench show required tokens, verified limit,
+    route/model, and affected stage from the durable model-call envelope."""
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "context-budget-resource",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个离乡的人回家处理旧屋。",
+            requirements="创作一部当代短剧。",
+        ),
+        snapshot.summary,
+    )
+    lease = await repository.lease_next_job("cb-worker", 30)
+    assert lease is not None
+    await repository.mark_run_running(lease.run_id)
+
+    # The audit handler would have written this durable record before raising.
+    from pengine.model_calls import (
+        ModelCallContext,
+        ModelCallStore,
+        build_started_record,
+    )
+
+    store = ModelCallStore(settings.database_path)
+    context = ModelCallContext(
+        run_id=str(lease.run_id),
+        creation_id=str(accepted.creation_id),
+        thread_id=lease.thread_id,
+        run_kind="initial",
+        stage="generating_story_outline",
+    )
+    record = build_started_record(
+        role="generation",
+        adapter="anthropic",
+        provider="anthropic",
+        model="claude-opus-5",
+        context=context,
+        estimated_input_tokens=2_000_000,
+        estimated_output_tokens=128_000,
+        verified_limit_tokens=200_000,
+    )
+    record.status = "preflight_blocked"
+    record.outcome = "blocked"
+    record.preflight = "blocked"
+    store.upsert(record)
+    store.close()
+
+    await repository.pause_context_budget(
+        lease.run_id,
+        stage=InternalStage.GENERATING_STORY_OUTLINE,
+        safe_message=(
+            "The generation model request needs about 2128000 tokens (input plus "
+            "reserved output), but the verified context limit for claude-opus-5 is "
+            "200000. No request was sent; the current run paused without changing "
+            "approved work."
+        ),
+    )
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "paused"
+    assert resource.initial.pause.code == "context_budget"
+    assert resource.initial.pause.stage.value == "generating_story_outline"
+
+    calls = resource.initial.progress.model_calls
+    assert len(calls) == 1
+    blocked = calls[0]
+    assert blocked.status == "preflight_blocked"
+    assert blocked.preflight == "blocked"
+    assert blocked.model == "claude-opus-5"
+    assert blocked.stage == "generating_story_outline"
+    assert blocked.estimated_total_tokens == 2_128_000
+    assert blocked.verified_limit_tokens == 200_000
+    assert blocked.usage.status == "unavailable"
+    assert blocked.usage.input_tokens is None
 
 
 @pytest.mark.asyncio

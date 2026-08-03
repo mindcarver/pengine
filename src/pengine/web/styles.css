@@ -1142,6 +1142,49 @@ textarea:disabled {
   font-size: 0.7rem;
 }
 
+.model-call-panel {
+  margin-top: 0.85rem;
+  padding-top: 0.8rem;
+  border-top: 1px dashed rgba(90, 69, 45, 0.28);
+}
+
+.model-call-title {
+  margin: 0 0 0.2rem;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+}
+
+.model-call-subtitle {
+  margin: 0 0 0.5rem;
+  color: var(--ink-mid);
+  font-size: 0.72rem;
+}
+
+.model-call-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.model-call-list li {
+  padding: 0.34rem 0.5rem;
+  border: 1px solid rgba(90, 69, 45, 0.18);
+  background: rgba(255, 255, 255, 0.35);
+  font-family: var(--mono);
+  font-size: 0.64rem;
+  line-height: 1.45;
+}
+
+.model-call-list li[data-call-status="preflight_blocked"],
+.model-call-list li[data-call-status="failed"],
+.model-call-list li[data-call-status="timed_out"] {
+  border-color: rgba(153, 60, 34, 0.45);
+}
+
 .run-controls {
   display: grid;
   grid-template-columns: 1fr auto;

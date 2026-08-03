@@ -98,6 +98,7 @@ def test_openapi_exposes_recovery_reasons_and_pause_evidence() -> None:
         "relay_interruption",
         "content_rejected",
         "episode_error",
+        "context_budget",
     ]
     assert "recovery_reason" in schemas["RunProgress"]["required"]
     assert schemas["RunPause"]["properties"]["code"]["enum"] == [
@@ -105,7 +106,13 @@ def test_openapi_exposes_recovery_reasons_and_pause_evidence() -> None:
         "relay_interruption",
         "content_rejected",
         "episode_error",
+        "context_budget",
     ]
+    assert schemas["RunProgress"]["properties"]["model_calls"] == {
+        "items": {"$ref": "#/components/schemas/ModelCallSummary"},
+        "type": "array",
+        "title": "Model Calls",
+    }
     assert schemas["RunPause"]["properties"]["content_repair_count"]["anyOf"] == [
         {"type": "integer", "maximum": 6.0, "minimum": 2.0},
         {"type": "null"},

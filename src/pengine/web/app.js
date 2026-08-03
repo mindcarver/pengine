@@ -194,6 +194,9 @@ function cacheElements() {
     "review-progress",
     "review-l0",
     "review-l4",
+    "model-call-panel",
+    "model-call-totals",
+    "model-call-list",
     "run-controls",
     "run-control-title",
     "run-control-description",
@@ -718,18 +721,23 @@ function renderCreation() {
     const relayInterrupted = initial.progress.recovery_reason === "relay_interruption";
     const contentRejected = initial.progress.recovery_reason === "content_rejected";
     const episodeError = initial.progress.recovery_reason === "episode_error";
+    const contextBudget = initial.progress.recovery_reason === "context_budget";
     const episodeNumber = initial.pause?.episode_number || initial.progress.episodes?.current;
     const retainedEpisodes = initial.progress.episodes?.completed || 0;
     showWaiting(
-      "任务已暂停",
-      episodeError
+      contextBudget ? "任务已暂停 · 上下文预算不足" : "任务已暂停",
+      contextBudget
+        ? "模型请求未发出，已完成的批准内容保持不变"
+        : episodeError
         ? `第 ${episodeNumber} 集生成遇到可恢复错误`
         : contentRejected
         ? "内容一致性审查连续修复后仍未通过"
         : relayInterrupted
           ? "当前阶段再次发生网络 / Relay 中断"
           : "当前阶段再次超过整体运行时限",
-      episodeError
+      contextBudget
+        ? `${initial.pause?.message || "完整请求超出已验证上下文上限。"} 请配置更高的已验证上限后，在上方继续当前阶段；未发出的请求不消耗额度。`
+        : episodeError
         ? `${initial.pause?.message || "当前集生成遇到可恢复错误。"} 已完成的 ${retainedEpisodes} 集已保留，请在上方从第 ${episodeNumber} 集继续或结束任务。`
         : contentRejected
         ? "审查证据已保留。请在上方选择继续重新生成当前未锁内容，或结束本次任务；锁定内容不会改变。"
@@ -840,28 +848,37 @@ function renderProgress() {
   elements["review-l4"].textContent =
     `L4 技法与价值观 · ${REVIEW_STATUS_LABELS[progress.final_review.l4]}`;
 
+  renderModelCalls(progress);
+
   const controllable = progress.can_continue || progress.can_end;
   elements["run-controls"].hidden = !controllable;
   const relayInterrupted = progress.recovery_reason === "relay_interruption";
   const contentRejected = progress.recovery_reason === "content_rejected";
   const episodeError = progress.recovery_reason === "episode_error";
+  const contextBudget = progress.recovery_reason === "context_budget";
   const episodeNumber = run.pause?.episode_number || progress.episodes?.current;
   const retainedEpisodes = progress.episodes?.completed || 0;
-  elements["run-control-title"].textContent = episodeError
+  elements["run-control-title"].textContent = contextBudget
+    ? "模型上下文预算不足 · 已安全暂停"
+    : episodeError
     ? `第 ${episodeNumber} 集可继续`
     : contentRejected
     ? "内容一致性审查已完成两轮修复"
     : relayInterrupted
       ? "本阶段已两次发生网络 / Relay 中断"
       : "本阶段已两次超过整体运行时限";
-  elements["run-control-description"].textContent = episodeError
+  elements["run-control-description"].textContent = contextBudget
+    ? `${run.pause?.message || "请求未发出，未消耗任何额度。"} 请为对应路由配置更高的已验证上下文上限后继续当前阶段。`
+    : episodeError
     ? `${run.pause?.message || "当前集生成遇到可恢复错误。"} 已完成的 ${retainedEpisodes} 集不会重新生成。`
     : contentRejected
     ? `${run.pause?.message || "当前内容仍与锁定合同冲突。"} 可重新生成当前未锁内容，或结束本次任务。`
     : relayInterrupted
       ? "可从当前未批准阶段继续；已完成阶段、时长和已提交草稿不会重新生成或丢失，也可以结束本次任务。"
       : "可从当前未批准阶段继续，已完成阶段不会重新生成；也可以结束本次任务。";
-  elements["continue-run"].textContent = episodeError
+  elements["continue-run"].textContent = contextBudget
+    ? "继续创作"
+    : episodeError
     ? `从第 ${episodeNumber} 集继续`
     : "继续创作";
   elements["continue-run"].hidden = !progress.can_continue;
@@ -872,6 +889,88 @@ function renderProgress() {
     elements["run-control-message"].textContent = "";
   }
 }
+
+function renderModelCalls(progress) {
+  const calls = progress?.model_calls;
+  const panel = elements["model-call-panel"];
+  if (!calls || calls.length === 0) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+
+  const totals = {
+    succeeded: 0,
+    failed: 0,
+    timed_out: 0,
+    superseded: 0,
+    stale: 0,
+    preflight_blocked: 0,
+  };
+  let inputTokens = 0;
+  let outputTokens = 0;
+  for (const call of calls) {
+    const status = call.status || "started";
+    if (status in totals) totals[status] += 1;
+    if (call.usage?.status === "reported" || call.usage?.status === "partial") {
+      if (typeof call.usage.input_tokens === "number") inputTokens += call.usage.input_tokens;
+      if (typeof call.usage.output_tokens === "number") outputTokens += call.usage.output_tokens;
+    }
+  }
+  const total = calls.length;
+  const success = totals.succeeded;
+  const failed = totals.failed + totals.timed_out + totals.superseded + totals.stale;
+  const blocked = totals.preflight_blocked;
+  elements["model-call-totals"].textContent =
+    `共 ${total} 次调用 · 成功 ${success} · 失败 ${failed} · 预检拦截 ${blocked}` +
+    (inputTokens + outputTokens > 0 ? ` · 实际用量 输入 ${inputTokens} / 输出 ${outputTokens}` : "");
+
+  const list = elements["model-call-list"];
+  list.replaceChildren();
+  for (const call of calls) {
+    const item = document.createElement("li");
+    const usageText = formatCallUsage(call);
+    const durationText =
+      typeof call.duration_seconds === "number" ? ` · ${formatElapsed(Math.round(call.duration_seconds))}` : "";
+    item.textContent =
+      `${MODEL_CALL_ROLE_LABELS[call.role] || call.role} ${call.model}` +
+      (call.stage ? ` · ${USER_STAGE_LABELS.get(call.stage) || call.stage}` : "") +
+      (call.episode_number ? ` · 第 ${call.episode_number} 集` : "") +
+      ` · ${MODEL_CALL_STATUS_LABELS[call.status] || call.status}` +
+      (call.estimated_total_tokens ? ` · 预估 ${call.estimated_total_tokens}` : "") +
+      (call.verified_limit_tokens ? ` / 上限 ${call.verified_limit_tokens}` : "") +
+      (usageText ? ` · ${usageText}` : "") +
+      (call.finish_reason ? ` · ${call.finish_reason}` : "") +
+      durationText;
+    item.dataset.callStatus = call.status;
+    list.appendChild(item);
+  }
+}
+
+function formatCallUsage(call) {
+  const usage = call.usage || {};
+  if (usage.status === "unavailable" || usage.status === undefined) {
+    return "用量不可用";
+  }
+  const parts = [];
+  if (typeof usage.input_tokens === "number") parts.push(`输入 ${usage.input_tokens}`);
+  if (typeof usage.output_tokens === "number") parts.push(`输出 ${usage.output_tokens}`);
+  if (typeof usage.cache_read_tokens === "number" && usage.cache_read_tokens > 0) {
+    parts.push(`缓存读 ${usage.cache_read_tokens}`);
+  }
+  return parts.length > 0 ? `实际 ${parts.join(" · ")}` : "用量不可用";
+}
+
+const MODEL_CALL_ROLE_LABELS = { generation: "生成", review: "审核" };
+const MODEL_CALL_STATUS_LABELS = {
+  started: "进行中",
+  succeeded: "成功",
+  failed: "失败",
+  timed_out: "超时",
+  stale: "过期",
+  superseded: "被取代",
+  preflight_blocked: "预检拦截",
+};
 
 function showWaiting(kicker, title, description, options = {}) {
   resetQualityRejectionPresentation();
