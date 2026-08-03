@@ -157,6 +157,36 @@ The supervisor and subagents may propose structured results and evidence. The
 creation service validates them, enforces the three-attempt budget, and remains
 the sole authority that approves a stage or marks a run succeeded.
 
+### Design package (SeriesBible)
+
+A unified run builds one atomic story-design package once the L0 variant and the
+approved story-outline, biography, relationship, and episode-outline projections
+are available. The package is one immutable `SeriesBible` candidate that bundles
+the four Markdown projections with the machine-readable `StoryContract`; every
+projection and hash belongs to exactly one candidate, and no cross-version
+mixture is observable through the API, UI, checkpoints, or restart state.
+
+When the episode-outline result declares a `story_contract`, the creation
+service assembles a candidate and runs deterministic universal validation
+(schema, references, uniqueness, ordering, explicit arithmetic, and projection
+consistency) plus the genre-activated rules the candidate declares. `mystery`
+activates reveal and clue obligations; a general-genre idea is never rejected
+for missing mystery-only mechanics. The bound DeepSeek global design review is
+the review-route `canon_reviewer` result for that exact candidate id and content
+hash; another candidate's review cannot approve it.
+
+A candidate becomes `active` only through a transactional/CAS promotion that
+requires passing deterministic validation and a passing bound review. At most
+one complete automatic rebuild per run lineage may follow a confirmed design
+defect; a second requires explicit authorization. Late or superseded candidates
+are retained as immutable `stale`/`superseded` evidence with their review and
+usage and can never move the active pointer or trigger downstream work. A design
+hash/epoch change supersedes the whole prior script batch and signals the writer
+Issue to start a fresh batch at episode 1.
+
+The workbench exposes the four familiar projections from the one active candidate
+with an explicit unfinished label; the design package is never formal delivery.
+
 ### Delivery
 
 `ContentPackage` contains exactly five creative outputs:

@@ -88,6 +88,13 @@ const EPISODE_SCRIPTS_DRAFT = {
   isEpisodeNavigator: true,
 };
 
+const SERIES_BIBLE_DESIGN = {
+  key: "series_bible_design",
+  title: "设计包",
+  overline: "DESIGN",
+  isSeriesBibleDesign: true,
+};
+
 const STAGE_ARTIFACT_KEYS = new Map([
   ...DRAFT_ARTIFACTS.map(({ stage, key }) => [stage, key]),
   ["generating_episode_scripts", "episode_scripts"],
@@ -1157,7 +1164,40 @@ function artifactViewsForRun(run) {
       ? [{ ...artifact, content, isDraft: true }]
       : [];
   });
+  const design = seriesBibleDesignView(run);
+  if (design) {
+    artifacts.push(design);
+  }
   return [...artifacts, ...episodeScriptDraftView(run)];
+}
+
+function seriesBibleDesignView(run) {
+  const design = run?.drafts?.design;
+  if (!design || typeof design !== "object") {
+    return null;
+  }
+  const sections = [
+    "未完成设计包（不作为正式交付）",
+    "",
+    `候选 ID: ${design.candidate_id || ""}`,
+    `版本: ${design.version ?? ""}`,
+    `内容哈希: ${design.content_hash || ""}`,
+    `类型: ${design.genre || ""}`,
+    design.is_active ? "状态: 当前激活" : `状态: ${design.status || ""}`,
+    "",
+    "故事大纲:",
+    design.projections?.story_outline || "",
+    "",
+    "人物小传:",
+    design.projections?.character_biographies || "",
+    "",
+    "关系逻辑:",
+    design.projections?.relationship_logic || "",
+    "",
+    "分集大纲:",
+    design.projections?.episode_outline || "",
+  ];
+  return { ...SERIES_BIBLE_DESIGN, content: sections.join("\n"), isDraft: true };
 }
 
 function visibleArtifactViews(run) {

@@ -13,6 +13,7 @@ from pydantic import (
 )
 
 from pengine.continuity import EpisodeStateDelta, SemanticReview, SeriesState
+from pengine.series_bible import SeriesBibleSummary
 
 NonEmptyText = Annotated[
     str,
@@ -273,6 +274,14 @@ CreativeDraft = Annotated[
 class RunDraftSnapshot(StrictModel):
     artifacts: list[CreativeDraft] = Field(default_factory=list)
     episodes: list[EpisodeDraft] = Field(default_factory=list)
+    design: SeriesBibleSummary | None = Field(
+        default=None,
+        description=(
+            "The latest deterministically valid unfinished SeriesBible design candidate "
+            "for this run. Every projection and hash belongs to one candidate; the design "
+            "package is never formal delivery."
+        ),
+    )
     review_status: FinalReviewProgress
 
 

@@ -1335,6 +1335,91 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
+def test_workbench_presents_one_active_unfinished_series_bible_design() -> None:
+    script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
+    assertions = """
+const designRun = {
+  state: "running",
+  progress: {
+    episodes: { total: 2, completed: 0, current: null },
+    current_stage: "generating_episode_scripts",
+    completed_stages: ["generating_story_outline", "generating_character_biographies"],
+  },
+  drafts: {
+    artifacts: [
+      { stage: "generating_story_outline", content: "故事大纲" },
+    ],
+    design: {
+      candidate_id: "candidate_abcdef1234567890",
+      version: 1,
+      design_epoch: 1,
+      content_hash: "a".repeat(64),
+      status: "active",
+      is_active: true,
+      unfinished: true,
+      genre: "general",
+      projections: {
+        story_outline: "离乡者回到旧屋。",
+        character_biographies: "林岚：主角。",
+        relationship_logic: "关系逻辑",
+        episode_outline: "第 1 集：林岚回到旧屋。",
+        story_contract_markdown: "# Story Contract",
+      },
+    },
+  },
+};
+const designView = seriesBibleDesignView(designRun);
+if (!designView) throw new Error("active design was not exposed to the workbench");
+if (designView.key !== "series_bible_design") throw new Error("design view key is wrong");
+if (designView.overline !== "DESIGN") throw new Error("design view lacks its overline");
+if (!designView.content.includes("未完成设计包（不作为正式交付）")) {
+  throw new Error("active design was not labeled unfinished");
+}
+if (!designView.content.includes("candidate_abcdef1234567890")) {
+  throw new Error("design view did not expose the candidate id");
+}
+if (!designView.content.includes("a".repeat(64))) {
+  throw new Error("design view did not expose the content hash");
+}
+if (!designView.content.includes("第 1 集：林岚回到旧屋。")) {
+  throw new Error("design view did not expose the episode outline projection");
+}
+if (seriesBibleDesignView({ state: "running", drafts: {} }) !== null) {
+  throw new Error("a run without a design must not expose a design view");
+}
+const artifactViews = artifactViewsForRun(designRun);
+if (!artifactViews.some((view) => view.key === "series_bible_design")) {
+  throw new Error("the active design was missing from the run artifact tabs");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}} }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(() => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_progress_renders_model_call_usage_panel() -> None:
     script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
     assertions = """
