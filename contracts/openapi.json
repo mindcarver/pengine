@@ -357,6 +357,91 @@
         }
       }
     },
+    "/creations/{creation_id}/runs/{run_kind}/authorize-repair": {
+      "post": {
+        "summary": "Authorize exactly one generation-plus-review cycle for a repair",
+        "description": "Grants the pending repair authorization bound to the active lineage and queues the run for exactly one cycle. A failure returns to the same evidence pause without automatic repetition. Generic Continue cannot spend a content-repair budget.",
+        "operationId": "authorizeRepair",
+        "parameters": [
+          {
+            "name": "creation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Creation Id"
+            }
+          },
+          {
+            "name": "run_kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "initial",
+                "revision"
+              ],
+              "type": "string",
+              "title": "Run Kind"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Repair authorized and queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunControlAccepted"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Creation not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The requested run cannot be authorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/creations/{creation_id}/runs/{run_kind}/end": {
       "post": {
         "summary": "End a paused or quality-rejected initial or revision run permanently",
@@ -1101,6 +1186,18 @@
           },
           "pause": {
             "$ref": "#/components/schemas/RunPause"
+          },
+          "authorization": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RepairAuthorization"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Authorization"
           }
         },
         "additionalProperties": false,
@@ -1468,6 +1565,18 @@
           },
           "pause": {
             "$ref": "#/components/schemas/RunPause"
+          },
+          "authorization": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RepairAuthorization"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Authorization"
           }
         },
         "additionalProperties": false,
@@ -1792,7 +1901,8 @@
               "relay_interruption",
               "content_rejected",
               "episode_error",
-              "context_budget"
+              "context_budget",
+              "repair_authorization"
             ],
             "title": "Code",
             "default": "run_timeout"
@@ -1886,7 +1996,8 @@
               "relay_interruption",
               "content_rejected",
               "episode_error",
-              "context_budget"
+              "context_budget",
+              "repair_authorization"
             ],
             "title": "Recovery Reason"
           },
@@ -3097,6 +3208,131 @@
           "message"
         ],
         "title": "ValidationIssue"
+      },
+      "RepairAuthorization": {
+        "properties": {
+          "authorization_epoch": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Authorization Epoch"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "design_rebuild",
+              "suffix_rewrite"
+            ],
+            "title": "Kind"
+          },
+          "design_candidate_id": {
+            "type": "string",
+            "title": "Design Candidate Id"
+          },
+          "design_content_hash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Design Content Hash"
+          },
+          "design_epoch": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Design Epoch"
+          },
+          "batch_id": {
+            "type": "string",
+            "title": "Batch Id"
+          },
+          "batch_epoch": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Batch Epoch"
+          },
+          "earliest_affected_episode": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Earliest Affected Episode"
+          },
+          "range_episodes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Range Episodes"
+          },
+          "estimated_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Tokens"
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Evidence"
+          },
+          "review_id": {
+            "type": "string",
+            "title": "Review Id"
+          },
+          "granted_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted At"
+          },
+          "consumed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Consumed At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "authorization_epoch",
+          "kind",
+          "design_candidate_id",
+          "design_content_hash",
+          "design_epoch",
+          "batch_id",
+          "batch_epoch",
+          "evidence",
+          "review_id"
+        ],
+        "title": "RepairAuthorization",
+        "description": "The exact one-cycle repair authorization shown at a repair-authorization pause.\n\nIt binds the active lineage and carries the review evidence, the affected\nrange, and the estimated token requirement so the operator can decide between\n``authorize once`` and ``end and preserve workspace`` (RPR-A8/A9)."
       }
     }
   },

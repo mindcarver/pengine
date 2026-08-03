@@ -228,6 +228,7 @@ class RunProgress(StrictModel):
         "content_rejected",
         "episode_error",
         "context_budget",
+        "repair_authorization",
     ]
     final_review: FinalReviewProgress
     episodes: EpisodeProgress | None = None
@@ -292,6 +293,7 @@ class RunPause(StrictModel):
         "content_rejected",
         "episode_error",
         "context_budget",
+        "repair_authorization",
     ] = "run_timeout"
     message: NonEmptyText
     stage: UserStage
@@ -316,17 +318,38 @@ class RunPause(StrictModel):
                 UserStage.GENERATING_RELATIONSHIPS,
             }:
                 raise ValueError("Only story creation stages allow more than two content repairs")
-        elif self.code == "episode_error":
+        elif self.code in {"episode_error", "context_budget", "repair_authorization"}:
             if self.timeout_count is not None or self.content_repair_count is not None:
-                raise ValueError("Episode errors do not use timeout or repair counts")
-        elif self.code == "context_budget":
-            if self.timeout_count is not None or self.content_repair_count is not None:
-                raise ValueError("Context-budget pauses do not use timeout or repair counts")
+                raise ValueError("This pause does not use timeout or repair counts")
         elif self.timeout_count is None or self.content_repair_count is not None:
             raise ValueError(
                 "Timeout and relay pauses require a timeout count and no content repair count"
             )
         return self
+
+
+class RepairAuthorization(StrictModel):
+    """The exact one-cycle repair authorization shown at a repair-authorization pause.
+
+    It binds the active lineage and carries the review evidence, the affected
+    range, and the estimated token requirement so the operator can decide between
+    ``authorize once`` and ``end and preserve workspace`` (RPR-A8/A9).
+    """
+
+    authorization_epoch: int = Field(ge=1)
+    kind: Literal["design_rebuild", "suffix_rewrite"]
+    design_candidate_id: str
+    design_content_hash: Sha256
+    design_epoch: int = Field(ge=1)
+    batch_id: str
+    batch_epoch: int = Field(ge=1)
+    earliest_affected_episode: int | None = Field(default=None, ge=1)
+    range_episodes: int | None = Field(default=None, ge=1)
+    estimated_tokens: int | None = Field(default=None, ge=0)
+    evidence: NonEmptyText
+    review_id: str
+    granted_at: datetime | None = None
+    consumed_at: datetime | None = None
 
 
 class QueuedRun(StrictModel):
@@ -352,6 +375,7 @@ class PausedRun(StrictModel):
     progress: RunProgress
     drafts: RunDraftSnapshot
     pause: RunPause
+    authorization: RepairAuthorization | None = None
 
 
 class EndedRun(StrictModel):
@@ -431,6 +455,7 @@ class RevisionPaused(StrictModel):
     progress: RunProgress
     drafts: RunDraftSnapshot
     pause: RunPause
+    authorization: RepairAuthorization | None = None
 
 
 class RevisionEnded(StrictModel):

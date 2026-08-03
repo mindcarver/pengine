@@ -47,6 +47,7 @@ def test_openapi_exposes_creation_and_run_control_operations() -> None:
         ("POST", "/creations/{creation_id}/revision"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/retry-final-review"),
+        ("POST", "/creations/{creation_id}/runs/{run_kind}/authorize-repair"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
     }
 
@@ -99,6 +100,7 @@ def test_openapi_exposes_recovery_reasons_and_pause_evidence() -> None:
         "content_rejected",
         "episode_error",
         "context_budget",
+        "repair_authorization",
     ]
     assert "recovery_reason" in schemas["RunProgress"]["required"]
     assert schemas["RunPause"]["properties"]["code"]["enum"] == [
@@ -107,6 +109,7 @@ def test_openapi_exposes_recovery_reasons_and_pause_evidence() -> None:
         "content_rejected",
         "episode_error",
         "context_budget",
+        "repair_authorization",
     ]
     assert schemas["RunProgress"]["properties"]["model_calls"] == {
         "items": {"$ref": "#/components/schemas/ModelCallSummary"},

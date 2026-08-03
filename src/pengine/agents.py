@@ -31,6 +31,7 @@ from pengine.continuity import (
     ContinuityViolation,
     EpisodeStateDelta,
     SemanticReview,
+    SeriesState,
     StoryContract,
     bind_episode_delta_to_contract,
     build_episode_lock,
@@ -58,6 +59,7 @@ from pengine.schemas import (
     WorkflowResult,
 )
 from pengine.series_bible import SeriesBibleSummary
+from pengine.series_review import StructuralReviewResult, effective_milestones
 from pengine.skill_assets import load_agent_skill_files
 
 logger = logging.getLogger(__name__)
@@ -71,6 +73,12 @@ EpisodeAttemptHook = Callable[[EpisodePlan], Awaitable[int]]
 EpisodeCommitHook = Callable[..., Awaitable[EpisodeDraft]]
 EpisodeAssemblyHook = Callable[[], Awaitable[str]]
 EpisodeDeadlineReset = Callable[[], Awaitable[None]]
+# ``register_series_review`` persists one bound structural review and returns its
+# review id; the middleware raises ``MilestoneRejectedError`` on a rejection.
+SeriesReviewRegistration = Callable[..., Awaitable[str]]
+# ``get_series_bible`` returns the active SeriesBible projection so the writer can
+# refresh the design after the outline stage promotes it (mid-execution).
+SeriesBibleRetriever = Callable[[], Awaitable[SeriesBibleSummary | None]]
 
 _STAGE_TOKEN = re.compile(r"^\[stage=([a-z0-9_]+)\](?:\[episode=\d+\])?(?:\s|$)")
 _BILINGUAL_GLOSS_SUFFIX = re.compile(r"\s*[（(][^()（）]*[A-Za-z][^()（）]*[）)]\s*$")
@@ -291,6 +299,14 @@ class EpisodePlannerResult(StrictModel):
     episode_count: int = Field(ge=1)
     episodes: list[EpisodePlan] = Field(min_length=1)
     story_contract: StoryContract
+    review_milestones: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Optional SeriesBible-declared structural review milestone episode numbers "
+            "within 1..episode_count. Empty means the only structural review is the final "
+            "completion review; the final episode is always reviewed."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_episode_sequence(self) -> "EpisodePlannerResult":
@@ -300,6 +316,13 @@ class EpisodePlannerResult(StrictModel):
             raise ValueError("Episode plans must be ordered and contiguous from 1")
         if self.story_contract.episode_count != self.episode_count:
             raise ValueError("Story contract episode count must match the episode plan")
+        milestones = [int(item) for item in self.review_milestones]
+        if len(milestones) != len(set(milestones)):
+            raise ValueError("Review milestones must be unique")
+        for milestone in milestones:
+            if milestone < 1 or milestone > self.episode_count:
+                raise ValueError("Review milestones must lie within the episode count")
+        self.review_milestones = sorted(milestones)
         return self
 
 
@@ -1225,6 +1248,29 @@ class ContentReviewRejectedError(RuntimeError):
 
 class CheckpointUnavailableError(RuntimeError):
     """The durable thread state required for a resumed run is missing."""
+
+
+class MilestoneRejectedError(RuntimeError):
+    """A bound structural milestone or final review rejected the active prefix.
+
+    The worker orchestrator classifies the failure (design defect / script defect)
+    and either triggers the existing design-rebuild or suffix-rewrite operation or
+    pauses for an exact one-cycle repair authorization (RPR-A3/A4/A5).
+    """
+
+    def __init__(
+        self,
+        *,
+        category: str,
+        evidence: str,
+        earliest_affected_episode: int | None,
+        review_id: str | None,
+    ) -> None:
+        super().__init__("Structural review did not pass")
+        self.category = category
+        self.evidence = evidence
+        self.earliest_affected_episode = earliest_affected_episode
+        self.review_id = review_id
 
 
 class EpisodeTimeoutError(TimeoutError):
@@ -2280,6 +2326,8 @@ class StageGuardMiddleware(AgentMiddleware):
         generate_outline_patch: OutlinePatchGenerator | None = None,
         generate_story_patch: StoryPatchGenerator | None = None,
         series_bible: SeriesBibleSummary | None = None,
+        register_series_review: SeriesReviewRegistration | None = None,
+        get_series_bible: SeriesBibleRetriever | None = None,
     ) -> None:
         self.before_stage = before_stage
         self.approve_stage = approve_stage
@@ -2296,6 +2344,8 @@ class StageGuardMiddleware(AgentMiddleware):
         self.generate_outline_patch = generate_outline_patch
         self.generate_story_patch = generate_story_patch
         self.series_bible = series_bible
+        self.register_series_review = register_series_review
+        self.get_series_bible = get_series_bible
 
     async def awrap_tool_call(
         self,
@@ -3131,6 +3181,84 @@ class StageGuardMiddleware(AgentMiddleware):
                 ) from exc
         return result, parsed.model_dump(mode="json")
 
+    async def _milestone_review(
+        self,
+        *,
+        episode_number: int,
+        prior_state: SeriesState,
+        contract: StoryContract,
+        contract_hash: str,
+        contract_json: str,
+        outline: Mapping[str, Any],
+        plan: EpisodePlan,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> StructuralReviewResult:
+        """Run the bound structural review for a declared milestone or the final episode.
+
+        The review observes the complete active prefix at this milestone and classifies
+        a rejection as a design defect or a script defect with the earliest affected
+        episode (RPR-A3). A rejected review raises ``MilestoneRejectedError`` so the
+        worker can orchestrate the bounded repair; a passing review is registered as
+        bound evidence (RPR-A1).
+        """
+        if self.register_series_review is None:
+            raise AgentProtocolError(
+                "Structural milestone reviews require the series-review registration hook",
+                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            )
+        milestone_scripts = "\n\n---\n\n".join(
+            [
+                *(
+                    f"第 {draft.episode_number} 集\n{draft.content}"
+                    for draft in sorted(
+                        self.episode_drafts.values(),
+                        key=lambda draft: draft.episode_number,
+                    )
+                ),
+            ]
+        )
+        result = await self._invoke_semantic_reviewer(
+            request=request,
+            handler=handler,
+            subagent_type="series_reviewer",
+            description=(
+                f"Review the complete active series prefix through episode {episode_number} "
+                "against the active SeriesBible and locked story contract. Treat the design "
+                "and every committed script as immutable. Classify the decision exactly: a "
+                "pass requires concrete whole-series consistency evidence; a design defect "
+                "means the structural design itself is unsound (return earliest_affected_episode "
+                "null); a script defect means the writing from the earliest affected episode "
+                "violates the contract, continuity, clue lifecycle, or obligations (return the "
+                "earliest affected episode N). Return the structured classification only."
+            ),
+            files={
+                "/workspace/series_prefix.md": milestone_scripts,
+                "/workspace/series_state.json": prior_state.model_dump_json(),
+                "/workspace/story_contract.json": contract_json,
+                "/workspace/story_contract.md": outline["story_contract_markdown"],
+                "/workspace/current_episode_plan.md": plan.plan,
+            },
+            schema=StructuralReviewResult,
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+        )
+        review_id = await self.register_series_review(
+            review_type=("final" if episode_number == contract.episode_count else "milestone"),
+            episode_number=episode_number,
+            passed=result.passed,
+            category=result.category,
+            evidence=result.evidence,
+            earliest_affected_episode=result.earliest_affected_episode,
+        )
+        if not result.passed:
+            raise MilestoneRejectedError(
+                category=result.category,
+                evidence=result.evidence,
+                earliest_affected_episode=result.earliest_affected_episode,
+                review_id=review_id,
+            )
+        return result
+
     async def _write_episodes(
         self,
         request: ToolCallRequest,
@@ -3149,7 +3277,11 @@ class StageGuardMiddleware(AgentMiddleware):
         outline = self.approved_payloads.get(InternalStage.GENERATING_EPISODE_OUTLINE)
         try:
             parsed_outline = EpisodePlannerResult.model_validate(
-                {field: outline[field] for field in EpisodePlannerResult.model_fields}
+                {
+                    field: outline[field]
+                    for field in EpisodePlannerResult.model_fields
+                    if field in outline
+                }
             )
             plans = parsed_outline.episodes
             contract = parsed_outline.story_contract
@@ -3187,6 +3319,18 @@ class StageGuardMiddleware(AgentMiddleware):
 
         last_result: ToolMessage | Command[Any] | None = None
         writer_notes = ""
+        if self.get_series_bible is not None:
+            # Refresh the active design each time the writer runs. The design is
+            # promoted when the outline stage is approved (which can happen after
+            # ``execute`` resolved ``series_bible``) and can be superseded by an
+            # authorized design rebuild; the writer must use the current design for
+            # its milestone schedule and projections (RPR-A1/A4).
+            self.series_bible = await self.get_series_bible()
+        milestones = (
+            effective_milestones(self.series_bible.review_milestones, contract.episode_count)
+            if self.series_bible is not None
+            else frozenset()
+        )
         for plan in plans:
             if plan.episode_number in self.episode_drafts:
                 continue
@@ -3280,45 +3424,57 @@ class StageGuardMiddleware(AgentMiddleware):
                     content=parsed.content,
                     delta=parsed.state_delta,
                 )
-                semantic_review = await self._invoke_semantic_reviewer(
-                    request=episode_request,
-                    handler=handler,
-                    subagent_type="episode_reviewer",
-                    description=(
-                        f"Review episode {plan.episode_number} and the complete committed "
-                        "series prefix against the locked contract and every approved upstream "
-                        "artifact. Compare identities, relationships, aliases, pronouns, ages, "
-                        "durations, call participants, clue meanings, causal facts, viewpoint "
-                        "knowledge, cast, and episode obligation across all prior scripts and "
-                        "the current candidate. The candidate's final dramatic beat must realize "
-                        "the locked end_hook without a later beat undoing it. On the final episode "
-                        "this is the whole-series consistency review before script-stage approval. "
-                        "Return structured evidence only."
-                    ),
-                    files={
-                        "/workspace/story_contract.json": contract_json,
-                        "/workspace/series_state.json": prior_state.model_dump_json(),
-                        "/workspace/current_episode_plan.md": plan.plan,
-                        "/workspace/current_episode_obligation.json": (
-                            current_obligation.model_dump_json()
+                if self.series_bible is not None:
+                    # RPR-A1: in the unified SeriesBible flow DeepSeek is reserved for
+                    # the declared structural milestones and the final completion review;
+                    # per-episode semantic review is superseded by deterministic
+                    # per-episode validation in the writer.
+                    semantic_review = SemanticReview(
+                        passed=True,
+                        evidence="确定性逐集校验通过；结构性里程碑与终审由系列级审查覆盖。",
+                    )
+                else:
+                    semantic_review = await self._invoke_semantic_reviewer(
+                        request=episode_request,
+                        handler=handler,
+                        subagent_type="episode_reviewer",
+                        description=(
+                            f"Review episode {plan.episode_number} and the complete committed "
+                            "series prefix against the locked contract and every approved upstream "
+                            "artifact. Compare identities, relationships, aliases, pronouns, ages, "
+                            "durations, call participants, clue meanings, causal facts, viewpoint "
+                            "knowledge, cast, and episode obligation across all prior scripts and "
+                            "the current candidate. The candidate's final dramatic beat must "
+                            "realize the locked end_hook without a later beat undoing it. On the "
+                            "final episode this is the whole-series consistency review before "
+                            "script-stage approval. Return structured evidence only."
                         ),
-                        "/workspace/candidate_episode.md": parsed.content,
-                        "/workspace/series_prefix.md": "\n\n---\n\n".join(
-                            [
-                                *(
-                                    f"第 {episode_number} 集\n{draft.content}"
-                                    for episode_number, draft in sorted(self.episode_drafts.items())
-                                ),
-                                f"第 {plan.episode_number} 集\n{parsed.content}",
-                            ]
-                        ),
-                        "/workspace/candidate_state_delta.json": (
-                            parsed.state_delta.model_dump_json()
-                        ),
-                    },
-                    schema=EpisodeReviewerResult,
-                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
-                )
+                        files={
+                            "/workspace/story_contract.json": contract_json,
+                            "/workspace/series_state.json": prior_state.model_dump_json(),
+                            "/workspace/current_episode_plan.md": plan.plan,
+                            "/workspace/current_episode_obligation.json": (
+                                current_obligation.model_dump_json()
+                            ),
+                            "/workspace/candidate_episode.md": parsed.content,
+                            "/workspace/series_prefix.md": "\n\n---\n\n".join(
+                                [
+                                    *(
+                                        f"第 {episode_number} 集\n{draft.content}"
+                                        for episode_number, draft in sorted(
+                                            self.episode_drafts.items()
+                                        )
+                                    ),
+                                    f"第 {plan.episode_number} 集\n{parsed.content}",
+                                ]
+                            ),
+                            "/workspace/candidate_state_delta.json": (
+                                parsed.state_delta.model_dump_json()
+                            ),
+                        },
+                        schema=EpisodeReviewerResult,
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    )
                 review = _merge_episode_reviews(deterministic_issues, semantic_review)
                 if review.passed:
                     try:
@@ -3346,6 +3502,21 @@ class StageGuardMiddleware(AgentMiddleware):
                     prior_state = episode_lock.series_state
                     writer_notes = _bounded_writer_notes(writer_notes, parsed.writer_notes)
                     last_result = result
+                    if plan.episode_number in milestones and self.series_bible is not None:
+                        # Structural milestone / final review of the complete active
+                        # prefix. A rejection raises MilestoneRejectedError and aborts
+                        # the pass; the worker orchestrates the bounded repair.
+                        await self._milestone_review(
+                            episode_number=plan.episode_number,
+                            prior_state=prior_state,
+                            contract=contract,
+                            contract_hash=contract_hash,
+                            contract_json=contract_json,
+                            outline=outline,
+                            plan=plan,
+                            request=episode_request,
+                            handler=handler,
+                        )
                     break
                 if repair_rounds >= 2:
                     raise ContentReviewRejectedError(
@@ -3450,6 +3621,8 @@ class DeepAgentWorkflow:
         feedback: str | None = None,
         retrieve_references: ReferenceRetriever | None = None,
         series_bible: SeriesBibleSummary | None = None,
+        register_series_review: SeriesReviewRegistration | None = None,
+        get_series_bible: SeriesBibleRetriever | None = None,
     ) -> WorkflowResult:
         approved_payloads: dict[InternalStage, Any] = {
             stage: payload for stage, payload in (approved_checkpoints or {}).items()
@@ -3735,6 +3908,30 @@ class DeepAgentWorkflow:
                 ),
             },
             {
+                "name": "series_reviewer",
+                "description": (
+                    "Reviews the complete active series prefix at a SeriesBible-declared "
+                    "structural milestone or the final completion and returns a deterministic "
+                    "classification."
+                ),
+                "system_prompt": bind_language(
+                    "Review the complete active series prefix against the active SeriesBible "
+                    "and locked story contract. The design and every committed script are "
+                    "immutable. Classify the decision exactly: pass requires concrete "
+                    "whole-series consistency evidence; a design defect returns no affected "
+                    "episode; a script defect returns the earliest affected episode N. Never "
+                    "repair content and never reinterpret the design to make the prefix pass."
+                ),
+                "model": self.review_model,
+                "tools": tools,
+                "permissions": REVIEW_FILE_PERMISSIONS,
+                "middleware": structured_result_middleware,
+                "response_format": ToolStrategy(
+                    schema=StructuralReviewResult,
+                    handle_errors=structured_output_retry,
+                ),
+            },
+            {
                 "name": "episode_repair",
                 "description": "Repairs only the current unlocked episode candidate.",
                 "system_prompt": bind_language(
@@ -3780,6 +3977,8 @@ class DeepAgentWorkflow:
                     generate_outline_patch=generate_outline_patch,
                     generate_story_patch=generate_story_patch,
                     series_bible=series_bible,
+                    register_series_review=register_series_review,
+                    get_series_bible=get_series_bible,
                 )
             ],
             subagents=subagents,

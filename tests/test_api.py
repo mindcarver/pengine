@@ -61,6 +61,7 @@ async def test_frontend_and_assets_are_served_with_run_control_openapi(
         ("POST", "/creations/{creation_id}/revision"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/retry-final-review"),
+        ("POST", "/creations/{creation_id}/runs/{run_kind}/authorize-repair"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
     }
 

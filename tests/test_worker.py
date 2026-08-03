@@ -57,6 +57,8 @@ class DeterministicWorkflow:
         feedback=None,
         retrieve_references=None,
         series_bible=None,
+        register_series_review=None,
+        get_series_bible=None,
     ) -> WorkflowResult:
         del (
             thread_id,
@@ -67,6 +69,8 @@ class DeterministicWorkflow:
             output_language,
             retrieve_references,
             series_bible,
+            register_series_review,
+            get_series_bible,
         )
         approved = dict(approved_checkpoints or {})
         handling = (
@@ -466,6 +470,8 @@ class PreflightBlockedWorkflow:
         feedback=None,
         retrieve_references=None,
         series_bible=None,
+        register_series_review=None,
+        get_series_bible=None,
     ) -> WorkflowResult:
         del (
             thread_id,
@@ -482,6 +488,8 @@ class PreflightBlockedWorkflow:
             feedback,
             retrieve_references,
             series_bible,
+            register_series_review,
+            get_series_bible,
         )
         self.calls += 1
         approved = dict(approved_checkpoints or {})
