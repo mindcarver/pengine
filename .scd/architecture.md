@@ -217,6 +217,37 @@ The active candidate projection stays readable through the workbench after a
 refresh or restart; only a complete active batch assembles into the episode
 scripts, which are never formal delivery until the final gate.
 
+### Bounded structural review and repair authorization
+
+The SeriesBible declares structural review milestones (`review_milestones`); the
+final episode is always a structural milestone. DeepSeek reviews only these
+milestones and the final completion.
+
+- A **bound structural review** observes the complete active prefix at one
+  milestone and binds the exact design candidate, script batch/epoch,
+  active-prefix hash, and model-call id. It returns a deterministic category
+  (pass / design defect / script defect) and, for a script defect, the earliest
+  affected episode. Reviews are immutable evidence; a review bound to a
+  different design or batch is retained as `stale` and can never approve,
+  rebuild, rewrite, or deliver the active lineage.
+- A **design defect** triggers the one automatic complete design regeneration
+  per run lineage: the approved outline and downstream stages are reset, the
+  prior script batch is superseded, and writing restarts at episode 1. When the
+  automatic budget is exhausted, the run pauses for authorization.
+- A **script defect** consumes the single automatic suffix-rewrite budget shared
+  by all milestone and final reviews for the script batch: active 1..N-1 are
+  preserved, active N..end are superseded, SeriesState is replayed, and the
+  run requeues to rewrite the suffix. When the budget is exhausted, the run
+  pauses for authorization.
+- A **repair authorization** is bound to the active lineage, shows the evidence,
+  the affected range, and the estimated token requirement, and grants exactly
+  one generation-plus-review cycle. A failure returns to the same evidence
+  pause. Generic Continue is for transient runtime/Relay/timeout states only
+  and can never bypass a semantic rejection or spend a content-repair budget.
+- Only a passing **bound final whole-series review** atomically freezes the
+  active design and complete active script batch as formal delivery; without
+  it `succeed_run` refuses to persist a delivery.
+
 ### Delivery
 
 `ContentPackage` contains exactly five creative outputs:

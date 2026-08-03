@@ -50,6 +50,7 @@ from pengine.schemas import (
     QualityGateRejection,
     QualityRejectedRun,
     QueuedRun,
+    RepairAuthorization,
     RevisionAccepted,
     RevisionAutoResuming,
     RevisionAvailable,
@@ -86,8 +87,12 @@ from pengine.series_bible import (
     ValidationEvidence,
     project_series_bible,
 )
+from pengine.series_review import (
+    BoundStructuralReview,
+    new_review_id,
+)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -105,6 +110,8 @@ RecoveryReason = Literal[
     "relay_interruption",
     "content_rejected",
     "episode_error",
+    "context_budget",
+    "repair_authorization",
 ]
 RecoveryState = Literal["auto_resuming", "paused", "failed"]
 
@@ -873,6 +880,103 @@ ON episode_candidates(run_id);
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (13);
 """
 
+_SCHEMA_V14_REVIEW_SQL = """
+CREATE TABLE IF NOT EXISTS series_reviews (
+    review_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    review_epoch INTEGER NOT NULL CHECK (review_epoch >= 1),
+    review_type TEXT NOT NULL CHECK (review_type IN ('milestone', 'final')),
+    episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+    design_candidate_id TEXT NOT NULL,
+    design_content_hash TEXT NOT NULL,
+    design_epoch INTEGER NOT NULL CHECK (design_epoch >= 1),
+    batch_id TEXT NOT NULL,
+    batch_epoch INTEGER NOT NULL CHECK (batch_epoch >= 1),
+    prefix_hash TEXT NOT NULL,
+    call_id TEXT NOT NULL,
+    passed INTEGER NOT NULL CHECK (passed IN (0, 1)),
+    category TEXT NOT NULL CHECK (
+        category IN (
+            'pass', 'design_defect', 'script_defect',
+            'protocol_failure', 'transient_failure', 'stale'
+        )
+    ),
+    evidence TEXT NOT NULL,
+    earliest_affected_episode INTEGER CHECK (
+        earliest_affected_episode IS NULL OR earliest_affected_episode >= 1
+    ),
+    status TEXT NOT NULL CHECK (status IN ('active', 'superseded', 'stale')),
+    created_at TEXT NOT NULL,
+    consumed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS series_reviews_run
+ON series_reviews(run_id);
+
+CREATE TABLE IF NOT EXISTS repair_authorizations (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    authorization_epoch INTEGER NOT NULL CHECK (authorization_epoch >= 1),
+    kind TEXT NOT NULL CHECK (kind IN ('design_rebuild', 'suffix_rewrite')),
+    design_candidate_id TEXT NOT NULL,
+    design_content_hash TEXT NOT NULL,
+    design_epoch INTEGER NOT NULL CHECK (design_epoch >= 1),
+    batch_id TEXT NOT NULL,
+    batch_epoch INTEGER NOT NULL CHECK (batch_epoch >= 1),
+    earliest_affected_episode INTEGER,
+    range_episodes INTEGER CHECK (range_episodes IS NULL OR range_episodes >= 1),
+    estimated_tokens INTEGER CHECK (estimated_tokens IS NULL OR estimated_tokens >= 0),
+    evidence TEXT NOT NULL,
+    review_id TEXT NOT NULL,
+    granted_at TEXT,
+    consumed_at TEXT,
+    PRIMARY KEY (run_id, authorization_epoch)
+);
+
+DROP TABLE IF EXISTS run_progress_v14;
+CREATE TABLE run_progress_v14 (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    current_stage TEXT NOT NULL,
+    execution_state TEXT NOT NULL CHECK (
+        execution_state IN (
+            'queued', 'running', 'auto_resuming', 'paused',
+            'quality_rejected', 'ended', 'succeeded', 'failed'
+        )
+    ),
+    elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (elapsed_seconds >= 0),
+    active_started_at TEXT,
+    timeout_stage TEXT,
+    timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+    updated_at TEXT NOT NULL,
+    current_episode INTEGER CHECK (current_episode IS NULL OR current_episode >= 1),
+    recovery_reason TEXT NOT NULL DEFAULT 'none' CHECK (
+        recovery_reason IN (
+            'none', 'run_timeout', 'relay_interruption', 'content_rejected',
+            'episode_error', 'context_budget', 'repair_authorization'
+        )
+    ),
+    content_repair_count INTEGER CHECK (
+        content_repair_count IS NULL
+        OR content_repair_count BETWEEN 2 AND 6
+    ),
+    pause_message TEXT
+);
+
+INSERT INTO run_progress_v14(
+    run_id, current_stage, execution_state, elapsed_seconds,
+    active_started_at, timeout_stage, timeout_count, updated_at,
+    current_episode, recovery_reason, content_repair_count, pause_message
+)
+SELECT
+    run_id, current_stage, execution_state, elapsed_seconds,
+    active_started_at, timeout_stage, timeout_count, updated_at,
+    current_episode, recovery_reason, content_repair_count, pause_message
+FROM run_progress;
+
+DROP TABLE run_progress;
+ALTER TABLE run_progress_v14 RENAME TO run_progress;
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (14);
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -1257,6 +1361,30 @@ class Repository:
                 await connection.executescript(_SCHEMA_V13_SCRIPT_BATCH_SQL)
                 await connection.commit()
                 schema_version = 13
+            if schema_version == 13:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    batch_columns = await (
+                        await connection.execute("PRAGMA table_info(script_batches)")
+                    ).fetchall()
+                    if "suffix_rewrite_count" not in {column[1] for column in batch_columns}:
+                        await connection.execute(
+                            """
+                            ALTER TABLE script_batches
+                            ADD COLUMN suffix_rewrite_count INTEGER NOT NULL DEFAULT 0
+                                CHECK (suffix_rewrite_count IN (0, 1))
+                            """
+                        )
+                    await connection.executescript(_SCHEMA_V14_REVIEW_SQL)
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (14)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 14
 
     async def setup(self) -> None:
         await self.initialize()
@@ -1738,6 +1866,55 @@ class Repository:
                 (timestamp, timestamp, timestamp),
             )
             return cursor.rowcount
+
+    async def requeue_run_job(
+        self,
+        run_id: UUID,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Requeue the run's job immediately so the worker re-processes it.
+
+        Used after a suffix rewrite or an authorized repair so the run resumes
+        deterministically instead of waiting for lease expiry (RPR-A5/A9).
+        """
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            run = await self._fetchone(
+                connection,
+                "SELECT id, creation_id FROM runs WHERE id = ?",
+                (str(run_id),),
+            )
+            if run is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET execution_state = 'running',
+                    recovery_reason = 'none',
+                    content_repair_count = NULL,
+                    pause_message = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, str(run_id)),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued',
+                    available_at = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, timestamp, str(run_id)),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, str(run["creation_id"])),
+            )
 
     async def record_episode_attempt(
         self,
@@ -4103,6 +4280,607 @@ class Repository:
             superseded_at=(_datetime(row["superseded_at"]) if row["superseded_at"] else None),
         )
 
+    # ------------------------------------------------------------------
+    # Bound structural reviews, shared budgets, and repair authorization
+    # ------------------------------------------------------------------
+
+    async def register_series_review(
+        self,
+        run_id: UUID,
+        *,
+        review_type: str,
+        episode_number: int,
+        design_candidate_id: str,
+        design_content_hash: str,
+        design_epoch: int,
+        batch_id: str,
+        batch_epoch: int,
+        prefix_hash: str,
+        call_id: str,
+        passed: bool,
+        category: str,
+        evidence: str,
+        earliest_affected_episode: int | None,
+        now: datetime | None = None,
+    ) -> BoundStructuralReview:
+        """Persist one immutable bound structural review and retire superseded reviews.
+
+        A review binds the exact design candidate, script batch/epoch, active-prefix
+        hash, and model-call id it observed (RPR-A1). Any prior ``active`` review for
+        a different design or batch is marked stale and can never approve, rebuild,
+        rewrite, or deliver the current lineage (RPR-A11).
+        """
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE series_reviews
+                SET status = 'stale'
+                WHERE run_id = ?
+                  AND status = 'active'
+                  AND (
+                      design_content_hash <> ?
+                      OR batch_id <> ?
+                      OR batch_epoch <> ?
+                  )
+                """,
+                (
+                    str(run_id),
+                    design_content_hash,
+                    batch_id,
+                    batch_epoch,
+                ),
+            )
+            review = BoundStructuralReview(
+                review_id=new_review_id(),
+                run_id=str(run_id),
+                review_epoch=await self._next_review_epoch(connection, run_id),
+                review_type=review_type,
+                episode_number=episode_number,
+                design_candidate_id=design_candidate_id,
+                design_content_hash=design_content_hash,
+                design_epoch=design_epoch,
+                batch_id=batch_id,
+                batch_epoch=batch_epoch,
+                prefix_hash=prefix_hash,
+                call_id=call_id,
+                passed=passed,
+                category=category,
+                evidence=evidence,
+                earliest_affected_episode=earliest_affected_episode,
+                status="active",
+                reviewed_at=_datetime(timestamp),
+            )
+            await connection.execute(
+                """
+                INSERT INTO series_reviews(
+                    review_id, run_id, review_epoch, review_type, episode_number,
+                    design_candidate_id, design_content_hash, design_epoch,
+                    batch_id, batch_epoch, prefix_hash, call_id, passed, category,
+                    evidence, earliest_affected_episode, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review.review_id,
+                    review.run_id,
+                    review.review_epoch,
+                    review.review_type,
+                    review.episode_number,
+                    review.design_candidate_id,
+                    review.design_content_hash,
+                    review.design_epoch,
+                    review.batch_id,
+                    review.batch_epoch,
+                    review.prefix_hash,
+                    review.call_id,
+                    1 if review.passed else 0,
+                    review.category,
+                    review.evidence,
+                    review.earliest_affected_episode,
+                    review.status,
+                    _timestamp(review.reviewed_at),
+                ),
+            )
+        return review
+
+    async def get_latest_passing_final_review(
+        self,
+        run_id: UUID,
+        *,
+        design_content_hash: str | None = None,
+        batch_id: str | None = None,
+        prefix_hash: str | None = None,
+    ) -> BoundStructuralReview | None:
+        """The latest active passing final review bound to the given lineage.
+
+        Only a passing bound final whole-series review can freeze formal delivery
+        (RPR-A13). When lineage filters are supplied, a review bound to a different
+        design, batch, or prefix is not a passing gate.
+        """
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT * FROM series_reviews
+                WHERE run_id = ?
+                  AND review_type = 'final'
+                  AND status = 'active'
+                  AND passed = 1
+                  AND (
+                      ? IS NULL OR design_content_hash = ?
+                  )
+                  AND (? IS NULL OR batch_id = ?)
+                  AND (? IS NULL OR prefix_hash = ?)
+                ORDER BY review_epoch DESC
+                LIMIT 1
+                """,
+                (
+                    str(run_id),
+                    design_content_hash,
+                    design_content_hash,
+                    batch_id,
+                    batch_id,
+                    prefix_hash,
+                    prefix_hash,
+                ),
+            )
+        return self._series_review_from_row(row) if row is not None else None
+
+    async def get_series_reviews(self, run_id: UUID) -> list[BoundStructuralReview]:
+        """Every bound structural review for one run, newest first (immutable evidence)."""
+        async with self._connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT * FROM series_reviews
+                WHERE run_id = ?
+                ORDER BY review_epoch DESC
+                """,
+                (str(run_id),),
+            )
+            rows = await cursor.fetchall()
+        return [self._series_review_from_row(row) for row in rows]
+
+    async def consume_automatic_suffix_budget(
+        self,
+        run_id: UUID,
+        batch_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Consume the single automatic suffix-rewrite budget shared by all reviews.
+
+        All milestone and final reviews share exactly one automatic suffix-rewrite
+        per script batch (RPR-A6). A second consumption is rejected.
+        """
+        async with self._transaction() as connection:
+            batch = await self._fetch_script_batch_lineage(connection, run_id)
+            if batch is None or batch["batch_id"] != batch_id or batch["status"] != "active":
+                raise DomainError(
+                    "episode_batch_missing",
+                    "The active script batch is missing.",
+                    409,
+                )
+            cursor = await connection.execute(
+                """
+                UPDATE script_batches
+                SET suffix_rewrite_count = 1
+                WHERE batch_id = ? AND status = 'active' AND suffix_rewrite_count = 0
+                """,
+                (batch_id,),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError(
+                    "suffix_budget_exhausted",
+                    "The automatic suffix-rewrite budget for this script batch is exhausted.",
+                    409,
+                )
+
+    async def has_automatic_suffix_budget(self, run_id: UUID, batch_id: str) -> bool:
+        async with self._connection() as connection:
+            batch = await self._fetch_script_batch_lineage(connection, run_id)
+        return bool(
+            batch is not None
+            and batch["batch_id"] == batch_id
+            and batch["status"] == "active"
+            and int(batch["suffix_rewrite_count"]) == 0
+        )
+
+    async def design_rebuild_budget_available(self, run_id: UUID) -> bool:
+        lineage = await self.get_series_bible_lineage(run_id)
+        return lineage is not None and int(lineage["rebuild_count"]) < 1
+
+    async def trigger_design_rebuild(
+        self,
+        run_id: UUID,
+        *,
+        evidence: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Trigger the one automatic complete design regeneration for a design defect.
+
+        The run's approved outline and every downstream stage are reset so the
+        design stages regenerate; ``_sync_series_bible`` then builds and promotes a
+        complete re-reviewed design (consuming the one-per-lineage rebuild budget),
+        invalidates the prior script batch, and restarts writing at episode 1
+        (RPR-A4). The defect evidence stays bound in ``series_reviews``.
+        """
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            run = await self._fetchone(
+                connection,
+                "SELECT state, creation_id FROM runs WHERE id = ?",
+                (str(run_id),),
+            )
+            if run is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if run["state"] != "running":
+                raise DomainError("run_not_running", "Workflow run is not running.", 409)
+            lineage = await self._fetch_series_bible_lineage(connection, run_id)
+            if lineage is None or int(lineage["rebuild_count"]) >= 1:
+                raise DomainError(
+                    "series_bible_rebuild_exhausted",
+                    "This run lineage may rebuild the design automatically at most once.",
+                    409,
+                )
+            batch_row = await self._fetch_script_batch_lineage(connection, run_id)
+            if batch_row is not None and batch_row["status"] == "active":
+                await self._supersede_active_batch(connection, run_id, batch_row, timestamp)
+            await connection.execute(
+                """
+                DELETE FROM business_checkpoints
+                WHERE run_id = ? AND stage IN (
+                    'generating_episode_outline',
+                    'generating_episode_scripts',
+                    'accepting_l0',
+                    'accepting_l4',
+                    'assembling_delivery'
+                )
+                """,
+                (str(run_id),),
+            )
+            await connection.execute(
+                """
+                DELETE FROM episode_plans WHERE run_id = ?
+                """,
+                (str(run_id),),
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    execution_state = 'queued',
+                    active_started_at = NULL,
+                    timeout_stage = ?,
+                    timeout_count = 0,
+                    recovery_reason = 'none',
+                    content_repair_count = NULL,
+                    pause_message = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    InternalStage.GENERATING_EPISODE_OUTLINE.value,
+                    UserStage.GENERATING_EPISODE_OUTLINE.value,
+                    evidence,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued',
+                    available_at = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, timestamp, str(run_id)),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, str(run["creation_id"])),
+            )
+
+    async def pause_repair_authorization(
+        self,
+        run_id: UUID,
+        *,
+        kind: str,
+        design_candidate_id: str,
+        design_content_hash: str,
+        design_epoch: int,
+        batch_id: str,
+        batch_epoch: int,
+        earliest_affected_episode: int | None,
+        range_episodes: int | None,
+        estimated_tokens: int | None,
+        evidence: str,
+        review_id: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Pause the run for an exact one-cycle repair authorization.
+
+        The authorization is bound to the active lineage and shows the evidence,
+        the affected range, and the estimated token requirement (RPR-A8). It grants
+        at most one generation-plus-review cycle (RPR-A9).
+        """
+        current = now or _utc_now()
+        timestamp = _timestamp(current)
+        async with self._transaction() as connection:
+            progress = await self._fetchone(
+                connection,
+                """
+                SELECT run_progress.*, runs.state AS run_state, runs.creation_id
+                FROM run_progress
+                JOIN runs ON runs.id = run_progress.run_id
+                WHERE run_progress.run_id = ?
+                """,
+                (str(run_id),),
+            )
+            if progress is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if progress["run_state"] != "running" or progress["execution_state"] != "running":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Workflow run is not actively running.",
+                    409,
+                )
+            cursor = await connection.execute(
+                """
+                SELECT COALESCE(MAX(authorization_epoch), 0)
+                FROM repair_authorizations WHERE run_id = ?
+                """,
+                (str(run_id),),
+            )
+            row = await cursor.fetchone()
+            authorization_epoch = int(row[0]) + 1 if row is not None else 1
+            await connection.execute(
+                """
+                INSERT INTO repair_authorizations(
+                    run_id, authorization_epoch, kind,
+                    design_candidate_id, design_content_hash, design_epoch,
+                    batch_id, batch_epoch, earliest_affected_episode,
+                    range_episodes, estimated_tokens, evidence, review_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(run_id),
+                    authorization_epoch,
+                    kind,
+                    design_candidate_id,
+                    design_content_hash,
+                    design_epoch,
+                    batch_id,
+                    batch_epoch,
+                    earliest_affected_episode,
+                    range_episodes,
+                    estimated_tokens,
+                    evidence,
+                    review_id,
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    execution_state = 'paused',
+                    elapsed_seconds = ?,
+                    active_started_at = NULL,
+                    timeout_stage = ?,
+                    timeout_count = 0,
+                    recovery_reason = 'repair_authorization',
+                    content_repair_count = NULL,
+                    pause_message = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                    self._elapsed_seconds(progress, current),
+                    UserStage.FINAL_REVIEW.value,
+                    evidence,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'failed',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, str(run_id)),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, progress["creation_id"]),
+            )
+
+    async def get_repair_authorization(self, run_id: UUID) -> Mapping[str, Any] | None:
+        """The latest not-yet-consumed repair authorization (granted or pending)."""
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT * FROM repair_authorizations
+                WHERE run_id = ?
+                ORDER BY authorization_epoch DESC LIMIT 1
+                """,
+                (str(run_id),),
+            )
+        if row is None:
+            return None
+        return {
+            "authorization_epoch": int(row["authorization_epoch"]),
+            "kind": row["kind"],
+            "design_candidate_id": row["design_candidate_id"],
+            "design_content_hash": row["design_content_hash"],
+            "design_epoch": int(row["design_epoch"]),
+            "batch_id": row["batch_id"],
+            "batch_epoch": int(row["batch_epoch"]),
+            "earliest_affected_episode": row["earliest_affected_episode"],
+            "range_episodes": row["range_episodes"],
+            "estimated_tokens": row["estimated_tokens"],
+            "evidence": row["evidence"],
+            "review_id": row["review_id"],
+            "granted_at": row["granted_at"],
+            "consumed_at": row["consumed_at"],
+        }
+
+    async def authorize_repair(
+        self,
+        *,
+        creation_id: UUID,
+        run_kind: RunKind,
+        idempotency_key: str,
+        now: datetime | None = None,
+    ) -> RunControlAccepted:
+        """Grant exactly one generation-plus-review cycle for the pending authorization.
+
+        The authorization is bound to the active lineage; if the active design or
+        batch changed since the pause, it cannot be granted (RPR-A9). Granting
+        requeues the run for exactly one cycle; a subsequent failure returns to the
+        same evidence pause.
+        """
+        timestamp = _timestamp(now or _utc_now())
+        scope = f"run-control:{creation_id}:{run_kind}:authorize-repair"
+        payload_hash = canonical_payload_hash({"action": "authorize-repair"})
+
+        async with self._transaction() as connection:
+            replay = await self._idempotency_replay(
+                connection,
+                idempotency_key,
+                scope,
+                payload_hash,
+                RunControlAccepted,
+            )
+            if replay is not None:
+                return replay
+
+            run = await self._fetch_control_run(connection, creation_id, run_kind)
+            state = run["execution_state"]
+            if state != "paused" or run["recovery_reason"] != "repair_authorization":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Only a repair-authorization pause can be authorized.",
+                    409,
+                )
+            auth = await self._fetchone(
+                connection,
+                """
+                SELECT * FROM repair_authorizations
+                WHERE run_id = ? ORDER BY authorization_epoch DESC LIMIT 1
+                """,
+                (run["id"],),
+            )
+            if auth is None:
+                raise DomainError(
+                    "run_not_controllable",
+                    "The repair authorization record is missing.",
+                    409,
+                )
+            if auth["consumed_at"] is not None:
+                raise DomainError(
+                    "run_not_controllable",
+                    "The repair authorization is already consumed.",
+                    409,
+                )
+            lineage = await self._fetch_series_bible_lineage(connection, UUID(run["id"]))
+            active_batch = await self._fetch_script_batch_lineage(connection, UUID(run["id"]))
+            if (
+                lineage is None
+                or lineage["active_content_hash"] != auth["design_content_hash"]
+                or active_batch is None
+                or active_batch["batch_id"] != auth["batch_id"]
+                or int(active_batch["batch_epoch"]) != int(auth["batch_epoch"])
+            ):
+                raise DomainError(
+                    "repair_authorization_stale",
+                    "The active lineage changed; the repair authorization is stale.",
+                    409,
+                )
+            await connection.execute(
+                """
+                UPDATE repair_authorizations
+                SET granted_at = ?, consumed_at = ?
+                WHERE run_id = ? AND authorization_epoch = ?
+                """,
+                (timestamp, timestamp, run["id"], int(auth["authorization_epoch"])),
+            )
+            response = RunControlAccepted(
+                creation_id=creation_id,
+                run_kind=run_kind,
+                run_state="queued",
+                resource_url=f"/creations/{creation_id}",
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, str(creation_id)),
+            )
+            await self._store_idempotency(
+                connection,
+                idempotency_key,
+                scope,
+                payload_hash,
+                response,
+                timestamp,
+            )
+            auth_kind = auth["kind"]
+            auth_episode = auth["earliest_affected_episode"]
+            auth_evidence = auth["evidence"]
+            run_id = UUID(run["id"])
+
+        # RPR-A9: the authorization permits exactly one generation-plus-review cycle.
+        # Perform the bound repair now so the run actually regenerates the affected
+        # range and a fresh bound review can pass (or return to the evidence pause).
+        if auth_kind == "suffix_rewrite" and auth_episode is not None:
+            await self.rewrite_episode_suffix(run_id, int(auth_episode))
+            await self.requeue_run_job(run_id)
+        elif auth_kind == "design_rebuild":
+            await self.trigger_design_rebuild(run_id, evidence=auth_evidence or "")
+        return response
+
+    async def _next_review_epoch(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+    ) -> int:
+        row = await self._fetchone(
+            connection,
+            "SELECT COALESCE(MAX(review_epoch), 0) AS epoch FROM series_reviews WHERE run_id = ?",
+            (str(run_id),),
+        )
+        return int(row["epoch"]) + 1 if row is not None else 1
+
+    @staticmethod
+    def _series_review_from_row(row: aiosqlite.Row) -> BoundStructuralReview:
+        return BoundStructuralReview(
+            review_id=row["review_id"],
+            run_id=row["run_id"],
+            review_epoch=int(row["review_epoch"]),
+            review_type=row["review_type"],
+            episode_number=int(row["episode_number"]),
+            design_candidate_id=row["design_candidate_id"],
+            design_content_hash=row["design_content_hash"],
+            design_epoch=int(row["design_epoch"]),
+            batch_id=row["batch_id"],
+            batch_epoch=int(row["batch_epoch"]),
+            prefix_hash=row["prefix_hash"],
+            call_id=row["call_id"],
+            passed=bool(row["passed"]),
+            category=row["category"],
+            evidence=row["evidence"],
+            earliest_affected_episode=row["earliest_affected_episode"],
+            status=row["status"],
+            reviewed_at=_datetime(row["created_at"]),
+            consumed_at=(_datetime(row["consumed_at"]) if row["consumed_at"] else None),
+        )
+
     async def _fetch_series_bible_candidate(
         self,
         connection: aiosqlite.Connection,
@@ -4528,6 +5306,16 @@ class Repository:
             run = await self._fetch_control_run(connection, creation_id, run_kind)
             state = run["execution_state"]
             if state == "paused":
+                if run["recovery_reason"] == "repair_authorization":
+                    # RPR-A10: generic Continue is for transient runtime/Relay/timeout
+                    # states only and can never bypass a semantic rejection or spend a
+                    # content-repair budget. A repair-authorization pause requires the
+                    # exact one-cycle authorize control.
+                    raise DomainError(
+                        "run_not_controllable",
+                        "Generic Continue cannot bypass a repair authorization.",
+                        409,
+                    )
                 if not await self._has_remaining_attempts(
                     connection,
                     run_id=run["id"],
@@ -4725,6 +5513,7 @@ class Repository:
         run_id: UUID,
         delivery: Delivery,
         *,
+        final_review_id: str | None = None,
         now: datetime | None = None,
     ) -> None:
         timestamp = _timestamp(now or _utc_now())
@@ -4819,6 +5608,35 @@ class Repository:
                     raise DomainError(
                         "episode_aggregate_conflict",
                         "The delivery must use the committed episode aggregate.",
+                        409,
+                    )
+
+            if final_review_id is not None:
+                # RPR-A13: only a bound final whole-series PASS freezes formal delivery.
+                review = await self._fetchone(
+                    connection,
+                    """
+                    SELECT * FROM series_reviews
+                    WHERE run_id = ? AND review_id = ?
+                      AND review_type = 'final' AND status = 'active' AND passed = 1
+                    """,
+                    (str(run_id), final_review_id),
+                )
+                if review is None:
+                    raise DomainError(
+                        "final_review_required",
+                        "Formal delivery requires a passing bound final whole-series review.",
+                        409,
+                    )
+                active_batch = await self._fetch_script_batch_lineage(connection, run_id)
+                if (
+                    active_batch is None
+                    or active_batch["batch_id"] != review["batch_id"]
+                    or int(active_batch["batch_epoch"]) != int(review["batch_epoch"])
+                ):
+                    raise DomainError(
+                        "final_review_required",
+                        "The final review must bind the active script batch.",
                         409,
                     )
 
@@ -5234,6 +6052,11 @@ class Repository:
                     progress=progress,
                     pause=self._pause_from_progress(progress_row),
                     drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                    authorization=await self._repair_authorization_snapshot(
+                        connection,
+                        UUID(run["id"]),
+                        progress_row,
+                    ),
                 )
             case "ended":
                 return EndedRun(
@@ -5301,6 +6124,11 @@ class Repository:
                     progress=progress,
                     pause=self._pause_from_progress(progress_row),
                     drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
+                    authorization=await self._repair_authorization_snapshot(
+                        connection,
+                        UUID(run["id"]),
+                        progress_row,
+                    ),
                 )
             case "ended":
                 return RevisionEnded(
@@ -5597,6 +6425,39 @@ class Repository:
             can_retry=int(rejection["attempt_number"]) < MAX_STAGE_ATTEMPTS,
         )
 
+    async def _repair_authorization_snapshot(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+        progress: aiosqlite.Row,
+    ) -> RepairAuthorization | None:
+        if progress["recovery_reason"] != "repair_authorization":
+            return None
+        auth = await self._fetchone(
+            connection,
+            "SELECT * FROM repair_authorizations "
+            "WHERE run_id = ? ORDER BY authorization_epoch DESC LIMIT 1",
+            (str(run_id),),
+        )
+        if auth is None:
+            return None
+        return RepairAuthorization(
+            authorization_epoch=int(auth["authorization_epoch"]),
+            kind=auth["kind"],
+            design_candidate_id=auth["design_candidate_id"],
+            design_content_hash=auth["design_content_hash"],
+            design_epoch=int(auth["design_epoch"]),
+            batch_id=auth["batch_id"],
+            batch_epoch=int(auth["batch_epoch"]),
+            earliest_affected_episode=auth["earliest_affected_episode"],
+            range_episodes=auth["range_episodes"],
+            estimated_tokens=auth["estimated_tokens"],
+            evidence=auth["evidence"],
+            review_id=auth["review_id"],
+            granted_at=(_datetime(auth["granted_at"]) if auth["granted_at"] else None),
+            consumed_at=(_datetime(auth["consumed_at"]) if auth["consumed_at"] else None),
+        )
+
     @staticmethod
     def _pause_from_progress(progress: aiosqlite.Row) -> RunPause:
         timeout_stage = progress["timeout_stage"]
@@ -5610,8 +6471,17 @@ class Repository:
             "content_rejected",
             "episode_error",
             "context_budget",
+            "repair_authorization",
         }:
             raise RuntimeError("Paused workflow run is missing its recovery reason")
+        if recovery_reason == "repair_authorization":
+            if not progress["pause_message"]:
+                raise RuntimeError("Repair-authorization pause is missing its evidence")
+            return RunPause(
+                message=progress["pause_message"],
+                code="repair_authorization",
+                stage=stage,
+            )
         if recovery_reason == "context_budget":
             if not progress["pause_message"]:
                 raise RuntimeError("Context-budget pause is missing safe recovery evidence")
@@ -5932,7 +6802,8 @@ class Repository:
                 runs.state AS run_state,
                 run_progress.current_stage,
                 run_progress.current_episode,
-                run_progress.execution_state
+                run_progress.execution_state,
+                run_progress.recovery_reason
             FROM runs
             JOIN run_progress ON run_progress.run_id = runs.id
             WHERE runs.creation_id = ? AND runs.kind = ?

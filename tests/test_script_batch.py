@@ -638,7 +638,7 @@ async def test_incomplete_active_batch_cannot_assemble_formal_delivery(
 
 
 async def test_v13_migration_preserves_existing_database(repository) -> None:
-    assert SCHEMA_VERSION == 13
+    assert SCHEMA_VERSION == 14
     accepted, lease = await create_leased_run(repository)
     contract, active, committed = await seed_batch_with_episodes(repository, lease.run_id, up_to=1)
     async with repository._connection() as connection:

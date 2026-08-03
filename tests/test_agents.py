@@ -370,6 +370,30 @@ def _successful_responses() -> list[AIMessage]:
     return responses
 
 
+def _successful_responses_unified() -> list[AIMessage]:
+    """The unified SeriesBible flow response sequence.
+
+    In the unified path the writer relies on deterministic per-episode validation and
+    the declared structural milestone/final reviews, so the per-episode
+    ``episode_reviewer`` response (index 19 in the legacy sequence) is replaced by the
+    bound final ``series_reviewer`` result for the single-episode series.
+    """
+    responses = _successful_responses()
+    unified: list[AIMessage] = []
+    for index, response in enumerate(responses):
+        if index == 19:
+            unified.append(
+                _tool_call(
+                    "StructuralReviewResult",
+                    {"passed": True, "category": "pass", "evidence": "全系列一致"},
+                    index,
+                )
+            )
+        else:
+            unified.append(response)
+    return unified
+
+
 def _episode_hook_kwargs(
     *,
     episode_drafts: list[EpisodeDraft] | None = None,
@@ -2224,6 +2248,7 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
         "quality_reviewer",
         "canon_reviewer",
         "episode_reviewer",
+        "series_reviewer",
     }
 
 
@@ -3345,12 +3370,19 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
     }
     approved_stages = set(approved_payloads)
     episode_hooks, attempts = _episode_hook_kwargs()
+    registered_reviews: list[dict[str, Any]] = []
+
+    async def register_series_review(**kwargs: Any) -> str:
+        registered_reviews.append(kwargs)
+        return f"review-{kwargs['episode_number']}"
+
     middleware = StageGuardMiddleware(
         before_stage=lambda _stage: _async_one(),
         approve_stage=lambda _stage, _payload: _async_none(),
         approved_stages=approved_stages,
         approved_payloads=approved_payloads,
         series_bible=summary,
+        register_series_review=register_series_review,
         **episode_hooks,
     )
     request = ToolCallRequest(
@@ -3384,6 +3416,9 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
                 "state_delta": _state_delta(contract, episode_number),
                 "writer_notes": f"第{episode_number}集备忘",
             }
+        elif subagent_type == "series_reviewer":
+            # The final milestone (episode 2) fires the bound final structural review.
+            payload = {"passed": True, "category": "pass", "evidence": "全系列一致"}
         else:
             assert subagent_type == "episode_reviewer"
             payload = {"passed": True, "evidence": "完整前缀一致", "issues": []}
@@ -3421,6 +3456,18 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
 
     # Bounded advisory WriterNotes from episode 1 flow forward.
     assert second_input["/workspace/writer_notes.md"]["content"] == "第1集备忘"
+
+    # The final episode fired the bound final structural review (RPR-A2).
+    assert registered_reviews == [
+        {
+            "review_type": "final",
+            "episode_number": 2,
+            "passed": True,
+            "category": "pass",
+            "evidence": "全系列一致",
+            "earliest_affected_episode": None,
+        }
+    ]
 
 
 async def _async_one() -> int:
@@ -5165,7 +5212,7 @@ async def test_restarted_worker_resumes_same_run_and_thread(
     )
     assert lease is not None
 
-    responses = _successful_responses()
+    responses = _successful_responses_unified()
 
     async def before_stage(stage: InternalStage) -> int:
         return await repository.record_stage_attempt(lease.run_id, stage)

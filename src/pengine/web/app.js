@@ -208,6 +208,7 @@ function cacheElements() {
     "run-control-title",
     "run-control-description",
     "continue-run",
+    "authorize-repair-run",
     "end-run",
     "run-control-message",
     "task-waiting",
@@ -265,6 +266,11 @@ function bindEvents() {
   elements["creation-form"].addEventListener("submit", handleCreate);
   elements["revision-form"].addEventListener("submit", handleRevision);
   elements["continue-run"].addEventListener("click", () => void handleRunControl("continue"));
+  if (elements["authorize-repair-run"]) {
+    elements["authorize-repair-run"].addEventListener("click", () =>
+      void handleRunControl("authorize-repair"),
+    );
+  }
   elements["end-run"].addEventListener("click", () => void handleRunControl("end"));
   elements["start-new-creation"].addEventListener("click", startNewCreation);
   elements["retry-final-review"].addEventListener("click", () =>
@@ -559,6 +565,8 @@ async function handleRunControl(action, options = {}) {
       actionMessage = "正在恢复当前阶段……";
     } else if (action === "retry-final-review") {
       actionMessage = "正在重新提交成品审核……";
+    } else if (action === "authorize-repair") {
+      actionMessage = "正在授权一次修复循环……";
     }
     messageElement.textContent = actionMessage;
   }
@@ -731,9 +739,19 @@ function renderCreation() {
     const contextBudget = initial.progress.recovery_reason === "context_budget";
     const episodeNumber = initial.pause?.episode_number || initial.progress.episodes?.current;
     const retainedEpisodes = initial.progress.episodes?.completed || 0;
+    const repairAuthorization = initial.progress.recovery_reason === "repair_authorization";
+    const authorization = initial.authorization || null;
     showWaiting(
-      contextBudget ? "任务已暂停 · 上下文预算不足" : "任务已暂停",
-      contextBudget
+      repairAuthorization
+        ? "任务已暂停 · 等待一次修复授权"
+        : contextBudget
+        ? "任务已暂停 · 上下文预算不足"
+        : "任务已暂停",
+      repairAuthorization
+        ? authorization && authorization.kind === "design_rebuild"
+          ? "设计需整体重建 · 自动预算已用尽"
+          : "分集后缀需重写 · 自动预算已用尽"
+        : contextBudget
         ? "模型请求未发出，已完成的批准内容保持不变"
         : episodeError
         ? `第 ${episodeNumber} 集生成遇到可恢复错误`
@@ -742,7 +760,9 @@ function renderCreation() {
         : relayInterrupted
           ? "当前阶段再次发生网络 / Relay 中断"
           : "当前阶段再次超过整体运行时限",
-      contextBudget
+      repairAuthorization
+        ? `${initial.pause?.message || "内容审查未通过。"} 自动修复预算已用尽，需在上方授权一次修复循环。`
+        : contextBudget
         ? `${initial.pause?.message || "完整请求超出已验证上下文上限。"} 请配置更高的已验证上限后，在上方继续当前阶段；未发出的请求不消耗额度。`
         : episodeError
         ? `${initial.pause?.message || "当前集生成遇到可恢复错误。"} 已完成的 ${retainedEpisodes} 集已保留，请在上方从第 ${episodeNumber} 集继续或结束任务。`
@@ -863,9 +883,15 @@ function renderProgress() {
   const contentRejected = progress.recovery_reason === "content_rejected";
   const episodeError = progress.recovery_reason === "episode_error";
   const contextBudget = progress.recovery_reason === "context_budget";
+  const repairAuthorization = progress.recovery_reason === "repair_authorization";
+  const authorization = run.authorization || null;
   const episodeNumber = run.pause?.episode_number || progress.episodes?.current;
   const retainedEpisodes = progress.episodes?.completed || 0;
-  elements["run-control-title"].textContent = contextBudget
+  elements["run-control-title"].textContent = repairAuthorization
+    ? authorization && authorization.kind === "design_rebuild"
+      ? "设计需整体重建 · 等待授权"
+      : "分集后缀需重写 · 等待授权"
+    : contextBudget
     ? "模型上下文预算不足 · 已安全暂停"
     : episodeError
     ? `第 ${episodeNumber} 集可继续`
@@ -874,7 +900,24 @@ function renderProgress() {
     : relayInterrupted
       ? "本阶段已两次发生网络 / Relay 中断"
       : "本阶段已两次超过整体运行时限";
-  elements["run-control-description"].textContent = contextBudget
+  elements["run-control-description"].textContent = repairAuthorization
+    ? `${run.pause?.message || "内容审查未通过。"} 自动修复预算已用尽，需授权一次修复循环：`
+        .concat(
+          authorization && authorization.earliest_affected_episode != null
+            ? `影响范围：从第 ${authorization.earliest_affected_episode} 集到第 ${
+                authorization.earliest_affected_episode +
+                (authorization.range_episodes || 1) -
+                1
+              } 集。`
+            : "影响范围：完整设计。",
+        )
+        .concat(
+          authorization && authorization.estimated_tokens != null
+            ? ` 预计令牌：${authorization.estimated_tokens.toLocaleString()}。`
+            : "",
+        )
+        .concat(" 授权将执行一次生成加审查循环；失败会回到同一证据暂停。")
+    : contextBudget
     ? `${run.pause?.message || "请求未发出，未消耗任何额度。"} 请为对应路由配置更高的已验证上下文上限后继续当前阶段。`
     : episodeError
     ? `${run.pause?.message || "当前集生成遇到可恢复错误。"} 已完成的 ${retainedEpisodes} 集不会重新生成。`
@@ -883,13 +926,21 @@ function renderProgress() {
     : relayInterrupted
       ? "可从当前未批准阶段继续；已完成阶段、时长和已提交草稿不会重新生成或丢失，也可以结束本次任务。"
       : "可从当前未批准阶段继续，已完成阶段不会重新生成；也可以结束本次任务。";
-  elements["continue-run"].textContent = contextBudget
+  elements["continue-run"].textContent = repairAuthorization
+    ? "授权一次修复"
+    : contextBudget
     ? "继续创作"
     : episodeError
     ? `从第 ${episodeNumber} 集继续`
     : "继续创作";
-  elements["continue-run"].hidden = !progress.can_continue;
+  elements["continue-run"].hidden = !progress.can_continue || repairAuthorization;
   elements["continue-run"].disabled = state.runControlBusy || !progress.can_continue;
+  const authorizeRepairRun = elements["authorize-repair-run"];
+  if (authorizeRepairRun) {
+    authorizeRepairRun.hidden = !repairAuthorization || !progress.can_continue;
+    authorizeRepairRun.disabled =
+      state.runControlBusy || !repairAuthorization || !progress.can_continue;
+  }
   elements["end-run"].hidden = !progress.can_end;
   elements["end-run"].disabled = state.runControlBusy || !progress.can_end;
   if (!controllable) {

@@ -134,6 +134,24 @@ class SeriesBibleContent(ContinuityModel):
     relationship_logic: NonEmptyText
     episode_outline: NonEmptyText
     story_contract: StoryContract
+    review_milestones: list[int] = Field(
+        default_factory=list,
+        description=(
+            "SeriesBible-declared structural review milestone episode numbers. Empty means the "
+            "only structural review is the final completion review."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_milestones(self) -> SeriesBibleContent:
+        milestones = [int(item) for item in self.review_milestones]
+        if len(milestones) != len(set(milestones)):
+            raise ValueError("Review milestones must be unique")
+        for milestone in milestones:
+            if milestone < 1 or milestone > self.story_contract.episode_count:
+                raise ValueError("Review milestones must lie within the episode count")
+        self.review_milestones = sorted(milestones)
+        return self
 
 
 class ValidationIssue(ContinuityModel):
@@ -208,6 +226,7 @@ class SeriesBibleProjections(ContinuityModel):
     relationship_logic: NonEmptyText
     episode_outline: NonEmptyText
     story_contract_markdown: NonEmptyText
+    review_milestones: list[int] = Field(default_factory=list)
 
 
 class SeriesBibleSummary(ContinuityModel):
@@ -224,6 +243,7 @@ class SeriesBibleSummary(ContinuityModel):
     genre: SeriesBibleGenre
     lineage: DesignLineage
     projections: SeriesBibleProjections
+    review_milestones: list[int] = Field(default_factory=list)
     validation: ValidationEvidence | None = None
     global_review: GlobalDesignReview | None = None
     created_at: datetime
@@ -263,6 +283,7 @@ def build_series_bible(
     rebuild_count: int = 0,
     design_epoch: int | None = None,
     candidate_id: StableId | None = None,
+    review_milestones: list[int] | None = None,
     now: datetime | None = None,
 ) -> SeriesBible:
     """Build one immutable SeriesBible candidate from complete content.
@@ -271,7 +292,8 @@ def build_series_bible(
     identifiers, references, uniqueness, ordering, and typed arithmetic through
     the underlying :class:`StoryContract` model. Any structural violation raises
     :class:`pydantic.ValidationError` before the candidate can be reviewed or
-    promoted.
+    promoted. ``review_milestones`` declares the SeriesBible structural review
+    schedule; an empty list leaves only the final completion review.
     """
     contract = StoryContract.model_validate(story_contract_payload)
     content = SeriesBibleContent(
@@ -280,6 +302,7 @@ def build_series_bible(
         relationship_logic=relationship_logic,
         episode_outline=episode_outline,
         story_contract=contract,
+        review_milestones=review_milestones or [],
     )
     return SeriesBible(
         candidate_id=candidate_id or new_candidate_id(),
@@ -437,7 +460,9 @@ def project_series_bible(bible: SeriesBible, *, is_active: bool) -> SeriesBibleS
             relationship_logic=bible.content.relationship_logic,
             episode_outline=bible.content.episode_outline,
             story_contract_markdown=render_story_contract_markdown(contract, contract_hash),
+            review_milestones=bible.content.review_milestones,
         ),
+        review_milestones=bible.content.review_milestones,
         validation=bible.validation,
         global_review=bible.global_review,
         created_at=bible.created_at,

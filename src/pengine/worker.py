@@ -17,6 +17,7 @@ from pengine.agents import (
     ContentReviewRejectedError,
     DeepAgentWorkflow,
     EpisodeTimeoutError,
+    MilestoneRejectedError,
     QualityGateRejectedError,
 )
 from pengine.config import Settings
@@ -47,11 +48,13 @@ from pengine.schemas import (
 from pengine.series_bible import (
     GlobalDesignReview,
     SeriesBible,
+    SeriesBibleSummary,
     bind_global_design_review,
     build_series_bible,
     detect_genre,
     validate_series_bible,
 )
+from pengine.series_review import active_prefix_hash
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +93,7 @@ EpisodeAttemptHook = Callable[[EpisodePlan], Awaitable[int]]
 EpisodeCommitHook = Callable[[int, str, EpisodeLock | None], Awaitable[EpisodeDraft]]
 EpisodeAssemblyHook = Callable[[], Awaitable[str]]
 EpisodeDeadlineReset = Callable[[], Awaitable[None]]
+SeriesReviewRegistration = Callable[..., Awaitable[str]]
 
 
 class WorkflowExecutor(Protocol):
@@ -112,6 +116,9 @@ class WorkflowExecutor(Protocol):
         output_language: OutputLanguage | None = None,
         feedback: str | None = None,
         retrieve_references: ReferenceRetriever | None = None,
+        series_bible: SeriesBibleSummary | None = None,
+        register_series_review: SeriesReviewRegistration | None = None,
+        get_series_bible: Callable[[], Awaitable[SeriesBibleSummary | None]] | None = None,
     ) -> WorkflowResult: ...
 
 
@@ -411,6 +418,55 @@ class Worker:
                     separators=(",", ":"),
                 )
 
+            async def register_series_review(
+                *,
+                review_type: str,
+                episode_number: int,
+                passed: bool,
+                category: str,
+                evidence: str,
+                earliest_affected_episode: int | None,
+            ) -> str:
+                """Bind and persist one structural review to the exact active lineage."""
+                active = await self.repository.get_run_series_bible(work.run_id)
+                batch = await self.repository.get_script_batch_lineage(work.run_id)
+                if active is None or batch is None:
+                    raise AgentProtocolError(
+                        "A structural review requires an active SeriesBible and script batch",
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    )
+                prefix = await self.repository.get_active_episode_candidates(work.run_id)
+                prefix_hash = active_prefix_hash(
+                    [
+                        {
+                            "episode_number": candidate.episode_number,
+                            "content_sha256": candidate.content_sha256,
+                        }
+                        for candidate in prefix
+                    ]
+                )
+                call_id = await self.repository.latest_review_call_id(
+                    work.run_id,
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                )
+                bound = await self.repository.register_series_review(
+                    work.run_id,
+                    review_type=review_type,
+                    episode_number=episode_number,
+                    design_candidate_id=active.candidate_id,
+                    design_content_hash=active.content_hash,
+                    design_epoch=active.design_epoch,
+                    batch_id=batch.batch_id,
+                    batch_epoch=batch.batch_epoch,
+                    prefix_hash=prefix_hash,
+                    call_id=call_id or f"{work.run_id}-review-{episode_number}",
+                    passed=passed,
+                    category=category,
+                    evidence=evidence,
+                    earliest_affected_episode=earliest_affected_episode,
+                )
+                return bound.review_id
+
             run_timeout_scope = asyncio.timeout(self.settings.run_timeout_seconds)
             async with run_timeout_scope:
 
@@ -439,6 +495,8 @@ class Worker:
                     feedback=work.frozen_feedback,
                     retrieve_references=retrieve_references,
                     series_bible=await self.repository.get_run_series_bible(work.run_id),
+                    register_series_review=register_series_review,
+                    get_series_bible=lambda: self.repository.get_run_series_bible(work.run_id),
                 )
             if work.run_kind == "revision" and not result.feedback_handling:
                 raise AgentProtocolError(
@@ -459,7 +517,12 @@ class Worker:
                     assembly_payload,
                 )
                 approved[current_stage] = assembly_payload
-            await self.repository.succeed_run(work.run_id, delivery)
+            final_review_id = await self._resolve_final_review_id(work.run_id)
+            await self.repository.succeed_run(
+                work.run_id,
+                delivery,
+                final_review_id=final_review_id,
+            )
             logger.info(
                 "workflow run succeeded run_id=%s creation_id=%s",
                 work.run_id,
@@ -467,6 +530,9 @@ class Worker:
             )
         except asyncio.CancelledError:
             raise
+        except MilestoneRejectedError as exc:
+            await self._handle_milestone_rejection(work, exc)
+            return
         except EpisodeTimeoutError as exc:
             recovery_state = await self.repository.handle_episode_timeout(
                 work.run_id,
@@ -722,6 +788,9 @@ class Worker:
             relationship_logic=relationships["content"],
             episode_outline=outline["content"],
             story_contract_payload=outline["story_contract"],
+            review_milestones=(
+                outline.get("review_milestones") if isinstance(outline, Mapping) else None
+            ),
         )
         candidate = build_series_bible(**base)
         if active is not None and active.content_hash == candidate.content_hash:
@@ -837,6 +906,182 @@ class Worker:
             (stage for stage in _ALL_STAGES if stage not in approved),
             InternalStage.ASSEMBLING_DELIVERY,
         )
+
+    async def _resolve_final_review_id(self, run_id: UUID) -> str | None:
+        """The bound passing final review that authorizes formal delivery.
+
+        Legacy runs without an active SeriesBible keep the previous behavior
+        (``None``). A unified run must have a passing bound final whole-series
+        review; otherwise the run never reaches delivery (RPR-A2/A13).
+        """
+        active = await self.repository.get_run_series_bible(run_id)
+        if active is None:
+            return None
+        batch = await self.repository.get_script_batch_lineage(run_id)
+        if batch is None:
+            raise AgentProtocolError(
+                "A unified run requires an active script batch before delivery.",
+                stage=InternalStage.ASSEMBLING_DELIVERY,
+            )
+        prefix = await self.repository.get_active_episode_candidates(run_id)
+        prefix_hash = active_prefix_hash(
+            [
+                {
+                    "episode_number": candidate.episode_number,
+                    "content_sha256": candidate.content_sha256,
+                }
+                for candidate in prefix
+            ]
+        )
+        review = await self.repository.get_latest_passing_final_review(
+            run_id,
+            design_content_hash=active.content_hash,
+            batch_id=batch.batch_id,
+            prefix_hash=prefix_hash,
+        )
+        if review is None:
+            raise AgentProtocolError(
+                "Formal delivery requires a passing bound final whole-series review.",
+                stage=InternalStage.ASSEMBLING_DELIVERY,
+            )
+        return review.review_id
+
+    async def _handle_milestone_rejection(
+        self,
+        work: RunWorkItem,
+        exc: MilestoneRejectedError,
+    ) -> None:
+        """Classify and bound a rejected structural review.
+
+        A script defect consumes the single automatic suffix-rewrite budget shared
+        by all milestone and final reviews, preserves the retained prefix, and
+        requeues the run to rewrite N..end. A design defect triggers the one
+        automatic complete design regeneration per lineage. When an automatic
+        budget is exhausted, the run pauses for an exact one-cycle authorization
+        (RPR-A4/A5/A6/A8/A9).
+        """
+        if exc.category == "script_defect":
+            batch = await self.repository.get_script_batch_lineage(work.run_id)
+            if (
+                batch is not None
+                and exc.earliest_affected_episode is not None
+                and await self.repository.has_automatic_suffix_budget(
+                    work.run_id,
+                    batch.batch_id,
+                )
+            ):
+                await self.repository.consume_automatic_suffix_budget(
+                    work.run_id,
+                    batch.batch_id,
+                )
+                await self.repository.rewrite_episode_suffix(
+                    work.run_id,
+                    exc.earliest_affected_episode,
+                )
+                await self.repository.requeue_run_job(work.run_id)
+                logger.info(
+                    "automatic suffix rewrite run_id=%s creation_id=%s from_episode=%s",
+                    work.run_id,
+                    work.creation_id,
+                    exc.earliest_affected_episode,
+                )
+                return
+            await self.repository.pause_repair_authorization(
+                work.run_id,
+                kind="suffix_rewrite",
+                design_candidate_id=(batch.design_candidate_id if batch is not None else ""),
+                design_content_hash=(batch.design_content_hash if batch is not None else ""),
+                design_epoch=(batch.design_epoch if batch is not None else 1),
+                batch_id=(batch.batch_id if batch is not None else ""),
+                batch_epoch=(batch.batch_epoch if batch is not None else 1),
+                earliest_affected_episode=exc.earliest_affected_episode,
+                range_episodes=(
+                    len(await self.repository.get_active_episode_candidates(work.run_id))
+                    - (exc.earliest_affected_episode or 1)
+                    + 1
+                ),
+                estimated_tokens=await self._repair_token_estimate(
+                    work.run_id,
+                    from_episode=exc.earliest_affected_episode or 1,
+                ),
+                evidence=exc.evidence,
+                review_id=exc.review_id or "",
+            )
+            logger.info(
+                "suffix-rewrite authorization required run_id=%s creation_id=%s",
+                work.run_id,
+                work.creation_id,
+            )
+            return
+        if exc.category == "design_defect":
+            if await self.repository.design_rebuild_budget_available(work.run_id):
+                await self.repository.trigger_design_rebuild(
+                    work.run_id,
+                    evidence=exc.evidence,
+                )
+                logger.info(
+                    "automatic design rebuild run_id=%s creation_id=%s",
+                    work.run_id,
+                    work.creation_id,
+                )
+                return
+            active = await self.repository.get_run_series_bible(work.run_id)
+            batch = await self.repository.get_script_batch_lineage(work.run_id)
+            await self.repository.pause_repair_authorization(
+                work.run_id,
+                kind="design_rebuild",
+                design_candidate_id=(active.candidate_id if active else ""),
+                design_content_hash=(active.content_hash if active else ""),
+                design_epoch=(active.design_epoch if active else 1),
+                batch_id=(batch.batch_id if batch else ""),
+                batch_epoch=(batch.batch_epoch if batch else 1),
+                earliest_affected_episode=None,
+                range_episodes=None,
+                estimated_tokens=await self._repair_token_estimate(
+                    work.run_id,
+                    from_episode=1,
+                ),
+                evidence=exc.evidence,
+                review_id=exc.review_id or "",
+            )
+            logger.info(
+                "design-rebuild authorization required run_id=%s creation_id=%s",
+                work.run_id,
+                work.creation_id,
+            )
+            return
+        logger.warning(
+            "unexpected structural review category run_id=%s category=%s",
+            work.run_id,
+            exc.category,
+        )
+
+    async def _repair_token_estimate(self, run_id: UUID, *, from_episode: int) -> int:
+        """A deterministic token estimate for the one authorized generation+review cycle.
+
+        The estimate covers the retained active prefix scripts plus the active design
+        projections that the writer must carry into the regenerated range (RPR-A8).
+        """
+        from pengine.model_calls import estimate_text_tokens
+
+        active = await self.repository.get_run_series_bible(run_id)
+        prefix = await self.repository.get_active_episode_candidates(run_id)
+        parts: list[str] = []
+        if active is not None:
+            projections = active.projections
+            parts.extend(
+                [
+                    projections.story_outline,
+                    projections.character_biographies,
+                    projections.relationship_logic,
+                    projections.episode_outline,
+                    projections.story_contract_markdown,
+                ]
+            )
+        for candidate in prefix:
+            if candidate.episode_number < from_episode:
+                parts.append(candidate.content)
+        return estimate_text_tokens("\n".join(parts))
 
     @staticmethod
     def _requires_langgraph_checkpoint(work: RunWorkItem) -> bool:

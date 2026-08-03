@@ -221,6 +221,36 @@ def create_app(
         )
 
     @app.post(
+        "/creations/{creation_id}/runs/{run_kind}/authorize-repair",
+        operation_id="authorizeRepair",
+        status_code=202,
+        response_model=RunControlAccepted,
+        summary="Authorize exactly one generation-plus-review cycle for a repair",
+        description=(
+            "Grants the pending repair authorization bound to the active lineage and "
+            "queues the run for exactly one cycle. A failure returns to the same "
+            "evidence pause without automatic repetition. Generic Continue cannot "
+            "spend a content-repair budget."
+        ),
+        responses={
+            202: {"description": "Repair authorized and queued"},
+            404: {"description": "Creation not found", "model": CommandError},
+            409: {"description": "The requested run cannot be authorized", "model": CommandError},
+            422: {"description": "Request schema validation failed", "model": CommandError},
+        },
+    )
+    async def authorize_repair(
+        creation_id: UUID,
+        run_kind: Literal["initial", "revision"],
+        idempotency_key: IdempotencyKey,
+    ) -> RunControlAccepted:
+        return await resolved_repository.authorize_repair(
+            creation_id=creation_id,
+            run_kind=run_kind,
+            idempotency_key=idempotency_key,
+        )
+
+    @app.post(
         "/creations/{creation_id}/runs/{run_kind}/end",
         operation_id="endRun",
         status_code=202,
