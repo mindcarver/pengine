@@ -23,7 +23,7 @@ from pengine.config import Settings
 from pengine.continuity import EpisodeLock
 from pengine.errors import DomainError
 from pengine.language import OutputLanguage
-from pengine.model_calls import ModelCallState, ModelCallStore
+from pengine.model_calls import ModelCallState, ModelCallStore, new_call_id
 from pengine.personas import PersonaCatalog, PersonaPackageError
 from pengine.relay import (
     PreflightBlockedError,
@@ -338,6 +338,7 @@ class Worker:
                 if model_call_state is not None:
                     model_call_state.context.stage = InternalStage.GENERATING_EPISODE_SCRIPTS.value
                     model_call_state.context.episode_number = plan.episode_number
+                    model_call_state.context.call_id = new_call_id()
                 return await self.repository.record_episode_attempt(
                     work.run_id,
                     plan.episode_number,
@@ -347,12 +348,55 @@ class Worker:
                 episode_number: int,
                 content: str,
                 episode_lock: EpisodeLock | None = None,
+                *,
+                call_id: str | None = None,
+                writer_notes: str = "",
             ) -> EpisodeDraft:
-                return await self.repository.commit_episode_draft(
+                if episode_lock is None:
+                    # Legacy outline path without a locked story contract keeps the
+                    # immutable per-episode draft behavior unchanged.
+                    return await self.repository.commit_episode_draft(
+                        work.run_id,
+                        episode_number,
+                        content,
+                        episode_lock=episode_lock,
+                    )
+                active = await self.repository.get_run_series_bible(work.run_id)
+                if active is None:
+                    raise AgentProtocolError(
+                        "Episode generation requires an active SeriesBible design",
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    )
+                await self.repository.create_script_batch(
                     work.run_id,
-                    episode_number,
-                    content,
+                    design_candidate_id=active.candidate_id,
+                    design_content_hash=active.content_hash,
+                    design_epoch=active.design_epoch,
+                )
+                resolved_call_id = (
+                    call_id
+                    or (model_call_state.context.call_id if model_call_state is not None else None)
+                    or f"{work.run_id}-episode-{episode_number}"
+                )
+                candidate = await self.repository.commit_episode_candidate(
+                    work.run_id,
+                    episode_number=episode_number,
+                    content=content,
                     episode_lock=episode_lock,
+                    call_id=resolved_call_id,
+                    writer_notes=writer_notes,
+                )
+                return EpisodeDraft(
+                    episode_number=candidate.episode_number,
+                    content=candidate.content,
+                    content_sha256=candidate.content_sha256,
+                    completed_at=candidate.created_at,
+                    contract_sha256=candidate.state_delta.contract_sha256,
+                    state_delta=candidate.state_delta,
+                    series_state=candidate.series_state,
+                    series_state_sha256=candidate.series_state_sha256,
+                    semantic_review=candidate.semantic_review,
+                    repair_rounds=candidate.repair_rounds,
                 )
 
             async def retrieve_references(query: str) -> str:
@@ -394,6 +438,7 @@ class Worker:
                     output_language=work.output_language,
                     feedback=work.frozen_feedback,
                     retrieve_references=retrieve_references,
+                    series_bible=await self.repository.get_run_series_bible(work.run_id),
                 )
             if work.run_kind == "revision" and not result.feedback_handling:
                 raise AgentProtocolError(

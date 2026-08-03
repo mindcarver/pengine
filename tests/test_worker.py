@@ -56,6 +56,7 @@ class DeterministicWorkflow:
         output_language=None,
         feedback=None,
         retrieve_references=None,
+        series_bible=None,
     ) -> WorkflowResult:
         del (
             thread_id,
@@ -65,6 +66,7 @@ class DeterministicWorkflow:
             episode_timeout_seconds,
             output_language,
             retrieve_references,
+            series_bible,
         )
         approved = dict(approved_checkpoints or {})
         handling = (
@@ -308,8 +310,8 @@ class TimeoutAfterFirstEpisodeWorkflow(DeterministicWorkflow):
         approve_stage = kwargs["approve_stage"]
         assert commit_episode is not None
 
-        async def commit_then_timeout(episode_number: int, content: str):
-            draft = await commit_episode(episode_number, content)
+        async def commit_then_timeout(episode_number: int, content: str, *args, **kwargs):
+            draft = await commit_episode(episode_number, content, *args, **kwargs)
             self.writer_commits.append(episode_number)
             self.events.append(f"commit:{episode_number}")
             if self.calls == 1 and episode_number == self.timeout_after_episode:
@@ -463,6 +465,7 @@ class PreflightBlockedWorkflow:
         output_language=None,
         feedback=None,
         retrieve_references=None,
+        series_bible=None,
     ) -> WorkflowResult:
         del (
             thread_id,
@@ -478,6 +481,7 @@ class PreflightBlockedWorkflow:
             output_language,
             feedback,
             retrieve_references,
+            series_bible,
         )
         self.calls += 1
         approved = dict(approved_checkpoints or {})
