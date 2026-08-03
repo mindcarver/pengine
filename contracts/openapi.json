@@ -1713,6 +1713,17 @@
             "type": "array",
             "title": "Episodes"
           },
+          "design": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SeriesBibleSummary"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The latest deterministically valid unfinished SeriesBible design candidate for this run. Every projection and hash belongs to one candidate; the design package is never formal delivery."
+          },
           "review_status": {
             "$ref": "#/components/schemas/FinalReviewProgress"
           }
@@ -2765,6 +2776,327 @@
           "outcome"
         ],
         "title": "ModelCallSummary"
+      },
+      "DesignLineage": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Run Id"
+          },
+          "run_kind": {
+            "type": "string",
+            "enum": [
+              "initial",
+              "revision"
+            ],
+            "title": "Run Kind"
+          },
+          "parent_candidate_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]{1,63}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Candidate Id"
+          },
+          "rebuild_count": {
+            "type": "integer",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Rebuild Count",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "run_kind"
+        ],
+        "title": "DesignLineage",
+        "description": "Run-lineage identity and automatic-rebuild budget of one candidate."
+      },
+      "GlobalDesignReview": {
+        "properties": {
+          "review_call_id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Review Call Id"
+          },
+          "candidate_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$",
+            "title": "Candidate Id"
+          },
+          "candidate_hash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Candidate Hash"
+          },
+          "review_model_id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Review Model Id"
+          },
+          "passed": {
+            "type": "boolean",
+            "title": "Passed"
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Evidence"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewIssue"
+            },
+            "type": "array",
+            "title": "Issues"
+          },
+          "reviewed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Reviewed At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "review_call_id",
+          "candidate_id",
+          "candidate_hash",
+          "review_model_id",
+          "passed",
+          "evidence",
+          "reviewed_at"
+        ],
+        "title": "GlobalDesignReview",
+        "description": "One DeepSeek global design review bound to a single candidate."
+      },
+      "SeriesBibleProjections": {
+        "properties": {
+          "story_outline": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Story Outline"
+          },
+          "character_biographies": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Character Biographies"
+          },
+          "relationship_logic": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Relationship Logic"
+          },
+          "episode_outline": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Episode Outline"
+          },
+          "story_contract_markdown": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Story Contract Markdown"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "story_outline",
+          "character_biographies",
+          "relationship_logic",
+          "episode_outline",
+          "story_contract_markdown"
+        ],
+        "title": "SeriesBibleProjections",
+        "description": "Readable projections exposed to the workbench from one active candidate."
+      },
+      "SeriesBibleSummary": {
+        "properties": {
+          "candidate_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$",
+            "title": "Candidate Id"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Version"
+          },
+          "design_epoch": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Design Epoch"
+          },
+          "content_hash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Content Hash"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "unvalidated",
+              "validated",
+              "active",
+              "superseded",
+              "stale"
+            ],
+            "title": "Status"
+          },
+          "is_active": {
+            "type": "boolean",
+            "title": "Is Active"
+          },
+          "unfinished": {
+            "type": "boolean",
+            "const": true,
+            "title": "Unfinished",
+            "default": true
+          },
+          "l0_variant": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "L0 Variant"
+          },
+          "genre": {
+            "type": "string",
+            "enum": [
+              "mystery",
+              "general"
+            ],
+            "title": "Genre"
+          },
+          "lineage": {
+            "$ref": "#/components/schemas/DesignLineage"
+          },
+          "projections": {
+            "$ref": "#/components/schemas/SeriesBibleProjections"
+          },
+          "validation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ValidationEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "global_review": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GlobalDesignReview"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "candidate_id",
+          "version",
+          "design_epoch",
+          "content_hash",
+          "status",
+          "is_active",
+          "l0_variant",
+          "genre",
+          "lineage",
+          "projections",
+          "created_at"
+        ],
+        "title": "SeriesBibleSummary",
+        "description": "Durable API/UI projection of the latest active design candidate."
+      },
+      "ValidationEvidence": {
+        "properties": {
+          "passed": {
+            "type": "boolean",
+            "title": "Passed"
+          },
+          "validator_version": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Validator Version",
+            "default": 1
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationIssue"
+            },
+            "type": "array",
+            "title": "Issues"
+          },
+          "validated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Validated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "passed",
+          "validated_at"
+        ],
+        "title": "ValidationEvidence"
+      },
+      "ValidationIssue": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Message"
+          },
+          "refs": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,63}$"
+            },
+            "type": "array",
+            "title": "Refs"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ValidationIssue"
       }
     }
   },

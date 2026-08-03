@@ -1307,3 +1307,151 @@ def test_real_model_initial_creation_black_box() -> None:
             metadata["status"] = "failed"
         _write_json(evidence_dir / "metadata.json", metadata)
         _assert_evidence_has_no_secrets(evidence_dir, secret)
+
+
+@pytest.mark.live_model
+@pytest.mark.asyncio
+async def test_real_model_series_bible_design_review_binding() -> None:
+    """Opt-in probe proving Opus generation + DeepSeek review role routing and
+    candidate binding (SDP-A11).
+
+    The Opus generation route produces an EpisodePlannerResult with a story
+    contract; the DeepSeek review route produces a global design review; the
+    review record binds the exact candidate id and content hash. No promotion
+    can occur without a review bound to that exact candidate.
+    """
+    if os.getenv(_ENABLE_ENV) != "1":
+        pytest.skip(f"set {_ENABLE_ENV}=1 to make real, potentially billable model requests")
+
+    settings = Settings()
+    _require_dual_model_relay(settings, "Real-model SeriesBible binding probe")
+
+    from pengine.agents import CanonReviewerResult, EpisodePlannerResult
+    from pengine.series_bible import (
+        bind_global_design_review,
+        build_series_bible,
+        detect_genre,
+        validate_series_bible,
+    )
+
+    story = "林夏回到家乡，在旧屋整理遗物时决定处理一段家族往事。"
+    requirements = "创作两集现实主义短剧；人物、时间线与证据全程一致；全部使用简体中文。"
+    assert detect_genre(story, requirements) == "general"
+
+    generation = build_relay_adapter(settings, role="generation")
+    structured = generation.model.with_structured_output(
+        EpisodePlannerResult,
+        method="function_calling",
+        include_raw=True,
+    )
+    response = await structured.ainvoke(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "一次性返回 EpisodePlannerResult 结构化结果，不要输出任何正文。"
+                    "自动编译最小连续性台账：人物与事实使用唯一小写 snake_case ID；"
+                    "时间线从 1 开始连续编号；每集恰好一条义务；"
+                    "没有证据支持的事实不要编造。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"故事：{story}\n要求：{requirements}",
+            },
+        ]
+    )
+    raw = response.get("raw", {})
+    message_text = ""
+    if isinstance(raw, dict) and isinstance(raw.get("raw"), list):
+        blocks = [b for b in raw["raw"] if isinstance(b, dict)]
+        message_text = "".join(str(b.get("text", "")) for b in blocks)
+    if not message_text:
+        parsed = response.get("parsed")
+        if isinstance(parsed, EpisodePlannerResult):
+            candidate_bible = build_series_bible(
+                run_id="live-series-bible-probe",
+                run_kind="initial",
+                l0_variant="现实叙事",
+                genre=detect_genre(story, requirements),
+                story_outline="故事大纲",
+                character_biographies="\n".join(
+                    f"{character.name}：主要人物。"
+                    for character in parsed.story_contract.characters
+                ),
+                relationship_logic="关系逻辑",
+                episode_outline=parsed.content,
+                story_contract_payload=parsed.story_contract.model_dump(mode="json"),
+            )
+        else:
+            candidate_bible = None
+    else:
+        parsed = EpisodePlannerResult.model_validate_json(message_text)
+        candidate_bible = build_series_bible(
+            run_id="live-series-bible-probe",
+            run_kind="initial",
+            l0_variant="现实叙事",
+            genre=detect_genre(story, requirements),
+            story_outline="故事大纲",
+            character_biographies="\n".join(
+                f"{character.name}：主要人物。" for character in parsed.story_contract.characters
+            ),
+            relationship_logic="关系逻辑",
+            episode_outline=parsed.content,
+            story_contract_payload=parsed.story_contract.model_dump(mode="json"),
+        )
+
+    assert candidate_bible is not None, "The Opus generation route returned no EpisodePlannerResult"
+    evidence = validate_series_bible(candidate_bible)
+    assert evidence.passed, evidence.issues
+
+    review_adapter = build_relay_adapter(settings, role="review")
+    review_model = review_adapter.model.with_structured_output(
+        CanonReviewerResult,
+        method="function_calling",
+    )
+    review = await review_model.ainvoke(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是 DeepSeek 全局设计审核者。只返回 CanonReviewerResult 结构化结果。"
+                    "审核整个设计候选：角色、关系、事实、时间线、分集义务与投影一致性。"
+                    "不要要求上游留白的事实；不要修改任何候选。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "candidate_id": candidate_bible.candidate_id,
+                        "content_hash": candidate_bible.content_hash,
+                        "projections": {
+                            "story_outline": candidate_bible.content.story_outline,
+                            "character_biographies": candidate_bible.content.character_biographies,
+                            "relationship_logic": candidate_bible.content.relationship_logic,
+                            "episode_outline": candidate_bible.content.episode_outline,
+                        },
+                        "story_contract": candidate_bible.content.story_contract.model_dump(
+                            mode="json"
+                        ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ]
+    )
+
+    bound = bind_global_design_review(
+        candidate_bible,
+        review_call_id=f"live-probe-{uuid4().hex}",
+        review_model_id=settings.review_model_id,
+        passed=review.passed,
+        evidence=review.evidence,
+        issues=[issue.model_dump(mode="json") for issue in review.issues],
+    )
+    assert bound.candidate_id == candidate_bible.candidate_id
+    assert bound.candidate_hash == candidate_bible.content_hash
+    assert bound.review_call_id.startswith("live-probe-")
+    assert bound.review_model_id == settings.review_model_id

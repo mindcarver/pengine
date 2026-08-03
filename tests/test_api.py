@@ -169,6 +169,7 @@ async def test_persona_creation_and_query_contract(tmp_path: Path) -> None:
             "drafts": {
                 "artifacts": [],
                 "episodes": [],
+                "design": None,
                 "review_status": {"l0": "pending", "l4": "pending"},
             },
         }
@@ -249,6 +250,7 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
                 }
             ],
             "episodes": [],
+            "design": None,
             "review_status": {"l0": "pending", "l4": "pending"},
         }
 

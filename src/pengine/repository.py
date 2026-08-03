@@ -69,8 +69,15 @@ from pengine.schemas import (
     SucceededRun,
     UserStage,
 )
+from pengine.series_bible import (
+    GlobalDesignReview,
+    SeriesBible,
+    SeriesBibleSummary,
+    ValidationEvidence,
+    project_series_bible,
+)
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -764,6 +771,43 @@ CREATE INDEX IF NOT EXISTS model_calls_run_id
 ON model_calls(run_id);
 """
 
+_SCHEMA_V12_SERIES_BIBLE_SQL = """
+CREATE TABLE IF NOT EXISTS series_bible_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    creation_id TEXT,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    design_epoch INTEGER NOT NULL CHECK (design_epoch >= 1),
+    content_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('unvalidated', 'validated', 'active', 'superseded', 'stale')
+    ),
+    l0_variant TEXT NOT NULL,
+    genre TEXT NOT NULL CHECK (genre IN ('mystery', 'general')),
+    lineage_json TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    validation_json TEXT,
+    global_review_json TEXT,
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    superseded_at TEXT
+);
+CREATE INDEX IF NOT EXISTS series_bible_candidates_run
+ON series_bible_candidates(run_id);
+
+CREATE TABLE IF NOT EXISTS series_bible_lineage (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    creation_id TEXT NOT NULL,
+    active_candidate_id TEXT,
+    active_design_epoch INTEGER NOT NULL DEFAULT 0 CHECK (active_design_epoch >= 0),
+    active_content_hash TEXT,
+    rebuild_count INTEGER NOT NULL DEFAULT 0 CHECK (rebuild_count IN (0, 1)),
+    updated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (12);
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -1140,6 +1184,10 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 11
+            if schema_version == 11:
+                await connection.executescript(_SCHEMA_V12_SERIES_BIBLE_SQL)
+                await connection.commit()
+                schema_version = 12
 
     async def setup(self) -> None:
         await self.initialize()
@@ -2827,6 +2875,476 @@ class Repository:
             rows = await cursor.fetchall()
         return {InternalStage(row["stage"]): int(row["attempt_count"]) for row in rows}
 
+    # ------------------------------------------------------------------
+    # SeriesBible design-package aggregate
+    # ------------------------------------------------------------------
+
+    async def register_series_bible_candidate(
+        self,
+        creation_id: str,
+        run_id: UUID,
+        candidate: SeriesBible,
+        validation: ValidationEvidence,
+        *,
+        now: datetime | None = None,
+    ) -> SeriesBible:
+        """Persist one immutable design candidate with its deterministic evidence."""
+        timestamp = _timestamp(now or _utc_now())
+        candidate = candidate.model_copy(
+            update={
+                "status": "validated" if validation.passed else "unvalidated",
+                "validation": validation,
+            }
+        )
+        async with self._transaction() as connection:
+            existing = await self._fetchone(
+                connection,
+                "SELECT candidate_id FROM series_bible_candidates WHERE candidate_id = ?",
+                (candidate.candidate_id,),
+            )
+            if existing is not None:
+                return self._series_bible_from_row(
+                    await self._fetch_series_bible_candidate(
+                        connection,
+                        run_id,
+                        candidate.candidate_id,
+                    )
+                )
+            await connection.execute(
+                """
+                INSERT INTO series_bible_candidates(
+                    candidate_id, run_id, creation_id, version, design_epoch,
+                    content_hash, status, l0_variant, genre, lineage_json,
+                    content_json, validation_json, global_review_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate.candidate_id,
+                    str(run_id),
+                    creation_id,
+                    candidate.version,
+                    candidate.design_epoch,
+                    candidate.content_hash,
+                    candidate.status,
+                    candidate.l0_variant,
+                    candidate.genre,
+                    _json(candidate.lineage),
+                    _json(candidate.content),
+                    _json(candidate.validation),
+                    _json(candidate.global_review) if candidate.global_review is not None else None,
+                    timestamp,
+                ),
+            )
+            await connection.execute(
+                """
+                INSERT OR IGNORE INTO series_bible_lineage(
+                    run_id, creation_id, active_design_epoch, rebuild_count, updated_at
+                ) VALUES (?, ?, 0, 0, ?)
+                """,
+                (str(run_id), creation_id, timestamp),
+            )
+        return candidate
+
+    async def record_series_bible_review(
+        self,
+        run_id: UUID,
+        candidate_id: str,
+        review: GlobalDesignReview,
+        *,
+        now: datetime | None = None,
+    ) -> SeriesBible:
+        """Bind one DeepSeek global design review to exactly one candidate."""
+        async with self._transaction() as connection:
+            candidate = await self._fetch_series_bible_candidate(
+                connection,
+                run_id,
+                candidate_id,
+            )
+            if candidate is None:
+                raise DomainError(
+                    "series_bible_candidate_not_found",
+                    "The design candidate is not registered for this run.",
+                    409,
+                )
+            if (
+                review.candidate_id != candidate_id
+                or review.candidate_hash != candidate["content_hash"]
+            ):
+                raise DomainError(
+                    "series_bible_review_mismatch",
+                    "The review does not bind the candidate it records.",
+                    409,
+                )
+            await connection.execute(
+                """
+                UPDATE series_bible_candidates
+                SET global_review_json = ?,
+                    status = CASE
+                        WHEN validation_json IS NOT NULL
+                             AND json_extract(validation_json, '$.passed') = 1
+                        THEN 'validated'
+                        ELSE 'unvalidated'
+                    END
+                WHERE candidate_id = ?
+                """,
+                (_json(review), candidate_id),
+            )
+            stored = await self._fetch_series_bible_candidate(connection, run_id, candidate_id)
+        return self._series_bible_from_row(stored)
+
+    async def promote_series_bible(
+        self,
+        run_id: UUID,
+        candidate_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> SeriesBible:
+        """Transactional/CAS promotion of exactly one active design candidate.
+
+        Only the active lineage may move the active pointer. The promoted candidate
+        must carry passing deterministic validation and a passing bound global
+        design review whose candidate id and content hash match this candidate. A
+        late candidate whose design epoch is not the next active epoch is retained
+        but cannot promote.
+        """
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            candidate = await self._fetch_series_bible_candidate(
+                connection,
+                run_id,
+                candidate_id,
+            )
+            if candidate is None:
+                raise DomainError(
+                    "series_bible_candidate_not_found",
+                    "The design candidate is not registered for this run.",
+                    409,
+                )
+            if candidate["status"] == "active":
+                return self._series_bible_from_row(candidate)
+            validation = (
+                json.loads(candidate["validation_json"]) if candidate["validation_json"] else None
+            )
+            if validation is None or not validation.get("passed"):
+                raise DomainError(
+                    "series_bible_unvalidated",
+                    "A design candidate requires passing deterministic validation "
+                    "before promotion.",
+                    409,
+                )
+            review = (
+                json.loads(candidate["global_review_json"])
+                if candidate["global_review_json"]
+                else None
+            )
+            if review is None or not review.get("passed"):
+                raise DomainError(
+                    "series_bible_review_required",
+                    "A design candidate requires a passing bound global design review.",
+                    409,
+                )
+            if (
+                review["candidate_id"] != candidate_id
+                or review["candidate_hash"] != candidate["content_hash"]
+            ):
+                raise DomainError(
+                    "series_bible_review_mismatch",
+                    "Another candidate's review cannot approve this candidate.",
+                    409,
+                )
+            lineage = await self._fetch_series_bible_lineage(connection, run_id)
+            if lineage is None:
+                raise DomainError(
+                    "series_bible_lineage_missing",
+                    "The design lineage for this run is missing.",
+                    409,
+                )
+            active_epoch = lineage["active_design_epoch"]
+            candidate_epoch = candidate["design_epoch"]
+            if (
+                candidate_epoch != active_epoch + 1
+                and candidate["content_hash"] != lineage["active_content_hash"]
+            ):
+                raise DomainError(
+                    "series_bible_stale_promotion",
+                    "Only the active lineage may move the active pointer.",
+                    409,
+                )
+            cursor = await connection.execute(
+                """
+                UPDATE series_bible_lineage
+                SET active_candidate_id = ?, active_design_epoch = ?,
+                    active_content_hash = ?, updated_at = ?
+                WHERE run_id = ? AND active_design_epoch = ?
+                """,
+                (
+                    candidate_id,
+                    candidate_epoch,
+                    candidate["content_hash"],
+                    timestamp,
+                    str(run_id),
+                    active_epoch,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError(
+                    "series_bible_stale_promotion",
+                    "A newer design epoch became active concurrently.",
+                    409,
+                )
+            if lineage["active_candidate_id"] is not None:
+                await connection.execute(
+                    """
+                    UPDATE series_bible_candidates
+                    SET status = 'superseded', superseded_at = ?
+                    WHERE candidate_id = ? AND status = 'active'
+                    """,
+                    (timestamp, lineage["active_candidate_id"]),
+                )
+            await connection.execute(
+                """
+                UPDATE series_bible_candidates
+                SET status = 'active', activated_at = ?
+                WHERE candidate_id = ?
+                """,
+                (timestamp, candidate_id),
+            )
+            stored = await self._fetch_series_bible_candidate(connection, run_id, candidate_id)
+        return self._series_bible_from_row(stored)
+
+    async def mark_series_bible_stale(
+        self,
+        run_id: UUID,
+        *,
+        active_candidate_id: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Retain every older non-active candidate as stale evidence."""
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE series_bible_candidates
+                SET status = 'stale', superseded_at = COALESCE(superseded_at, ?)
+                WHERE run_id = ? AND candidate_id <> ? AND status NOT IN ('active', 'superseded')
+                """,
+                (timestamp, str(run_id), active_candidate_id),
+            )
+
+    async def rebuild_series_bible(
+        self,
+        creation_id: str,
+        run_id: UUID,
+        candidate: SeriesBible,
+        validation: ValidationEvidence,
+        *,
+        now: datetime | None = None,
+    ) -> SeriesBible:
+        """CAS-create one complete new candidate for a confirmed design defect.
+
+        The same run lineage may automatically rebuild the complete design at most
+        once (SDP-A6). A second automatic rebuild is rejected with a stable error.
+        The rebuilt candidate is a complete, fresh bundle (never a partial patch),
+        and the superseded candidate remains immutable evidence.
+        """
+        timestamp = _timestamp(now or _utc_now())
+        candidate = candidate.model_copy(
+            update={
+                "status": "validated" if validation.passed else "unvalidated",
+                "validation": validation,
+            }
+        )
+        async with self._transaction() as connection:
+            lineage = await self._fetch_series_bible_lineage(connection, run_id)
+            if lineage is None:
+                raise DomainError(
+                    "series_bible_lineage_missing",
+                    "The design lineage for this run is missing.",
+                    409,
+                )
+            if lineage["rebuild_count"] >= 1:
+                raise DomainError(
+                    "series_bible_rebuild_exhausted",
+                    "This run lineage may rebuild the design automatically at most once.",
+                    409,
+                )
+            if lineage["active_candidate_id"] is None:
+                raise DomainError(
+                    "series_bible_no_active",
+                    "A complete design rebuild requires an active candidate.",
+                    409,
+                )
+            expected_epoch = lineage["active_design_epoch"] + 1
+            if candidate.design_epoch != expected_epoch:
+                raise DomainError(
+                    "series_bible_stale_rebuild",
+                    "The rebuild epoch must follow the active design epoch.",
+                    409,
+                )
+            cursor = await connection.execute(
+                """
+                UPDATE series_bible_lineage
+                SET rebuild_count = 1, updated_at = ?
+                WHERE run_id = ? AND rebuild_count = 0 AND active_design_epoch = ?
+                """,
+                (timestamp, str(run_id), lineage["active_design_epoch"]),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError(
+                    "series_bible_rebuild_exhausted",
+                    "A concurrent rebuild already consumed the lineage budget.",
+                    409,
+                )
+            await connection.execute(
+                """
+                INSERT INTO series_bible_candidates(
+                    candidate_id, run_id, creation_id, version, design_epoch,
+                    content_hash, status, l0_variant, genre, lineage_json,
+                    content_json, validation_json, global_review_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate.candidate_id,
+                    str(run_id),
+                    creation_id,
+                    candidate.version,
+                    candidate.design_epoch,
+                    candidate.content_hash,
+                    candidate.status,
+                    candidate.l0_variant,
+                    candidate.genre,
+                    _json(candidate.lineage),
+                    _json(candidate.content),
+                    _json(candidate.validation),
+                    _json(candidate.global_review) if candidate.global_review is not None else None,
+                    timestamp,
+                ),
+            )
+        return candidate
+
+    async def get_run_series_bible(self, run_id: UUID) -> SeriesBibleSummary | None:
+        """The durable active design candidate projection for one run."""
+        async with self._connection() as connection:
+            lineage = await self._fetch_series_bible_lineage(connection, run_id)
+            if lineage is None or lineage["active_candidate_id"] is None:
+                return None
+            candidate = await self._fetch_series_bible_candidate(
+                connection,
+                run_id,
+                lineage["active_candidate_id"],
+            )
+            if candidate is None:
+                return None
+        bible = self._series_bible_from_row(candidate)
+        return project_series_bible(bible, is_active=True)
+
+    async def get_run_series_bible_candidates(self, run_id: UUID) -> list[SeriesBibleSummary]:
+        """Every candidate registered for one run, newest first (immutable evidence)."""
+        async with self._connection() as connection:
+            lineage = await self._fetch_series_bible_lineage(connection, run_id)
+            active_id = lineage["active_candidate_id"] if lineage is not None else None
+            cursor = await connection.execute(
+                """
+                SELECT *
+                FROM series_bible_candidates
+                WHERE run_id = ?
+                ORDER BY design_epoch DESC, created_at DESC
+                """,
+                (str(run_id),),
+            )
+            rows = await cursor.fetchall()
+        return [
+            project_series_bible(
+                self._series_bible_from_row(row),
+                is_active=(row["candidate_id"] == active_id),
+            )
+            for row in rows
+        ]
+
+    async def get_series_bible_lineage(self, run_id: UUID) -> dict[str, Any] | None:
+        async with self._connection() as connection:
+            return await self._fetch_series_bible_lineage(connection, run_id)
+
+    async def latest_review_call_id(
+        self,
+        run_id: UUID,
+        *,
+        stage: InternalStage,
+    ) -> str | None:
+        """The most recent succeeded review-route call for a design stage."""
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT call_id
+                FROM model_calls
+                WHERE run_id = ? AND role = 'review' AND stage = ?
+                      AND status = 'succeeded'
+                ORDER BY requested_at DESC, call_id DESC
+                LIMIT 1
+                """,
+                (str(run_id), stage.value),
+            )
+            return row["call_id"] if row is not None else None
+
+    async def assert_episode_batch_current(self, run_id: UUID) -> str | None:
+        """Return the active design content hash, or ``None`` when no design is active.
+
+        When a design hash/epoch change supersedes the active candidate, every prior
+        script batch becomes ineligible for active generation or delivery (SDP-A9).
+        The dependent writer Issue completes the full invalidation behavior.
+        """
+        lineage = await self.get_series_bible_lineage(run_id)
+        if lineage is None or lineage["active_content_hash"] is None:
+            return None
+        return lineage["active_content_hash"]
+
+    async def _fetch_series_bible_candidate(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+        candidate_id: str,
+    ) -> aiosqlite.Row | None:
+        return await self._fetchone(
+            connection,
+            """
+            SELECT *
+            FROM series_bible_candidates
+            WHERE run_id = ? AND candidate_id = ?
+            """,
+            (str(run_id), candidate_id),
+        )
+
+    async def _fetch_series_bible_lineage(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+    ) -> aiosqlite.Row | None:
+        return await self._fetchone(
+            connection,
+            "SELECT * FROM series_bible_lineage WHERE run_id = ?",
+            (str(run_id),),
+        )
+
+    @staticmethod
+    def _series_bible_from_row(row: aiosqlite.Row) -> SeriesBible:
+        return SeriesBible(
+            candidate_id=row["candidate_id"],
+            version=row["version"],
+            design_epoch=row["design_epoch"],
+            content_hash=row["content_hash"],
+            status=row["status"],
+            l0_variant=row["l0_variant"],
+            genre=row["genre"],
+            lineage=json.loads(row["lineage_json"]),
+            content=json.loads(row["content_json"]),
+            validation=json.loads(row["validation_json"]) if row["validation_json"] else None,
+            global_review=(
+                json.loads(row["global_review_json"]) if row["global_review_json"] else None
+            ),
+            created_at=_datetime(row["created_at"]),
+        )
+
     async def handle_run_timeout(
         self,
         run_id: UUID,
@@ -4166,8 +4684,26 @@ class Repository:
         return RunDraftSnapshot(
             artifacts=artifacts,
             episodes=await self._episode_drafts(connection, run_id),
+            design=await self._run_design_snapshot(connection, run_id),
             review_status=progress.final_review,
         )
+
+    async def _run_design_snapshot(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+    ) -> SeriesBibleSummary | None:
+        lineage = await self._fetch_series_bible_lineage(connection, run_id)
+        if lineage is None or lineage["active_candidate_id"] is None:
+            return None
+        candidate = await self._fetch_series_bible_candidate(
+            connection,
+            run_id,
+            lineage["active_candidate_id"],
+        )
+        if candidate is None:
+            return None
+        return project_series_bible(self._series_bible_from_row(candidate), is_active=True)
 
     async def _episode_progress(
         self,

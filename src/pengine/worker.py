@@ -44,6 +44,14 @@ from pengine.schemas import (
     RunFailure,
     WorkflowResult,
 )
+from pengine.series_bible import (
+    GlobalDesignReview,
+    SeriesBible,
+    bind_global_design_review,
+    build_series_bible,
+    detect_genre,
+    validate_series_bible,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +276,19 @@ class Worker:
                     "The approved legacy episode outline has no durable episode plan."
                 )
 
+            if InternalStage.GENERATING_EPISODE_OUTLINE in approved:
+                # Restart recovery: the outline checkpoint is durable and the
+                # approve hook that normally syncs the design only fires during
+                # live delegation. If the process died after the outline commit
+                # but before candidate promotion, re-run the idempotent sync so
+                # the run never proceeds without an active design (SDP-A8).
+                await self._sync_series_bible(work, approved)
+                if model_call_state is not None:
+                    active = await self.repository.get_run_series_bible(work.run_id)
+                    model_call_state.context.candidate = (
+                        active.candidate_id if active is not None else None
+                    )
+
             if self.workflow is None:
                 current_stage = self._next_unapproved(approved)
                 if current_stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
@@ -303,6 +324,13 @@ class Worker:
             ) -> None:
                 await self.repository.approve_checkpoint(work.run_id, stage, payload)
                 approved[stage] = dict(payload)
+                if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+                    await self._sync_series_bible(work, approved)
+                    if model_call_state is not None:
+                        active = await self.repository.get_run_series_bible(work.run_id)
+                        model_call_state.context.candidate = (
+                            active.candidate_id if active is not None else None
+                        )
 
             async def before_episode(plan: EpisodePlan) -> int:
                 nonlocal current_stage
@@ -613,6 +641,129 @@ class Worker:
                 else:
                     files.setdefault(path, content)
         return files
+
+    async def _sync_series_bible(
+        self,
+        work: RunWorkItem,
+        approved: Mapping[InternalStage, Any],
+    ) -> None:
+        """Assemble, validate, bind the review, and atomically promote one design candidate.
+
+        Only unified runs whose approved episode outline carries a story contract
+        produce a SeriesBible. The candidate is immutable; a confirmed design
+        defect may trigger one complete automatic rebuild per run lineage, and a
+        late candidate can never promote the active pointer (SDP-A5/A6/A7).
+        """
+        outline = approved.get(InternalStage.GENERATING_EPISODE_OUTLINE)
+        if outline is None or "story_contract" not in outline:
+            return
+        story_outline = approved.get(InternalStage.GENERATING_STORY_OUTLINE)
+        biographies = approved.get(InternalStage.GENERATING_CHARACTER_BIOGRAPHIES)
+        relationships = approved.get(InternalStage.GENERATING_RELATIONSHIP_LOGIC)
+        l0_selection = approved.get(InternalStage.SELECTING_L0_VARIANT)
+        if not all((story_outline, biographies, relationships, l0_selection)):
+            raise AgentProtocolError(
+                "SeriesBible assembly requires every approved design projection",
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            )
+        active = await self.repository.get_run_series_bible(work.run_id)
+        base = dict(
+            run_id=str(work.run_id),
+            run_kind=work.run_kind,
+            l0_variant=l0_selection["selected_l0_variant"],
+            genre=detect_genre(work.story, work.requirements),
+            story_outline=story_outline["content"],
+            character_biographies=biographies["content"],
+            relationship_logic=relationships["content"],
+            episode_outline=outline["content"],
+            story_contract_payload=outline["story_contract"],
+        )
+        candidate = build_series_bible(**base)
+        if active is not None and active.content_hash == candidate.content_hash:
+            return
+        is_rebuild = active is not None
+        if is_rebuild:
+            lineage = await self.repository.get_series_bible_lineage(work.run_id)
+            if lineage is not None and lineage["rebuild_count"] >= 1:
+                raise AgentProtocolError(
+                    "This run lineage may rebuild the design automatically at most once",
+                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                )
+            candidate = build_series_bible(
+                **base,
+                parent_candidate_id=active.candidate_id,
+                rebuild_count=1,
+                design_epoch=active.design_epoch + 1,
+            )
+        evidence = validate_series_bible(candidate)
+        if is_rebuild:
+            await self.repository.rebuild_series_bible(
+                str(work.creation_id),
+                work.run_id,
+                candidate,
+                evidence,
+            )
+        else:
+            await self.repository.register_series_bible_candidate(
+                str(work.creation_id),
+                work.run_id,
+                candidate,
+                evidence,
+            )
+        if not evidence.passed:
+            # A deterministically invalid candidate is retained as immutable
+            # evidence but is never reviewed or promoted, so no active pointer
+            # can change (SDP-A3). The already-approved outline continues the run.
+            logger.warning(
+                "series bible candidate rejected run_id=%s candidate=%s issues=%s",
+                work.run_id,
+                candidate.candidate_id,
+                sorted(issue.code for issue in evidence.issues),
+            )
+            return
+        review = await self._bind_global_design_review(work, candidate, outline)
+        await self.repository.record_series_bible_review(
+            work.run_id,
+            candidate.candidate_id,
+            review,
+        )
+        await self.repository.promote_series_bible(work.run_id, candidate.candidate_id)
+        await self.repository.mark_series_bible_stale(
+            work.run_id,
+            active_candidate_id=candidate.candidate_id,
+        )
+
+    async def _bind_global_design_review(
+        self,
+        work: RunWorkItem,
+        candidate: SeriesBible,
+        outline: Mapping[str, Any],
+    ) -> GlobalDesignReview:
+        """Bind the DeepSeek review evidence to this exact candidate and model call."""
+        contract_review = outline.get("contract_review")
+        if not isinstance(contract_review, Mapping):
+            raise AgentProtocolError(
+                "A unified outline requires bound global design review evidence",
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            )
+        call_id = await self.repository.latest_review_call_id(
+            work.run_id,
+            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+        )
+        if call_id is None:
+            call_id = f"{work.run_id}-outline-review"
+
+        return bind_global_design_review(
+            candidate,
+            review_call_id=call_id,
+            review_model_id=self._review_model_id(),
+            passed=bool(contract_review.get("passed")),
+            evidence=str(contract_review.get("evidence", "")),
+            issues=contract_review.get("issues") or [],
+        )
+
+    def _review_model_id(self) -> str:
+        return self.settings.review_model_id or "deepseek-v4-flash"
 
     @staticmethod
     def _assemble_delivery(work: RunWorkItem, result: WorkflowResult) -> Delivery:
