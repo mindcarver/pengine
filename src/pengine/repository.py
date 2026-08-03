@@ -41,6 +41,8 @@ from pengine.schemas import (
     FailedRun,
     FinalReviewProgress,
     InternalStage,
+    ModelCallSummary,
+    ModelCallUsage,
     PausedRun,
     PersonaSnapshot,
     QualityGateRejection,
@@ -68,7 +70,7 @@ from pengine.schemas import (
     UserStage,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -689,6 +691,79 @@ CREATE TABLE content_rejections_v10 (
 )
 """
 
+_SCHEMA_V11_RUN_PROGRESS_SQL = """
+CREATE TABLE run_progress_v11 (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    current_stage TEXT NOT NULL,
+    execution_state TEXT NOT NULL CHECK (
+        execution_state IN (
+            'queued', 'running', 'auto_resuming', 'paused',
+            'quality_rejected', 'ended', 'succeeded', 'failed'
+        )
+    ),
+    elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (elapsed_seconds >= 0),
+    active_started_at TEXT,
+    timeout_stage TEXT,
+    timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+    updated_at TEXT NOT NULL,
+    current_episode INTEGER CHECK (current_episode IS NULL OR current_episode >= 1),
+    recovery_reason TEXT NOT NULL DEFAULT 'none' CHECK (
+        recovery_reason IN (
+            'none', 'run_timeout', 'relay_interruption', 'content_rejected',
+            'episode_error', 'context_budget'
+        )
+    ),
+    content_repair_count INTEGER CHECK (
+        content_repair_count IS NULL
+        OR content_repair_count BETWEEN 2 AND 6
+    ),
+    pause_message TEXT
+)
+"""
+
+_SCHEMA_V11_MODEL_CALLS_SQL = """
+CREATE TABLE IF NOT EXISTS model_calls (
+    call_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    creation_id TEXT,
+    thread_id TEXT,
+    run_kind TEXT,
+    role TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    stage TEXT,
+    episode_number INTEGER,
+    candidate TEXT,
+    batch TEXT,
+    requested_at TEXT NOT NULL,
+    finished_at TEXT,
+    duration_seconds REAL,
+    estimated_input_tokens INTEGER NOT NULL CHECK (estimated_input_tokens >= 0),
+    estimated_output_tokens INTEGER NOT NULL CHECK (estimated_output_tokens >= 0),
+    estimated_total_tokens INTEGER NOT NULL CHECK (estimated_total_tokens >= 0),
+    verified_limit_tokens INTEGER,
+    preflight TEXT NOT NULL CHECK (preflight IN ('ok', 'blocked')),
+    status TEXT NOT NULL,
+    usage_status TEXT NOT NULL CHECK (usage_status IN ('reported', 'partial', 'unavailable')),
+    actual_input_tokens INTEGER,
+    actual_output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_creation_tokens INTEGER,
+    finish_reason TEXT,
+    outcome TEXT NOT NULL,
+    error_code TEXT,
+    error_type TEXT,
+    safe_message TEXT,
+    supersedes_call_id TEXT
+);
+"""
+
+_SCHEMA_V11_MODEL_CALLS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS model_calls_run_id
+ON model_calls(run_id);
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -1032,6 +1107,39 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 10
+            if schema_version == 10:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.execute("DROP TABLE IF EXISTS run_progress_v11")
+                    await connection.execute(_SCHEMA_V11_RUN_PROGRESS_SQL)
+                    await connection.execute(
+                        """
+                        INSERT INTO run_progress_v11(
+                            run_id, current_stage, execution_state, elapsed_seconds,
+                            active_started_at, timeout_stage, timeout_count, updated_at,
+                            current_episode, recovery_reason, content_repair_count, pause_message
+                        )
+                        SELECT
+                            run_id, current_stage, execution_state, elapsed_seconds,
+                            active_started_at, timeout_stage, timeout_count, updated_at,
+                            current_episode, recovery_reason, content_repair_count, pause_message
+                        FROM run_progress
+                        """
+                    )
+                    await connection.execute("DROP TABLE run_progress")
+                    await connection.execute("ALTER TABLE run_progress_v11 RENAME TO run_progress")
+
+                    await connection.execute(_SCHEMA_V11_MODEL_CALLS_SQL)
+                    await connection.execute(_SCHEMA_V11_MODEL_CALLS_INDEX_SQL)
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (11)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 11
 
     async def setup(self) -> None:
         await self.initialize()
@@ -2042,6 +2150,83 @@ class Repository:
                     episode_number,
                     self._elapsed_seconds(progress, current),
                     UserStage.GENERATING_EPISODE_SCRIPTS.value,
+                    safe_message.strip(),
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'failed',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, str(run_id)),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, progress["creation_id"]),
+            )
+
+    async def pause_context_budget(
+        self,
+        run_id: UUID,
+        *,
+        stage: InternalStage,
+        safe_message: str,
+        episode_number: int | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Pause a running workflow after a fail-closed context preflight block."""
+        if not safe_message.strip():
+            raise ValueError("Context-budget pauses require a safe message")
+        if episode_number is not None and episode_number < 1:
+            raise ValueError("Context-budget pauses require a valid episode number")
+        current = now or _utc_now()
+        timestamp = _timestamp(current)
+        async with self._transaction() as connection:
+            progress = await self._fetchone(
+                connection,
+                """
+                SELECT run_progress.*, runs.state AS run_state, runs.creation_id
+                FROM run_progress
+                JOIN runs ON runs.id = run_progress.run_id
+                WHERE run_progress.run_id = ?
+                """,
+                (str(run_id),),
+            )
+            if progress is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if progress["run_state"] != "running" or progress["execution_state"] != "running":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Workflow run is not actively running.",
+                    409,
+                )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    current_episode = ?,
+                    execution_state = 'paused',
+                    elapsed_seconds = ?,
+                    active_started_at = NULL,
+                    timeout_stage = ?,
+                    timeout_count = 0,
+                    recovery_reason = 'context_budget',
+                    content_repair_count = NULL,
+                    pause_message = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    stage.value,
+                    episode_number,
+                    self._elapsed_seconds(progress, current),
+                    _USER_STAGE_BY_INTERNAL[stage].value,
                     safe_message.strip(),
                     timestamp,
                     str(run_id),
@@ -3824,6 +4009,63 @@ class Repository:
             case _:
                 raise RuntimeError("Unknown revision progress state")
 
+    async def get_run_model_calls(self, run_id: UUID) -> list[ModelCallSummary]:
+        async with self._connection() as connection:
+            return await self._model_calls(connection, run_id)
+
+    async def _model_calls(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+    ) -> list[ModelCallSummary]:
+        cursor = await connection.execute(
+            """
+            SELECT *
+            FROM model_calls
+            WHERE run_id = ?
+            ORDER BY requested_at, call_id
+            """,
+            (str(run_id),),
+        )
+        rows = await cursor.fetchall()
+        return [self._model_call_summary(row) for row in rows]
+
+    @staticmethod
+    def _model_call_summary(row: aiosqlite.Row) -> ModelCallSummary:
+        return ModelCallSummary(
+            call_id=row["call_id"],
+            role=row["role"],
+            adapter=row["adapter"],
+            provider=row["provider"],
+            model=row["model"],
+            stage=row["stage"],
+            episode_number=row["episode_number"],
+            candidate=row["candidate"],
+            batch=row["batch"],
+            requested_at=_datetime(row["requested_at"]),
+            finished_at=_datetime(row["finished_at"]) if row["finished_at"] else None,
+            duration_seconds=row["duration_seconds"],
+            estimated_input_tokens=row["estimated_input_tokens"],
+            estimated_output_tokens=row["estimated_output_tokens"],
+            estimated_total_tokens=row["estimated_total_tokens"],
+            verified_limit_tokens=row["verified_limit_tokens"],
+            preflight=row["preflight"],
+            status=row["status"],
+            usage=ModelCallUsage(
+                input_tokens=row["actual_input_tokens"],
+                output_tokens=row["actual_output_tokens"],
+                cache_read_tokens=row["cache_read_tokens"],
+                cache_creation_tokens=row["cache_creation_tokens"],
+                status=row["usage_status"],
+            ),
+            finish_reason=row["finish_reason"],
+            outcome=row["outcome"],
+            error_code=row["error_code"],
+            error_type=row["error_type"],
+            safe_message=row["safe_message"],
+            supersedes_call_id=row["supersedes_call_id"],
+        )
+
     async def _run_progress(
         self,
         connection: aiosqlite.Connection,
@@ -3857,6 +4099,7 @@ class Repository:
             UUID(run["id"]),
             progress["current_episode"],
         )
+        model_calls = await self._model_calls(connection, UUID(run["id"]))
         return progress, RunProgress(
             current_stage=_USER_STAGE_BY_INTERNAL[current_internal],
             completed_stages=completed,
@@ -3884,6 +4127,7 @@ class Repository:
                 ),
             ),
             episodes=episodes,
+            model_calls=model_calls,
             can_continue=(
                 execution_state == "paused"
                 and await self._has_remaining_attempts(
@@ -4025,8 +4269,22 @@ class Repository:
             "relay_interruption",
             "content_rejected",
             "episode_error",
+            "context_budget",
         }:
             raise RuntimeError("Paused workflow run is missing its recovery reason")
+        if recovery_reason == "context_budget":
+            if not progress["pause_message"]:
+                raise RuntimeError("Context-budget pause is missing safe recovery evidence")
+            return RunPause(
+                message=progress["pause_message"],
+                code="context_budget",
+                stage=stage,
+                episode_number=(
+                    int(progress["current_episode"])
+                    if progress["current_episode"] is not None
+                    else None
+                ),
+            )
         if recovery_reason == "content_rejected":
             if progress["content_repair_count"] is None or not progress["pause_message"]:
                 raise RuntimeError("Content-rejected run is missing review evidence")

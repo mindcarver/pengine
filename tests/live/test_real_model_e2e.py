@@ -74,6 +74,16 @@ def _require_dual_model_relay(
     evidence = f"; evidence: {evidence_dir}" if evidence_dir is not None else ""
     if not settings.relay_configured:
         pytest.fail(f"{probe} requires configured generation and review routes{evidence}")
+    if settings.generation_context_limit_tokens is None:
+        pytest.fail(
+            f"{probe} requires PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS (the verified "
+            f"context window of the generation route){evidence}"
+        )
+    if settings.review_context_limit_tokens is None:
+        pytest.fail(
+            f"{probe} requires PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS (the verified "
+            f"context window of the review route){evidence}"
+        )
 
 
 def _now() -> str:
@@ -217,6 +227,15 @@ def _child_environment(
         "PENGINE_REVIEW_MAX_OUTPUT_TOKENS": settings.review_max_output_tokens,
     }
     for name, value in caps.items():
+        if value is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = str(value)
+    context_limits = {
+        "PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS": settings.generation_context_limit_tokens,
+        "PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS": settings.review_context_limit_tokens,
+    }
+    for name, value in context_limits.items():
         if value is None:
             environment.pop(name, None)
         else:
@@ -481,6 +500,80 @@ def _assert_model_routing_audit(
             "response_model_id": model_id,
             "completed_calls": len(ended),
         }
+    return summary
+
+
+def _assert_durable_usage_evidence(
+    log_path: Path,
+    database_path: Path,
+    *,
+    evidence_dir: Path,
+) -> dict[str, Any]:
+    """The durable model-call envelope agrees across structured logs and SQLite."""
+    record_lines = [
+        line
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if "model_call_record " in line
+    ]
+    assert record_lines, f"No durable model-call records were captured; evidence: {evidence_dir}"
+
+    log_records: dict[str, dict[str, Any]] = {}
+    for line in record_lines:
+        fields = dict(
+            token.split("=", 1)
+            for token in line.split("model_call_record ", 1)[1].split()
+            if "=" in token
+        )
+        call_id = fields.get("call_id")
+        assert call_id, f"Unparseable model-call record: {line!r}; evidence: {evidence_dir}"
+        log_records[call_id] = fields
+
+    succeeded = {
+        call_id: fields
+        for call_id, fields in log_records.items()
+        if fields.get("status") == "succeeded"
+    }
+    assert succeeded, f"No completed model calls with provider usage; evidence: {evidence_dir}"
+    usage_mismatches = [
+        call_id
+        for call_id, fields in succeeded.items()
+        if fields.get("usage_status") != "reported"
+        or not fields.get("actual_input_tokens")
+        or not fields.get("actual_output_tokens")
+    ]
+    assert not usage_mismatches, (
+        f"Real calls are missing provider-reported usage: {sorted(usage_mismatches)}; "
+        f"evidence: {evidence_dir}"
+    )
+
+    with sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True) as connection:
+        rows = connection.execute(
+            "SELECT call_id, status, usage_status, actual_input_tokens, actual_output_tokens "
+            "FROM model_calls"
+        ).fetchall()
+    db_records = {row[0]: row for row in rows}
+    assert set(log_records) <= set(db_records), (
+        f"SQLite model_calls missing log call_ids: {sorted(set(log_records) - set(db_records))}; "
+        f"evidence: {evidence_dir}"
+    )
+    for call_id, _fields in succeeded.items():
+        row = db_records[call_id]
+        assert row[1] == "succeeded"
+        assert row[2] == "reported"
+        assert row[3] is not None and row[4] is not None
+
+    summary: dict[str, Any] = {
+        "status": "passed",
+        "recorded_calls": len(log_records),
+        "succeeded_with_usage": len(succeeded),
+        "example": {
+            "call_id": next(iter(succeeded)),
+            "model": succeeded[next(iter(succeeded))].get("model"),
+            "input_tokens": succeeded[next(iter(succeeded))].get("actual_input_tokens"),
+            "output_tokens": succeeded[next(iter(succeeded))].get("actual_output_tokens"),
+            "finish_reason": succeeded[next(iter(succeeded))].get("finish_reason"),
+        },
+    }
     return summary
 
 
@@ -1179,7 +1272,14 @@ def test_real_model_initial_creation_black_box() -> None:
                 evidence_dir=evidence_dir,
             )
             _write_json(evidence_dir / "model-routing-audit.json", routing_audit)
+            usage_audit = _assert_durable_usage_evidence(
+                log_path,
+                data_dir / "pengine.sqlite3",
+                evidence_dir=evidence_dir,
+            )
+            _write_json(evidence_dir / "model-usage-audit.json", usage_audit)
             metadata["model_routing_audit"] = routing_audit
+            metadata["model_usage_audit"] = usage_audit
             metadata["status"] = "succeeded"
     except BaseException as error:
         caught = error

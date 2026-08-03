@@ -22,8 +22,10 @@ class Settings(BaseSettings):
     relay_api_key: SecretStr | None = None
     generation_model_id: str | None = None
     generation_max_output_tokens: int = Field(default=128_000, ge=1, le=128_000)
+    generation_context_limit_tokens: int | None = Field(default=None, ge=1)
     review_model_id: str | None = None
     review_max_output_tokens: int | None = Field(default=None, ge=1)
+    review_context_limit_tokens: int | None = Field(default=None, ge=1)
     model_timeout_seconds: float = Field(default=180.0, gt=0)
     run_timeout_seconds: float = Field(default=1800.0, gt=0)
     lease_seconds: int = Field(default=60, ge=5)

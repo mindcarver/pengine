@@ -127,6 +127,7 @@ class RunFailure(StrictModel):
         "persona_package_invalid",
         "relay_unavailable",
         "relay_incompatible",
+        "preflight_blocked",
         "structured_output_invalid",
         "stage_validation_failed",
         "content_review_rejected",
@@ -162,6 +163,58 @@ class EpisodeProgress(StrictModel):
     current: int | None = Field(default=None, ge=1)
 
 
+class ModelCallUsage(StrictModel):
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    cache_read_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_tokens: int | None = Field(default=None, ge=0)
+    status: Literal["reported", "partial", "unavailable"]
+
+
+class ModelCallSummary(StrictModel):
+    call_id: str
+    role: Literal["generation", "review"]
+    adapter: str
+    provider: str
+    model: str
+    stage: str | None = None
+    episode_number: int | None = Field(default=None, ge=1)
+    candidate: str | None = None
+    batch: str | None = None
+    requested_at: datetime
+    finished_at: datetime | None = None
+    duration_seconds: float | None = Field(default=None, ge=0)
+    estimated_input_tokens: int = Field(ge=0)
+    estimated_output_tokens: int = Field(ge=0)
+    estimated_total_tokens: int = Field(ge=0)
+    verified_limit_tokens: int | None = Field(default=None, ge=1)
+    preflight: Literal["ok", "blocked"]
+    status: Literal[
+        "started",
+        "succeeded",
+        "failed",
+        "timed_out",
+        "stale",
+        "superseded",
+        "preflight_blocked",
+    ]
+    usage: ModelCallUsage
+    finish_reason: str | None = None
+    outcome: Literal[
+        "success",
+        "failure",
+        "timeout",
+        "stale",
+        "superseded",
+        "blocked",
+        "incomplete",
+    ]
+    error_code: str | None = None
+    error_type: str | None = None
+    safe_message: str | None = None
+    supersedes_call_id: str | None = None
+
+
 class RunProgress(StrictModel):
     current_stage: UserStage
     completed_stages: list[UserStage]
@@ -173,9 +226,11 @@ class RunProgress(StrictModel):
         "relay_interruption",
         "content_rejected",
         "episode_error",
+        "context_budget",
     ]
     final_review: FinalReviewProgress
     episodes: EpisodeProgress | None = None
+    model_calls: list[ModelCallSummary] = Field(default_factory=list)
     can_continue: bool
     can_end: bool
 
@@ -227,6 +282,7 @@ class RunPause(StrictModel):
         "relay_interruption",
         "content_rejected",
         "episode_error",
+        "context_budget",
     ] = "run_timeout"
     message: NonEmptyText
     stage: UserStage
@@ -254,6 +310,9 @@ class RunPause(StrictModel):
         elif self.code == "episode_error":
             if self.timeout_count is not None or self.content_repair_count is not None:
                 raise ValueError("Episode errors do not use timeout or repair counts")
+        elif self.code == "context_budget":
+            if self.timeout_count is not None or self.content_repair_count is not None:
+                raise ValueError("Context-budget pauses do not use timeout or repair counts")
         elif self.timeout_count is None or self.content_repair_count is not None:
             raise ValueError(
                 "Timeout and relay pauses require a timeout count and no content repair count"

@@ -629,6 +629,9 @@ Object.assign(elements, {
   "continue-run": { disabled: false },
   "end-run": { disabled: false },
   "run-control-message": { textContent: "" },
+  "model-call-panel": { hidden: true },
+  "model-call-totals": { textContent: "" },
+  "model-call-list": { replaceChildren() {} },
 });
 const progress = {
   current_stage: "generating_story_outline",
@@ -819,6 +822,9 @@ Object.assign(elements, {
   "continue-run": { hidden: false, disabled: false },
   "end-run": { hidden: false, disabled: false },
   "run-control-message": { textContent: "" },
+  "model-call-panel": { hidden: true },
+  "model-call-totals": { textContent: "" },
+  "model-call-list": { replaceChildren() {} },
   "result-workspace": { hidden: true, dataset: {} },
   "revision-desk": { hidden: false },
   "version-initial": button("initial", "version"),
@@ -1307,6 +1313,160 @@ const vm = require("vm");
 const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
 const context = {{
   document: {{ addEventListener() {{}}, createElement() {{ return {{}}; }} }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(() => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_progress_renders_model_call_usage_panel() -> None:
+    script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
+    assertions = """
+const stageItems = USER_STAGES.map(([stage]) => ({
+  dataset: { stage },
+  attrs: {},
+  setAttribute(name, value) { this.attrs[name] = value; },
+  removeAttribute(name) { delete this.attrs[name]; },
+}));
+const listItems = [];
+Object.assign(elements, {
+  "run-progress": { hidden: true },
+  "progress-kind": { textContent: "" },
+  "progress-title": { textContent: "" },
+  "progress-elapsed": { textContent: "" },
+  "progress-stages": { querySelectorAll() { return stageItems; } },
+  "review-progress": { hidden: true },
+  "review-l0": { textContent: "" },
+  "review-l4": { textContent: "" },
+  "run-controls": { hidden: true },
+  "run-control-title": { textContent: "" },
+  "run-control-description": { textContent: "" },
+  "continue-run": { disabled: false },
+  "end-run": { disabled: false },
+  "run-control-message": { textContent: "" },
+  "model-call-panel": { hidden: true },
+  "model-call-totals": { textContent: "" },
+  "model-call-list": {
+    replaceChildren() { listItems.length = 0; },
+    appendChild(item) { listItems.push(item); },
+  },
+});
+state.workspaceView = "progress";
+state.activeVersion = "initial";
+state.activeArtifact = "direction";
+state.creation = {
+  initial: {
+    state: "paused",
+    pause: {
+      code: "context_budget",
+      message: "完整请求超出已验证上下文上限。",
+      stage: "generating_story_outline",
+    },
+    progress: {
+      current_stage: "generating_story_outline",
+      completed_stages: ["determining_direction"],
+      elapsed_seconds: 10,
+      recovery_state: "paused",
+      recovery_reason: "context_budget",
+      final_review: { l0: "pending", l4: "pending" },
+      can_continue: true,
+      can_end: true,
+      model_calls: [
+        {
+          call_id: "call-1",
+          role: "generation",
+          adapter: "anthropic",
+          provider: "anthropic",
+          model: "claude-opus-5",
+          stage: "generating_story_outline",
+          episode_number: null,
+          requested_at: "2026-08-03T00:00:00Z",
+          estimated_total_tokens: 2128000,
+          verified_limit_tokens: 200000,
+          preflight: "blocked",
+          status: "preflight_blocked",
+          usage: { input_tokens: null, output_tokens: null, status: "unavailable" },
+          finish_reason: null,
+          duration_seconds: 0,
+          outcome: "blocked",
+        },
+        {
+          call_id: "call-2",
+          role: "review",
+          adapter: "deepseek",
+          provider: "deepseek",
+          model: "deepseek-v4-flash",
+          stage: "accepting_l0",
+          episode_number: null,
+          requested_at: "2026-08-03T00:01:00Z",
+          estimated_total_tokens: 5000,
+          verified_limit_tokens: 64000,
+          preflight: "ok",
+          status: "succeeded",
+          usage: { input_tokens: 1200, output_tokens: 300, status: "reported" },
+          finish_reason: "stop",
+          duration_seconds: 3,
+          outcome: "success",
+        },
+      ],
+    },
+    drafts: { artifacts: [], episodes: [] },
+  },
+  revision: { state: "unavailable" },
+};
+renderProgress();
+if (elements["model-call-panel"].hidden) {
+  throw new Error("model-call panel stayed hidden with durable records");
+}
+if (!elements["model-call-totals"].textContent.includes("共 2 次调用")) {
+  throw new Error("model-call totals missing call count");
+}
+if (!elements["model-call-totals"].textContent.includes("成功 1")) {
+  throw new Error("model-call totals missing success classification");
+}
+if (!elements["model-call-totals"].textContent.includes("预检拦截 1")) {
+  throw new Error("model-call totals missing blocked classification");
+}
+if (!elements["model-call-totals"].textContent.includes("实际用量 输入 1200 / 输出 300")) {
+  throw new Error("model-call totals missing reported actual usage");
+}
+if (listItems.length !== 2) {
+  throw new Error("model-call list did not render each durable call");
+}
+if (listItems[0].dataset.callStatus !== "preflight_blocked") {
+  throw new Error("blocked call lost its classification");
+}
+if (!listItems[1].textContent.includes("deepseek-v4-flash")) {
+  throw new Error("review call did not render its model");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{
+    addEventListener() {{}},
+    createElement() {{
+      return {{ dataset: {{}}, textContent: "", appendChild() {{}} }};
+    }},
+  }},
   window: {{}},
   crypto: {{ randomUUID() {{ return "test-id"; }} }},
   console,

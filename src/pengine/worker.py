@@ -23,8 +23,10 @@ from pengine.config import Settings
 from pengine.continuity import EpisodeLock
 from pengine.errors import DomainError
 from pengine.language import OutputLanguage
+from pengine.model_calls import ModelCallState, ModelCallStore
 from pengine.personas import PersonaCatalog, PersonaPackageError
 from pengine.relay import (
+    PreflightBlockedError,
     RelayError,
     build_relay_routes,
     classify_relay_exception,
@@ -124,6 +126,8 @@ class Worker:
         self._task: asyncio.Task[None] | None = None
         self._saver_context: AbstractAsyncContextManager[AsyncSqliteSaver] | None = None
         self._saver: AsyncSqliteSaver | None = None
+        self._model_call_state: ModelCallState | None = None
+        self._model_call_store: ModelCallStore | None = None
 
     async def start(self) -> None:
         if self._task is not None:
@@ -137,6 +141,13 @@ class Worker:
             await self._saver.setup()
             if self.settings.relay_configured:
                 routes = build_relay_routes(self.settings)
+                state = getattr(routes, "model_call_state", None)
+                if state is not None:
+                    store = ModelCallStore(self.settings.database_path)
+                    state.store = store
+                    state.context.reset()
+                    self._model_call_state = state
+                    self._model_call_store = store
                 self.workflow = DeepAgentWorkflow(
                     generation_model=routes.generation.model,
                     review_model=routes.review.model,
@@ -159,6 +170,10 @@ class Worker:
             await self._saver_context.__aexit__(None, None, None)
             self._saver_context = None
             self._saver = None
+        if self._model_call_store is not None:
+            self._model_call_store.close()
+            self._model_call_store = None
+        self._model_call_state = None
 
     async def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -214,6 +229,14 @@ class Worker:
             approved[InternalStage.GENERATING_EPISODE_SCRIPTS] = payload
         current_stage = InternalStage.LOADING_PERSONA
         run_timeout_scope: asyncio.Timeout | None = None
+        model_call_state = self._model_call_state
+        if model_call_state is not None:
+            model_call_state.context.reset()
+            model_call_state.context.run_id = str(work.run_id)
+            model_call_state.context.creation_id = str(work.creation_id)
+            model_call_state.context.thread_id = work.thread_id
+            model_call_state.context.run_kind = work.run_kind
+            model_call_state.context.stage = current_stage.value
         logger.info(
             "workflow run started run_id=%s creation_id=%s kind=%s",
             work.run_id,
@@ -269,6 +292,9 @@ class Worker:
             async def before_stage(stage: InternalStage) -> int:
                 nonlocal current_stage
                 current_stage = stage
+                if model_call_state is not None:
+                    model_call_state.context.stage = stage.value
+                    model_call_state.context.episode_number = None
                 return await self.repository.record_stage_attempt(work.run_id, stage)
 
             async def approve_stage(
@@ -281,6 +307,9 @@ class Worker:
             async def before_episode(plan: EpisodePlan) -> int:
                 nonlocal current_stage
                 current_stage = InternalStage.GENERATING_EPISODE_SCRIPTS
+                if model_call_state is not None:
+                    model_call_state.context.stage = InternalStage.GENERATING_EPISODE_SCRIPTS.value
+                    model_call_state.context.episode_number = plan.episode_number
                 return await self.repository.record_episode_attempt(
                     work.run_id,
                     plan.episode_number,
@@ -408,9 +437,29 @@ class Worker:
                 rejection.attempt_count,
             )
             return
+        except PreflightBlockedError as exc:
+            await self.repository.pause_context_budget(
+                work.run_id,
+                stage=(InternalStage(exc.stage) if exc.stage else current_stage),
+                safe_message=exc.safe_message,
+                episode_number=exc.episode_number,
+            )
+            logger.warning(
+                "context preflight blocked run_id=%s creation_id=%s stage=%s episode=%s "
+                "required_tokens=%s verified_limit_tokens=%s",
+                work.run_id,
+                work.creation_id,
+                exc.stage,
+                exc.episode_number,
+                exc.required_tokens,
+                exc.verified_limit_tokens,
+            )
+            return
         except TimeoutError as exc:
             if run_timeout_scope is not None and run_timeout_scope.expired():
                 timeout_stage = self._failure_stage(exc, current_stage, approved)
+                if model_call_state is not None and model_call_state.store is not None:
+                    model_call_state.store.mark_timed_out(run_id=str(work.run_id))
                 if timeout_stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
                     refreshed = await self.repository.get_run_work_item(work.run_id)
                     episode_number = len(refreshed.episode_drafts) + 1

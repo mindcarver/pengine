@@ -1732,6 +1732,7 @@
               "persona_package_invalid",
               "relay_unavailable",
               "relay_incompatible",
+              "preflight_blocked",
               "structured_output_invalid",
               "stage_validation_failed",
               "content_review_rejected",
@@ -1779,7 +1780,8 @@
               "run_timeout",
               "relay_interruption",
               "content_rejected",
-              "episode_error"
+              "episode_error",
+              "context_budget"
             ],
             "title": "Code",
             "default": "run_timeout"
@@ -1872,7 +1874,8 @@
               "run_timeout",
               "relay_interruption",
               "content_rejected",
-              "episode_error"
+              "episode_error",
+              "context_budget"
             ],
             "title": "Recovery Reason"
           },
@@ -1888,6 +1891,13 @@
                 "type": "null"
               }
             ]
+          },
+          "model_calls": {
+            "items": {
+              "$ref": "#/components/schemas/ModelCallSummary"
+            },
+            "type": "array",
+            "title": "Model Calls"
           },
           "can_continue": {
             "type": "boolean",
@@ -2449,6 +2459,312 @@
           "completed"
         ],
         "title": "EpisodeProgress"
+      },
+      "ModelCallUsage": {
+        "properties": {
+          "input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Tokens"
+          },
+          "cache_read_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Read Tokens"
+          },
+          "cache_creation_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Creation Tokens"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "reported",
+              "partial",
+              "unavailable"
+            ],
+            "title": "Status"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "ModelCallUsage"
+      },
+      "ModelCallSummary": {
+        "properties": {
+          "call_id": {
+            "type": "string",
+            "title": "Call Id"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "generation",
+              "review"
+            ],
+            "title": "Role"
+          },
+          "adapter": {
+            "type": "string",
+            "title": "Adapter"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
+          "episode_number": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Episode Number"
+          },
+          "candidate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate"
+          },
+          "batch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Batch"
+          },
+          "requested_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Requested At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "estimated_input_tokens": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Estimated Input Tokens"
+          },
+          "estimated_output_tokens": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Estimated Output Tokens"
+          },
+          "estimated_total_tokens": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Estimated Total Tokens"
+          },
+          "verified_limit_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verified Limit Tokens"
+          },
+          "preflight": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "blocked"
+            ],
+            "title": "Preflight"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "started",
+              "succeeded",
+              "failed",
+              "timed_out",
+              "stale",
+              "superseded",
+              "preflight_blocked"
+            ],
+            "title": "Status"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/ModelCallUsage"
+          },
+          "finish_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finish Reason"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "success",
+              "failure",
+              "timeout",
+              "stale",
+              "superseded",
+              "blocked",
+              "incomplete"
+            ],
+            "title": "Outcome"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Type"
+          },
+          "safe_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Safe Message"
+          },
+          "supersedes_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Call Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "call_id",
+          "role",
+          "adapter",
+          "provider",
+          "model",
+          "requested_at",
+          "estimated_input_tokens",
+          "estimated_output_tokens",
+          "estimated_total_tokens",
+          "preflight",
+          "status",
+          "usage",
+          "outcome"
+        ],
+        "title": "ModelCallSummary"
       }
     }
   },

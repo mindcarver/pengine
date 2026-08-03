@@ -16,11 +16,23 @@ from langchain_core.outputs import LLMResult
 from langchain_deepseek import ChatDeepSeek
 
 from pengine.config import Settings
+from pengine.model_calls import (
+    ModelCallContext,
+    ModelCallRecord,
+    ModelCallState,
+    build_started_record,
+    estimate_messages_tokens,
+    estimate_tools_tokens,
+    extract_provider_usage,
+    usage_status_from,
+)
 
 _AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 # Uvicorn owns the runtime log handlers. This child logger keeps the safe model-call
 # audit at INFO while ensuring it reaches the same server evidence stream.
 _MODEL_CALL_LOGGER = logging.getLogger("uvicorn.error.pengine.model_calls")
+# Durable structured record lines that carry estimate/actual/duration/finish/outcome.
+_MODEL_CALL_RECORD_LOGGER = logging.getLogger("uvicorn.error.pengine.model_call_records")
 ModelRole = Literal["generation", "review"]
 
 
@@ -44,13 +56,38 @@ class _SerialChatDeepSeek(ChatDeepSeek):
         return super().bind_tools(tools, **kwargs)
 
 
-@dataclass(frozen=True, slots=True)
 class _ModelCallAuditHandler(BaseCallbackHandler):
+    """Preflight + durable audit at the common outbound model-call boundary.
+
+    ``on_chat_model_start`` estimates the exact serialized request plus reserved output
+    against the verified route capacity and raises :class:`PreflightBlockedError` when
+    the request cannot fit, so no provider request is dispatched. Every attempted call
+    is recorded (estimate, actual-or-unavailable usage, duration, finish reason,
+    outcome, lineage) to the shared :class:`ModelCallState` store and structured logs.
+    """
+
     raise_error = True
     run_inline = True
 
-    role: ModelRole
-    model_id: str
+    def __init__(
+        self,
+        *,
+        role: ModelRole,
+        model_id: str,
+        adapter: str = "",
+        provider: str = "",
+        model_call_state: ModelCallState | None = None,
+        context_limit_tokens: int | None = None,
+        reserved_output_tokens: int = 0,
+    ) -> None:
+        self.role = role
+        self.model_id = model_id
+        self.adapter = adapter
+        self.provider = provider
+        self.state = model_call_state
+        self.context_limit_tokens = context_limit_tokens
+        self.reserved_output_tokens = reserved_output_tokens
+        self._pending: dict[UUID, ModelCallRecord] = {}
 
     def on_chat_model_start(
         self,
@@ -60,18 +97,82 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         run_id: UUID,
         **kwargs: Any,
     ) -> None:
-        del serialized, messages, kwargs
+        message_batch = messages[0] if messages else []
+        context = self.state.context if self.state is not None else ModelCallContext()
+        estimated_input = estimate_messages_tokens(message_batch)
+        estimated_input += estimate_tools_tokens(_extract_tools(serialized, kwargs))
+        estimated_total = estimated_input + self.reserved_output_tokens
+        record = build_started_record(
+            role=self.role,
+            adapter=self.adapter,
+            provider=self.provider,
+            model=self.model_id,
+            context=context,
+            estimated_input_tokens=estimated_input,
+            estimated_output_tokens=self.reserved_output_tokens,
+            verified_limit_tokens=self.context_limit_tokens,
+        )
+        blocked = self.context_limit_tokens is None or estimated_total > self.context_limit_tokens
+        if blocked:
+            record.preflight = "blocked"
+            record.status = "preflight_blocked"
+            record.outcome = "blocked"
+            record.finished_at = _utc_now().isoformat()
+            record.duration_seconds = 0.0
+            self._persist(record)
+            _MODEL_CALL_LOGGER.info(
+                "model_call event=error role=%s requested_model_id=%s call_id=%s "
+                "error_type=preflight_blocked http_status=none "
+                "estimated_total_tokens=%s verified_limit_tokens=%s",
+                self.role,
+                self.model_id,
+                run_id,
+                estimated_total,
+                self.context_limit_tokens,
+            )
+            raise PreflightBlockedError(
+                role=self.role,
+                model_id=self.model_id,
+                stage=context.stage,
+                episode_number=context.episode_number,
+                required_tokens=estimated_total,
+                verified_limit_tokens=self.context_limit_tokens,
+            )
+        self._pending[run_id] = record
+        # Supersede any prior still-started call for this run/role BEFORE persisting
+        # the current record, so the current in-flight call is never self-superseded.
+        if self.state is not None and self.state.store is not None and context.run_id is not None:
+            self.state.store.mark_superseded_pending(run_id=context.run_id, role=self.role)
+        self._persist(record)
         _MODEL_CALL_LOGGER.info(
-            "model_call event=start role=%s requested_model_id=%s call_id=%s",
+            "model_call event=start role=%s requested_model_id=%s call_id=%s "
+            "stage=%s episode=%s estimated_input_tokens=%s estimated_output_tokens=%s",
             self.role,
             self.model_id,
             run_id,
+            context.stage,
+            context.episode_number,
+            estimated_input,
+            self.reserved_output_tokens,
         )
 
     def on_llm_end(self, response: LLMResult, *, run_id: UUID, **kwargs: Any) -> None:
         del kwargs
+        record = self._pending.pop(run_id, None)
         response_model_ids = _response_model_ids(response)
+        tokens, finish_reason = extract_provider_usage(response)
         if response_model_ids != {self.model_id}:
+            if record is not None:
+                self._finalize(
+                    record,
+                    status="failed",
+                    outcome="failure",
+                    tokens=tokens,
+                    finish_reason=finish_reason,
+                    error_code="relay_incompatible",
+                    error_type="RelayError",
+                    safe_message="The relay returned an unexpected model for the configured role.",
+                )
             _MODEL_CALL_LOGGER.error(
                 "model_call event=identity_mismatch role=%s requested_model_id=%s "
                 "response_model_ids=%s call_id=%s",
@@ -84,16 +185,44 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 code="relay_incompatible",
                 safe_message="The relay returned an unexpected model for the configured role.",
             )
+        if record is not None:
+            self._finalize(
+                record,
+                status="succeeded",
+                outcome="success",
+                tokens=tokens,
+                finish_reason=finish_reason,
+            )
         _MODEL_CALL_LOGGER.info(
-            "model_call event=end role=%s requested_model_id=%s response_model_id=%s call_id=%s",
+            "model_call event=end role=%s requested_model_id=%s response_model_id=%s "
+            "call_id=%s usage_status=%s finish_reason=%s",
             self.role,
             self.model_id,
             self.model_id,
             run_id,
+            usage_status_from(tokens) if record is not None else "unavailable",
+            finish_reason,
         )
 
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         del kwargs
+        record = self._pending.pop(run_id, None)
+        if record is not None:
+            timed_out = isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower()
+            self._finalize(
+                record,
+                status="timed_out" if timed_out else "failed",
+                outcome="timeout" if timed_out else "failure",
+                tokens={
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "cache_read_tokens": None,
+                    "cache_creation_tokens": None,
+                },
+                finish_reason="timeout" if timed_out else None,
+                error_code="relay_timeout" if timed_out else "relay_error",
+                error_type=type(error).__name__,
+            )
         _MODEL_CALL_LOGGER.warning(
             "model_call event=error role=%s requested_model_id=%s call_id=%s "
             "error_type=%s http_status=%s",
@@ -103,6 +232,103 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             type(error).__name__,
             _safe_http_status(error) or "none",
         )
+
+    def _persist(self, record: ModelCallRecord) -> None:
+        if self.state is not None and self.state.store is not None:
+            self.state.store.upsert(record)
+        self._log_record(record)
+
+    def _finalize(
+        self,
+        record: ModelCallRecord,
+        *,
+        status: str,
+        outcome: str,
+        tokens: dict[str, int | None],
+        finish_reason: str | None,
+        error_code: str | None = None,
+        error_type: str | None = None,
+        safe_message: str | None = None,
+    ) -> None:
+        now = _utc_now()
+        record.status = status  # type: ignore[assignment]
+        record.outcome = outcome  # type: ignore[assignment]
+        record.finished_at = now.isoformat()
+        if record.requested_at:
+            try:
+                started = datetime.fromisoformat(record.requested_at)
+            except ValueError:
+                started = now
+            record.duration_seconds = max(0.0, (now - started).total_seconds())
+        else:
+            record.duration_seconds = 0.0
+        record.actual_input_tokens = tokens["input_tokens"]
+        record.actual_output_tokens = tokens["output_tokens"]
+        record.cache_read_tokens = tokens["cache_read_tokens"]
+        record.cache_creation_tokens = tokens["cache_creation_tokens"]
+        record.usage_status = usage_status_from(tokens)
+        record.finish_reason = finish_reason
+        record.error_code = error_code
+        record.error_type = error_type
+        record.safe_message = safe_message
+        self._persist(record)
+
+    def _log_record(self, record: ModelCallRecord) -> None:
+        _MODEL_CALL_RECORD_LOGGER.info(
+            "model_call_record call_id=%s role=%s adapter=%s provider=%s model=%s "
+            "stage=%s episode=%s status=%s preflight=%s estimated_input_tokens=%s "
+            "estimated_output_tokens=%s estimated_total_tokens=%s verified_limit_tokens=%s "
+            "usage_status=%s actual_input_tokens=%s actual_output_tokens=%s "
+            "cache_read_tokens=%s cache_creation_tokens=%s duration_ms=%s "
+            "finish_reason=%s outcome=%s error_code=%s error_type=%s supersedes_call_id=%s",
+            record.call_id,
+            record.role,
+            record.adapter,
+            record.provider,
+            record.model,
+            record.stage,
+            record.episode_number,
+            record.status,
+            record.preflight,
+            record.estimated_input_tokens,
+            record.estimated_output_tokens,
+            record.estimated_total_tokens,
+            record.verified_limit_tokens,
+            record.usage_status,
+            record.actual_input_tokens,
+            record.actual_output_tokens,
+            record.cache_read_tokens,
+            record.cache_creation_tokens,
+            None if record.duration_seconds is None else round(record.duration_seconds * 1000),
+            record.finish_reason,
+            record.outcome,
+            record.error_code,
+            record.error_type,
+            record.supersedes_call_id,
+        )
+
+
+def _extract_tools(serialized: dict[str, Any], kwargs: dict[str, Any]) -> list[Any]:
+    # The bound tool/schema definitions ride in invocation_params (and the serialized
+    # model config) rather than in the message batch, so preflight pulls them from here
+    # to count tool/schema overhead against the verified context limit.
+    tools: list[Any] = []
+    for source in (kwargs, serialized):
+        if not isinstance(source, dict):
+            continue
+        invocation = source.get("invocation_params")
+        if isinstance(invocation, dict):
+            candidate = invocation.get("tools")
+            if isinstance(candidate, list):
+                tools.extend(candidate)
+        candidate = source.get("tools")
+        if isinstance(candidate, list):
+            tools.extend(candidate)
+    return tools
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _response_model_ids(response: LLMResult) -> set[str]:
@@ -143,21 +369,57 @@ class RelayAdapter:
     role: ModelRole
     model_id: str
     provider_profile_key: str
+    model_call_state: ModelCallState | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class RelayRoutes:
     generation: RelayAdapter
     review: RelayAdapter
+    model_call_state: ModelCallState | None = None
 
 
 @dataclass(slots=True)
 class RelayError(Exception):
-    code: Literal["relay_unavailable", "relay_incompatible"]
+    code: Literal["relay_unavailable", "relay_incompatible", "preflight_blocked"]
     safe_message: str
 
     def __str__(self) -> str:
         return self.safe_message
+
+
+class PreflightBlockedError(RelayError):
+    """Fail-closed result when the serialized request cannot fit the verified route."""
+
+    def __init__(
+        self,
+        *,
+        role: ModelRole,
+        model_id: str,
+        stage: str | None,
+        episode_number: int | None,
+        required_tokens: int,
+        verified_limit_tokens: int | None,
+    ) -> None:
+        self.stage = stage
+        self.episode_number = episode_number
+        self.required_tokens = required_tokens
+        self.verified_limit_tokens = verified_limit_tokens
+        self.model_id = model_id
+        limit_text = (
+            str(verified_limit_tokens)
+            if verified_limit_tokens is not None
+            else "unverified (no trustworthy verified limit)"
+        )
+        super().__init__(
+            code="preflight_blocked",
+            safe_message=(
+                f"The {role} model request needs about {required_tokens} tokens "
+                f"(input plus reserved output), but the verified context limit for "
+                f"{model_id} is {limit_text}. No request was sent; the current run "
+                "paused without changing approved work."
+            ),
+        )
 
 
 MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -169,30 +431,57 @@ class RetryableRelayInterruption:
     retry_delay_seconds: int
 
 
-def build_relay_routes(settings: Settings) -> RelayRoutes:
+def build_relay_routes(
+    settings: Settings,
+    *,
+    model_call_state: ModelCallState | None = None,
+) -> RelayRoutes:
     if not settings.relay_configured:
         raise RelayError(
             code="relay_unavailable",
             safe_message="Both generation and review model routes must be configured.",
         )
+    if model_call_state is None:
+        model_call_state = ModelCallState()
     return RelayRoutes(
-        generation=build_relay_adapter(settings, role="generation"),
-        review=build_relay_adapter(settings, role="review"),
+        generation=build_relay_adapter(
+            settings,
+            role="generation",
+            model_call_state=model_call_state,
+        ),
+        review=build_relay_adapter(
+            settings,
+            role="review",
+            model_call_state=model_call_state,
+        ),
+        model_call_state=model_call_state,
     )
 
 
-def build_relay_adapter(settings: Settings, *, role: ModelRole) -> RelayAdapter:
+def build_relay_adapter(
+    settings: Settings,
+    *,
+    role: ModelRole,
+    model_call_state: ModelCallState | None = None,
+) -> RelayAdapter:
     if role == "generation":
         model_id = settings.generation_model_id
         max_output_tokens = settings.generation_max_output_tokens
+        context_limit_tokens = settings.generation_context_limit_tokens
+        provider_profile_key = "anthropic"
     else:
         model_id = settings.review_model_id
         max_output_tokens = settings.review_max_output_tokens
+        context_limit_tokens = settings.review_context_limit_tokens
+        provider_profile_key = "deepseek"
     if not settings.relay_base_url or not settings.relay_api_key or not model_id:
         raise RelayError(
             code="relay_unavailable",
             safe_message=f"The {role} model route is not configured.",
         )
+    if model_call_state is None:
+        model_call_state = ModelCallState()
+    reserved_output_tokens = max_output_tokens or 0
 
     common = {
         "model": model_id,
@@ -201,7 +490,17 @@ def build_relay_adapter(settings: Settings, *, role: ModelRole) -> RelayAdapter:
         "max_retries": 0,
         "timeout": settings.model_timeout_seconds,
         "temperature": 0,
-        "callbacks": [_ModelCallAuditHandler(role=role, model_id=model_id)],
+        "callbacks": [
+            _ModelCallAuditHandler(
+                role=role,
+                model_id=model_id,
+                adapter=provider_profile_key,
+                provider=provider_profile_key,
+                model_call_state=model_call_state,
+                context_limit_tokens=context_limit_tokens,
+                reserved_output_tokens=reserved_output_tokens,
+            )
+        ],
     }
     if role == "review":
         return RelayAdapter(
@@ -212,7 +511,8 @@ def build_relay_adapter(settings: Settings, *, role: ModelRole) -> RelayAdapter:
             ),
             role=role,
             model_id=model_id,
-            provider_profile_key="deepseek",
+            provider_profile_key=provider_profile_key,
+            model_call_state=model_call_state,
         )
     return RelayAdapter(
         model=_SerialChatAnthropic(
@@ -221,7 +521,8 @@ def build_relay_adapter(settings: Settings, *, role: ModelRole) -> RelayAdapter:
         ),
         role=role,
         model_id=model_id,
-        provider_profile_key="anthropic",
+        provider_profile_key=provider_profile_key,
+        model_call_state=model_call_state,
     )
 
 
