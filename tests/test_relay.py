@@ -257,14 +257,118 @@ def test_missing_relay_configuration_is_safe(monkeypatch) -> None:
         raise AssertionError("Expected missing relay configuration to fail")
 
 
+def _openai_bad_request(
+    *,
+    message: str,
+    code: str | None = None,
+) -> openai.BadRequestError:
+    request = httpx.Request("POST", "https://relay.example/v1/chat/completions")
+    body: dict[str, object] = {
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+        }
+    }
+    if code is not None:
+        body["error"]["code"] = code  # type: ignore[index]
+    response = httpx.Response(400, request=request, json=body)
+    return openai.BadRequestError(message, response=response, body=body)
+
+
+def test_classify_relay_exception_400_content_rejection_is_not_tool_protocol() -> None:
+    """A provider 400 that rejects the *request content* must not be labeled as a
+    tool-protocol incompatibility (Issue #52 graph revision 4 defect 1)."""
+    error = _openai_bad_request(
+        message="this model's maximum context length is 32768 tokens; you requested 52000 tokens",
+        code="context_length_exceeded",
+    )
+
+    mapped = classify_relay_exception(error)
+
+    assert mapped.http_status == 400
+    assert mapped.provider_error_code == "context_length_exceeded"
+    assert mapped.code == "relay_rejected"
+    assert "unsupported tool protocol" not in mapped.safe_message
+    assert "400" in mapped.safe_message
+    assert "context length" in mapped.safe_message
+    assert "secret" not in mapped.safe_message
+
+
+def test_classify_relay_exception_400_tool_protocol_keeps_incompatible() -> None:
+    """A provider 400 that does reject the tool protocol stays relay_incompatible,
+    but now carries the precise status and truthful provider detail."""
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    body = {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "tool_use blocks are not supported"},
+    }
+    response = httpx.Response(400, request=request, json=body)
+    error = anthropic.BadRequestError("bad", response=response, body=body)
+
+    mapped = classify_relay_exception(error)
+
+    assert mapped.http_status == 400
+    assert mapped.code == "relay_incompatible"
+    assert "tool" in mapped.safe_message
+    assert "400" in mapped.safe_message
+
+
+def test_classify_relay_exception_401_keeps_precise_status_and_message() -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    body = {
+        "type": "error",
+        "error": {"type": "authentication_error", "message": "invalid x-api-key"},
+    }
+    response = httpx.Response(401, request=request, json=body)
+    error = anthropic.AuthenticationError("invalid x-api-key", response=response, body=body)
+
+    mapped = classify_relay_exception(error)
+
+    assert mapped.http_status == 401
+    assert mapped.code == "relay_unavailable"
+    assert "401" in mapped.safe_message
+
+
+def test_classify_relay_exception_500_carries_precise_status_and_evidence() -> None:
+    """Non-retryable 5xx responses stay relay_unavailable but still expose the exact
+    status and redacted provider detail so the external block stays distinguishable."""
+    request = httpx.Request("POST", "https://relay.example/v1/chat/completions")
+    body = {"error": {"message": "upstream storage error", "type": "server_error"}}
+    response = httpx.Response(500, request=request, json=body)
+    error = openai.InternalServerError("upstream storage error", response=response, body=body)
+
+    mapped = classify_relay_exception(error)
+
+    assert mapped.http_status == 500
+    assert mapped.code == "relay_unavailable"
+    assert "500" in mapped.safe_message
+    assert "storage error" in mapped.safe_message
+
+
+def test_classify_relay_exception_400_redacts_provider_body() -> None:
+    error = _openai_bad_request(
+        message="rejected with sk-abc123456789abcdefg token material",
+    )
+
+    mapped = classify_relay_exception(error)
+
+    assert mapped.http_status == 400
+    assert mapped.redacted_body is not None
+    assert "sk-abc123456789abcdefg" not in mapped.redacted_body
+    assert "sk-***" in mapped.redacted_body
+
+
 def test_exception_mapping_does_not_echo_provider_body() -> None:
-    class BadRequestError(Exception):
+    class BareBadRequestError(Exception):
         pass
 
     raw = "vendor body with api-key=secret-value and full prompt"
-    mapped = classify_relay_exception(BadRequestError(raw))
+    mapped = classify_relay_exception(BareBadRequestError(raw))
 
-    assert mapped.code == "relay_incompatible"
+    # A bare error without a precise HTTP status must not be heuristically
+    # labeled a tool-protocol incompatibility (Issue #52 graph revision 4 defect 1).
+    assert mapped.code != "relay_incompatible"
+    assert mapped.http_status is None
     assert raw not in mapped.safe_message
     assert "secret-value" not in mapped.safe_message
 

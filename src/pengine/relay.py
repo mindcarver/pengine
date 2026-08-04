@@ -1,7 +1,10 @@
 import asyncio
 import concurrent.futures
+import json
 import logging
+import re
 import ssl
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -258,6 +261,8 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         del kwargs
         record = self._pending.pop(run_id, None)
+        failure = _extract_provider_failure(error)
+        http_status = failure.http_status if failure is not None else None
         if record is not None:
             timed_out = isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower()
             self._finalize(
@@ -273,15 +278,21 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 finish_reason="timeout" if timed_out else None,
                 error_code="relay_timeout" if timed_out else "relay_error",
                 error_type=type(error).__name__,
+                http_status=http_status,
+                provider_error_code=(failure.provider_code if failure is not None else None),
+                redacted_body=(failure.redacted_body if failure is not None else None),
             )
+        redacted = failure.redacted_body if failure is not None else None
         _MODEL_CALL_LOGGER.warning(
             "model_call event=error role=%s requested_model_id=%s call_id=%s "
-            "error_type=%s http_status=%s",
+            "error_type=%s http_status=%s provider_error_code=%s redacted_response=%s",
             self.role,
             self.model_id,
             run_id,
             type(error).__name__,
-            _safe_http_status(error) or "none",
+            http_status if http_status is not None else "none",
+            (failure.provider_code if failure is not None else "none"),
+            _truncate(redacted, 300) if redacted else "none",
         )
 
     def _persist(self, record: ModelCallRecord) -> None:
@@ -300,6 +311,9 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         error_code: str | None = None,
         error_type: str | None = None,
         safe_message: str | None = None,
+        http_status: int | None = None,
+        provider_error_code: str | None = None,
+        redacted_body: str | None = None,
     ) -> None:
         now = _utc_now()
         record.status = status  # type: ignore[assignment]
@@ -322,6 +336,9 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         record.error_code = error_code
         record.error_type = error_type
         record.safe_message = safe_message
+        record.http_status = http_status
+        record.provider_error_code = provider_error_code
+        record.redacted_response = redacted_body
         self._persist(record)
 
     def _log_record(self, record: ModelCallRecord) -> None:
@@ -402,16 +419,222 @@ def _response_model_ids(response: LLMResult) -> set[str]:
     return model_ids
 
 
-def _safe_http_status(error: BaseException) -> int | None:
+@dataclass(frozen=True, slots=True)
+class _ProviderFailure:
+    """Precise provider failure signal extracted from an exception and its cause chain.
+
+    ``detail`` is the provider's own error message (pre-redaction, used only for
+    classification); ``raw_body`` is the full response body before redaction. Both stay
+    internal: anything surfaced through :class:`RelayError` is redacted and truncated.
+    """
+
+    http_status: int | None
+    provider_code: str | None
+    detail: str
+    raw_body: str | None
+
+    @property
+    def redacted_body(self) -> str | None:
+        if self.raw_body is None:
+            return None
+        return redact_provider_response(self.raw_body)
+
+
+_SECRET_KEY_NAME = re.compile(
+    r"^(?:api[_-]?key|apikey|authorization|x-api-key|access[_-]?token|"
+    r"refresh[_-]?token|bearer|secret|password|token|key)$",
+    re.IGNORECASE,
+)
+_SK_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
+_BEARER_TOKEN = re.compile(r"\bBearer [A-Za-z0-9._~+/=\-]+")
+_SECRET_KEY_PAIR = re.compile(
+    r"([\"']?(?:api[_-]?key|apikey|authorization|access[_-]?token|"
+    r"refresh[_-]?token|secret|password)[\"']?\s*[:=]\s*)([\"'][^\"']*[\"']|\S+)",
+    re.IGNORECASE,
+)
+# Known operator secrets (the configured relay API key) are masked exactly anywhere a
+# provider response echoes them back. Registration is thread-safe; extra masks are
+# harmless, so tests may register their own probe secrets.
+_REDACTION_SECRETS: set[str] = set()
+_REDACTION_SECRETS_LOCK = threading.Lock()
+
+
+def register_redaction_secret(secret: Any) -> None:
+    """Register an exact credential value that must never persist in provider evidence.
+
+    Accepts either a plain string or a pydantic ``SecretStr`` (the configured relay key
+    arrives as ``SecretStr``); only strings of at least 6 characters are registered.
+    """
+    if not isinstance(secret, str):
+        reveal = getattr(secret, "get_secret_value", None)
+        if callable(reveal):
+            secret = reveal()
+    if not isinstance(secret, str) or not secret or len(secret) < 6:
+        return
+    with _REDACTION_SECRETS_LOCK:
+        _REDACTION_SECRETS.add(secret)
+
+
+def _mask_known_secrets(text: str) -> str:
+    with _REDACTION_SECRETS_LOCK:
+        secrets = tuple(_REDACTION_SECRETS)
+    for secret in secrets:
+        if secret in text:
+            text = text.replace(secret, "***")
+    return text
+
+
+def redact_provider_response(text: str | None) -> str | None:
+    """Return a credential-safe copy of a provider response body.
+
+    JSON bodies are redacted structurally (secret-named keys become ``***``, secret
+    token patterns inside text are masked); non-JSON text is scrubbed with the same
+    token patterns. Known operator secrets (the configured relay API key) are masked
+    exactly. This keeps provider failure evidence durable and queryable while never
+    persisting keys or bearer tokens (Issue #52).
+    """
+    if not text:
+        return text
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return _redact_text(text)
+    try:
+        return json.dumps(_redact_value(payload), ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return _redact_text(text)
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: "***" if _SECRET_KEY_NAME.fullmatch(key) else _redact_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
+
+def _redact_text(text: str) -> str:
+    text = _mask_known_secrets(text)
+    text = _SK_TOKEN.sub("sk-***", text)
+    text = _BEARER_TOKEN.sub("Bearer ***", text)
+    text = _SECRET_KEY_PAIR.sub(r"\1***", text)
+    return text
+
+
+def _raw_body_from(candidate: BaseException) -> str | None:
+    body = getattr(candidate, "body", None)
+    if isinstance(body, (dict, list)):
+        try:
+            return json.dumps(body, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return repr(body)
+    if isinstance(body, str) and body:
+        return body
+    response = getattr(candidate, "response", None)
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text:
+        return text
+    return None
+
+
+def _provider_error_code_from(candidate: BaseException, raw_body: str | None) -> str | None:
+    if raw_body is not None:
+        try:
+            parsed = json.loads(raw_body)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            error = parsed.get("error")
+            if isinstance(error, dict):
+                for key in ("code", "type"):
+                    value = error.get(key)
+                    if isinstance(value, str) and value:
+                        return value
+    for attr in ("code", "type"):
+        value = getattr(candidate, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _detail_from(candidate: BaseException, raw_body: str | None) -> str:
+    if raw_body is not None:
+        try:
+            parsed = json.loads(raw_body)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            error = parsed.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message:
+                    return message.strip()
+            message = parsed.get("message")
+            if isinstance(message, str) and message:
+                return message.strip()
+    message = getattr(candidate, "message", None)
+    if isinstance(message, str) and message:
+        return message.strip()
+    text = str(candidate)
+    return text.strip() if text and text != "()" else ""
+
+
+def _extract_provider_failure(error: BaseException) -> _ProviderFailure | None:
     for candidate in (error, *_cause_chain(error)):
         status = getattr(candidate, "status_code", None)
-        if isinstance(status, int):
-            return status
-        response = getattr(candidate, "response", None)
-        response_status = getattr(response, "status_code", None)
-        if isinstance(response_status, int):
-            return response_status
+        if not isinstance(status, int):
+            response = getattr(candidate, "response", None)
+            status = getattr(response, "status_code", None)
+            if not isinstance(status, int):
+                continue
+        raw_body = _raw_body_from(candidate)
+        return _ProviderFailure(
+            http_status=status,
+            provider_code=_provider_error_code_from(candidate, raw_body),
+            detail=_detail_from(candidate, raw_body),
+            raw_body=raw_body,
+        )
     return None
+
+
+_PROVIDER_EVIDENCE_MAX_CHARS = 400
+
+
+def _provider_evidence(failure: _ProviderFailure | None) -> str:
+    if failure is None:
+        return "no provider detail available"
+    redacted = failure.redacted_body
+    if redacted:
+        return _truncate(redacted, _PROVIDER_EVIDENCE_MAX_CHARS)
+    detail = failure.detail
+    if detail:
+        return _truncate(redact_provider_response(detail) or "", _PROVIDER_EVIDENCE_MAX_CHARS)
+    return "no provider detail available"
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
+
+
+# Tool/function protocol rejection, not arbitrary request-content rejection. The
+# pattern requires an explicit "not supported"-style signal near tool language, so
+# ordinary 400s (context length, content policy, malformed input) stay classified as
+# request rejection instead of a protocol mismatch (Issue #52 graph revision 4).
+_TOOL_PROTOCOL_REJECTION = re.compile(
+    r"\b(?:tool|tools|tool_use|tool_calls|function|functions|function_call|"
+    r"structured output)\b.{0,80}\b(?:not supported|unsupported|does not support|"
+    r"not allowed|not available|unavailable|disabled)\b"
+    r"|\b(?:not supported|unsupported|does not support|not allowed)\b.{0,60}\b(?:tool|tools|"
+    r"tool_use|tool_calls|function|functions|function_call)\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,8 +655,11 @@ class RelayRoutes:
 
 @dataclass(slots=True)
 class RelayError(Exception):
-    code: Literal["relay_unavailable", "relay_incompatible", "preflight_blocked"]
+    code: Literal["relay_unavailable", "relay_incompatible", "relay_rejected", "preflight_blocked"]
     safe_message: str
+    http_status: int | None = None
+    provider_error_code: str | None = None
+    redacted_body: str | None = None
 
     def __str__(self) -> str:
         return self.safe_message
@@ -533,6 +759,9 @@ def build_relay_adapter(
     if model_call_state is None:
         model_call_state = ModelCallState()
     reserved_output_tokens = max_output_tokens or 0
+    # The operator's relay key is an exact credential that must never survive in
+    # durable provider-error evidence, even if the relay echoes it in an error body.
+    register_redaction_secret(settings.relay_api_key)
 
     common = {
         "model": model_id,
@@ -599,8 +828,58 @@ def is_relay_connection_error(exc: BaseException) -> bool:
 
 
 def classify_relay_exception(exc: Exception) -> RelayError:
+    """Classify a relay failure from precise provider evidence, never type-name heuristics.
+
+    An explicit HTTP status carries the real semantics: 400 content rejection maps to
+    ``relay_rejected``, a 400 tool-protocol rejection stays ``relay_incompatible``,
+    and auth/other terminal statuses map to ``relay_unavailable``. Every surfaced
+    message reflects the provider's own (redacted, truncated) response so the external
+    block root cause stays distinguishable (Issue #52 graph revision 4). Recovery
+    semantics are unchanged: these statuses are terminal, never retryable.
+    """
+    failure = _extract_provider_failure(exc)
+    status = failure.http_status if failure is not None else None
+    if status is not None:
+        evidence = _provider_evidence(failure)
+        if (
+            status == 400
+            and failure is not None
+            and _TOOL_PROTOCOL_REJECTION.search(failure.detail)
+        ):
+            return RelayError(
+                code="relay_incompatible",
+                safe_message=(
+                    "The model relay rejected the tool request (HTTP 400): the provider "
+                    "does not support the required tool protocol. "
+                    f"Provider response: {evidence}"
+                ),
+                http_status=status,
+                provider_error_code=failure.provider_code,
+                redacted_body=failure.redacted_body,
+            )
+        if status == 400:
+            return RelayError(
+                code="relay_rejected",
+                safe_message=(
+                    "The model relay rejected the request (HTTP 400): the provider "
+                    "response indicates a request-content problem, not a protocol "
+                    f"mismatch. Provider response: {evidence}"
+                ),
+                http_status=status,
+                provider_error_code=failure.provider_code,
+                redacted_body=failure.redacted_body,
+            )
+        return RelayError(
+            code="relay_unavailable",
+            safe_message=(
+                f"The model relay request failed (HTTP {status}). Provider response: {evidence}"
+            ),
+            http_status=status,
+            provider_error_code=failure.provider_code,
+            redacted_body=failure.redacted_body,
+        )
     type_name = type(exc).__name__.lower()
-    if any(token in type_name for token in ("badrequest", "tool", "structured")):
+    if any(token in type_name for token in ("tool", "structured")):
         return RelayError(
             code="relay_incompatible",
             safe_message="The model relay does not support the required tool protocol.",

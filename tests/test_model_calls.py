@@ -11,7 +11,10 @@ import re
 import sqlite3
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+import httpx
+import openai
 import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
@@ -475,4 +478,144 @@ def test_model_call_id_is_unique_and_lineaged(tmp_path: Path) -> None:
     assert row["run_kind"] == "initial"
     assert row["stage"] == "generating_episode_scripts"
     assert row["episode_number"] == 3
+    store.close()
+
+
+_LEGACY_MODEL_CALLS_TABLE_SQL = """
+CREATE TABLE model_calls (
+    call_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    creation_id TEXT,
+    thread_id TEXT,
+    run_kind TEXT,
+    role TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    stage TEXT,
+    episode_number INTEGER,
+    candidate TEXT,
+    batch TEXT,
+    requested_at TEXT NOT NULL,
+    finished_at TEXT,
+    duration_seconds REAL,
+    estimated_input_tokens INTEGER NOT NULL CHECK (estimated_input_tokens >= 0),
+    estimated_output_tokens INTEGER NOT NULL CHECK (estimated_output_tokens >= 0),
+    estimated_total_tokens INTEGER NOT NULL CHECK (estimated_total_tokens >= 0),
+    verified_limit_tokens INTEGER,
+    preflight TEXT NOT NULL CHECK (preflight IN ('ok', 'blocked')),
+    status TEXT NOT NULL,
+    usage_status TEXT NOT NULL CHECK (usage_status IN ('reported', 'partial', 'unavailable')),
+    actual_input_tokens INTEGER,
+    actual_output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_creation_tokens INTEGER,
+    finish_reason TEXT,
+    outcome TEXT NOT NULL,
+    error_code TEXT,
+    error_type TEXT,
+    safe_message TEXT,
+    supersedes_call_id TEXT
+);
+"""
+
+
+def test_store_migrates_legacy_table_without_provider_evidence_columns(
+    tmp_path: Path,
+) -> None:
+    """An existing model_calls table without the provider-evidence columns must be
+    upgraded in place so evidence persistence works on real databases (Issue #52)."""
+    db_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(_LEGACY_MODEL_CALLS_TABLE_SQL)
+        connection.execute(
+            "INSERT INTO model_calls (call_id, role, adapter, provider, model, "
+            "requested_at, estimated_input_tokens, estimated_output_tokens, "
+            "estimated_total_tokens, preflight, status, usage_status, outcome) "
+            "VALUES ('legacy-1', 'review', 'deepseek', 'deepseek', 'deepseek-v4-flash', "
+            "'2026-08-01T00:00:00+00:00', 1, 1, 2, 'ok', 'failed', 'unavailable', 'failure')"
+        )
+
+    store = ModelCallStore(db_path)
+
+    record = build_started_record(
+        role="review",
+        adapter="deepseek",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        context=ModelCallContext(run_id="run-migrated", stage="generating_story_outline"),
+        estimated_input_tokens=10,
+        estimated_output_tokens=100,
+        verified_limit_tokens=200_000,
+    )
+    store.upsert(record)
+
+    rows = store._connection.execute(
+        "SELECT call_id, http_status, provider_error_code, redacted_response "
+        "FROM model_calls ORDER BY requested_at"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["call_id"] == "legacy-1"
+    assert rows[0]["http_status"] is None
+    assert rows[0]["provider_error_code"] is None
+    assert rows[0]["redacted_response"] is None
+    assert rows[1]["call_id"] != "legacy-1"
+    assert rows[1]["http_status"] is None
+    assert rows[1]["provider_error_code"] is None
+    assert rows[1]["redacted_response"] is None
+    store.close()
+
+
+def test_on_llm_error_persists_redacted_provider_400_evidence(tmp_path: Path) -> None:
+    """A failed provider response (status + redacted body) must be durable and
+    retrievable from the model_calls table, without leaking credentials (Issue #52)."""
+    from pengine.relay import _ModelCallAuditHandler, register_redaction_secret
+
+    register_redaction_secret("secret-value")
+
+    store = ModelCallStore(tmp_path / "model_calls.sqlite3")
+    state = ModelCallState(store=store)
+    state.context.run_id = "run-provider-400"
+    state.context.stage = "generating_story_outline"
+    handler = _ModelCallAuditHandler(
+        role="review",
+        model_id="deepseek-v4-flash",
+        adapter="deepseek",
+        provider="deepseek",
+        model_call_state=state,
+        context_limit_tokens=200_000,
+        reserved_output_tokens=100,
+    )
+    run_id = uuid4()
+    handler.on_chat_model_start(
+        {},
+        [[{"role": "user", "content": "你好。"}]],
+        run_id=run_id,
+    )
+    request = httpx.Request("POST", "https://relay.example/v1/chat/completions")
+    body = {
+        "error": {
+            "message": "invalid tool input with secret-value",
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+        }
+    }
+    error = openai.BadRequestError(
+        "bad",
+        response=httpx.Response(400, request=request, json=body),
+        body=body,
+    )
+
+    handler.on_llm_error(error, run_id=run_id)
+
+    row = store._connection.execute(
+        "SELECT status, outcome, error_type, http_status, provider_error_code, "
+        "redacted_response FROM model_calls WHERE run_id = 'run-provider-400'"
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["outcome"] == "failure"
+    assert row["http_status"] == 400
+    assert row["provider_error_code"] == "invalid_request_error"
+    assert row["redacted_response"] is not None
+    assert "secret-value" not in row["redacted_response"]
     store.close()
