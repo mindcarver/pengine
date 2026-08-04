@@ -92,7 +92,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -977,6 +977,7 @@ ALTER TABLE run_progress_v14 RENAME TO run_progress;
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (14);
 """
 
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -1385,6 +1386,25 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 14
+            if schema_version == 14:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    auth_columns = await (
+                        await connection.execute("PRAGMA table_info(repair_authorizations)")
+                    ).fetchall()
+                    if "rebuild_candidate_id" not in {column[1] for column in auth_columns}:
+                        await connection.execute(
+                            "ALTER TABLE repair_authorizations ADD COLUMN rebuild_candidate_id TEXT"
+                        )
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (15)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 15
 
     async def setup(self) -> None:
         await self.initialize()
@@ -3385,11 +3405,14 @@ class Repository:
         validation: ValidationEvidence,
         *,
         now: datetime | None = None,
+        authorized: bool = False,
     ) -> SeriesBible:
         """CAS-create one complete new candidate for a confirmed design defect.
 
         The same run lineage may automatically rebuild the complete design at most
         once (SDP-A6). A second automatic rebuild is rejected with a stable error.
+        ``authorized`` allows exactly one further rebuild for an explicit one-cycle
+        repair authorization (RPR-A9) while keeping the automatic budget consumed.
         The rebuilt candidate is a complete, fresh bundle (never a partial patch),
         and the superseded candidate remains immutable evidence.
         """
@@ -3408,7 +3431,7 @@ class Repository:
                     "The design lineage for this run is missing.",
                     409,
                 )
-            if lineage["rebuild_count"] >= 1:
+            if int(lineage["rebuild_count"]) >= 1 and not authorized:
                 raise DomainError(
                     "series_bible_rebuild_exhausted",
                     "This run lineage may rebuild the design automatically at most once.",
@@ -3431,9 +3454,14 @@ class Repository:
                 """
                 UPDATE series_bible_lineage
                 SET rebuild_count = 1, updated_at = ?
-                WHERE run_id = ? AND rebuild_count = 0 AND active_design_epoch = ?
+                WHERE run_id = ? AND rebuild_count = ? AND active_design_epoch = ?
                 """,
-                (timestamp, str(run_id), lineage["active_design_epoch"]),
+                (
+                    timestamp,
+                    str(run_id),
+                    1 if authorized else 0,
+                    lineage["active_design_epoch"],
+                ),
             )
             if cursor.rowcount != 1:
                 raise DomainError(
@@ -3441,9 +3469,9 @@ class Repository:
                     "A concurrent rebuild already consumed the lineage budget.",
                     409,
                 )
-            await connection.execute(
+            cursor = await connection.execute(
                 """
-                INSERT INTO series_bible_candidates(
+                INSERT OR IGNORE INTO series_bible_candidates(
                     candidate_id, run_id, creation_id, version, design_epoch,
                     content_hash, status, l0_variant, genre, lineage_json,
                     content_json, validation_json, global_review_json, created_at
@@ -3466,6 +3494,50 @@ class Repository:
                     timestamp,
                 ),
             )
+            if cursor.rowcount == 0:
+                # A candidate with this id already exists: a crash between INSERT
+                # and promotion of the same one-cycle rebuild resumes the same
+                # candidate instead of inserting a duplicate.
+                existing = await self._fetch_series_bible_candidate(
+                    connection,
+                    run_id,
+                    candidate.candidate_id,
+                )
+                if existing is None:
+                    raise DomainError(
+                        "series_bible_rebuild_candidate_missing",
+                        "The rebuild candidate was lost between insert and read.",
+                        409,
+                    )
+                return self._series_bible_from_row(existing)
+            if authorized:
+                # Bind this rebuild candidate to the granted design_rebuild
+                # authorization so the worker resumes the exact same candidate
+                # (and not an orphan) if it crashes before promotion.
+                auth_row = await self._fetchone(
+                    connection,
+                    """
+                    SELECT authorization_epoch
+                    FROM repair_authorizations
+                    WHERE run_id = ? AND kind = 'design_rebuild'
+                    ORDER BY authorization_epoch DESC LIMIT 1
+                    """,
+                    (str(run_id),),
+                )
+                if auth_row is not None:
+                    await connection.execute(
+                        """
+                        UPDATE repair_authorizations
+                        SET rebuild_candidate_id = ?
+                        WHERE run_id = ? AND authorization_epoch = ?
+                          AND rebuild_candidate_id IS NULL
+                        """,
+                        (
+                            candidate.candidate_id,
+                            str(run_id),
+                            int(auth_row["authorization_epoch"]),
+                        ),
+                    )
         return candidate
 
     async def get_run_series_bible(self, run_id: UUID) -> SeriesBibleSummary | None:
@@ -4495,6 +4567,7 @@ class Repository:
         *,
         evidence: str,
         now: datetime | None = None,
+        authorized: bool = False,
     ) -> None:
         """Trigger the one automatic complete design regeneration for a design defect.
 
@@ -4503,6 +4576,10 @@ class Repository:
         complete re-reviewed design (consuming the one-per-lineage rebuild budget),
         invalidates the prior script batch, and restarts writing at episode 1
         (RPR-A4). The defect evidence stays bound in ``series_reviews``.
+
+        ``authorized`` is used by ``authorize_repair``: an explicit one-cycle
+        repair authorization (RPR-A9) performs exactly one further complete
+        rebuild even after the automatic budget is consumed.
         """
         timestamp = _timestamp(now or _utc_now())
         async with self._transaction() as connection:
@@ -4516,7 +4593,13 @@ class Repository:
             if run["state"] != "running":
                 raise DomainError("run_not_running", "Workflow run is not running.", 409)
             lineage = await self._fetch_series_bible_lineage(connection, run_id)
-            if lineage is None or int(lineage["rebuild_count"]) >= 1:
+            if lineage is None:
+                raise DomainError(
+                    "series_bible_lineage_missing",
+                    "The design lineage for this run is missing.",
+                    409,
+                )
+            if int(lineage["rebuild_count"]) >= 1 and not authorized:
                 raise DomainError(
                     "series_bible_rebuild_exhausted",
                     "This run lineage may rebuild the design automatically at most once.",
@@ -4730,6 +4813,7 @@ class Repository:
             "review_id": row["review_id"],
             "granted_at": row["granted_at"],
             "consumed_at": row["consumed_at"],
+            "rebuild_candidate_id": row["rebuild_candidate_id"],
         }
 
     async def authorize_repair(
@@ -4842,7 +4926,27 @@ class Repository:
             await self.rewrite_episode_suffix(run_id, int(auth_episode))
             await self.requeue_run_job(run_id)
         elif auth_kind == "design_rebuild":
-            await self.trigger_design_rebuild(run_id, evidence=auth_evidence or "")
+            # RPR-A9: the authorization permits exactly one design-rebuild cycle
+            # even after the automatic budget was consumed. If the rebuild trigger
+            # itself fails, roll the authorization back so the same evidence pause
+            # can be authorized again instead of being stranded as consumed.
+            try:
+                await self.trigger_design_rebuild(
+                    run_id,
+                    evidence=auth_evidence or "",
+                    authorized=True,
+                )
+            except Exception:
+                async with self._transaction() as connection:
+                    await connection.execute(
+                        """
+                        UPDATE repair_authorizations
+                        SET granted_at = NULL, consumed_at = NULL
+                        WHERE run_id = ? AND authorization_epoch = ?
+                        """,
+                        (str(run_id), int(auth["authorization_epoch"])),
+                    )
+                raise
         return response
 
     async def _next_review_epoch(

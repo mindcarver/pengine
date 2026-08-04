@@ -2161,8 +2161,10 @@
               "idempotency_conflict",
               "revision_not_allowed",
               "revision_feedback_locked",
-              "service_unavailable",
-              "run_not_controllable"
+              "run_not_controllable",
+              "repair_authorization_stale",
+              "series_bible_rebuild_exhausted",
+              "service_unavailable"
             ]
           },
           "message": {

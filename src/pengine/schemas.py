@@ -543,6 +543,8 @@ class CommandError(StrictModel):
         "revision_not_allowed",
         "revision_feedback_locked",
         "run_not_controllable",
+        "repair_authorization_stale",
+        "series_bible_rebuild_exhausted",
         "service_unavailable",
     ]
     message: NonEmptyText

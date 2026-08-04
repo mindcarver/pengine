@@ -796,26 +796,45 @@ class Worker:
         if active is not None and active.content_hash == candidate.content_hash:
             return
         is_rebuild = active is not None
+        authorized_rebuild = False
+        persisted_rebuild_id = None
         if is_rebuild:
             lineage = await self.repository.get_series_bible_lineage(work.run_id)
-            if lineage is not None and lineage["rebuild_count"] >= 1:
-                raise AgentProtocolError(
-                    "This run lineage may rebuild the design automatically at most once",
-                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
-                )
+            if lineage is not None and int(lineage["rebuild_count"]) >= 1:
+                # An explicit one-cycle repair authorization (RPR-A9) may rebuild
+                # exactly once more after the automatic budget is consumed. The
+                # authorization is bound to the active design it was granted for.
+                auth = await self.repository.get_repair_authorization(work.run_id)
+                if (
+                    auth is None
+                    or auth["kind"] != "design_rebuild"
+                    or auth["consumed_at"] is None
+                    or auth["design_content_hash"] != active.content_hash
+                ):
+                    raise AgentProtocolError(
+                        "This run lineage may rebuild the design automatically at most once",
+                        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                    )
+                authorized_rebuild = True
+                persisted_rebuild_id = auth["rebuild_candidate_id"]
             candidate = build_series_bible(
                 **base,
                 parent_candidate_id=active.candidate_id,
                 rebuild_count=1,
                 design_epoch=active.design_epoch + 1,
+                candidate_id=persisted_rebuild_id,
             )
         evidence = validate_series_bible(candidate)
         if is_rebuild:
-            await self.repository.rebuild_series_bible(
+            # Returns the persisted candidate for this epoch: after a crash
+            # between INSERT and promotion, the same authorized one-cycle rebuild
+            # resumes the identical candidate instead of building a duplicate.
+            candidate = await self.repository.rebuild_series_bible(
                 str(work.creation_id),
                 work.run_id,
                 candidate,
                 evidence,
+                authorized=authorized_rebuild,
             )
         else:
             await self.repository.register_series_bible_candidate(

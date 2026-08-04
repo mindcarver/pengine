@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from test_script_batch import (
     build_episode_lock_for,
@@ -8,8 +10,11 @@ from test_script_batch import (
     story_contract_sha256,
     three_episode_contract,
 )
+from test_series_bible import make_candidate
 
+from pengine.config import Settings
 from pengine.errors import DomainError
+from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import InternalStage
 from pengine.series_bible import (
@@ -18,6 +23,7 @@ from pengine.series_bible import (
     validate_series_bible,
 )
 from pengine.series_review import active_prefix_hash, effective_milestones
+from pengine.worker import AgentProtocolError, Worker
 
 
 @pytest.fixture
@@ -310,6 +316,279 @@ async def test_authorization_is_stale_when_lineage_changes(
             idempotency_key="authorize-stale",
         )
     assert stale.value.code == "repair_authorization_stale"
+
+
+async def test_authorized_design_rebuild_allows_one_cycle_after_automatic_budget(
+    repository: Repository,
+) -> None:
+    # Delivery #57 INT-A8: after the one automatic design rebuild is consumed, an
+    # explicit repair authorization must still grant exactly one design-rebuild
+    # cycle (RPR-A9) instead of being refused as "series_bible_rebuild_exhausted".
+    accepted, lease = await create_leased_run(repository)
+    contract, active = await seed_active_design_and_batch(repository, lease.run_id)
+    batch = await repository.get_script_batch_lineage(lease.run_id)
+    # Simulate the consumed automatic design-rebuild budget (rebuild_count = 1).
+    async with repository._transaction() as connection:
+        await connection.execute(
+            "UPDATE series_bible_lineage SET rebuild_count = 1 WHERE run_id = ?",
+            (str(lease.run_id),),
+        )
+    assert not await repository.design_rebuild_budget_available(lease.run_id)
+
+    await repository.pause_repair_authorization(
+        lease.run_id,
+        kind="design_rebuild",
+        design_candidate_id=active.candidate_id,
+        design_content_hash=active.content_hash,
+        design_epoch=active.design_epoch,
+        batch_id=batch.batch_id,
+        batch_epoch=batch.batch_epoch,
+        earliest_affected_episode=None,
+        range_episodes=None,
+        estimated_tokens=9_000,
+        evidence="设计缺陷证据",
+        review_id="review-auth",
+    )
+
+    # Authorize exactly one cycle: the design stage resets and the run requeues,
+    # while the automatic budget stays consumed (no implicit second automatic
+    # rebuild and no third version).
+    accepted_control = await repository.authorize_repair(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="authorize-design-1",
+    )
+    assert accepted_control.run_state == "queued"
+    checkpoints = await repository.get_business_checkpoints(lease.run_id)
+    assert InternalStage.GENERATING_EPISODE_OUTLINE not in checkpoints
+    lineage = await repository.get_series_bible_lineage(lease.run_id)
+    assert lineage["rebuild_count"] == 1
+    assert not await repository.design_rebuild_budget_available(lease.run_id)
+    drafts = await repository.get_episode_drafts(lease.run_id)
+    assert [draft.episode_number for draft in drafts] == []
+
+
+async def test_worker_authorized_design_rebuild_promotes_a_fresh_design(
+    repository: Repository,
+    tmp_path: Path,
+) -> None:
+    # The authorized design-rebuild cycle must actually regenerate and promote a
+    # complete fresh design (RPR-A9) when the worker syncs the design after the
+    # run is requeued, invalidate the prior script batch (episodes restart at 1),
+    # and must not restore the automatic budget.
+    accepted, lease = await create_leased_run(repository)
+    contract, active, committed = await seed_batch_with_episodes(
+        repository,
+        lease.run_id,
+        up_to=2,
+    )
+    batch = await repository.get_script_batch_lineage(lease.run_id)
+    assert len(await repository.get_active_episode_candidates(lease.run_id)) == 2
+    async with repository._transaction() as connection:
+        await connection.execute(
+            "UPDATE series_bible_lineage SET rebuild_count = 1 WHERE run_id = ?",
+            (str(lease.run_id),),
+        )
+    await repository.pause_repair_authorization(
+        lease.run_id,
+        kind="design_rebuild",
+        design_candidate_id=active.candidate_id,
+        design_content_hash=active.content_hash,
+        design_epoch=active.design_epoch,
+        batch_id=batch.batch_id,
+        batch_epoch=batch.batch_epoch,
+        earliest_affected_episode=None,
+        range_episodes=None,
+        estimated_tokens=9_000,
+        evidence="设计缺陷证据",
+        review_id="review-worker",
+    )
+    await repository.authorize_repair(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="authorize-worker-1",
+    )
+
+    settings = Settings(
+        persona_root=tmp_path / "personas",
+        data_dir=tmp_path / "data",
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=PersonaCatalog(
+            settings.persona_root,
+            settings.snapshot_root,
+        ),
+    )
+    work = await repository.get_run_work_item(lease.run_id)
+    rebuilt_contract = three_episode_contract().model_copy(deep=True)
+    for fact in rebuilt_contract.facts:
+        fact.value = f"{fact.value}（重建版）"
+    approved = {
+        InternalStage.GENERATING_STORY_OUTLINE: {
+            "content": "新的完整故事梗概。\n其余人物设定与已批准大纲保持一致。"
+        },
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
+            "content": "阿丽：回乡调查旧案的主角。\n阿博：见证旧事的证人。"
+        },
+        InternalStage.GENERATING_RELATIONSHIP_LOGIC: {"content": "阿丽与阿博为搭档。"},
+        InternalStage.SELECTING_L0_VARIANT: {"selected_l0_variant": "归返"},
+        InternalStage.GENERATING_EPISODE_OUTLINE: {
+            "content": "三集连续写作。",
+            "story_contract": rebuilt_contract.model_dump(mode="json"),
+            "contract_review": {
+                "passed": True,
+                "evidence": "独立设计审查通过。",
+                "issues": [],
+            },
+        },
+    }
+    await worker._sync_series_bible(work, approved)
+
+    fresh = await repository.get_run_series_bible(lease.run_id)
+    assert fresh is not None
+    assert fresh.content_hash != active.content_hash
+    assert fresh.design_epoch == active.design_epoch + 1
+    lineage = await repository.get_series_bible_lineage(lease.run_id)
+    assert int(lineage["rebuild_count"]) == 1
+    assert not await repository.design_rebuild_budget_available(lease.run_id)
+    # The prior script batch is invalidated and writing restarts at episode 1.
+    assert await repository.get_active_episode_candidates(lease.run_id) == []
+
+
+async def test_worker_refuses_unauthorized_rebuild_after_automatic_budget(
+    repository: Repository,
+    tmp_path: Path,
+) -> None:
+    # With the automatic budget consumed and no granted design_rebuild
+    # authorization bound to the active design, the worker must refuse the
+    # rebuild instead of silently performing a second automatic one.
+    accepted, lease = await create_leased_run(repository)
+    contract, active = await seed_active_design_and_batch(repository, lease.run_id)
+    async with repository._transaction() as connection:
+        await connection.execute(
+            "UPDATE series_bible_lineage SET rebuild_count = 1 WHERE run_id = ?",
+            (str(lease.run_id),),
+        )
+
+    settings = Settings(
+        persona_root=tmp_path / "personas",
+        data_dir=tmp_path / "data",
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=PersonaCatalog(
+            settings.persona_root,
+            settings.snapshot_root,
+        ),
+    )
+    work = await repository.get_run_work_item(lease.run_id)
+    approved = {
+        InternalStage.GENERATING_STORY_OUTLINE: {
+            "content": "新的完整故事梗概。\n其余人物设定与已批准大纲保持一致。"
+        },
+        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
+            "content": "阿丽：回乡调查旧案的主角。\n阿博：见证旧事的证人。"
+        },
+        InternalStage.GENERATING_RELATIONSHIP_LOGIC: {"content": "阿丽与阿博为搭档。"},
+        InternalStage.SELECTING_L0_VARIANT: {"selected_l0_variant": "归返"},
+        InternalStage.GENERATING_EPISODE_OUTLINE: {
+            "content": "三集连续写作。",
+            "story_contract": contract.model_dump(mode="json"),
+            "contract_review": {
+                "passed": True,
+                "evidence": "独立设计审查通过。",
+                "issues": [],
+            },
+        },
+    }
+    with pytest.raises(
+        AgentProtocolError, match="may rebuild the design automatically at most once"
+    ):
+        await worker._sync_series_bible(work, approved)
+    # Nothing changed: no second candidate, budget still consumed.
+    lineage = await repository.get_series_bible_lineage(lease.run_id)
+    assert int(lineage["rebuild_count"]) == 1
+    active_now = await repository.get_run_series_bible(lease.run_id)
+    assert active_now is not None
+    assert active_now.content_hash == active.content_hash
+
+
+async def test_authorized_rebuild_is_idempotent_after_crash_before_promotion(
+    repository: Repository,
+) -> None:
+    # Re-running the same authorized one-cycle rebuild (a crash between INSERT and
+    # promotion) must resume the same candidate instead of failing on a duplicate
+    # key or creating an orphan rebuild candidate.
+    accepted, lease = await create_leased_run(repository)
+    contract, active = await seed_active_design_and_batch(repository, lease.run_id)
+    batch = await repository.get_script_batch_lineage(lease.run_id)
+    async with repository._transaction() as connection:
+        await connection.execute(
+            "UPDATE series_bible_lineage SET rebuild_count = 1 WHERE run_id = ?",
+            (str(lease.run_id),),
+        )
+    await repository.pause_repair_authorization(
+        lease.run_id,
+        kind="design_rebuild",
+        design_candidate_id=active.candidate_id,
+        design_content_hash=active.content_hash,
+        design_epoch=active.design_epoch,
+        batch_id=batch.batch_id,
+        batch_epoch=batch.batch_epoch,
+        earliest_affected_episode=None,
+        range_episodes=None,
+        estimated_tokens=9_000,
+        evidence="设计缺陷证据",
+        review_id="review-idem",
+    )
+    rebuilt = make_candidate(
+        run_id=str(lease.run_id),
+        story_outline="设计师确认首个候选存在结构性缺陷，整体重建设计。",
+        parent_candidate_id=active.candidate_id,
+        rebuild_count=1,
+        design_epoch=active.design_epoch + 1,
+    )
+    evidence = validate_series_bible(rebuilt)
+    first = await repository.rebuild_series_bible(
+        str(accepted.creation_id),
+        lease.run_id,
+        rebuilt,
+        evidence,
+        authorized=True,
+    )
+    # The granted authorization now points at the rebuild candidate it produced.
+    auth = await repository.get_repair_authorization(lease.run_id)
+    assert auth is not None
+    assert auth["rebuild_candidate_id"] == first.candidate_id
+
+    # Simulate a crash between INSERT and promotion: the worker re-runs and
+    # builds a fresh candidate object but reuses the persisted candidate id
+    # bound to the authorization, so the same cycle resumes without an orphan.
+    retried_build = make_candidate(
+        run_id=str(lease.run_id),
+        story_outline="设计师确认首个候选存在结构性缺陷，整体重建设计。",
+        parent_candidate_id=active.candidate_id,
+        rebuild_count=1,
+        design_epoch=active.design_epoch + 1,
+    )
+    assert retried_build.candidate_id != rebuilt.candidate_id
+    retried_build = retried_build.model_copy(update={"candidate_id": auth["rebuild_candidate_id"]})
+    resumed = await repository.rebuild_series_bible(
+        str(accepted.creation_id),
+        lease.run_id,
+        retried_build,
+        evidence,
+        authorized=True,
+    )
+    assert resumed.candidate_id == first.candidate_id
+    candidates = await repository.get_run_series_bible_candidates(lease.run_id)
+    assert len(candidates) == 2  # the active design plus exactly one rebuild
+    lineage = await repository.get_series_bible_lineage(lease.run_id)
+    assert int(lineage["rebuild_count"]) == 1
+    assert not await repository.design_rebuild_budget_available(lease.run_id)
 
 
 # ---------------------------------------------------------------------------
