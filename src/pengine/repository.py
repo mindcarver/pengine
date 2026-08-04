@@ -3449,9 +3449,9 @@ class Repository:
                     "A concurrent rebuild already consumed the lineage budget.",
                     409,
                 )
-            await connection.execute(
+            cursor = await connection.execute(
                 """
-                INSERT INTO series_bible_candidates(
+                INSERT OR IGNORE INTO series_bible_candidates(
                     candidate_id, run_id, creation_id, version, design_epoch,
                     content_hash, status, l0_variant, genre, lineage_json,
                     content_json, validation_json, global_review_json, created_at
@@ -3474,6 +3474,22 @@ class Repository:
                     timestamp,
                 ),
             )
+            if cursor.rowcount == 0:
+                # The candidate for this exact content already exists: a crash
+                # between INSERT and promotion of the same authorized one-cycle
+                # rebuild (RPR-A9) resumes the same cycle instead of repeating it.
+                existing = await self._fetch_series_bible_candidate(
+                    connection,
+                    run_id,
+                    candidate.candidate_id,
+                )
+                if existing is None:
+                    raise DomainError(
+                        "series_bible_rebuild_candidate_missing",
+                        "The rebuild candidate was lost between insert and read.",
+                        409,
+                    )
+                return self._series_bible_from_row(existing)
         return candidate
 
     async def get_run_series_bible(self, run_id: UUID) -> SeriesBibleSummary | None:
