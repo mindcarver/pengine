@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal, Protocol, get_args
 from uuid import UUID
 
 from fastapi import FastAPI, Header
@@ -31,6 +31,13 @@ IdempotencyKey = Annotated[
 ]
 _WEB_ROOT = Path(__file__).with_name("web")
 
+# The bounded, browser-displayable CommandError codes that the API may return.
+# Any DomainError raised by a route must map onto this contract so a defect can
+# never surface as an HTTP 500 (INT-A8).
+_COMMAND_ERROR_CODES: frozenset[str] = frozenset(
+    get_args(CommandError.model_fields["code"].annotation)
+)
+
 
 class WorkerControl(Protocol):
     async def start(self) -> None: ...
@@ -39,7 +46,8 @@ class WorkerControl(Protocol):
 
 
 def _error_response(error: DomainError) -> JSONResponse:
-    body = CommandError(code=error.code, message=error.message)
+    code = error.code if error.code in _COMMAND_ERROR_CODES else "service_unavailable"
+    body = CommandError(code=code, message=error.message)
     return JSONResponse(status_code=error.status_code, content=body.model_dump(mode="json"))
 
 

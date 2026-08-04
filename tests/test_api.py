@@ -6,9 +6,12 @@ from uuid import uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 from persona_factory import create_persona_package
+from test_script_batch import create_leased_run, seed_active_design_and_batch
 
-from pengine.api import create_app
+from pengine.api import _error_response, create_app
 from pengine.config import Settings
+from pengine.errors import DomainError
+from pengine.repository import Repository
 from pengine.schemas import InternalStage
 
 
@@ -614,3 +617,84 @@ async def test_api_returns_stable_command_errors(tmp_path: Path) -> None:
         )
         assert blank_feedback.status_code == 422
         assert blank_feedback.json()["code"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_authorize_repair_design_rebuild_returns_202_never_500(
+    tmp_path: Path,
+) -> None:
+    # Delivery #57 INT-A8: authorizing a design-rebuild cycle after the one
+    # automatic rebuild is consumed must succeed with a bounded 202 response, not
+    # an HTTP 500 from a series_bible_rebuild_exhausted DomainError escaping the
+    # CommandError contract. The paused resource still carries the evidence,
+    # affected range, and token estimate.
+    persona_root = tmp_path / "personas"
+    create_persona_package(persona_root / "active")
+    settings = Settings(persona_root=persona_root, data_dir=tmp_path / "data")
+    repository = Repository(settings.database_path)
+    await repository.initialize()
+
+    accepted, lease = await create_leased_run(repository)
+    contract, active = await seed_active_design_and_batch(repository, lease.run_id)
+    batch = await repository.get_script_batch_lineage(lease.run_id)
+    async with repository._transaction() as connection:
+        await connection.execute(
+            "UPDATE series_bible_lineage SET rebuild_count = 1 WHERE run_id = ?",
+            (str(lease.run_id),),
+        )
+    await repository.pause_repair_authorization(
+        lease.run_id,
+        kind="design_rebuild",
+        design_candidate_id=active.candidate_id,
+        design_content_hash=active.content_hash,
+        design_epoch=active.design_epoch,
+        batch_id=batch.batch_id,
+        batch_epoch=batch.batch_epoch,
+        earliest_affected_episode=None,
+        range_episodes=None,
+        estimated_tokens=9_000,
+        evidence="设计缺陷证据",
+        review_id="review-a8",
+    )
+    paused_resource = await repository.get_creation(accepted.creation_id)
+    assert paused_resource is not None
+    assert paused_resource.initial.state == "paused"
+    assert paused_resource.initial.pause.code == "repair_authorization"
+    assert paused_resource.initial.authorization is not None
+    assert paused_resource.initial.authorization.kind == "design_rebuild"
+    assert paused_resource.initial.authorization.estimated_tokens == 9_000
+    assert paused_resource.initial.authorization.evidence == "设计缺陷证据"
+
+    app = create_app(settings=settings, repository=repository)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client,
+    ):
+        authorized = await client.post(
+            f"/creations/{accepted.creation_id}/runs/initial/authorize-repair",
+            headers={"Idempotency-Key": "a8-authorize"},
+        )
+
+    assert authorized.status_code == 202
+    body = authorized.json()
+    assert body["run_state"] == "queued"
+    assert body["resource_url"] == f"/creations/{accepted.creation_id}"
+
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "queued"
+
+
+def test_error_response_maps_unknown_domain_error_code_without_500() -> None:
+    # Delivery #57 INT-A8: a DomainError that is not part of the CommandError
+    # contract must still surface as a bounded displayable error, never a 500.
+    response = _error_response(DomainError("series_bible_rebuild_exhausted", "消息", 409))
+    assert response.status_code == 409
+    assert response.body.decode() == '{"code":"series_bible_rebuild_exhausted","message":"消息"}'
+
+    response = _error_response(DomainError("some_future_code", "消息", 409))
+    assert response.status_code == 409
+    assert response.body.decode() == '{"code":"service_unavailable","message":"消息"}'

@@ -35,6 +35,15 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/pengine"]
 
+[tool.hatch.build.targets.sdist]
+# Local worktree scaffolding (shared .venv link, uv cache, pytest scratch
+# dirs) must never leak into the source distribution.
+exclude = [
+  ".venv",
+  ".uv-cache",
+  "pytest-of-*",
+]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 asyncio_mode = "auto"

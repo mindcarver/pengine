@@ -3385,11 +3385,14 @@ class Repository:
         validation: ValidationEvidence,
         *,
         now: datetime | None = None,
+        authorized: bool = False,
     ) -> SeriesBible:
         """CAS-create one complete new candidate for a confirmed design defect.
 
         The same run lineage may automatically rebuild the complete design at most
         once (SDP-A6). A second automatic rebuild is rejected with a stable error.
+        ``authorized`` allows exactly one further rebuild for an explicit one-cycle
+        repair authorization (RPR-A9) while keeping the automatic budget consumed.
         The rebuilt candidate is a complete, fresh bundle (never a partial patch),
         and the superseded candidate remains immutable evidence.
         """
@@ -3408,7 +3411,7 @@ class Repository:
                     "The design lineage for this run is missing.",
                     409,
                 )
-            if lineage["rebuild_count"] >= 1:
+            if int(lineage["rebuild_count"]) >= 1 and not authorized:
                 raise DomainError(
                     "series_bible_rebuild_exhausted",
                     "This run lineage may rebuild the design automatically at most once.",
@@ -3431,9 +3434,14 @@ class Repository:
                 """
                 UPDATE series_bible_lineage
                 SET rebuild_count = 1, updated_at = ?
-                WHERE run_id = ? AND rebuild_count = 0 AND active_design_epoch = ?
+                WHERE run_id = ? AND rebuild_count = ? AND active_design_epoch = ?
                 """,
-                (timestamp, str(run_id), lineage["active_design_epoch"]),
+                (
+                    timestamp,
+                    str(run_id),
+                    1 if authorized else 0,
+                    lineage["active_design_epoch"],
+                ),
             )
             if cursor.rowcount != 1:
                 raise DomainError(
@@ -4495,6 +4503,7 @@ class Repository:
         *,
         evidence: str,
         now: datetime | None = None,
+        authorized: bool = False,
     ) -> None:
         """Trigger the one automatic complete design regeneration for a design defect.
 
@@ -4503,6 +4512,10 @@ class Repository:
         complete re-reviewed design (consuming the one-per-lineage rebuild budget),
         invalidates the prior script batch, and restarts writing at episode 1
         (RPR-A4). The defect evidence stays bound in ``series_reviews``.
+
+        ``authorized`` is used by ``authorize_repair``: an explicit one-cycle
+        repair authorization (RPR-A9) performs exactly one further complete
+        rebuild even after the automatic budget is consumed.
         """
         timestamp = _timestamp(now or _utc_now())
         async with self._transaction() as connection:
@@ -4516,7 +4529,13 @@ class Repository:
             if run["state"] != "running":
                 raise DomainError("run_not_running", "Workflow run is not running.", 409)
             lineage = await self._fetch_series_bible_lineage(connection, run_id)
-            if lineage is None or int(lineage["rebuild_count"]) >= 1:
+            if lineage is None:
+                raise DomainError(
+                    "series_bible_lineage_missing",
+                    "The design lineage for this run is missing.",
+                    409,
+                )
+            if int(lineage["rebuild_count"]) >= 1 and not authorized:
                 raise DomainError(
                     "series_bible_rebuild_exhausted",
                     "This run lineage may rebuild the design automatically at most once.",
@@ -4842,7 +4861,13 @@ class Repository:
             await self.rewrite_episode_suffix(run_id, int(auth_episode))
             await self.requeue_run_job(run_id)
         elif auth_kind == "design_rebuild":
-            await self.trigger_design_rebuild(run_id, evidence=auth_evidence or "")
+            # RPR-A9: the authorization permits exactly one design-rebuild cycle
+            # even after the automatic budget was consumed.
+            await self.trigger_design_rebuild(
+                run_id,
+                evidence=auth_evidence or "",
+                authorized=True,
+            )
         return response
 
     async def _next_review_epoch(

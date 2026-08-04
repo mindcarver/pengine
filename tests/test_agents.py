@@ -712,6 +712,51 @@ def test_story_artifact_patch_enforces_total_old_or_new_line_change_budget() -> 
         )
 
 
+def test_story_artifact_patch_allows_in_scope_multi_line_outline_repair() -> None:
+    # Delivery #57: a canon repair that legitimately fixes several lines of a short
+    # story outline is bounded line addressing, not an over-scope rewrite. It must
+    # apply while each replacement stays smaller than the whole candidate.
+    content = (
+        "开局：林夏在台风夜回到旧屋。\n"
+        "中段：林夏发现旧表与父亲失踪有关。\n"
+        "结尾：林夏决定调查旧表来历。\n"
+        "其余人物设定与已批准大纲保持一致。"
+    )
+    patch = StoryArtifactRepairPatch.model_validate(
+        {
+            "stage": "generating_story_outline",
+            "line_replacements": [
+                {
+                    "start_line": 1,
+                    "end_line": 1,
+                    "replacement": "开局：林夏在台风夜赶回旧屋，发现门锁被换。",
+                },
+                {
+                    "start_line": 2,
+                    "end_line": 2,
+                    "replacement": "中段：林夏查明旧表与父亲失踪直接相关。",
+                },
+                {
+                    "start_line": 3,
+                    "end_line": 3,
+                    "replacement": "结尾：林夏决定留在岛上继续追查真相。",
+                },
+            ],
+        }
+    )
+
+    repaired = _apply_story_artifact_repair_patch(
+        stage=InternalStage.GENERATING_STORY_OUTLINE,
+        content=content,
+        patch=patch,
+    )
+    assert "发现门锁被换" in repaired.content
+    assert "直接相关" in repaired.content
+    assert "继续追查真相" in repaired.content
+    assert "其余人物设定与已批准大纲保持一致" in repaired.content
+    assert "其余人物设定与已批准大纲保持一致" in content  # closing line is untouched
+
+
 def test_canon_review_rejects_non_blocking_suggestions_as_issues() -> None:
     with pytest.raises(
         ValidationError,

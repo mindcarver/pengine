@@ -1604,8 +1604,9 @@ def _story_patch_correction(
         )
     if error_code == "story_repair_patch_not_minimal":
         return (
-            "The previous line patch change budget reached at least half of candidate. Use fewer "
-            "and smaller numbered line ranges and change only confirmed blocking issues."
+            "The previous line patch replaced or added content at least as large as the "
+            "whole candidate. Return a smaller, bounded repair that changes only the "
+            "confirmed blocking lines."
         )
     if error_code == "story_repair_line_did_not_change":
         return (
@@ -1682,8 +1683,11 @@ def _apply_story_artifact_repair_patch(
     change_budget = 0
     for replacement in meaningful:
         old_span = "\n".join(lines[replacement.start_line - 1 : replacement.end_line])
-        change_budget += max(len(old_span), len(replacement.replacement))
-    if change_budget * 2 >= len(content):
+        replacement_budget = max(len(old_span), len(replacement.replacement))
+        if replacement_budget >= len(content):
+            raise ValueError("story_repair_patch_not_minimal")
+        change_budget += replacement_budget
+    if change_budget >= len(content):
         raise ValueError("story_repair_patch_not_minimal")
     repaired_lines = lines.copy()
     for replacement in reversed(meaningful):
