@@ -949,6 +949,28 @@ def _work_tool_stop_reason(
     return None
 
 
+def _structured_response_truncated(response: ModelResponse) -> bool:
+    """Detect a provider output-token truncation in a structured-call response.
+
+    The model relay surfaces ``finish_reason`` (OpenAI-compatible adapters) or
+    ``stop_reason`` (Anthropic) on each ``AIMessage`` response metadata. A
+    ``length``/``max_tokens`` reason means the model ran out of output tokens and
+    the response is incomplete, which must be classified and recovered as a
+    truncation rather than silently treated as an ordinary prose failure.
+    """
+
+    for message in response.result:
+        if not isinstance(message, AIMessage):
+            continue
+        metadata = getattr(message, "response_metadata", None)
+        if not isinstance(metadata, Mapping):
+            continue
+        for key in ("finish_reason", "stop_reason"):
+            if metadata.get(key) in {"length", "max_tokens"}:
+                return True
+    return False
+
+
 def _user_facing_texts(result: Any) -> list[str]:
     if isinstance(result, StoryArchitectResult):
         if result.stage == InternalStage.SELECTING_L0_VARIANT:
@@ -2277,13 +2299,24 @@ class StructuredResultMiddleware(AgentMiddleware):
             return response
 
         schema_names = ", ".join(sorted(result_tool_names))
-        correction = HumanMessage(
-            content=(
-                f"Return exactly one valid {schema_names} tool call now. Reuse the completed "
-                "work above, correct any schema violation, and do not return prose or call a "
-                "working tool."
+        truncated = _structured_response_truncated(response)
+        if truncated:
+            correction = HumanMessage(
+                content=(
+                    f"Your previous response was truncated by the model output token limit. "
+                    f"Do not repeat or analyze the work already completed. Return exactly one "
+                    f"valid {schema_names} tool call now, with the complete structured result "
+                    f"as its arguments and no prose."
+                )
             )
-        )
+        else:
+            correction = HumanMessage(
+                content=(
+                    f"Return exactly one valid {schema_names} tool call now. Reuse the completed "
+                    "work above, correct any schema violation, and do not return prose or call a "
+                    "working tool."
+                )
+            )
         forced = await handler(
             model_request.override(
                 messages=[*model_request.messages, *response.result, correction],
@@ -2305,6 +2338,15 @@ class StructuredResultMiddleware(AgentMiddleware):
             # Return it to the agent loop so the normal bounded correction path
             # can provide validation details on the next assistant turn.
             return forced
+        if truncated or _structured_response_truncated(forced):
+            raise AgentProtocolError(
+                "Subagent structured output was truncated by the output token limit",
+                repair_instruction=(
+                    "The previous response was truncated. Return only the complete "
+                    "structured result tool call without repeating or analyzing source material."
+                ),
+                safe_message="结构化评审输出被模型截断。",
+            )
         raise AgentProtocolError("Subagent returned invalid structured output")
 
 

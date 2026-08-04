@@ -1724,6 +1724,81 @@ async def test_structured_result_middleware_keeps_only_langchain_result_tool() -
     assert model.bound_tool_names[-1] == ["Result"]
 
 
+@pytest.mark.asyncio
+async def test_structured_result_middleware_recovers_truncated_output() -> None:
+    class Result(BaseModel):
+        value: str
+
+    calls: list[ModelRequest] = []
+
+    async def handler(request: ModelRequest) -> ModelResponse:
+        calls.append(request)
+        if len(calls) == 1:
+            return ModelResponse(
+                result=[
+                    AIMessage(
+                        content="The review evidence is long and continues past the limit...",
+                        response_metadata={"finish_reason": "length"},
+                    )
+                ],
+                structured_response=None,
+            )
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="done"),
+        )
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[],
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value="done")
+    assert len(calls) == 2
+    assert calls[1].tools == []
+    assert isinstance(calls[1].messages[-1], HumanMessage)
+    assert "truncated" in calls[1].messages[-1].content
+    assert "Result tool call" in calls[1].messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_classifies_persistent_truncation() -> None:
+    class Result(BaseModel):
+        value: str
+
+    calls: list[ModelRequest] = []
+
+    async def handler(request: ModelRequest) -> ModelResponse:
+        calls.append(request)
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content="Truncated review evidence that never fits within the limit...",
+                    response_metadata={"finish_reason": "length"},
+                )
+            ],
+            structured_response=None,
+        )
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[],
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    with pytest.raises(AgentProtocolError) as error:
+        await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert "truncated" in str(error.value)
+    assert error.value.safe_message == "结构化评审输出被模型截断。"
+    assert error.value.repair_instruction is not None
+
+
 def test_outline_repair_patch_applies_only_guarded_minimal_edits() -> None:
     contract = _story_contract()
     candidate = {
