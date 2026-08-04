@@ -3,11 +3,12 @@ import json
 import logging
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, suppress
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import asdict
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
+import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 
@@ -31,9 +32,11 @@ from pengine.relay import (
     RelayError,
     build_relay_routes,
     classify_relay_exception,
+    drain_audit_writes,
     is_relay_connection_error,
     is_relay_exception,
     retryable_relay_interruption,
+    submit_store_write,
 )
 from pengine.repository import LeasedJob, Repository, RunWorkItem
 from pengine.schemas import (
@@ -149,9 +152,17 @@ class Worker:
             return
         await self.repository.reconcile_startup()
         if self.workflow is None:
-            self._saver_context = AsyncSqliteSaver.from_conn_string(
-                str(self.settings.database_path)
-            )
+
+            @asynccontextmanager
+            async def _saver_conn() -> AbstractAsyncContextManager[AsyncSqliteSaver]:
+                connection = await aiosqlite.connect(str(self.settings.database_path), timeout=30)
+                await connection.execute("PRAGMA busy_timeout = 30000")
+                try:
+                    yield AsyncSqliteSaver(connection)
+                finally:
+                    await connection.close()
+
+            self._saver_context = _saver_conn()
             self._saver = await self._saver_context.__aenter__()
             await self._saver.setup()
             if self.settings.relay_configured:
@@ -181,6 +192,7 @@ class Worker:
             with suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        await asyncio.to_thread(drain_audit_writes)
         if self._saver_context is not None:
             await self._saver_context.__aexit__(None, None, None)
             self._saver_context = None
@@ -598,7 +610,10 @@ class Worker:
             if run_timeout_scope is not None and run_timeout_scope.expired():
                 timeout_stage = self._failure_stage(exc, current_stage, approved)
                 if model_call_state is not None and model_call_state.store is not None:
-                    model_call_state.store.mark_timed_out(run_id=str(work.run_id))
+                    submit_store_write(
+                        model_call_state.store.mark_timed_out,
+                        run_id=str(work.run_id),
+                    )
                 if timeout_stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
                     refreshed = await self.repository.get_run_work_item(work.run_id)
                     episode_number = len(refreshed.episode_drafts) + 1
@@ -670,6 +685,13 @@ class Worker:
                 failure.code,
                 _exception_type_chain(exc),
             )
+        finally:
+            # The audit handler dispatches SQLite writes to a writer thread so it
+            # never deadlocks with the LangGraph checkpointer on the loop. Drain
+            # before this job's run state is observed so the durable model-call
+            # records (usage, stale, failed, blocked) are present for the API, UI,
+            # and evidence (Delivery #58 INT-A2/A6/A9).
+            await asyncio.to_thread(drain_audit_writes)
 
     async def _pause_recoverable_episode_error(
         self,

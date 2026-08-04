@@ -240,6 +240,14 @@ def _child_environment(
             environment.pop(name, None)
         else:
             environment[name] = str(value)
+    # The child server must import this repository's ``src`` even when the shared
+    # environment installs ``pengine`` editable from another checkout.
+    repository_root = Path(__file__).resolve().parents[2]
+    src_path = str(repository_root / "src")
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        f"{src_path}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else src_path
+    )
     return environment
 
 
@@ -428,6 +436,130 @@ def _redact_log(log_path: Path, secret: str | None) -> None:
     content = re.sub(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,;}]+", r"\1[REDACTED]", content)
     content = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "sk-[REDACTED]", content)
     log_path.write_text(content, encoding="utf-8")
+
+
+def _assert_unified_delivery_facts(
+    database_path: Path,
+    *,
+    creation_id: str,
+    generation_model_id: str,
+    review_model_id: str,
+    evidence_dir: Path,
+) -> dict[str, Any]:
+    """INT-A2/INT-A9: the real unified path produced one active SeriesBible design,
+    ordered versioned episode candidates, a bound final whole-series review, and one
+    formal delivery with provider-reported usage matching SQLite."""
+    with sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True) as connection:
+        run_row = connection.execute(
+            "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+            (creation_id,),
+        ).fetchone()
+        assert run_row is not None, "Initial run missing"
+        run_id = run_row[0]
+
+        active_designs = connection.execute(
+            """
+            SELECT candidate_id, content_hash, design_epoch, validation_json, global_review_json
+            FROM series_bible_candidates WHERE run_id = ? AND status = 'active'
+            """,
+            (run_id,),
+        ).fetchall()
+        assert len(active_designs) == 1, f"Expected one active design, found {len(active_designs)}"
+        design = active_designs[0]
+        validation = json.loads(design[3] or "{}")
+        review = json.loads(design[4] or "{}")
+        assert validation.get("passed") is True, (
+            "Active design lacks passing deterministic validation"
+        )
+        assert review.get("passed") is True, (
+            "Active design lacks a passing bound global design review"
+        )
+        assert review.get("candidate_id") == design[0], (
+            "Global design review binds a different candidate"
+        )
+        assert review.get("candidate_hash") == design[1], (
+            "Global design review binds a different hash"
+        )
+        assert review.get("review_model_id") == review_model_id, (
+            "Global design review used the wrong role"
+        )
+
+        batches = connection.execute(
+            """
+            SELECT batch_id, batch_epoch, design_candidate_id, design_content_hash
+            FROM script_batches WHERE run_id = ? AND status = 'active'
+            """,
+            (run_id,),
+        ).fetchall()
+        assert len(batches) == 1, f"Expected one active script batch, found {len(batches)}"
+        batch = batches[0]
+        assert batch[2] == design[0] and batch[3] == design[1], (
+            "Batch does not bind the active design"
+        )
+
+        candidates = connection.execute(
+            """
+            SELECT candidate_id, episode_number, version, content_sha256,
+                   predecessor_candidate_id, call_id, status
+            FROM episode_candidates
+            WHERE run_id = ? AND batch_id = ? AND status = 'active'
+            ORDER BY episode_number
+            """,
+            (run_id, batch[0]),
+        ).fetchall()
+        assert candidates, "No active episode candidates"
+        for index, candidate in enumerate(candidates):
+            episode_number = candidate[1]
+            assert episode_number == index + 1, "Episode candidates are not ordered 1..N"
+            assert candidate[2] >= 1 and candidate[5], "Candidate lacks a version or call id"
+            if episode_number > 1:
+                assert candidate[4] == candidates[index - 1][0], (
+                    "Candidate predecessor chain is broken"
+                )
+
+        final_reviews = connection.execute(
+            """
+            SELECT review_id, design_content_hash, batch_id, prefix_hash, passed
+            FROM series_reviews
+            WHERE run_id = ? AND review_type = 'final' AND status = 'active'
+            ORDER BY review_epoch DESC
+            """,
+            (run_id,),
+        ).fetchall()
+        assert final_reviews, "No active final whole-series review"
+        final = final_reviews[0]
+        assert final[4] == 1, "Final review did not pass"
+        assert final[1] == design[1], "Final review does not bind the active design hash"
+        assert final[2] == batch[0], "Final review does not bind the active script batch"
+
+        deliveries = connection.execute(
+            "SELECT content_package_json FROM deliveries WHERE run_id = ?", (run_id,)
+        ).fetchall()
+        assert len(deliveries) == 1, "No formal delivery was frozen"
+
+        usage_rows = connection.execute(
+            "SELECT role, COUNT(*), SUM(actual_input_tokens), SUM(actual_output_tokens) "
+            "FROM model_calls WHERE run_id = ? AND status = 'succeeded' AND "
+            "usage_status = 'reported' GROUP BY role",
+            (run_id,),
+        ).fetchall()
+        usage = {row[0]: {"calls": row[1], "input": row[2], "output": row[3]} for row in usage_rows}
+        assert "generation" in usage and "review" in usage, "Both roles lack reported usage"
+        assert usage["generation"]["calls"] >= 1 and usage["review"]["calls"] >= 1
+
+    summary: dict[str, Any] = {
+        "status": "passed",
+        "active_design_candidate_id": design[0],
+        "active_design_content_hash": design[1],
+        "global_design_review_model": review.get("review_model_id"),
+        "active_batch_id": batch[0],
+        "episode_candidates": len(candidates),
+        "active_final_review_id": final[0],
+        "provider_reported_usage": usage,
+        "formal_delivery": 1,
+    }
+    _write_json(evidence_dir / "unified-delivery-facts.json", summary)
+    return summary
 
 
 def _assert_model_routing_audit(
@@ -1261,6 +1393,14 @@ def test_real_model_initial_creation_black_box() -> None:
                 creation_id=str(creation_body["creation_id"]),
                 evidence_dir=evidence_dir,
             )
+            unified_facts = _assert_unified_delivery_facts(
+                data_dir / "pengine.sqlite3",
+                creation_id=str(creation_body["creation_id"]),
+                generation_model_id=settings.generation_model_id,
+                review_model_id=settings.review_model_id,
+                evidence_dir=evidence_dir,
+            )
+            metadata["unified_delivery_facts"] = unified_facts
             process.terminate()
             process.wait(timeout=15)
             log_output.close()

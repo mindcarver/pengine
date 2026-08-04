@@ -1,3 +1,5 @@
+import asyncio
+import concurrent.futures
 import logging
 import ssl
 from collections.abc import Sequence
@@ -34,6 +36,51 @@ _MODEL_CALL_LOGGER = logging.getLogger("uvicorn.error.pengine.model_calls")
 # Durable structured record lines that carry estimate/actual/duration/finish/outcome.
 _MODEL_CALL_RECORD_LOGGER = logging.getLogger("uvicorn.error.pengine.model_call_records")
 ModelRole = Literal["generation", "review"]
+
+# The audit handler runs on the event-loop thread (the model is invoked with
+# ``ainvoke``), and a synchronous SQLite write there can deadlock with the
+# LangGraph AsyncSqliteSaver: the sync write blocks the loop while the saver holds
+# the database write lock and needs the loop to run its queued commit. The
+# persistence is therefore dispatched to this single writer thread whenever a
+# running loop is present; the worker drains it before finalizing a run
+# (Delivery #58 INT-A1/A2/A9). Sync tests without a running loop write inline and
+# stay deterministic.
+_AUDIT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="pengine-audit",
+)
+_PENDING_AUDIT_WRITES: set[concurrent.futures.Future[Any]] = set()
+
+
+def _running_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def submit_store_write(fn: Any, *args: Any, **kwargs: Any) -> None:
+    """Run one synchronous SQLite audit write, off the loop when a loop is running."""
+    if _running_loop():
+        future = _AUDIT_EXECUTOR.submit(fn, *args, **kwargs)
+        _PENDING_AUDIT_WRITES.add(future)
+        future.add_done_callback(_PENDING_AUDIT_WRITES.discard)
+    else:
+        fn(*args, **kwargs)
+
+
+def drain_audit_writes() -> None:
+    """Wait for every dispatched audit write to land (used at run finalization)."""
+    futures = list(_PENDING_AUDIT_WRITES)
+    for future in futures:
+        try:
+            # Cover the store's 30s busy timeout plus scheduling margin.
+            future.result(timeout=60)
+        except Exception as exc:  # pragma: no cover - infrastructure failure path
+            _MODEL_CALL_LOGGER.warning(
+                "model_call audit write failed error_type=%s", type(exc).__name__
+            )
 
 
 class _SerialChatAnthropic(ChatAnthropic):
@@ -142,7 +189,11 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         # Supersede any prior still-started call for this run/role BEFORE persisting
         # the current record, so the current in-flight call is never self-superseded.
         if self.state is not None and self.state.store is not None and context.run_id is not None:
-            self.state.store.mark_superseded_pending(run_id=context.run_id, role=self.role)
+            submit_store_write(
+                self.state.store.mark_superseded_pending,
+                run_id=context.run_id,
+                role=self.role,
+            )
         self._persist(record)
         _MODEL_CALL_LOGGER.info(
             "model_call event=start role=%s requested_model_id=%s call_id=%s "
@@ -235,7 +286,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
 
     def _persist(self, record: ModelCallRecord) -> None:
         if self.state is not None and self.state.store is not None:
-            self.state.store.upsert(record)
+            submit_store_write(self.state.store.upsert, record)
         self._log_record(record)
 
     def _finalize(
