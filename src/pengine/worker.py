@@ -797,6 +797,7 @@ class Worker:
             return
         is_rebuild = active is not None
         authorized_rebuild = False
+        persisted_rebuild_id = None
         if is_rebuild:
             lineage = await self.repository.get_series_bible_lineage(work.run_id)
             if lineage is not None and int(lineage["rebuild_count"]) >= 1:
@@ -815,15 +816,20 @@ class Worker:
                         stage=InternalStage.GENERATING_EPISODE_OUTLINE,
                     )
                 authorized_rebuild = True
+                persisted_rebuild_id = auth["rebuild_candidate_id"]
             candidate = build_series_bible(
                 **base,
                 parent_candidate_id=active.candidate_id,
                 rebuild_count=1,
                 design_epoch=active.design_epoch + 1,
+                candidate_id=persisted_rebuild_id,
             )
         evidence = validate_series_bible(candidate)
         if is_rebuild:
-            await self.repository.rebuild_series_bible(
+            # Returns the persisted candidate for this epoch: after a crash
+            # between INSERT and promotion, the same authorized one-cycle rebuild
+            # resumes the identical candidate instead of building a duplicate.
+            candidate = await self.repository.rebuild_series_bible(
                 str(work.creation_id),
                 work.run_id,
                 candidate,

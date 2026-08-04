@@ -524,11 +524,26 @@ async def test_authorized_rebuild_is_idempotent_after_crash_before_promotion(
     # key or creating an orphan rebuild candidate.
     accepted, lease = await create_leased_run(repository)
     contract, active = await seed_active_design_and_batch(repository, lease.run_id)
+    batch = await repository.get_script_batch_lineage(lease.run_id)
     async with repository._transaction() as connection:
         await connection.execute(
             "UPDATE series_bible_lineage SET rebuild_count = 1 WHERE run_id = ?",
             (str(lease.run_id),),
         )
+    await repository.pause_repair_authorization(
+        lease.run_id,
+        kind="design_rebuild",
+        design_candidate_id=active.candidate_id,
+        design_content_hash=active.content_hash,
+        design_epoch=active.design_epoch,
+        batch_id=batch.batch_id,
+        batch_epoch=batch.batch_epoch,
+        earliest_affected_episode=None,
+        range_episodes=None,
+        estimated_tokens=9_000,
+        evidence="设计缺陷证据",
+        review_id="review-idem",
+    )
     rebuilt = make_candidate(
         run_id=str(lease.run_id),
         story_outline="设计师确认首个候选存在结构性缺陷，整体重建设计。",
@@ -544,14 +559,31 @@ async def test_authorized_rebuild_is_idempotent_after_crash_before_promotion(
         evidence,
         authorized=True,
     )
-    second = await repository.rebuild_series_bible(
+    # The granted authorization now points at the rebuild candidate it produced.
+    auth = await repository.get_repair_authorization(lease.run_id)
+    assert auth is not None
+    assert auth["rebuild_candidate_id"] == first.candidate_id
+
+    # Simulate a crash between INSERT and promotion: the worker re-runs and
+    # builds a fresh candidate object but reuses the persisted candidate id
+    # bound to the authorization, so the same cycle resumes without an orphan.
+    retried_build = make_candidate(
+        run_id=str(lease.run_id),
+        story_outline="设计师确认首个候选存在结构性缺陷，整体重建设计。",
+        parent_candidate_id=active.candidate_id,
+        rebuild_count=1,
+        design_epoch=active.design_epoch + 1,
+    )
+    assert retried_build.candidate_id != rebuilt.candidate_id
+    retried_build = retried_build.model_copy(update={"candidate_id": auth["rebuild_candidate_id"]})
+    resumed = await repository.rebuild_series_bible(
         str(accepted.creation_id),
         lease.run_id,
-        rebuilt,
+        retried_build,
         evidence,
         authorized=True,
     )
-    assert second.candidate_id == first.candidate_id
+    assert resumed.candidate_id == first.candidate_id
     candidates = await repository.get_run_series_bible_candidates(lease.run_id)
     assert len(candidates) == 2  # the active design plus exactly one rebuild
     lineage = await repository.get_series_bible_lineage(lease.run_id)

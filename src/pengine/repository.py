@@ -92,7 +92,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -977,6 +977,7 @@ ALTER TABLE run_progress_v14 RENAME TO run_progress;
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (14);
 """
 
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RunKind = Literal["initial", "revision"]
@@ -1385,6 +1386,25 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 14
+            if schema_version == 14:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    auth_columns = await (
+                        await connection.execute("PRAGMA table_info(repair_authorizations)")
+                    ).fetchall()
+                    if "rebuild_candidate_id" not in {column[1] for column in auth_columns}:
+                        await connection.execute(
+                            "ALTER TABLE repair_authorizations ADD COLUMN rebuild_candidate_id TEXT"
+                        )
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (15)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 15
 
     async def setup(self) -> None:
         await self.initialize()
@@ -3475,9 +3495,9 @@ class Repository:
                 ),
             )
             if cursor.rowcount == 0:
-                # The candidate for this exact content already exists: a crash
-                # between INSERT and promotion of the same authorized one-cycle
-                # rebuild (RPR-A9) resumes the same cycle instead of repeating it.
+                # A candidate with this id already exists: a crash between INSERT
+                # and promotion of the same one-cycle rebuild resumes the same
+                # candidate instead of inserting a duplicate.
                 existing = await self._fetch_series_bible_candidate(
                     connection,
                     run_id,
@@ -3490,6 +3510,34 @@ class Repository:
                         409,
                     )
                 return self._series_bible_from_row(existing)
+            if authorized:
+                # Bind this rebuild candidate to the granted design_rebuild
+                # authorization so the worker resumes the exact same candidate
+                # (and not an orphan) if it crashes before promotion.
+                auth_row = await self._fetchone(
+                    connection,
+                    """
+                    SELECT authorization_epoch
+                    FROM repair_authorizations
+                    WHERE run_id = ? AND kind = 'design_rebuild'
+                    ORDER BY authorization_epoch DESC LIMIT 1
+                    """,
+                    (str(run_id),),
+                )
+                if auth_row is not None:
+                    await connection.execute(
+                        """
+                        UPDATE repair_authorizations
+                        SET rebuild_candidate_id = ?
+                        WHERE run_id = ? AND authorization_epoch = ?
+                          AND rebuild_candidate_id IS NULL
+                        """,
+                        (
+                            candidate.candidate_id,
+                            str(run_id),
+                            int(auth_row["authorization_epoch"]),
+                        ),
+                    )
         return candidate
 
     async def get_run_series_bible(self, run_id: UUID) -> SeriesBibleSummary | None:
@@ -4765,6 +4813,7 @@ class Repository:
             "review_id": row["review_id"],
             "granted_at": row["granted_at"],
             "consumed_at": row["consumed_at"],
+            "rebuild_candidate_id": row["rebuild_candidate_id"],
         }
 
     async def authorize_repair(
@@ -4878,12 +4927,26 @@ class Repository:
             await self.requeue_run_job(run_id)
         elif auth_kind == "design_rebuild":
             # RPR-A9: the authorization permits exactly one design-rebuild cycle
-            # even after the automatic budget was consumed.
-            await self.trigger_design_rebuild(
-                run_id,
-                evidence=auth_evidence or "",
-                authorized=True,
-            )
+            # even after the automatic budget was consumed. If the rebuild trigger
+            # itself fails, roll the authorization back so the same evidence pause
+            # can be authorized again instead of being stranded as consumed.
+            try:
+                await self.trigger_design_rebuild(
+                    run_id,
+                    evidence=auth_evidence or "",
+                    authorized=True,
+                )
+            except Exception:
+                async with self._transaction() as connection:
+                    await connection.execute(
+                        """
+                        UPDATE repair_authorizations
+                        SET granted_at = NULL, consumed_at = NULL
+                        WHERE run_id = ? AND authorization_epoch = ?
+                        """,
+                        (str(run_id), int(auth["authorization_epoch"])),
+                    )
+                raise
         return response
 
     async def _next_review_epoch(
