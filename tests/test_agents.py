@@ -49,6 +49,7 @@ from pengine.agents import (
     _arithmetic_tool,
     _calculate_arithmetic,
     _canon_issue_ledger,
+    _drop_dangling_tool_call_messages,
     _language_retry_fingerprint,
     _language_retry_matches,
     _merge_story_canon_reviews,
@@ -1327,12 +1328,15 @@ async def test_structured_result_middleware_removes_work_tools_after_schema_erro
 
     error_message = ToolMessage(
         content="Correct the schema.",
-        tool_call_id="result-call",
+        tool_call_id="call-9",
         name="Result",
     )
     request = ModelRequest(
         model=FakeMessagesListChatModel(responses=[]),
-        messages=[error_message],
+        messages=[
+            _tool_call("Result", {"value": "invalid"}, 9),
+            error_message,
+        ],
         tools=[{"type": "function", "function": {"name": "work"}}],
         response_format=ToolStrategy(Result),
     )
@@ -1674,10 +1678,12 @@ async def test_structured_result_middleware_stops_after_work_tool_turn_budget() 
     class Result(BaseModel):
         value: str
 
-    messages = [
-        _tool_call("read_file", {"file_path": f"/workspace/review-{index}.md"}, index)
-        for index in range(24)
-    ]
+    messages: list[AIMessage | ToolMessage] = []
+    for index in range(24):
+        messages.append(
+            _tool_call("read_file", {"file_path": f"/workspace/review-{index}.md"}, index)
+        )
+        messages.append(ToolMessage(content="ok", tool_call_id=f"call-{index}", name="read_file"))
     request = ModelRequest(
         model=FakeMessagesListChatModel(responses=[]),
         messages=messages,
@@ -1704,21 +1710,21 @@ async def test_structured_result_middleware_allows_normal_multi_tool_review() ->
     class Result(BaseModel):
         value: str
 
-    messages = [
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "read_file",
-                    "args": {"file_path": f"/workspace/review-{turn}-{call}.md"},
-                    "id": f"review-{turn}-{call}",
-                    "type": "tool_call",
-                }
-                for call in range(3)
-            ],
+    messages: list = []
+    for turn in range(8):
+        calls = [
+            {
+                "name": "read_file",
+                "args": {"file_path": f"/workspace/review-{turn}-{call}.md"},
+                "id": f"review-{turn}-{call}",
+                "type": "tool_call",
+            }
+            for call in range(3)
+        ]
+        messages.append(AIMessage(content="", tool_calls=calls))
+        messages.extend(
+            ToolMessage(content="ok", tool_call_id=f"review-{turn}-{call}") for call in range(3)
         )
-        for turn in range(8)
-    ]
     request = ModelRequest(
         model=FakeMessagesListChatModel(responses=[]),
         messages=messages,
@@ -1893,6 +1899,116 @@ async def test_structured_result_middleware_recovers_truncated_tool_call() -> No
     assert not any(
         isinstance(message, AIMessage) and message.tool_calls for message in calls[1].messages
     )
+
+
+def test_drop_dangling_tool_call_messages_cleans_truncated_history() -> None:
+    messages = [
+        HumanMessage(content="start"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "work", "args": {}, "id": "call-1", "type": "tool_call"},
+                {
+                    "name": "Result",
+                    "args": {"value": "trunc"},
+                    "id": "call-2",
+                    "type": "tool_call",
+                },
+            ],
+        ),
+        ToolMessage(content="ok", tool_call_id="call-1"),
+        HumanMessage(content="next"),
+    ]
+    cleaned = _drop_dangling_tool_call_messages(messages)
+    # call-2 was never answered by a ToolMessage (truncated tool call): the
+    # assistant message that declared it must be dropped so the next provider
+    # request never carries a dangling tool_calls message.
+    assert cleaned == [messages[0], messages[3]]
+    assert not any(isinstance(message, AIMessage) and message.tool_calls for message in cleaned)
+
+
+def test_drop_dangling_tool_call_messages_keeps_answered_calls() -> None:
+    messages = [
+        HumanMessage(content="start"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "work", "args": {}, "id": "call-1", "type": "tool_call"},
+            ],
+        ),
+        ToolMessage(content="ok", tool_call_id="call-1"),
+        HumanMessage(content="done"),
+    ]
+    cleaned = _drop_dangling_tool_call_messages(messages)
+    assert cleaned == messages
+
+
+def test_drop_dangling_tool_call_messages_removes_orphaned_tool_messages() -> None:
+    messages = [
+        HumanMessage(content="start"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "Result",
+                    "args": {"value": "trunc"},
+                    "id": "call-x",
+                    "type": "tool_call",
+                },
+            ],
+        ),
+        ToolMessage(content="orphan", tool_call_id="call-y"),
+    ]
+    cleaned = _drop_dangling_tool_call_messages(messages)
+    # call-x was truncated (no ToolMessage answered it) and call-y has no
+    # declaring assistant tool call: both are removed from the transcript.
+    assert cleaned == [messages[0]]
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_cleans_dangling_history_before_retry() -> None:
+    class Result(BaseModel):
+        value: str
+
+    calls: list[ModelRequest] = []
+
+    async def handler(request: ModelRequest) -> ModelResponse:
+        calls.append(request)
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="done"),
+        )
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[
+            HumanMessage(content="start"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "work",
+                        "args": {"expression": "1+1"},
+                        "id": "call-stale",
+                        "type": "tool_call",
+                    },
+                ],
+            ),
+            HumanMessage(content="continue"),
+        ],
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value="done")
+    assert len(calls) == 1
+    assert not any(
+        isinstance(message, AIMessage) and message.tool_calls for message in calls[0].messages
+    )
+    assert calls[0].messages[0] == request.messages[0]
+    assert calls[0].messages[-1] == request.messages[-1]
 
 
 def test_outline_repair_patch_applies_only_guarded_minimal_edits() -> None:
