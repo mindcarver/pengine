@@ -450,7 +450,7 @@ def test_retryable_relay_interruption_keeps_tls_certificate_configuration_termin
             assert retryable_relay_interruption(error) is None
 
 
-@pytest.mark.parametrize("status_code", [429, 502, 503, 504])
+@pytest.mark.parametrize("status_code", [408, 429, 502, 503, 504])
 def test_retryable_relay_interruption_accepts_allowed_statuses_and_transport_cause(
     status_code: int,
 ) -> None:
@@ -468,7 +468,7 @@ def test_retryable_relay_interruption_accepts_allowed_statuses_and_transport_cau
             assert retryable_relay_interruption(wrapped) is not None
 
 
-@pytest.mark.parametrize("status_code", [429, 502, 503, 504])
+@pytest.mark.parametrize("status_code", [408, 429, 502, 503, 504])
 def test_retryable_relay_interruption_accepts_openai_status_and_connection_errors(
     status_code: int,
 ) -> None:
@@ -484,6 +484,45 @@ def test_retryable_relay_interruption_accepts_openai_status_and_connection_error
             raise openai.APIConnectionError(request=request) from cause
         except openai.APIConnectionError as wrapped:
             assert retryable_relay_interruption(wrapped) is not None
+
+
+def test_retryable_relay_interruption_recovers_provider_408_request_timeout() -> None:
+    """A provider-side HTTP 408 request timeout (`timeout_error`) is transient
+    congestion, not a terminal relay failure: the run recovers instead of failing
+    on a single timed-out call (Issue #52 graph revision 10; E2E
+    20260804T131739Z-02ea1827 failed in `generating_character_biographies` after
+    one 408 with attempt_count=1, recovery_state=none)."""
+    request = httpx.Request("POST", "https://relay.example/v1/chat/completions")
+    body = {
+        "message": "请求超时，请稍后重试",
+        "type": "timeout_error",
+    }
+    response = httpx.Response(408, request=request, json=body)
+    error = openai.APIStatusError("request timed out", response=response, body=body)
+
+    interruption = retryable_relay_interruption(error)
+
+    assert interruption is not None
+    assert interruption.retry_delay_seconds >= MIN_RELAY_RETRY_DELAY_SECONDS
+
+
+def test_classify_relay_exception_408_keeps_unavailable_with_timeout_evidence() -> None:
+    """HTTP 408 still classifies as relay_unavailable with the provider's
+    timeout detail surfaced, but it is now retryable so the worker recovers
+    rather than terminating the run."""
+    request = httpx.Request("POST", "https://relay.example/v1/chat/completions")
+    body = {
+        "message": "请求超时，请稍后重试",
+        "type": "timeout_error",
+    }
+    response = httpx.Response(408, request=request, json=body)
+    error = openai.APIStatusError("request timed out", response=response, body=body)
+
+    mapped = classify_relay_exception(error)
+
+    assert mapped.http_status == 408
+    assert mapped.code == "relay_unavailable"
+    assert retryable_relay_interruption(error) is not None
 
 
 @pytest.mark.parametrize(
