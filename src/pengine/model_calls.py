@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS model_calls (
     outcome TEXT NOT NULL,
     error_code TEXT,
     error_type TEXT,
+    http_status INTEGER,
+    provider_error_code TEXT,
+    redacted_response TEXT,
     safe_message TEXT,
     supersedes_call_id TEXT
 );
@@ -213,6 +216,9 @@ class ModelCallRecord:
     finish_reason: str | None = None
     error_code: str | None = None
     error_type: str | None = None
+    http_status: int | None = None
+    provider_error_code: str | None = None
+    redacted_response: str | None = None
     safe_message: str | None = None
     supersedes_call_id: str | None = None
 
@@ -415,6 +421,9 @@ _COLUMNS = (
     "outcome",
     "error_code",
     "error_type",
+    "http_status",
+    "provider_error_code",
+    "redacted_response",
     "safe_message",
     "supersedes_call_id",
 )
@@ -450,6 +459,13 @@ WHERE run_id = ?
 """
 
 
+_PROVIDER_EVIDENCE_ALTERS = (
+    "ALTER TABLE model_calls ADD COLUMN http_status INTEGER",
+    "ALTER TABLE model_calls ADD COLUMN provider_error_code TEXT",
+    "ALTER TABLE model_calls ADD COLUMN redacted_response TEXT",
+)
+
+
 class ModelCallStore:
     """Synchronous, immediately durable SQLite writer for model-call audit records.
 
@@ -473,10 +489,27 @@ class ModelCallStore:
         self._connection.execute("PRAGMA busy_timeout = 30000")
         self._connection.execute(_MODEL_CALLS_TABLE_SQL)
         self._connection.execute(_MODEL_CALLS_INDEX_SQL)
+        self._ensure_provider_evidence_columns()
         self._connection.commit()
         # Serialize writes when the store is used from the audit writer thread and
         # the worker loop (e.g. the timeout finalizer) at the same time.
         self._write_lock = threading.Lock()
+
+    def _ensure_provider_evidence_columns(self) -> None:
+        """Upgrade a pre-existing ``model_calls`` table in place.
+
+        Databases created before the provider-evidence columns were added keep working
+        after a restart: each missing column is added with a nullable default so the
+        upsert writes all columns (Issue #52 graph revision 4).
+        """
+        existing = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(model_calls)").fetchall()
+        }
+        for statement in _PROVIDER_EVIDENCE_ALTERS:
+            column = statement.split()[-2]
+            if column not in existing:
+                self._connection.execute(statement)
 
     def upsert(self, record: ModelCallRecord) -> None:
         with self._write_lock:

@@ -128,6 +128,7 @@ class RunFailure(StrictModel):
         "persona_package_invalid",
         "relay_unavailable",
         "relay_incompatible",
+        "relay_rejected",
         "preflight_blocked",
         "structured_output_invalid",
         "stage_validation_failed",
