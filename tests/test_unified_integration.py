@@ -1104,15 +1104,12 @@ async def test_int_a8_design_budget_exhaustion_and_authorization_cycle(
     assert paused.initial.pause.code == "repair_authorization"
     assert paused.initial.authorization.kind == "design_rebuild"
 
-    # Confirmed #57 integration defect: an authorized design rebuild after the one
-    # automatic rebuild is refused by ``trigger_design_rebuild`` because the
-    # automatic rebuild budget is already consumed, and the resulting
-    # ``series_bible_rebuild_exhausted`` DomainError is not part of the API
-    # CommandError contract, so the HTTP surface fails with an internal error
-    # instead of a stable rejection. The refusal is nonetheless SAFE for content:
-    # no content attempt occurs and the run remains paused at the same evidence
-    # pause. The authorized one-cycle design rebuild cannot complete until the
-    # owning contract (Delivery #57) repairs this gate.
+    # #57 repair: an explicit one-cycle authorization (RPR-A9) permits exactly one
+    # further complete design rebuild even after the automatic budget is consumed.
+    # The HTTP surface accepts the authorization (202, run requeued) and the next
+    # worker cycle completes that one rebuild before pausing again at the same
+    # repair-authorization evidence pause. The automatic budget stays consumed
+    # (rebuild_count remains 1).
     cycles_before = workflow.execution_count
     app = create_app(settings=settings, repository=repository, catalog=catalog)
     async with (
@@ -1126,13 +1123,61 @@ async def test_int_a8_design_budget_exhaustion_and_authorization_cycle(
             f"/creations/{accepted.creation_id}/runs/initial/authorize-repair",
             headers={"Idempotency-Key": "a8-design-authorize"},
         )
-        assert authorized.status_code == 500
-        assert workflow.execution_count == cycles_before
+        assert authorized.status_code == 202
+        assert authorized.json()["run_state"] == "queued"
+
+        # A real provider would produce fresh design content for the granted
+        # rebuild cycle. The deterministic workflow keeps one fixed rebuild
+        # contract, so a rebuild would regenerate byte-identical content and be
+        # skipped as a no-op (same content hash). Swap in a distinct second-round
+        # contract to prove the granted cycle actually rebuilds the design into a
+        # new active epoch instead of short-circuiting on the hash match.
+        second_round = _contract_b_rebuild()
+        for fact in second_round.facts:
+            fact.value = f"{fact.value}（授权重建版）"
+        workflow.rebuild_contract = second_round
+
         await worker.run_once()
+
+        # Exactly one authorized design-rebuild cycle ran, then the run paused
+        # again at the same repair-authorization evidence pause.
+        assert workflow.execution_count == cycles_before + 1
     still_paused = await repository.get_creation(accepted.creation_id)
     assert still_paused is not None
     assert still_paused.initial.state == "paused"
     assert still_paused.initial.pause.code == "repair_authorization"
+
+    # The authorized one-cycle rebuild completed: the consumed authorization is
+    # bound to the rebuilt candidate, that candidate is the single active design
+    # one epoch above the granted design, the automatic budget stays consumed,
+    # and the new evidence pause raised a fresh unconsumed authorization.
+    consumed = _sqlite_rows(
+        settings.database_path,
+        "SELECT consumed_at, rebuild_candidate_id, design_epoch "
+        "FROM repair_authorizations "
+        "WHERE kind='design_rebuild' AND consumed_at IS NOT NULL "
+        "ORDER BY authorization_epoch DESC LIMIT 1",
+    )
+    assert consumed and consumed[0]["consumed_at"] is not None
+    assert consumed[0]["rebuild_candidate_id"]
+    active = _sqlite_rows(
+        settings.database_path,
+        "SELECT candidate_id, design_epoch FROM series_bible_candidates WHERE status='active'",
+    )
+    assert len(active) == 1
+    assert active[0]["candidate_id"] == consumed[0]["rebuild_candidate_id"]
+    assert int(active[0]["design_epoch"]) == int(consumed[0]["design_epoch"]) + 1
+    lineage = _sqlite_rows(
+        settings.database_path,
+        "SELECT rebuild_count FROM series_bible_lineage",
+    )
+    assert lineage and int(lineage[0]["rebuild_count"]) == 1
+    unconsumed = _sqlite_rows(
+        settings.database_path,
+        "SELECT COUNT(*) AS n FROM repair_authorizations "
+        "WHERE kind='design_rebuild' AND consumed_at IS NULL",
+    )
+    assert int(unconsumed[0]["n"]) == 1
 
 
 # ---------------------------------------------------------------------------

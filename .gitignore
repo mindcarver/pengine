@@ -12,3 +12,5 @@ data/
 *.db
 *.sqlite
 *.sqlite3
+pytest-of-*/
+.venv
