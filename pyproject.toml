@@ -48,6 +48,7 @@ exclude = [
 addopts = "-q"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["src"]
 markers = [
   "live_model: opt-in black-box tests that call the Opus generation and DeepSeek review routes",
 ]

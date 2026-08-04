@@ -1143,10 +1143,10 @@ class Repository:
 
     @asynccontextmanager
     async def _connection(self) -> AsyncIterator[aiosqlite.Connection]:
-        connection = await aiosqlite.connect(self.database_path)
+        connection = await aiosqlite.connect(self.database_path, timeout=30)
         connection.row_factory = aiosqlite.Row
         await connection.execute("PRAGMA foreign_keys = ON")
-        await connection.execute("PRAGMA busy_timeout = 5000")
+        await connection.execute("PRAGMA busy_timeout = 30000")
         try:
             yield connection
         finally:

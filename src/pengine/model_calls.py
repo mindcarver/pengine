@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from math import ceil
@@ -460,31 +461,45 @@ class ModelCallStore:
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(str(self.database_path), timeout=10)
+        # The audit store writes synchronously from the event-loop thread while the
+        # repository and the LangGraph checkpointer write through their own aiosqlite
+        # connections. WAL plus a generous busy timeout keeps these writers from
+        # colliding during the real provider path (Delivery #58 INT-A1/A2/A9).
+        self._connection = sqlite3.connect(
+            str(self.database_path), timeout=30, check_same_thread=False
+        )
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA busy_timeout = 5000")
+        self._connection.execute("PRAGMA journal_mode = WAL")
+        self._connection.execute("PRAGMA busy_timeout = 30000")
         self._connection.execute(_MODEL_CALLS_TABLE_SQL)
         self._connection.execute(_MODEL_CALLS_INDEX_SQL)
         self._connection.commit()
+        # Serialize writes when the store is used from the audit writer thread and
+        # the worker loop (e.g. the timeout finalizer) at the same time.
+        self._write_lock = threading.Lock()
 
     def upsert(self, record: ModelCallRecord) -> None:
-        self._connection.execute(_UPSERT_SQL, _row_values(record))
-        self._connection.commit()
+        with self._write_lock:
+            self._connection.execute(_UPSERT_SQL, _row_values(record))
+            self._connection.commit()
 
     def mark_superseded_pending(self, *, run_id: str, role: str) -> None:
         """A new call for the same run/role supersedes any still-started prior call."""
-        timestamp = _utc_now().isoformat()
-        self._connection.execute(_SUPERSEDE_PENDING_SQL, (timestamp, run_id, role))
-        self._connection.commit()
+        with self._write_lock:
+            timestamp = _utc_now().isoformat()
+            self._connection.execute(_SUPERSEDE_PENDING_SQL, (timestamp, run_id, role))
+            self._connection.commit()
 
     def mark_timed_out(self, *, run_id: str) -> None:
         """Finalize every still-started call for a run as timed out."""
-        timestamp = _utc_now().isoformat()
-        self._connection.execute(_FINALIZE_TIMED_OUT_SQL, (timestamp, run_id))
-        self._connection.commit()
+        with self._write_lock:
+            timestamp = _utc_now().isoformat()
+            self._connection.execute(_FINALIZE_TIMED_OUT_SQL, (timestamp, run_id))
+            self._connection.commit()
 
     def close(self) -> None:
-        self._connection.close()
+        with self._write_lock:
+            self._connection.close()
 
 
 @dataclass(slots=True)
