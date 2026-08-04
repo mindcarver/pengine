@@ -2293,13 +2293,13 @@ class StructuredResultMiddleware(AgentMiddleware):
             if isinstance(message, AIMessage)
             for call in message.tool_calls
         }
-        if returned_tool_names:
+        truncated = _structured_response_truncated(response)
+        if returned_tool_names and not truncated:
             if not model_request.tools and not returned_tool_names <= result_tool_names:
                 raise AgentProtocolError("Subagent returned an unavailable working tool call")
             return response
 
         schema_names = ", ".join(sorted(result_tool_names))
-        truncated = _structured_response_truncated(response)
         if truncated:
             correction = HumanMessage(
                 content=(
@@ -2309,6 +2309,15 @@ class StructuredResultMiddleware(AgentMiddleware):
                     f"as its arguments and no prose."
                 )
             )
+            # A truncated tool call has incomplete arguments and must not be
+            # forwarded to the next provider turn (OpenAI-compatible relays reject
+            # an assistant tool_calls message that is not fully answered by tool
+            # messages). Drop truncated tool-call messages before the retry.
+            tail = [
+                message
+                for message in response.result
+                if not (isinstance(message, AIMessage) and message.tool_calls)
+            ]
         else:
             correction = HumanMessage(
                 content=(
@@ -2317,14 +2326,24 @@ class StructuredResultMiddleware(AgentMiddleware):
                     "working tool."
                 )
             )
+            tail = list(response.result)
         forced = await handler(
             model_request.override(
-                messages=[*model_request.messages, *response.result, correction],
+                messages=[*model_request.messages, *tail, correction],
                 tools=[],
             )
         )
         if forced.structured_response is not None:
             return forced
+        if truncated or _structured_response_truncated(forced):
+            raise AgentProtocolError(
+                "Subagent structured output was truncated by the output token limit",
+                repair_instruction=(
+                    "The previous response was truncated. Return only the complete "
+                    "structured result tool call without repeating or analyzing source material."
+                ),
+                safe_message="结构化评审输出被模型截断。",
+            )
         forced_tool_names = {
             call.get("name")
             for message in forced.result
@@ -2338,15 +2357,6 @@ class StructuredResultMiddleware(AgentMiddleware):
             # Return it to the agent loop so the normal bounded correction path
             # can provide validation details on the next assistant turn.
             return forced
-        if truncated or _structured_response_truncated(forced):
-            raise AgentProtocolError(
-                "Subagent structured output was truncated by the output token limit",
-                repair_instruction=(
-                    "The previous response was truncated. Return only the complete "
-                    "structured result tool call without repeating or analyzing source material."
-                ),
-                safe_message="结构化评审输出被模型截断。",
-            )
         raise AgentProtocolError("Subagent returned invalid structured output")
 
 

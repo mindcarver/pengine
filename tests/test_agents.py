@@ -1799,6 +1799,57 @@ async def test_structured_result_middleware_classifies_persistent_truncation() -
     assert error.value.repair_instruction is not None
 
 
+@pytest.mark.asyncio
+async def test_structured_result_middleware_recovers_truncated_tool_call() -> None:
+    class Result(BaseModel):
+        value: str
+
+    calls: list[ModelRequest] = []
+
+    async def handler(request: ModelRequest) -> ModelResponse:
+        calls.append(request)
+        if len(calls) == 1:
+            return ModelResponse(
+                result=[
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "Result",
+                                "args": {"value": "trunc"},
+                                "id": "truncated-result",
+                                "type": "tool_call",
+                            }
+                        ],
+                        response_metadata={"finish_reason": "length"},
+                    )
+                ],
+                structured_response=None,
+            )
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="done"),
+        )
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[],
+        tools=[{"type": "function", "function": {"name": "work"}}],
+        response_format=ToolStrategy(Result),
+    )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == Result(value="done")
+    assert len(calls) == 2
+    assert calls[1].tools == []
+    assert isinstance(calls[1].messages[-1], HumanMessage)
+    assert "truncated" in calls[1].messages[-1].content
+    assert not any(
+        isinstance(message, AIMessage) and message.tool_calls for message in calls[1].messages
+    )
+
+
 def test_outline_repair_patch_applies_only_guarded_minimal_edits() -> None:
     contract = _story_contract()
     candidate = {
