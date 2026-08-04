@@ -2233,6 +2233,64 @@ def _review_workspace_files(
     return files
 
 
+def _drop_dangling_tool_call_messages(messages: list[Any]) -> list[Any]:
+    """Drop assistant ``tool_calls`` messages that are not fully answered by
+    ToolMessages, plus their orphaned ToolMessages.
+
+    A truncation leaves a tool call whose arguments were cut off in the
+    conversation history. The provider protocol rejects a subsequent request
+    that still carries an assistant ``tool_calls`` message without a matching
+    tool response for every call id (Anthropic: "An assistant message with
+    'tool_calls' must be followed by tool messages responding to each
+    'tool_call_id'"). Cleaning the history before the next retry lets the
+    model regenerate the call on a consistent transcript.
+    """
+
+    answered = {message.tool_call_id for message in messages if isinstance(message, ToolMessage)}
+
+    def call_ids(message: Any) -> set[Any]:
+        return {call.get("id") for call in message.tool_calls if call.get("id")}
+
+    dropped_ai_messages = [
+        message
+        for message in messages
+        if isinstance(message, AIMessage)
+        and message.tool_calls
+        and call_ids(message)
+        and not call_ids(message) <= answered
+    ]
+    removed_ids: set[Any] = {
+        call.get("id")
+        for message in dropped_ai_messages
+        for call in message.tool_calls
+        if call.get("id")
+    }
+    kept_claimed_ids = {
+        call.get("id")
+        for message in messages
+        if isinstance(message, AIMessage)
+        and message.tool_calls
+        and message not in dropped_ai_messages
+        for call in message.tool_calls
+        if call.get("id")
+    }
+    removed_ids |= answered - kept_claimed_ids
+    if not removed_ids:
+        return messages
+    return [
+        message
+        for message in messages
+        if not (
+            (
+                isinstance(message, AIMessage)
+                and message.tool_calls
+                and call_ids(message) & removed_ids
+            )
+            or (isinstance(message, ToolMessage) and message.tool_call_id in removed_ids)
+        )
+    ]
+
+
 class StructuredResultMiddleware(AgentMiddleware):
     async def awrap_model_call(
         self,
@@ -2242,6 +2300,10 @@ class StructuredResultMiddleware(AgentMiddleware):
         response_format = request.response_format
         if not isinstance(response_format, ToolStrategy):
             return await handler(request)
+
+        cleaned_messages = _drop_dangling_tool_call_messages(list(request.messages))
+        if cleaned_messages != list(request.messages):
+            request = request.override(messages=cleaned_messages)
 
         result_tool_names = {spec.name for spec in response_format.schema_specs}
         validation_errors = _structured_validation_failure_turns(
