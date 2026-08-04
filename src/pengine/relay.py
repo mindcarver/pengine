@@ -700,7 +700,10 @@ class PreflightBlockedError(RelayError):
 
 
 MIN_RELAY_RETRY_DELAY_SECONDS = 10
-_RETRYABLE_RELAY_STATUSES = frozenset({429, 502, 503, 504})
+# HTTP 408 is a provider-side request timeout (`timeout_error`); it is transient
+# congestion, not a terminal relay failure, so the run recovers instead of
+# failing on a single timed-out call (Issue #52 graph revision 10).
+_RETRYABLE_RELAY_STATUSES = frozenset({408, 429, 502, 503, 504})
 
 
 @dataclass(frozen=True, slots=True)
@@ -834,8 +837,10 @@ def classify_relay_exception(exc: Exception) -> RelayError:
     ``relay_rejected``, a 400 tool-protocol rejection stays ``relay_incompatible``,
     and auth/other terminal statuses map to ``relay_unavailable``. Every surfaced
     message reflects the provider's own (redacted, truncated) response so the external
-    block root cause stays distinguishable (Issue #52 graph revision 4). Recovery
-    semantics are unchanged: these statuses are terminal, never retryable.
+    block root cause stays distinguishable (Issue #52 graph revision 4). This function
+    only labels the failure truthfully; whether a status is retryable is decided
+    separately by ``retryable_relay_interruption`` (e.g. HTTP 408 provider timeout is
+    classified as ``relay_unavailable`` but recoverable — Issue #52 graph revision 10).
     """
     failure = _extract_provider_failure(exc)
     status = failure.http_status if failure is not None else None
