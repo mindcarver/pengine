@@ -118,6 +118,28 @@ def test_model_call_audit_rejects_missing_or_mismatched_response_identity(
         handler.on_llm_end(response, run_id=uuid4())
 
 
+@pytest.mark.parametrize(
+    "response_model",
+    ["DeepSeek-V4-Flash", "deepseek-v4-flash", "DEEPSEEK-V4-FLASH"],
+)
+def test_model_call_audit_accepts_case_variant_model_identity(response_model: str) -> None:
+    handler = _ModelCallAuditHandler(role="review", model_id="deepseek-v4-flash")
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="ok",
+                        response_metadata={"model": response_model},
+                    )
+                )
+            ]
+        ]
+    )
+
+    handler.on_llm_end(response, run_id=uuid4())
+
+
 @pytest.mark.parametrize("max_output_tokens", [None, 16384])
 def test_build_relay_adapter_uses_native_deepseek_without_an_implicit_token_cap(
     max_output_tokens: int | None,

@@ -215,7 +215,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         record = self._pending.pop(run_id, None)
         response_model_ids = _response_model_ids(response)
         tokens, finish_reason = extract_provider_usage(response)
-        if response_model_ids != {self.model_id}:
+        if {model_id.casefold() for model_id in response_model_ids} != {self.model_id.casefold()}:
             if record is not None:
                 self._finalize(
                     record,
