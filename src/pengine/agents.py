@@ -949,6 +949,28 @@ def _work_tool_stop_reason(
     return None
 
 
+def _structured_response_truncated(response: ModelResponse) -> bool:
+    """Detect a provider output-token truncation in a structured-call response.
+
+    The model relay surfaces ``finish_reason`` (OpenAI-compatible adapters) or
+    ``stop_reason`` (Anthropic) on each ``AIMessage`` response metadata. A
+    ``length``/``max_tokens`` reason means the model ran out of output tokens and
+    the response is incomplete, which must be classified and recovered as a
+    truncation rather than silently treated as an ordinary prose failure.
+    """
+
+    for message in response.result:
+        if not isinstance(message, AIMessage):
+            continue
+        metadata = getattr(message, "response_metadata", None)
+        if not isinstance(metadata, Mapping):
+            continue
+        for key in ("finish_reason", "stop_reason"):
+            if metadata.get(key) in {"length", "max_tokens"}:
+                return True
+    return False
+
+
 def _user_facing_texts(result: Any) -> list[str]:
     if isinstance(result, StoryArchitectResult):
         if result.stage == InternalStage.SELECTING_L0_VARIANT:
@@ -2271,27 +2293,57 @@ class StructuredResultMiddleware(AgentMiddleware):
             if isinstance(message, AIMessage)
             for call in message.tool_calls
         }
-        if returned_tool_names:
+        truncated = _structured_response_truncated(response)
+        if returned_tool_names and not truncated:
             if not model_request.tools and not returned_tool_names <= result_tool_names:
                 raise AgentProtocolError("Subagent returned an unavailable working tool call")
             return response
 
         schema_names = ", ".join(sorted(result_tool_names))
-        correction = HumanMessage(
-            content=(
-                f"Return exactly one valid {schema_names} tool call now. Reuse the completed "
-                "work above, correct any schema violation, and do not return prose or call a "
-                "working tool."
+        if truncated:
+            correction = HumanMessage(
+                content=(
+                    f"Your previous response was truncated by the model output token limit. "
+                    f"Do not repeat or analyze the work already completed. Return exactly one "
+                    f"valid {schema_names} tool call now, with the complete structured result "
+                    f"as its arguments and no prose."
+                )
             )
-        )
+            # A truncated tool call has incomplete arguments and must not be
+            # forwarded to the next provider turn (OpenAI-compatible relays reject
+            # an assistant tool_calls message that is not fully answered by tool
+            # messages). Drop truncated tool-call messages before the retry.
+            tail = [
+                message
+                for message in response.result
+                if not (isinstance(message, AIMessage) and message.tool_calls)
+            ]
+        else:
+            correction = HumanMessage(
+                content=(
+                    f"Return exactly one valid {schema_names} tool call now. Reuse the completed "
+                    "work above, correct any schema violation, and do not return prose or call a "
+                    "working tool."
+                )
+            )
+            tail = list(response.result)
         forced = await handler(
             model_request.override(
-                messages=[*model_request.messages, *response.result, correction],
+                messages=[*model_request.messages, *tail, correction],
                 tools=[],
             )
         )
         if forced.structured_response is not None:
             return forced
+        if truncated or _structured_response_truncated(forced):
+            raise AgentProtocolError(
+                "Subagent structured output was truncated by the output token limit",
+                repair_instruction=(
+                    "The previous response was truncated. Return only the complete "
+                    "structured result tool call without repeating or analyzing source material."
+                ),
+                safe_message="结构化评审输出被模型截断。",
+            )
         forced_tool_names = {
             call.get("name")
             for message in forced.result
