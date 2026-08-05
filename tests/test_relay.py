@@ -9,6 +9,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr
 
 from pengine.config import Settings
@@ -159,6 +160,27 @@ def test_build_relay_adapter_uses_native_deepseek_without_an_implicit_token_cap(
     assert adapter.model.extra_body == {"thinking": {"type": "disabled"}}
     assert adapter.model.max_retries == 0
     assert adapter.model.openai_api_key.get_secret_value() == "secret-value"
+    assert "secret-value" not in repr(adapter.model)
+
+
+@pytest.mark.parametrize("max_output_tokens", [None, 16384])
+def test_build_relay_adapter_uses_openai_for_gpt55_review(max_output_tokens: int | None) -> None:
+    adapter = build_relay_adapter(
+        _role_settings(review_model_id="gpt-5.5", review_max_output_tokens=max_output_tokens),
+        role="review",
+    )
+
+    assert isinstance(adapter.model, ChatOpenAI)
+    assert not isinstance(adapter.model, ChatDeepSeek)
+    assert adapter.role == "review"
+    assert adapter.model_id == "gpt-5.5"
+    assert adapter.provider_profile_key == "openai"
+    assert adapter.model.model_name == "gpt-5.5"
+    assert adapter.model.openai_api_base == "https://relay.example/v1"
+    assert adapter.model.max_tokens == max_output_tokens
+    # GPT-5.5 must NOT receive the DeepSeek-specific "thinking" extra_body.
+    assert adapter.model.extra_body is None
+    assert adapter.model.max_retries == 0
     assert "secret-value" not in repr(adapter.model)
 
 

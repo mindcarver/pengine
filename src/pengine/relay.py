@@ -19,6 +19,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.outputs import LLMResult
 from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
 
 from pengine.config import Settings
 from pengine.model_calls import (
@@ -102,6 +103,12 @@ class _SerialChatDeepSeek(ChatDeepSeek):
         tool_choice = kwargs.get("tool_choice")
         if len(tools) > 1 and isinstance(tool_choice, str) and tool_choice in {"any", "required"}:
             kwargs["tool_choice"] = "auto"
+        kwargs["parallel_tool_calls"] = False
+        return super().bind_tools(tools, **kwargs)
+
+
+class _SerialChatOpenAI(ChatOpenAI):
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
         kwargs["parallel_tool_calls"] = False
         return super().bind_tools(tools, **kwargs)
 
@@ -753,7 +760,7 @@ def build_relay_adapter(
         model_id = settings.review_model_id
         max_output_tokens = settings.review_max_output_tokens
         context_limit_tokens = settings.review_context_limit_tokens
-        provider_profile_key = "deepseek"
+        provider_profile_key = "openai" if model_id == "gpt-5.5" else "deepseek"
     if not settings.relay_base_url or not settings.relay_api_key or not model_id:
         raise RelayError(
             code="relay_unavailable",
@@ -786,6 +793,17 @@ def build_relay_adapter(
         ],
     }
     if role == "review":
+        if model_id == "gpt-5.5":
+            return RelayAdapter(
+                model=_SerialChatOpenAI(
+                    **common,
+                    max_tokens=max_output_tokens,
+                ),
+                role=role,
+                model_id=model_id,
+                provider_profile_key=provider_profile_key,
+                model_call_state=model_call_state,
+            )
         return RelayAdapter(
             model=_SerialChatDeepSeek(
                 **common,

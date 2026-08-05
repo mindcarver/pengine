@@ -6,6 +6,8 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_ALLOWED_REVIEW_MODELS = frozenset({"deepseek-v4-flash", "gpt-5.5"})
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -59,9 +61,11 @@ class Settings(BaseSettings):
 
     @field_validator("review_model_id")
     @classmethod
-    def review_model_must_be_deepseek(cls, value: str | None) -> str | None:
-        if value is not None and value != "deepseek-v4-flash":
-            raise ValueError("review_model_id must be deepseek-v4-flash")
+    def review_model_must_be_allowed(cls, value: str | None) -> str | None:
+        if value is not None and value not in _ALLOWED_REVIEW_MODELS:
+            raise ValueError(
+                f"review_model_id must be one of: {', '.join(sorted(_ALLOWED_REVIEW_MODELS))}"
+            )
         return value
 
     @field_validator("host")
