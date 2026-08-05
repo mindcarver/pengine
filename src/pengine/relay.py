@@ -764,7 +764,7 @@ def build_relay_adapter(
             "anthropic"
             if model_id == "claude-opus-5"
             else "openai"
-            if model_id == "gpt-5.5"
+            if model_id in {"gpt-5.5", "gpt-5.6-terra"}
             else "deepseek"
         )
     if not settings.relay_base_url or not settings.relay_api_key or not model_id:
@@ -799,7 +799,7 @@ def build_relay_adapter(
         ],
     }
     if role == "review":
-        if model_id == "gpt-5.5":
+        if model_id in {"gpt-5.5", "gpt-5.6-terra"}:
             return RelayAdapter(
                 model=_SerialChatOpenAI(
                     **common,
