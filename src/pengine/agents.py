@@ -2244,34 +2244,45 @@ def _drop_dangling_tool_call_messages(messages: list[Any]) -> list[Any]:
     'tool_calls' must be followed by tool messages responding to each
     'tool_call_id'"). Cleaning the history before the next retry lets the
     model regenerate the call on a consistent transcript.
+
+    Malformed tool calls classified by langchain as ``invalid_tool_calls`` are
+    treated identically: langchain-openai re-serializes them as assistant
+    ``tool_calls`` on the next request, so an unanswered invalid call dangles
+    the same way a truncated one does (Issue #52 graph revision 12).
     """
 
     answered = {message.tool_call_id for message in messages if isinstance(message, ToolMessage)}
 
+    def _all_call_ids(message: Any) -> list[Any]:
+        return [*message.tool_calls, *getattr(message, "invalid_tool_calls", [])]
+
     def call_ids(message: Any) -> set[Any]:
-        return {call.get("id") for call in message.tool_calls if call.get("id")}
+        return {call.get("id") for call in _all_call_ids(message) if call.get("id")}
+
+    def has_calls(message: Any) -> bool:
+        return bool(_all_call_ids(message))
 
     dropped_ai_messages = [
         message
         for message in messages
         if isinstance(message, AIMessage)
-        and message.tool_calls
+        and has_calls(message)
         and call_ids(message)
         and not call_ids(message) <= answered
     ]
     removed_ids: set[Any] = {
         call.get("id")
         for message in dropped_ai_messages
-        for call in message.tool_calls
+        for call in _all_call_ids(message)
         if call.get("id")
     }
     kept_claimed_ids = {
         call.get("id")
         for message in messages
         if isinstance(message, AIMessage)
-        and message.tool_calls
+        and has_calls(message)
         and message not in dropped_ai_messages
-        for call in message.tool_calls
+        for call in _all_call_ids(message)
         if call.get("id")
     }
     removed_ids |= answered - kept_claimed_ids
@@ -2283,7 +2294,7 @@ def _drop_dangling_tool_call_messages(messages: list[Any]) -> list[Any]:
         if not (
             (
                 isinstance(message, AIMessage)
-                and message.tool_calls
+                and has_calls(message)
                 and call_ids(message) & removed_ids
             )
             or (isinstance(message, ToolMessage) and message.tool_call_id in removed_ids)
