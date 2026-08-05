@@ -1965,6 +1965,69 @@ def test_drop_dangling_tool_call_messages_removes_orphaned_tool_messages() -> No
     assert cleaned == [messages[0]]
 
 
+def test_drop_dangling_tool_call_messages_cleans_invalid_tool_calls() -> None:
+    """A malformed tool call classified as invalid_tool_calls (not truncation)
+    dangles identically: langchain-openai re-serializes it as an assistant
+    tool_calls entry on the next request, but no ToolMessage answers it, so the
+    provider rejects with HTTP 400 "insufficient tool messages following
+    tool_calls message" (Issue #52 graph revision 12; E2E
+    20260805T042536Z-1180ba17)."""
+    messages = [
+        HumanMessage(content="review the outline"),
+        AIMessage(
+            content="",
+            tool_calls=[],
+            invalid_tool_calls=[
+                {
+                    "name": "CanonReviewerResult",
+                    "args": '{"broken": json}',  # malformed -> classified invalid
+                    "id": "invalid-1",
+                    "type": "invalid_tool_call",
+                },
+            ],
+        ),
+        HumanMessage(content="retry"),
+    ]
+    cleaned = _drop_dangling_tool_call_messages(messages)
+    # The AIMessage carrying only an invalid_tool_call is dropped so the next
+    # provider request never carries a dangling tool_calls entry.
+    assert cleaned == [messages[0], messages[2]]
+    assert not any(
+        isinstance(message, AIMessage)
+        and (message.tool_calls or getattr(message, "invalid_tool_calls", []))
+        for message in cleaned
+    )
+
+
+def test_drop_dangling_tool_call_messages_cleans_mixed_valid_and_invalid_calls() -> None:
+    """When an AIMessage carries both a answered valid call and an unanswered
+    invalid call, the whole message is dropped (partial keep would re-serialize
+    the invalid call)."""
+    messages = [
+        HumanMessage(content="start"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "work", "args": {}, "id": "valid-1", "type": "tool_call"},
+            ],
+            invalid_tool_calls=[
+                {
+                    "name": "Result",
+                    "args": "{bad",
+                    "id": "invalid-2",
+                    "type": "invalid_tool_call",
+                },
+            ],
+        ),
+        ToolMessage(content="ok", tool_call_id="valid-1"),
+        HumanMessage(content="next"),
+    ]
+    cleaned = _drop_dangling_tool_call_messages(messages)
+    # invalid-2 is unanswered -> the AIMessage dangles -> dropped along with
+    # its orphaned valid-1 ToolMessage.
+    assert cleaned == [messages[0], messages[3]]
+
+
 @pytest.mark.asyncio
 async def test_structured_result_middleware_cleans_dangling_history_before_retry() -> None:
     class Result(BaseModel):
