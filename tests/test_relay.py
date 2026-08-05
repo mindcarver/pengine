@@ -184,6 +184,21 @@ def test_build_relay_adapter_uses_openai_for_gpt55_review(max_output_tokens: int
     assert "secret-value" not in repr(adapter.model)
 
 
+@pytest.mark.parametrize("max_output_tokens", [None, 16384])
+def test_build_relay_adapter_uses_anthropic_for_opus5_review(
+    max_output_tokens: int | None,
+) -> None:
+    adapter = build_relay_adapter(
+        _role_settings(review_model_id="claude-opus-5", review_max_output_tokens=max_output_tokens),
+        role="review",
+    )
+
+    assert isinstance(adapter.model, ChatAnthropic)
+    assert adapter.role == "review"
+    assert adapter.model_id == "claude-opus-5"
+    assert adapter.provider_profile_key == "anthropic"
+
+
 @pytest.mark.parametrize("tool_choice", ["any", "required"])
 def test_deepseek_uses_auto_serial_tools_for_mixed_tool_strategy(tool_choice: str) -> None:
     class WorkTool(BaseModel):

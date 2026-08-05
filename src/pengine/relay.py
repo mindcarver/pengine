@@ -760,7 +760,13 @@ def build_relay_adapter(
         model_id = settings.review_model_id
         max_output_tokens = settings.review_max_output_tokens
         context_limit_tokens = settings.review_context_limit_tokens
-        provider_profile_key = "openai" if model_id == "gpt-5.5" else "deepseek"
+        provider_profile_key = (
+            "anthropic"
+            if model_id == "claude-opus-5"
+            else "openai"
+            if model_id == "gpt-5.5"
+            else "deepseek"
+        )
     if not settings.relay_base_url or not settings.relay_api_key or not model_id:
         raise RelayError(
             code="relay_unavailable",
@@ -796,6 +802,17 @@ def build_relay_adapter(
         if model_id == "gpt-5.5":
             return RelayAdapter(
                 model=_SerialChatOpenAI(
+                    **common,
+                    max_tokens=max_output_tokens,
+                ),
+                role=role,
+                model_id=model_id,
+                provider_profile_key=provider_profile_key,
+                model_call_state=model_call_state,
+            )
+        if model_id == "claude-opus-5":
+            return RelayAdapter(
+                model=_SerialChatAnthropic(
                     **common,
                     max_tokens=max_output_tokens,
                 ),
