@@ -1308,8 +1308,9 @@ async def test_unified_delivery_facts_helper_validates_seeded_run(
 
     # Seed provider-reported usage rows for both roles on this run (as the relay
     # audit would have recorded for real calls).
+    review_model = settings.review_model_id or "gpt-5.5"
     with sqlite3.connect(settings.database_path) as connection:
-        for role, model in (("generation", "claude-opus-5"), ("review", "deepseek-v4-flash")):
+        for role, model in (("generation", "claude-opus-5"), ("review", review_model)):
             connection.execute(
                 """
                 INSERT INTO model_calls(
@@ -1326,7 +1327,9 @@ async def test_unified_delivery_facts_helper_validates_seeded_run(
                     None,
                     str(accepted.creation_id),
                     role,
-                    "anthropic" if role == "generation" else "deepseek",
+                    "anthropic"
+                    if role == "generation"
+                    else ("openai" if review_model == "gpt-5.5" else "deepseek"),
                     model.split("-")[0],
                     model,
                     "generating_episode_scripts",
@@ -1352,7 +1355,7 @@ async def test_unified_delivery_facts_helper_validates_seeded_run(
         settings.database_path,
         creation_id=str(accepted.creation_id),
         generation_model_id="claude-opus-5",
-        review_model_id="deepseek-v4-flash",
+        review_model_id=review_model,
         evidence_dir=tmp_path / "evidence",
     )
     assert summary["status"] == "passed"

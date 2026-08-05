@@ -918,7 +918,7 @@ class Worker:
         )
 
     def _review_model_id(self) -> str:
-        return self.settings.review_model_id or "deepseek-v4-flash"
+        return self.settings.review_model_id or "gpt-5.5"
 
     @staticmethod
     def _assemble_delivery(work: RunWorkItem, result: WorkflowResult) -> Delivery:
