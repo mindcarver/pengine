@@ -106,7 +106,9 @@ def test_model_families_cannot_be_swapped(field: str, value: str) -> None:
         Settings(_env_file=None, **{field: value})
 
 
-@pytest.mark.parametrize("model_id", ["deepseek-v4-flash", "gpt-5.5", "claude-opus-5"])
+@pytest.mark.parametrize(
+    "model_id", ["deepseek-v4-flash", "gpt-5.5", "gpt-5.6-terra", "claude-opus-5"]
+)
 def test_review_model_accepts_allowed_models(model_id: str) -> None:
     settings = Settings(_env_file=None, review_model_id=model_id)
     assert settings.review_model_id == model_id
