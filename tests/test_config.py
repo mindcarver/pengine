@@ -98,7 +98,7 @@ def test_both_model_roles_are_required(
     [
         ("generation_model_id", "claude-sonnet-5"),
         ("generation_model_id", "deepseek-v4-pro"),
-        ("review_model_id", "claude-opus-5"),
+        ("review_model_id", "claude-sonnet-5"),
     ],
 )
 def test_model_families_cannot_be_swapped(field: str, value: str) -> None:
@@ -106,7 +106,7 @@ def test_model_families_cannot_be_swapped(field: str, value: str) -> None:
         Settings(_env_file=None, **{field: value})
 
 
-@pytest.mark.parametrize("model_id", ["deepseek-v4-flash", "gpt-5.5"])
+@pytest.mark.parametrize("model_id", ["deepseek-v4-flash", "gpt-5.5", "claude-opus-5"])
 def test_review_model_accepts_allowed_models(model_id: str) -> None:
     settings = Settings(_env_file=None, review_model_id=model_id)
     assert settings.review_model_id == model_id

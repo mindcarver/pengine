@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_ALLOWED_REVIEW_MODELS = frozenset({"deepseek-v4-flash", "gpt-5.5"})
+_ALLOWED_REVIEW_MODELS = frozenset({"deepseek-v4-flash", "gpt-5.5", "claude-opus-5"})
 
 
 class Settings(BaseSettings):
