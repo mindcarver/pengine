@@ -140,6 +140,9 @@ _CANONICAL_WORKSPACE_PATHS = frozenset(
     {
         *_WORKSPACE_ARTIFACT_PATHS.values(),
         *_CR_WORKSPACE_FILES.values(),
+        "/workspace/current_character_biographies.md",
+        "/workspace/current_relationship_logic.md",
+        "/workspace/current_story_candidate.md",
         "/workspace/approved-checkpoints.json",
         "/workspace/story_contract.json",
         "/workspace/story_contract.md",
@@ -2572,6 +2575,12 @@ class StructuredResultMiddleware(AgentMiddleware):
 # the whole stage as before (no regression).
 _LOOP_RELAY_MAX_RETRIES = 2
 
+# Maximum internal handler dispatches for a single review subagent call. A
+# canon_reviewer that reads files, does arithmetic, and retries structured
+# output can consume dozens of graph steps; this bound ensures it raises a
+# visible error instead of silently exhausting the graph recursion budget.
+_REVIEW_SUBAGENT_MAX_CALLS = 12
+
 
 async def _with_loop_relay_retry(  # noqa: UP047
     coroutine_factory: Callable[[], Awaitable[T]],
@@ -2741,7 +2750,9 @@ class StageGuardMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
         args: Mapping[str, Any],
     ) -> tuple[ToolMessage | Command[Any], Mapping[str, Any]]:
+        logger.info("story artifact loop entered stage=%s", stage.value)
         result, payload = await self._call_structured_stage(stage, request, handler, args)
+        logger.info("story artifact initial generation done stage=%s", stage.value)
         repair_rounds = 0
         previous_content: str | None = None
         previous_review: CanonReviewerResult | None = None
@@ -2756,7 +2767,19 @@ class StageGuardMiddleware(AgentMiddleware):
                     character_biographies=parsed.character_biographies or "",
                     relationship_logic=parsed.relationship_logic or "",
                 )
-            review_files = {"/workspace/current_story_candidate.md": current_content}
+            if is_outline:
+                review_files = {"/workspace/current_story_candidate.md": current_content}
+            else:
+                # Split the c+r candidate into per-section files so each review
+                # pass sees a smaller, more focused input — this prevents the
+                # reviewer from producing oversized structured outputs that fail
+                # validation and trigger retry loops on the merged candidate.
+                review_files = {
+                    "/workspace/current_character_biographies.md": (
+                        parsed.character_biographies or ""
+                    ),
+                    "/workspace/current_relationship_logic.md": (parsed.relationship_logic or ""),
+                }
             if previous_review is not None:
                 review_files["/workspace/previous_story_review.json"] = json.dumps(
                     _canon_review_with_issue_ledger(previous_review),
@@ -2765,26 +2788,26 @@ class StageGuardMiddleware(AgentMiddleware):
                     sort_keys=True,
                 )
             review_prefix = (
-                f"Review only the unlocked {stage.value} candidate in "
-                "/workspace/current_story_candidate.md against the creation request, L0 "
-                "selection, persona rules, and every approved upstream artifact."
+                f"Review only the unlocked {stage.value} candidate against the creation "
+                "request, L0 selection, persona rules, and every approved upstream artifact."
             )
             if is_outline:
                 review_prefix += (
-                    " Audit the outline for foundational consistency with the L0 selection and "
-                    "persona rules: the protagonist, central conflict, key events, motivations, "
-                    "and story arc must agree with the chosen direction, and every explicit "
-                    "numeric or commitment the outline makes must be internally consistent. Fail "
-                    "on every explicit contradiction or missing upstream commitment."
+                    " The candidate is in /workspace/current_story_candidate.md. Audit the "
+                    "outline for foundational consistency with the L0 selection and persona "
+                    "rules: the protagonist, central conflict, key events, motivations, and "
+                    "story arc must agree with the chosen direction, and every explicit numeric "
+                    "or commitment the outline makes must be internally consistent. Fail on "
+                    "every explicit contradiction or missing upstream commitment."
                 )
             else:
                 review_prefix += (
-                    " The candidate combines two sections (character biographies, relationship "
-                    "logic) under fixed headers; audit every section and every repeated mention "
-                    "across both, including cross-section consistency, and collect all issues in "
-                    "this lens before returning rather than stopping after the first examples. "
-                    "Fail on every explicit contradiction or missing upstream commitment. A "
-                    "repair must preserve the two fixed section headers."
+                    " The candidate has two sections: character biographies in "
+                    "/workspace/current_character_biographies.md and relationship logic in "
+                    "/workspace/current_relationship_logic.md. Each pass primarily audits one "
+                    "section but may cross-reference the other as read-only context. Fail on "
+                    "every explicit contradiction or missing upstream commitment. A repair must "
+                    "preserve both sections."
                 )
             review_prefix += (
                 " For each issue include the exact conflicting candidate excerpt, authoritative "
@@ -2816,18 +2839,22 @@ class StageGuardMiddleware(AgentMiddleware):
             else:
                 lens_descriptions = (
                     (
-                        f"{review_prefix} This pass owns only the character-and-relationship lens: "
-                        "names, identities, roles, aliases, pronouns, absolute and relative "
-                        "ages, family and relationship direction, motives, secrets, guilt, "
-                        "character arcs, status or whereabouts, and promised character actions. "
-                        "For every character who holds a secret, knows a fact, or gives "
-                        "testimony, audit the explicit causal source of that knowledge (direct "
-                        "observation, a named informant, discovered evidence, or participation); "
-                        "fail knowledge that has no stated acquisition source. Recheck the "
-                        "summary tables and ending statements as well as each character section."
+                        f"{review_prefix} This pass owns the character-and-relationship lens "
+                        "and primarily audits "
+                        "/workspace/current_character_biographies.md (using "
+                        "/workspace/current_relationship_logic.md as cross-reference): names, "
+                        "identities, roles, aliases, pronouns, absolute and relative ages, "
+                        "family and relationship direction, motives, secrets, guilt, character "
+                        "arcs, status or whereabouts, and promised character actions. For every "
+                        "character who holds a secret, knows a fact, or gives testimony, audit "
+                        "the explicit causal source of that knowledge (direct observation, a "
+                        "named informant, discovered evidence, or participation); fail knowledge "
+                        "that has no stated acquisition source."
                     ),
                     (
-                        f"{review_prefix} This pass owns only the timeline-and-evidence lens: "
+                        f"{review_prefix} This pass owns the timeline-and-evidence lens and "
+                        "primarily audits /workspace/current_relationship_logic.md (using "
+                        "/workspace/current_character_biographies.md as cross-reference): "
                         "dates, times, durations, arithmetic, chronology, repeated event and "
                         "object names, clue meanings, evidence custody and provenance, call "
                         "participants, knowledge states, causal mechanisms, episode actions and "
@@ -3360,6 +3387,25 @@ class StageGuardMiddleware(AgentMiddleware):
         schema: type[SemanticReview],
         stage: InternalStage,
     ) -> SemanticReview:
+        # Bound the number of internal handler dispatches so a runaway subagent
+        # (work-tool loop, structured-output retry storm) raises instead of
+        # looping until the graph recursion limit silently cancels the run.
+        call_count = 0
+
+        async def bounded_handler(
+            candidate_request: ToolCallRequest,
+        ) -> ToolMessage | Command[Any]:
+            nonlocal call_count
+            call_count += 1
+            if call_count > _REVIEW_SUBAGENT_MAX_CALLS:
+                raise AgentProtocolError(
+                    "Review subagent exceeded its internal call budget without "
+                    "returning a structured result",
+                    stage=stage,
+                    safe_message="审查代理超出内部调用预算。",
+                )
+            return await handler(candidate_request)
+
         review_request = _subagent_request(
             request,
             subagent_type=subagent_type,
@@ -3380,7 +3426,7 @@ class StageGuardMiddleware(AgentMiddleware):
         async def invoke(
             candidate_request: ToolCallRequest,
         ) -> tuple[SemanticReview, ToolMessage | Command[Any]]:
-            result = await handler(candidate_request)
+            result = await bounded_handler(candidate_request)
             message = _tool_message(result)
             if not isinstance(message.content, str):
                 raise AgentProtocolError("Semantic reviewer result was not JSON text", stage=stage)
@@ -4279,7 +4325,11 @@ class DeepAgentWorkflow:
                     "or rewrite the candidate."
                 ),
                 "model": self.review_model,
-                "tools": tools,
+                # No working tools: the candidate and upstream artifacts are already
+                # injected as workspace files. Arithmetic and reference retrieval are
+                # generation-stage tools; giving them to the reviewer causes work-tool
+                # loops that exhaust the subagent recursion budget on large candidates.
+                "tools": [],
                 "permissions": REVIEW_FILE_PERMISSIONS,
                 "middleware": structured_result_middleware,
                 "skills": _SPECIALIST_SKILL_SOURCES["canon_reviewer"],

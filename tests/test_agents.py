@@ -2916,7 +2916,8 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
         else:
             assert subagent_type == "canon_reviewer"
             review_calls += 1
-            current = candidate.state["files"]["/workspace/current_story_candidate.md"]["content"]
+            rl = candidate.state["files"].get("/workspace/current_relationship_logic.md", {})
+            current = rl.get("content", "")
             if review_calls <= 2:
                 assert "二十四岁" in current
                 if review_calls == 1:
@@ -3103,8 +3104,10 @@ async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_ro
         else:
             assert subagent_type == "canon_reviewer"
             description = candidate.tool_call["args"]["description"]
-            current = candidate.state["files"]["/workspace/current_story_candidate.md"]["content"]
             if "convergence backstop" in description:
+                current = candidate.state["files"]["/workspace/current_story_candidate.md"][
+                    "content"
+                ]
                 # The backstop fires once at the repair_rounds == 1 checkpoint: the
                 # call conflict was fixed but the testimony basis is still unsupported.
                 backstop_calls += 1
@@ -3123,6 +3126,9 @@ async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_ro
                     ],
                 }
             else:
+                # Non-backstop c+r reviews now receive per-section files.
+                rl = candidate.state["files"].get("/workspace/current_relationship_logic.md", {})
+                current = rl.get("content", "")
                 review_calls += 1
                 if review_calls in {1, 2}:
                     # repair_rounds == 0: both lenses flag the call-participant conflict.
