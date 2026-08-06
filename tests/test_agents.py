@@ -374,9 +374,7 @@ def _successful_responses() -> list[AIMessage]:
     return responses
 
 
-def _index_of_tool_call(
-    responses: list[AIMessage], name: str, *, occurrence: int = 1
-) -> int:
+def _index_of_tool_call(responses: list[AIMessage], name: str, *, occurrence: int = 1) -> int:
     """1-based occurrence index of the Nth AIMessage carrying a tool call named ``name``."""
     seen = 0
     for index, message in enumerate(responses):
@@ -476,9 +474,7 @@ def test_story_architect_schema_exposes_stage_specific_field_contract() -> None:
     assert "generating_story_outline" in properties["content"]["description"]
     assert "Must be null for selecting_l0_variant" in properties["content"]["description"]
     for cr_field in ("character_biographies", "relationship_logic"):
-        assert (
-            "generating_character_relationships" in properties[cr_field]["description"]
-        )
+        assert "generating_character_relationships" in properties[cr_field]["description"]
         assert "Must be null for selecting_l0_variant" in properties[cr_field]["description"]
     assert "selecting_l0_variant" in properties["selected_l0_variant"]["description"]
     assert "do not add an English translation" in (properties["selected_l0_variant"]["description"])
@@ -586,9 +582,9 @@ def test_story_artifact_patch_repairs_only_numbered_minimal_lines() -> None:
             "其余人物关系与已批准的小传保持不变，并继续约束后续情节与人物行为。"
         ),
     )
-    relationship_conflict_line = content.split("\n").index(
-        "程远在海难时二十四岁，比程屿大约六岁。"
-    ) + 1
+    relationship_conflict_line = (
+        content.split("\n").index("程远在海难时二十四岁，比程屿大约六岁。") + 1
+    )
     review = CanonReviewerResult(
         passed=False,
         evidence="年龄与人物小传冲突",
@@ -693,9 +689,9 @@ def test_story_artifact_patch_discards_harmless_no_op_alongside_real_repairs() -
     )
     outline_lines = content.split("\n")
     date_line = outline_lines.index("台风预警在七月二十日晚发布。") + 1
-    closing_line = outline_lines.index(
-        "其余人物身份、动机、知识来源、时间线与证物约束均保持不变。"
-    ) + 1
+    closing_line = (
+        outline_lines.index("其余人物身份、动机、知识来源、时间线与证物约束均保持不变。") + 1
+    )
     patch = StoryArtifactRepairPatch.model_validate(
         {
             "stage": "generating_story_outline",
@@ -721,9 +717,7 @@ def test_story_artifact_patch_discards_harmless_no_op_alongside_real_repairs() -
     )
 
     assert "七月十九日晚" in repaired.content
-    assert repaired.content.endswith(
-        "其余人物身份、动机、知识来源、时间线与证物约束均保持不变。"
-    )
+    assert repaired.content.endswith("其余人物身份、动机、知识来源、时间线与证物约束均保持不变。")
 
 
 def test_story_artifact_patch_enforces_total_old_or_new_line_change_budget() -> None:
@@ -1000,9 +994,7 @@ async def test_story_repair_allows_two_bounded_targeted_patch_corrections() -> N
 
     assert len(corrections) == 3
     assert corrections[0] is None
-    assert all(
-        f"Candidate has {line_count} numbered lines" in value for value in corrections[1:]
-    )
+    assert all(f"Candidate has {line_count} numbered lines" in value for value in corrections[1:])
     assert "唯一" not in repaired.content
 
 
@@ -3233,12 +3225,8 @@ async def test_contract_repair_stops_after_one_invalid_patch_correction(tmp_path
         "content_replacements": [],
         "json_edits": [],
     }
-    responses.insert(
-        outline_review_index + 1, _tool_call("OutlineRepairPatch", invalid_patch, 101)
-    )
-    responses.insert(
-        outline_review_index + 2, _tool_call("OutlineRepairPatch", invalid_patch, 102)
-    )
+    responses.insert(outline_review_index + 1, _tool_call("OutlineRepairPatch", invalid_patch, 101))
+    responses.insert(outline_review_index + 2, _tool_call("OutlineRepairPatch", invalid_patch, 102))
     responses.insert(
         outline_review_index + 3,
         _tool_call(
@@ -3399,15 +3387,9 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
     }
     responses[review_index] = _tool_call("EpisodeReviewerResult", failed_review, review_index)
     responses.insert(review_index + 1, _tool_call("ScriptWriterResult", writer_payload, 201))
-    responses.insert(
-        review_index + 2, _tool_call("EpisodeReviewerResult", failed_review, 202)
-    )
-    responses.insert(
-        review_index + 3, _tool_call("ScriptWriterResult", writer_payload, 203)
-    )
-    responses.insert(
-        review_index + 4, _tool_call("EpisodeReviewerResult", failed_review, 204)
-    )
+    responses.insert(review_index + 2, _tool_call("EpisodeReviewerResult", failed_review, 202))
+    responses.insert(review_index + 3, _tool_call("ScriptWriterResult", writer_payload, 203))
+    responses.insert(review_index + 4, _tool_call("EpisodeReviewerResult", failed_review, 204))
     approved: list[InternalStage] = []
     episode_hooks, episode_attempts = _episode_hook_kwargs()
 

@@ -325,9 +325,7 @@ class StoryArchitectResult(StrictModel):
                 or self.selected_l0_variant
                 or self.selection_rationale
             ):
-                raise ValueError(
-                    "generating_story_outline requires only content"
-                )
+                raise ValueError("generating_story_outline requires only content")
         elif (
             not self.character_biographies
             or not self.relationship_logic
@@ -1622,11 +1620,7 @@ def split_cr_candidate(content: str) -> dict[str, str]:
     for line in content.split("\n"):
         stripped = line.strip()
         matched_field = next(
-            (
-                field
-                for field, header in _CR_HEADERS.items()
-                if stripped == f"# {header}"
-            ),
+            (field for field, header in _CR_HEADERS.items() if stripped == f"# {header}"),
             None,
         )
         if matched_field is not None:
@@ -2843,6 +2837,14 @@ class StageGuardMiddleware(AgentMiddleware):
                     ),
                     "consistency_repair_rounds": repair_rounds,
                 }
+            logger.info(
+                "story artifact review failed stage=%s repair_rounds=%s max_rounds=%s "
+                "issue_count=%s",
+                stage.value,
+                repair_rounds,
+                max_rounds,
+                len(review.issues),
+            )
             if repair_rounds >= max_rounds:
                 raise ContentReviewRejectedError(
                     stage=stage,
@@ -2861,6 +2863,11 @@ class StageGuardMiddleware(AgentMiddleware):
                 repair_round=repair_rounds,
             )
             payload = repaired.model_dump(mode="json")
+            logger.info(
+                "story artifact repair applied stage=%s repair_rounds=%s",
+                stage.value,
+                repair_rounds,
+            )
 
     async def _invoke_story_artifact_repair(
         self,
@@ -3399,9 +3406,7 @@ class StageGuardMiddleware(AgentMiddleware):
         description: str,
         files: Mapping[str, str],
         schema: (
-            type[EpisodePlannerResult]
-            | type[ScriptWriterResult]
-            | type[StoryArchitectResult]
+            type[EpisodePlannerResult] | type[ScriptWriterResult] | type[StoryArchitectResult]
         ),
         stage: InternalStage,
         expected_episode_number: int | None = None,

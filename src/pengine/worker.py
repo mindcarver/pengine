@@ -790,9 +790,7 @@ class Worker:
         if outline is None or "story_contract" not in outline:
             return
         story_outline = approved.get(InternalStage.GENERATING_STORY_OUTLINE)
-        character_relationships = approved.get(
-            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
-        )
+        character_relationships = approved.get(InternalStage.GENERATING_CHARACTER_RELATIONSHIPS)
         l0_selection = approved.get(InternalStage.SELECTING_L0_VARIANT)
         if not story_outline or not character_relationships or not l0_selection:
             raise AgentProtocolError(
@@ -1154,9 +1152,7 @@ class Worker:
             l0_gate = approved[InternalStage.ACCEPTING_L0]
             l4_gate = approved[InternalStage.ACCEPTING_L4]
             story_outline = approved[InternalStage.GENERATING_STORY_OUTLINE]
-            character_relationships = approved[
-                InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
-            ]
+            character_relationships = approved[InternalStage.GENERATING_CHARACTER_RELATIONSHIPS]
             expected = WorkflowResult.model_validate(
                 {
                     "content_package": {
