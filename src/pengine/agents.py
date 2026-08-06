@@ -7,7 +7,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
 from fractions import Fraction
-from typing import Any, Literal, cast
+from functools import partial
+from typing import Any, Literal, TypeVar, cast
 
 from deepagents import (
     GeneralPurposeSubagentProfile,
@@ -47,7 +48,7 @@ from pengine.language import (
     infer_output_language,
     language_instruction,
 )
-from pengine.relay import is_relay_exception
+from pengine.relay import is_relay_exception, retryable_relay_interruption
 from pengine.schemas import (
     EpisodeDraft,
     EpisodePlan,
@@ -79,6 +80,8 @@ SeriesReviewRegistration = Callable[..., Awaitable[str]]
 # ``get_series_bible`` returns the active SeriesBible projection so the writer can
 # refresh the design after the outline stage promotes it (mid-execution).
 SeriesBibleRetriever = Callable[[], Awaitable[SeriesBibleSummary | None]]
+
+T = TypeVar("T")
 
 _STAGE_TOKEN = re.compile(r"^\[stage=([a-z0-9_]+)\](?:\[episode=\d+\])?(?:\s|$)")
 _BILINGUAL_GLOSS_SUFFIX = re.compile(r"\s*[（(][^()（）]*[A-Za-z][^()（）]*[）)]\s*$")
@@ -2562,6 +2565,39 @@ class StructuredResultMiddleware(AgentMiddleware):
         raise AgentProtocolError("Subagent returned invalid structured output")
 
 
+# Maximum relay retries for a single subagent call inside a multi-round review
+# loop. A transient relay failure (HTTP 408, connection reset) retries the same
+# call so the loop's in-memory state (repair_rounds, previous_review) survives;
+# after this many retries the interruption propagates and the worker recovers
+# the whole stage as before (no regression).
+_LOOP_RELAY_MAX_RETRIES = 2
+
+
+async def _with_loop_relay_retry(  # noqa: UP047
+    coroutine_factory: Callable[[], Awaitable[T]],
+    *,
+    max_retries: int = _LOOP_RELAY_MAX_RETRIES,
+) -> T:
+    """Retry a loop-internal subagent call on a transient relay interruption.
+
+    Keeps the review/repair loop alive across transient relay failures so the
+    loop's accumulated state (repair_rounds, previous_review, candidate) is not
+    discarded by a stage-level restart.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return await coroutine_factory()
+        except Exception as exc:
+            if isinstance(exc, TimeoutError) or is_relay_exception(exc):
+                interruption = retryable_relay_interruption(exc)
+            else:
+                interruption = None
+            if interruption is None or attempt >= max_retries:
+                raise
+            await asyncio.sleep(interruption.retry_delay_seconds)
+    raise AssertionError("unreachable loop relay retry")
+
+
 class StageGuardMiddleware(AgentMiddleware):
     def __init__(
         self,
@@ -2799,18 +2835,21 @@ class StageGuardMiddleware(AgentMiddleware):
                         "every occurrence, not only the first matching sentence."
                     ),
                 )
-            reviews = [
-                await self._invoke_semantic_reviewer(
-                    request=request,
-                    handler=handler,
-                    subagent_type="canon_reviewer",
-                    description=description,
-                    files=review_files,
-                    schema=CanonReviewerResult,
-                    stage=stage,
+            reviews = []
+            for description in lens_descriptions:
+                review_result = await _with_loop_relay_retry(
+                    partial(
+                        self._invoke_semantic_reviewer,
+                        request=request,
+                        handler=handler,
+                        subagent_type="canon_reviewer",
+                        description=description,
+                        files=review_files,
+                        schema=CanonReviewerResult,
+                        stage=stage,
+                    )
                 )
-                for description in lens_descriptions
-            ]
+                reviews.append(review_result)
             review = _merge_story_canon_reviews(reviews, previous_review)
             if (
                 not review.passed
@@ -2819,14 +2858,17 @@ class StageGuardMiddleware(AgentMiddleware):
                 and previous_content is not None
                 and previous_review is not None
             ):
-                backstop = await self._invoke_story_review_backstop(
-                    request=request,
-                    handler=handler,
-                    stage=stage,
-                    previous_content=previous_content,
-                    previous_review=previous_review,
-                    current_content=current_content,
-                    current_review=review,
+                backstop = await _with_loop_relay_retry(
+                    partial(
+                        self._invoke_story_review_backstop,
+                        request=request,
+                        handler=handler,
+                        stage=stage,
+                        previous_content=previous_content,
+                        previous_review=previous_review,
+                        current_content=current_content,
+                        current_review=review,
+                    )
                 )
                 review = _merge_canon_reviews([review, backstop])
             if review.passed:
@@ -2854,13 +2896,16 @@ class StageGuardMiddleware(AgentMiddleware):
             previous_content = current_content
             previous_review = review
             repair_rounds += 1
-            repaired = await self._invoke_story_artifact_repair(
-                request=request,
-                handler=handler,
-                stage=stage,
-                content=current_content,
-                review=review,
-                repair_round=repair_rounds,
+            repaired = await _with_loop_relay_retry(
+                partial(
+                    self._invoke_story_artifact_repair,
+                    request=request,
+                    handler=handler,
+                    stage=stage,
+                    content=current_content,
+                    review=review,
+                    repair_round=repair_rounds,
+                )
             )
             payload = repaired.model_dump(mode="json")
             logger.info(

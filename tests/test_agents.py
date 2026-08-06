@@ -1055,6 +1055,90 @@ async def test_story_repair_preserves_transport_failures_without_retry(failure: 
     assert calls == 1
 
 
+@pytest.mark.asyncio
+async def test_loop_relay_retry_survives_transient_interruption() -> None:
+    """A transient relay interruption inside the review loop retries the same
+    call instead of propagating and resetting the loop's repair_rounds."""
+    from pengine.agents import _with_loop_relay_retry
+
+    calls = 0
+
+    async def flaky_call() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout(
+                "relay timed out",
+                request=httpx.Request("POST", "https://relay.example/v1/chat/completions"),
+            )
+        return "recovered"
+
+    # Patch the retry delay to zero so the test does not sleep.
+    import pengine.agents as agents_module
+
+    original = agents_module.retryable_relay_interruption
+    agents_module.retryable_relay_interruption = lambda exc: type(
+        "RRI", (), {"retry_delay_seconds": 0}
+    )()
+    try:
+        result = await _with_loop_relay_retry(flaky_call)
+    finally:
+        agents_module.retryable_relay_interruption = original
+
+    assert result == "recovered"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_loop_relay_retry_propagates_after_max_retries() -> None:
+    """After max_retries exhausted relay failures, the interruption propagates
+    so the worker recovers the stage as before (no regression)."""
+    from pengine.agents import _with_loop_relay_retry
+
+    calls = 0
+
+    async def always_fails() -> str:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout(
+            "relay timed out",
+            request=httpx.Request("POST", "https://relay.example/v1/chat/completions"),
+        )
+
+    import pengine.agents as agents_module
+
+    original = agents_module.retryable_relay_interruption
+    agents_module.retryable_relay_interruption = lambda exc: type(
+        "RRI", (), {"retry_delay_seconds": 0}
+    )()
+    try:
+        with pytest.raises(httpx.ReadTimeout):
+            await _with_loop_relay_retry(always_fails, max_retries=2)
+    finally:
+        agents_module.retryable_relay_interruption = original
+
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_loop_relay_retry_propagates_non_relay_errors_immediately() -> None:
+    """A non-relay error (e.g. AgentProtocolError) propagates immediately
+    without retrying, so structured-output failures are not masked."""
+    from pengine.agents import _with_loop_relay_retry
+
+    calls = 0
+
+    async def protocol_error() -> str:
+        nonlocal calls
+        calls += 1
+        raise ValueError("not a relay error")
+
+    with pytest.raises(ValueError, match="not a relay error"):
+        await _with_loop_relay_retry(protocol_error)
+
+    assert calls == 1
+
+
 def test_canonical_workspace_replaces_stale_story_files_and_preserves_scratch() -> None:
     request = ToolCallRequest(
         tool_call={"name": "task", "args": {}, "id": "canonical", "type": "tool_call"},
