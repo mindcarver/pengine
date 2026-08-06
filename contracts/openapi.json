@@ -725,8 +725,7 @@
             "type": "string",
             "enum": [
               "generating_story_outline",
-              "generating_character_biographies",
-              "generating_relationships",
+              "generating_character_relationships",
               "generating_episode_outline"
             ],
             "title": "Stage"
@@ -1160,8 +1159,7 @@
           "loading_persona",
           "selecting_l0_variant",
           "generating_story_outline",
-          "generating_character_biographies",
-          "generating_relationship_logic",
+          "generating_character_relationships",
           "generating_episode_outline",
           "generating_episode_scripts",
           "accepting_l0",
@@ -1805,10 +1803,9 @@
                 "propertyName": "stage",
                 "mapping": {
                   "determining_direction": "#/components/schemas/CreativeDirectionDraft",
-                  "generating_character_biographies": "#/components/schemas/CreativeTextDraft",
-                  "generating_episode_outline": "#/components/schemas/CreativeTextDraft",
-                  "generating_relationships": "#/components/schemas/CreativeTextDraft",
-                  "generating_story_outline": "#/components/schemas/CreativeTextDraft"
+                  "generating_story_outline": "#/components/schemas/CreativeTextDraft",
+                  "generating_character_relationships": "#/components/schemas/CreativeTextDraft",
+                  "generating_episode_outline": "#/components/schemas/CreativeTextDraft"
                 }
               }
             },
@@ -1933,7 +1930,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 6.0,
+                "maximum": 4.0,
                 "minimum": 2.0
               },
               {
@@ -2096,8 +2093,7 @@
         "enum": [
           "determining_direction",
           "generating_story_outline",
-          "generating_character_biographies",
-          "generating_relationships",
+          "generating_character_relationships",
           "generating_episode_outline",
           "generating_episode_scripts",
           "final_review"

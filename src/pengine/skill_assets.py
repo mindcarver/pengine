@@ -4,6 +4,7 @@ _SKILLS = (
     "canon-review",
     "episode-continuity-review",
     "continuity-repair",
+    "story-repair",
 )
 
 

@@ -92,7 +92,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 17
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -100,10 +100,31 @@ _MIN_RELAY_RETRY_DELAY_SECONDS = 10
 _EXTENDED_REPAIR_STAGES = frozenset(
     {
         InternalStage.GENERATING_STORY_OUTLINE,
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
     }
 )
+
+# Mirrors the flattened candidate shape used by the agent review/repair loop so
+# the character+relationships payload renders consistently in draft snapshots.
+_CR_DRAFT_SECTIONS = (
+    ("character_biographies", "人物小传 / Character Biographies"),
+    ("relationship_logic", "人物关系 / Relationship Logic"),
+)
+
+
+def _flatten_cr_draft(
+    *,
+    character_biographies: str,
+    relationship_logic: str,
+) -> str:
+    parts = {
+        "character_biographies": character_biographies,
+        "relationship_logic": relationship_logic,
+    }
+    return "\n\n".join(
+        f"# {header}\n{parts[field].strip()}" for field, header in _CR_DRAFT_SECTIONS
+    )
+
 
 RecoveryReason = Literal[
     "run_timeout",
@@ -678,6 +699,114 @@ CREATE TABLE content_rejections_v10 (
             'generating_story_outline',
             'generating_character_biographies',
             'generating_relationship_logic',
+            'generating_story_design',
+            'generating_episode_outline',
+            'generating_episode_scripts'
+        )
+    ),
+    episode_number INTEGER,
+    repair_rounds INTEGER NOT NULL,
+    evidence TEXT NOT NULL,
+    rejected_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, stage, episode_number, rejected_at),
+    CHECK (
+        (
+            stage = 'generating_story_design'
+            AND repair_rounds BETWEEN 2 AND 4
+        )
+        OR (
+            stage IN (
+                'generating_story_outline',
+                'generating_character_biographies',
+                'generating_relationship_logic'
+            )
+            AND repair_rounds BETWEEN 2 AND 6
+        )
+        OR (
+            stage IN ('generating_episode_outline', 'generating_episode_scripts')
+            AND repair_rounds = 2
+        )
+    ),
+    CHECK (
+        (
+            stage = 'generating_episode_scripts'
+            AND episode_number IS NOT NULL
+            AND episode_number >= 1
+        )
+        OR (
+            stage != 'generating_episode_scripts'
+            AND episode_number IS NULL
+        )
+    )
+)
+"""
+
+# v16 rebuilds content_rejections to accept the merged generating_story_design
+# stage (2..4 repair rounds) while still tolerating legacy stage names carried
+# over from rows written before the merge.
+_SCHEMA_V16_CONTENT_REJECTIONS_SQL = """
+CREATE TABLE content_rejections_v16 (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK (
+        stage IN (
+            'generating_story_outline',
+            'generating_character_biographies',
+            'generating_relationship_logic',
+            'generating_story_design',
+            'generating_episode_outline',
+            'generating_episode_scripts'
+        )
+    ),
+    episode_number INTEGER,
+    repair_rounds INTEGER NOT NULL,
+    evidence TEXT NOT NULL,
+    rejected_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, stage, episode_number, rejected_at),
+    CHECK (
+        (
+            stage = 'generating_story_design'
+            AND repair_rounds BETWEEN 2 AND 4
+        )
+        OR (
+            stage IN (
+                'generating_story_outline',
+                'generating_character_biographies',
+                'generating_relationship_logic'
+            )
+            AND repair_rounds BETWEEN 2 AND 6
+        )
+        OR (
+            stage IN ('generating_episode_outline', 'generating_episode_scripts')
+            AND repair_rounds = 2
+        )
+    ),
+    CHECK (
+        (
+            stage = 'generating_episode_scripts'
+            AND episode_number IS NOT NULL
+            AND episode_number >= 1
+        )
+        OR (
+            stage != 'generating_episode_scripts'
+            AND episode_number IS NULL
+        )
+    )
+)
+"""
+
+# v17 rebuilds content_rejections to accept the split generating_story_outline
+# and merged generating_character_relationships stages (2..4 repair rounds) while
+# still tolerating every legacy stage name carried over from prior schema versions.
+_SCHEMA_V17_CONTENT_REJECTIONS_SQL = """
+CREATE TABLE content_rejections_v17 (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK (
+        stage IN (
+            'generating_story_outline',
+            'generating_character_biographies',
+            'generating_relationship_logic',
+            'generating_story_design',
+            'generating_character_relationships',
             'generating_episode_outline',
             'generating_episode_scripts'
         )
@@ -691,6 +820,13 @@ CREATE TABLE content_rejections_v10 (
         (
             stage IN (
                 'generating_story_outline',
+                'generating_character_relationships',
+                'generating_story_design'
+            )
+            AND repair_rounds BETWEEN 2 AND 4
+        )
+        OR (
+            stage IN (
                 'generating_character_biographies',
                 'generating_relationship_logic'
             )
@@ -987,8 +1123,7 @@ _USER_STAGE_BY_INTERNAL = {
     InternalStage.LOADING_PERSONA: UserStage.DETERMINING_DIRECTION,
     InternalStage.SELECTING_L0_VARIANT: UserStage.DETERMINING_DIRECTION,
     InternalStage.GENERATING_STORY_OUTLINE: UserStage.GENERATING_STORY_OUTLINE,
-    InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: (UserStage.GENERATING_CHARACTER_BIOGRAPHIES),
-    InternalStage.GENERATING_RELATIONSHIP_LOGIC: UserStage.GENERATING_RELATIONSHIPS,
+    InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: UserStage.GENERATING_CHARACTER_RELATIONSHIPS,
     InternalStage.GENERATING_EPISODE_OUTLINE: UserStage.GENERATING_EPISODE_OUTLINE,
     InternalStage.GENERATING_EPISODE_SCRIPTS: UserStage.GENERATING_EPISODE_SCRIPTS,
     InternalStage.ACCEPTING_L0: UserStage.FINAL_REVIEW,
@@ -1000,10 +1135,9 @@ _COMPLETED_STAGE_CHECKPOINTS = (
     (UserStage.DETERMINING_DIRECTION, InternalStage.SELECTING_L0_VARIANT),
     (UserStage.GENERATING_STORY_OUTLINE, InternalStage.GENERATING_STORY_OUTLINE),
     (
-        UserStage.GENERATING_CHARACTER_BIOGRAPHIES,
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
+        UserStage.GENERATING_CHARACTER_RELATIONSHIPS,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
     ),
-    (UserStage.GENERATING_RELATIONSHIPS, InternalStage.GENERATING_RELATIONSHIP_LOGIC),
     (UserStage.GENERATING_EPISODE_OUTLINE, InternalStage.GENERATING_EPISODE_OUTLINE),
     (UserStage.GENERATING_EPISODE_SCRIPTS, InternalStage.GENERATING_EPISODE_SCRIPTS),
 )
@@ -1012,10 +1146,9 @@ _DRAFT_STAGE_CHECKPOINTS = (
     (InternalStage.SELECTING_L0_VARIANT, UserStage.DETERMINING_DIRECTION),
     (InternalStage.GENERATING_STORY_OUTLINE, UserStage.GENERATING_STORY_OUTLINE),
     (
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-        UserStage.GENERATING_CHARACTER_BIOGRAPHIES,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+        UserStage.GENERATING_CHARACTER_RELATIONSHIPS,
     ),
-    (InternalStage.GENERATING_RELATIONSHIP_LOGIC, UserStage.GENERATING_RELATIONSHIPS),
     (InternalStage.GENERATING_EPISODE_OUTLINE, UserStage.GENERATING_EPISODE_OUTLINE),
 )
 
@@ -1023,8 +1156,7 @@ _INTERNAL_STAGE_ORDER = (
     InternalStage.LOADING_PERSONA,
     InternalStage.SELECTING_L0_VARIANT,
     InternalStage.GENERATING_STORY_OUTLINE,
-    InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-    InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+    InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
     InternalStage.GENERATING_EPISODE_OUTLINE,
     InternalStage.GENERATING_EPISODE_SCRIPTS,
     InternalStage.ACCEPTING_L0,
@@ -1405,6 +1537,74 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 15
+            if schema_version == 15:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    # The merged story-design stage (generating_story_design) replaces the
+                    # three former story-artifact stages and caps repair rounds at four.
+                    # Rebuild content_rejections so the new stage name and the 2..4 bound are
+                    # accepted, while preserving every existing rejection row.
+                    await connection.execute("DROP TABLE IF EXISTS content_rejections_v16")
+                    await connection.execute(_SCHEMA_V16_CONTENT_REJECTIONS_SQL)
+                    await connection.execute(
+                        """
+                        INSERT INTO content_rejections_v16(
+                            run_id, stage, episode_number, repair_rounds,
+                            evidence, rejected_at
+                        )
+                        SELECT
+                            run_id, stage, episode_number, repair_rounds,
+                            evidence, rejected_at
+                        FROM content_rejections
+                        """
+                    )
+                    await connection.execute("DROP TABLE content_rejections")
+                    await connection.execute(
+                        "ALTER TABLE content_rejections_v16 RENAME TO content_rejections"
+                    )
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (16)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 16
+            if schema_version == 16:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    # Split the story-design stage into a light generating_story_outline
+                    # gate plus a merged generating_character_relationships stage.
+                    # Rebuild content_rejections so the new stage names are accepted while
+                    # preserving every existing rejection row (all legacy names tolerated).
+                    await connection.execute("DROP TABLE IF EXISTS content_rejections_v17")
+                    await connection.execute(_SCHEMA_V17_CONTENT_REJECTIONS_SQL)
+                    await connection.execute(
+                        """
+                        INSERT INTO content_rejections_v17(
+                            run_id, stage, episode_number, repair_rounds,
+                            evidence, rejected_at
+                        )
+                        SELECT
+                            run_id, stage, episode_number, repair_rounds,
+                            evidence, rejected_at
+                        FROM content_rejections
+                        """
+                    )
+                    await connection.execute("DROP TABLE content_rejections")
+                    await connection.execute(
+                        "ALTER TABLE content_rejections_v17 RENAME TO content_rejections"
+                    )
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (17)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 17
 
     async def setup(self) -> None:
         await self.initialize()
@@ -2281,16 +2481,15 @@ class Repository:
     ) -> None:
         if stage not in {
             InternalStage.GENERATING_STORY_OUTLINE,
-            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-            InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
             InternalStage.GENERATING_EPISODE_OUTLINE,
             InternalStage.GENERATING_EPISODE_SCRIPTS,
         }:
             raise ValueError("Only story text or episode generation can pause for content review")
-        allowed_repair_rounds = set(range(2, 7)) if stage in _EXTENDED_REPAIR_STAGES else {2}
+        allowed_repair_rounds = set(range(2, 5)) if stage in _EXTENDED_REPAIR_STAGES else {2}
         if repair_rounds not in allowed_repair_rounds or not evidence.strip():
             raise ValueError(
-                "Story content rejection requires two to six repair rounds and evidence"
+                "Story content rejection requires two to four repair rounds and evidence"
                 if stage in _EXTENDED_REPAIR_STAGES
                 else "Episode content rejection requires two repair rounds and evidence"
             )
@@ -6479,6 +6678,15 @@ class Repository:
                     selected_l0_variant=payload["selected_l0_variant"],
                     selection_rationale=payload["selection_rationale"],
                 )
+            if stage is UserStage.GENERATING_CHARACTER_RELATIONSHIPS:
+                # The character+relationships payload carries two content fields; render
+                # them as one readable artifact for the draft snapshot, mirroring the
+                # flattened candidate the agent reviews and repairs.
+                content = _flatten_cr_draft(
+                    character_biographies=payload["character_biographies"],
+                    relationship_logic=payload["relationship_logic"],
+                )
+                return CreativeTextDraft(stage=stage.value, content=content)
             return CreativeTextDraft(stage=stage.value, content=payload["content"])
         except (KeyError, TypeError, ValueError):
             return None

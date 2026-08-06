@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     run_timeout_seconds: float = Field(default=1800.0, gt=0)
     lease_seconds: int = Field(default=60, ge=5)
     worker_poll_seconds: float = Field(default=0.25, gt=0)
-    agent_recursion_limit: int = Field(default=80, ge=4)
+    agent_recursion_limit: int = Field(default=200, ge=4)
     retrieval_limit: int = Field(default=5, ge=1, le=20)
 
     @property

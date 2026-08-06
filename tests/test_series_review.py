@@ -427,12 +427,12 @@ async def test_worker_authorized_design_rebuild_promotes_a_fresh_design(
         fact.value = f"{fact.value}（重建版）"
     approved = {
         InternalStage.GENERATING_STORY_OUTLINE: {
-            "content": "新的完整故事梗概。\n其余人物设定与已批准大纲保持一致。"
+            "content": "新的完整故事梗概。\n其余人物设定与已批准大纲保持一致。",
         },
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
-            "content": "阿丽：回乡调查旧案的主角。\n阿博：见证旧事的证人。"
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+            "character_biographies": "阿丽：回乡调查旧案的主角。\n阿博：见证旧事的证人。",
+            "relationship_logic": "阿丽与阿博为搭档。",
         },
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC: {"content": "阿丽与阿博为搭档。"},
         InternalStage.SELECTING_L0_VARIANT: {"selected_l0_variant": "归返"},
         InternalStage.GENERATING_EPISODE_OUTLINE: {
             "content": "三集连续写作。",
@@ -487,12 +487,12 @@ async def test_worker_refuses_unauthorized_rebuild_after_automatic_budget(
     work = await repository.get_run_work_item(lease.run_id)
     approved = {
         InternalStage.GENERATING_STORY_OUTLINE: {
-            "content": "新的完整故事梗概。\n其余人物设定与已批准大纲保持一致。"
+            "content": "新的完整故事梗概。\n其余人物设定与已批准大纲保持一致。",
         },
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
-            "content": "阿丽：回乡调查旧案的主角。\n阿博：见证旧事的证人。"
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+            "character_biographies": "阿丽：回乡调查旧案的主角。\n阿博：见证旧事的证人。",
+            "relationship_logic": "阿丽与阿博为搭档。",
         },
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC: {"content": "阿丽与阿博为搭档。"},
         InternalStage.SELECTING_L0_VARIANT: {"selected_l0_variant": "归返"},
         InternalStage.GENERATING_EPISODE_OUTLINE: {
             "content": "三集连续写作。",

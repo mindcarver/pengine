@@ -94,13 +94,10 @@ class DeterministicWorkflow:
                 "stage": "generating_story_outline",
                 "content": "故事大纲",
             },
-            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
-                "stage": "generating_character_biographies",
-                "content": "人物小传",
-            },
-            InternalStage.GENERATING_RELATIONSHIP_LOGIC: {
-                "stage": "generating_relationship_logic",
-                "content": "关系逻辑",
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+                "stage": "generating_character_relationships",
+                "character_biographies": "人物小传",
+                "relationship_logic": "关系逻辑",
             },
             InternalStage.GENERATING_EPISODE_OUTLINE: {
                 "stage": "generating_episode_outline",
@@ -726,8 +723,7 @@ async def test_worker_auto_resumes_first_wall_clock_timeout_from_approved_checkp
     assert succeeded.initial.progress.completed_stages == [
         "determining_direction",
         "generating_story_outline",
-        "generating_character_biographies",
-        "generating_relationships",
+        "generating_character_relationships",
         "generating_episode_outline",
         "generating_episode_scripts",
         "final_review",
@@ -1182,8 +1178,7 @@ async def test_quality_rejection_retries_only_missing_final_gates_on_the_same_ru
         InternalStage.LOADING_PERSONA,
         InternalStage.SELECTING_L0_VARIANT,
         InternalStage.GENERATING_STORY_OUTLINE,
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         InternalStage.GENERATING_EPISODE_SCRIPTS,
     }

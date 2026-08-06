@@ -43,8 +43,7 @@ class InternalStage(StrEnum):
     LOADING_PERSONA = "loading_persona"
     SELECTING_L0_VARIANT = "selecting_l0_variant"
     GENERATING_STORY_OUTLINE = "generating_story_outline"
-    GENERATING_CHARACTER_BIOGRAPHIES = "generating_character_biographies"
-    GENERATING_RELATIONSHIP_LOGIC = "generating_relationship_logic"
+    GENERATING_CHARACTER_RELATIONSHIPS = "generating_character_relationships"
     GENERATING_EPISODE_OUTLINE = "generating_episode_outline"
     GENERATING_EPISODE_SCRIPTS = "generating_episode_scripts"
     ACCEPTING_L0 = "accepting_l0"
@@ -55,8 +54,7 @@ class InternalStage(StrEnum):
 class UserStage(StrEnum):
     DETERMINING_DIRECTION = "determining_direction"
     GENERATING_STORY_OUTLINE = "generating_story_outline"
-    GENERATING_CHARACTER_BIOGRAPHIES = "generating_character_biographies"
-    GENERATING_RELATIONSHIPS = "generating_relationships"
+    GENERATING_CHARACTER_RELATIONSHIPS = "generating_character_relationships"
     GENERATING_EPISODE_OUTLINE = "generating_episode_outline"
     GENERATING_EPISODE_SCRIPTS = "generating_episode_scripts"
     FINAL_REVIEW = "final_review"
@@ -247,8 +245,7 @@ class CreativeDirectionDraft(StrictModel):
 class CreativeTextDraft(StrictModel):
     stage: Literal[
         "generating_story_outline",
-        "generating_character_biographies",
-        "generating_relationships",
+        "generating_character_relationships",
         "generating_episode_outline",
     ]
     content: NonEmptyText
@@ -299,7 +296,7 @@ class RunPause(StrictModel):
     message: NonEmptyText
     stage: UserStage
     timeout_count: int | None = Field(default=None, ge=2)
-    content_repair_count: int | None = Field(default=None, ge=2, le=6)
+    content_repair_count: int | None = Field(default=None, ge=2, le=4)
     episode_number: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
@@ -307,16 +304,15 @@ class RunPause(StrictModel):
         if self.code == "content_rejected":
             if (
                 self.content_repair_count is None
-                or not 2 <= self.content_repair_count <= 6
+                or not 2 <= self.content_repair_count <= 4
                 or self.timeout_count is not None
             ):
                 raise ValueError(
-                    "Content rejection requires two to six content repairs and no timeout count"
+                    "Content rejection requires two to four content repairs and no timeout count"
                 )
             if self.content_repair_count > 2 and self.stage not in {
                 UserStage.GENERATING_STORY_OUTLINE,
-                UserStage.GENERATING_CHARACTER_BIOGRAPHIES,
-                UserStage.GENERATING_RELATIONSHIPS,
+                UserStage.GENERATING_CHARACTER_RELATIONSHIPS,
             }:
                 raise ValueError("Only story creation stages allow more than two content repairs")
         elif self.code in {"episode_error", "context_budget", "repair_authorization"}:

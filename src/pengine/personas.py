@@ -834,19 +834,18 @@ def _strip_pending_blocks(text: str) -> str:
     return "\n".join(output).strip()
 
 
-_STAGE_L4_ALIASES: dict[InternalStage, tuple[str, ...] | None] = {
+_STAGE_L4_ALIASES: dict[InternalStage, tuple[tuple[str, ...], ...] | None] = {
     InternalStage.LOADING_PERSONA: None,
     InternalStage.SELECTING_L0_VARIANT: None,
-    InternalStage.GENERATING_STORY_OUTLINE: ("故事大纲", "storyoutline"),
-    InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: (
-        "人物小传",
-        "characterbiographies",
+    InternalStage.GENERATING_STORY_OUTLINE: (("故事大纲", "storyoutline"),),
+    InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: (
+        ("人物小传", "characterbiographies"),
+        ("人物关系", "relationship"),
     ),
-    InternalStage.GENERATING_RELATIONSHIP_LOGIC: ("人物关系", "relationship"),
-    InternalStage.GENERATING_EPISODE_OUTLINE: ("分集大纲", "episodeoutline"),
-    InternalStage.GENERATING_EPISODE_SCRIPTS: ("分集剧本", "episodescripts"),
+    InternalStage.GENERATING_EPISODE_OUTLINE: (("分集大纲", "episodeoutline"),),
+    InternalStage.GENERATING_EPISODE_SCRIPTS: (("分集剧本", "episodescripts"),),
     InternalStage.ACCEPTING_L0: None,
-    InternalStage.ACCEPTING_L4: ("L4-B", "短剧技艺", "craft"),
+    InternalStage.ACCEPTING_L4: (("L4-B", "短剧技艺", "craft"),),
     InternalStage.ASSEMBLING_DELIVERY: None,
 }
 
@@ -857,7 +856,9 @@ def _stage_l4_context(text: str, stage: InternalStage) -> str:
         return text.strip()
     aliases = _STAGE_L4_ALIASES[stage]
     if aliases:
-        sections.append(_extract_required_section(text, (aliases,), f"L4 {stage.value}"))
+        for alias_group in aliases:
+            label = f"L4 {stage.value} {alias_group[0]}"
+            sections.append(_extract_required_section(text, (alias_group,), label))
         sections.append(
             _extract_required_section(text, (("参数", "parameter"),), "L4 numeric parameters")
         )

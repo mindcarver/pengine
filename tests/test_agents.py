@@ -63,6 +63,7 @@ from pengine.agents import (
     _supervisor_prompt,
     _validate_outline_repair_patch_targets,
     _validate_result_language,
+    flatten_cr_candidate,
 )
 from pengine.config import Settings
 from pengine.continuity import (
@@ -230,9 +231,11 @@ def _successful_responses() -> list[AIMessage]:
             "StoryArchitectResult",
             {
                 "stage": "selecting_l0_variant",
+                "content": None,
+                "character_biographies": None,
+                "relationship_logic": None,
                 "selected_l0_variant": "主动选择",
                 "selection_rationale": "契合故事",
-                "content": None,
             },
         ),
         (
@@ -242,28 +245,21 @@ def _successful_responses() -> list[AIMessage]:
             {
                 "stage": "generating_story_outline",
                 "content": "故事大纲",
+                "character_biographies": None,
+                "relationship_logic": None,
                 "selected_l0_variant": None,
                 "selection_rationale": None,
             },
         ),
         (
-            "generating_character_biographies",
+            "generating_character_relationships",
             "story_architect",
             "StoryArchitectResult",
             {
-                "stage": "generating_character_biographies",
-                "content": "人物小传",
-                "selected_l0_variant": None,
-                "selection_rationale": None,
-            },
-        ),
-        (
-            "generating_relationship_logic",
-            "story_architect",
-            "StoryArchitectResult",
-            {
-                "stage": "generating_relationship_logic",
-                "content": "关系逻辑",
+                "stage": "generating_character_relationships",
+                "content": None,
+                "character_biographies": "人物小传",
+                "relationship_logic": "关系逻辑",
                 "selected_l0_variant": None,
                 "selection_rationale": None,
             },
@@ -329,11 +325,18 @@ def _successful_responses() -> list[AIMessage]:
         )
         responses.append(_tool_call(schema, payload, index + 1))
         index += 2
-        if stage in {
-            "generating_story_outline",
-            "generating_character_biographies",
-            "generating_relationship_logic",
-        }:
+        if stage == "generating_story_outline":
+            # Outline stage: single-lens canon review (1 review call).
+            responses.append(
+                _tool_call(
+                    "CanonReviewerResult",
+                    {"passed": True, "evidence": "故事大纲一致", "issues": []},
+                    index,
+                )
+            )
+            index += 1
+        if stage == "generating_character_relationships":
+            # Character + relationships stage: two-lens canon review (2 review calls).
             for _ in range(2):
                 responses.append(
                     _tool_call(
@@ -371,18 +374,30 @@ def _successful_responses() -> list[AIMessage]:
     return responses
 
 
+def _index_of_tool_call(responses: list[AIMessage], name: str, *, occurrence: int = 1) -> int:
+    """1-based occurrence index of the Nth AIMessage carrying a tool call named ``name``."""
+    seen = 0
+    for index, message in enumerate(responses):
+        if message.tool_calls and message.tool_calls[0]["name"] == name:
+            seen += 1
+            if seen == occurrence:
+                return index
+    raise AssertionError(f"No tool call named {name!r} (occurrence {occurrence}) in responses")
+
+
 def _successful_responses_unified() -> list[AIMessage]:
     """The unified SeriesBible flow response sequence.
 
     In the unified path the writer relies on deterministic per-episode validation and
     the declared structural milestone/final reviews, so the per-episode
-    ``episode_reviewer`` response (index 19 in the legacy sequence) is replaced by the
-    bound final ``series_reviewer`` result for the single-episode series.
+    ``episode_reviewer`` response is replaced by the bound final ``series_reviewer``
+    result for the single-episode series.
     """
     responses = _successful_responses()
+    episode_review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
     unified: list[AIMessage] = []
     for index, response in enumerate(responses):
-        if index == 19:
+        if index == episode_review_index:
             unified.append(
                 _tool_call(
                     "StructuralReviewResult",
@@ -452,8 +467,15 @@ def _episode_hook_kwargs(
 def test_story_architect_schema_exposes_stage_specific_field_contract() -> None:
     properties = StoryArchitectResult.model_json_schema()["properties"]
 
-    assert "selecting_l0_variant" in properties["content"]["description"]
-    assert "Must be null" in properties["content"]["description"]
+    # The outline stage uses the single ``content`` field; the c+r stage uses the
+    # two ``character_biographies`` / ``relationship_logic`` fields. The old
+    # ``story_outline`` property is gone.
+    assert "story_outline" not in properties
+    assert "generating_story_outline" in properties["content"]["description"]
+    assert "Must be null for selecting_l0_variant" in properties["content"]["description"]
+    for cr_field in ("character_biographies", "relationship_logic"):
+        assert "generating_character_relationships" in properties[cr_field]["description"]
+        assert "Must be null for selecting_l0_variant" in properties[cr_field]["description"]
     assert "selecting_l0_variant" in properties["selected_l0_variant"]["description"]
     assert "do not add an English translation" in (properties["selected_l0_variant"]["description"])
     assert "Must be null" in properties["selected_l0_variant"]["description"]
@@ -552,11 +574,16 @@ def test_script_writer_rejects_invalid_json_encoded_state_delta(encoded: str) ->
 
 
 def test_story_artifact_patch_repairs_only_numbered_minimal_lines() -> None:
-    content = (
-        "# 人物关系\n"
-        "程远在海难时二十四岁，比程屿大约六岁。\n"
-        "兄弟二人的年龄差决定了程屿对兄长的依赖，也影响调查中的选择。\n"
-        "其余人物关系与已批准的小传保持不变，并继续约束后续情节与人物行为。"
+    content = flatten_cr_candidate(
+        character_biographies="人物小传确认程远二十二岁，比程屿大两岁。",
+        relationship_logic=(
+            "程远在海难时二十四岁，比程屿大约六岁。\n"
+            "兄弟二人的年龄差决定了程屿对兄长的依赖，也影响调查中的选择。\n"
+            "其余人物关系与已批准的小传保持不变，并继续约束后续情节与人物行为。"
+        ),
+    )
+    relationship_conflict_line = (
+        content.split("\n").index("程远在海难时二十四岁，比程屿大约六岁。") + 1
     )
     review = CanonReviewerResult(
         passed=False,
@@ -571,11 +598,11 @@ def test_story_artifact_patch_repairs_only_numbered_minimal_lines() -> None:
     )
     patch = StoryArtifactRepairPatch.model_validate(
         {
-            "stage": "generating_relationship_logic",
+            "stage": "generating_character_relationships",
             "line_replacements": [
                 {
-                    "start_line": 2,
-                    "end_line": 2,
+                    "start_line": relationship_conflict_line,
+                    "end_line": relationship_conflict_line,
                     "replacement": "程远在海难时二十二岁，比程屿大两岁。",
                 }
             ],
@@ -583,37 +610,36 @@ def test_story_artifact_patch_repairs_only_numbered_minimal_lines() -> None:
     )
 
     context = _story_repair_context(
-        stage=InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        stage=InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         content=content,
         review=review,
     )
     repaired = _apply_story_artifact_repair_patch(
-        stage=InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        stage=InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         content=content,
         patch=patch,
     )
 
-    assert context["candidate_lines"][0] == {"line_number": 1, "text": "# 人物关系"}
-    assert context["candidate_lines"][1] == {
-        "line_number": 2,
+    assert context["candidate_lines"][relationship_conflict_line - 1] == {
+        "line_number": relationship_conflict_line,
         "text": "程远在海难时二十四岁，比程屿大约六岁。",
     }
     assert context["confirmed_issues"][0]["code"] == "relative_age_conflict"
-    assert "二十二岁，比程屿大两岁" in repaired.content
-    assert "二十四岁" not in repaired.content
+    assert "二十二岁，比程屿大两岁" in repaired.relationship_logic
+    assert "二十四岁" not in repaired.relationship_logic
 
 
 def test_story_artifact_patch_rejects_invalid_overlapping_or_unchanged_lines() -> None:
     content = "标题\n年龄冲突。\n关系冲突。\n其余关系文本保持不变并提供足够上下文。"
     invalid_range = StoryArtifactRepairPatch.model_validate(
         {
-            "stage": "generating_relationship_logic",
+            "stage": "generating_story_outline",
             "line_replacements": [{"start_line": 9, "end_line": 9, "replacement": "年龄一致。"}],
         }
     )
     overlapping = StoryArtifactRepairPatch.model_validate(
         {
-            "stage": "generating_relationship_logic",
+            "stage": "generating_story_outline",
             "line_replacements": [
                 {"start_line": 2, "end_line": 3, "replacement": "关系一致。"},
                 {"start_line": 3, "end_line": 3, "replacement": "年龄一致。"},
@@ -622,26 +648,26 @@ def test_story_artifact_patch_rejects_invalid_overlapping_or_unchanged_lines() -
     )
     unchanged = StoryArtifactRepairPatch.model_validate(
         {
-            "stage": "generating_relationship_logic",
+            "stage": "generating_story_outline",
             "line_replacements": [{"start_line": 2, "end_line": 2, "replacement": "年龄冲突。"}],
         }
     )
 
     with pytest.raises(ValueError, match="story_repair_line_range_invalid"):
         _apply_story_artifact_repair_patch(
-            stage=InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            stage=InternalStage.GENERATING_STORY_OUTLINE,
             content=content,
             patch=invalid_range,
         )
     with pytest.raises(ValueError, match="overlapping_story_line_replacement"):
         _apply_story_artifact_repair_patch(
-            stage=InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            stage=InternalStage.GENERATING_STORY_OUTLINE,
             content=content,
             patch=overlapping,
         )
     with pytest.raises(ValueError, match="story_repair_line_did_not_change"):
         _apply_story_artifact_repair_patch(
-            stage=InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            stage=InternalStage.GENERATING_STORY_OUTLINE,
             content=content,
             patch=unchanged,
         )
@@ -657,23 +683,27 @@ def test_story_artifact_patch_rejects_invalid_overlapping_or_unchanged_lines() -
 
 def test_story_artifact_patch_discards_harmless_no_op_alongside_real_repairs() -> None:
     content = (
-        "# 故事大纲\n"
         "台风预警在七月二十日晚发布。\n"
         "林夏必须在封岛前查清旧表来历。\n"
         "其余人物身份、动机、知识来源、时间线与证物约束均保持不变。"
+    )
+    outline_lines = content.split("\n")
+    date_line = outline_lines.index("台风预警在七月二十日晚发布。") + 1
+    closing_line = (
+        outline_lines.index("其余人物身份、动机、知识来源、时间线与证物约束均保持不变。") + 1
     )
     patch = StoryArtifactRepairPatch.model_validate(
         {
             "stage": "generating_story_outline",
             "line_replacements": [
                 {
-                    "start_line": 2,
-                    "end_line": 2,
+                    "start_line": date_line,
+                    "end_line": date_line,
                     "replacement": "台风预警在七月十九日晚发布。",
                 },
                 {
-                    "start_line": 4,
-                    "end_line": 4,
+                    "start_line": closing_line,
+                    "end_line": closing_line,
                     "replacement": "其余人物身份、动机、知识来源、时间线与证物约束均保持不变。",
                 },
             ],
@@ -723,23 +753,27 @@ def test_story_artifact_patch_allows_in_scope_multi_line_outline_repair() -> Non
         "结尾：林夏决定调查旧表来历。\n"
         "其余人物设定与已批准大纲保持一致。"
     )
+    outline_lines = content.split("\n")
+    opening_line = outline_lines.index("开局：林夏在台风夜回到旧屋。") + 1
+    middle_line = outline_lines.index("中段：林夏发现旧表与父亲失踪有关。") + 1
+    ending_line = outline_lines.index("结尾：林夏决定调查旧表来历。") + 1
     patch = StoryArtifactRepairPatch.model_validate(
         {
             "stage": "generating_story_outline",
             "line_replacements": [
                 {
-                    "start_line": 1,
-                    "end_line": 1,
+                    "start_line": opening_line,
+                    "end_line": opening_line,
                     "replacement": "开局：林夏在台风夜赶回旧屋，发现门锁被换。",
                 },
                 {
-                    "start_line": 2,
-                    "end_line": 2,
+                    "start_line": middle_line,
+                    "end_line": middle_line,
                     "replacement": "中段：林夏查明旧表与父亲失踪直接相关。",
                 },
                 {
-                    "start_line": 3,
-                    "end_line": 3,
+                    "start_line": ending_line,
+                    "end_line": ending_line,
                     "replacement": "结尾：林夏决定留在岛上继续追查真相。",
                 },
             ],
@@ -900,6 +934,8 @@ async def test_story_repair_allows_two_bounded_targeted_patch_corrections() -> N
         "其余人物身份、关系、时间线与证物约束均保持不变。\n"
         "本段补充足够上下文，确保修复只触及冲突限定词而不重写整个故事工件。"
     )
+    conflict_line = content.split("\n").index("- **林守诚（父亲）**：兼岛上唯一修表师。") + 1
+    line_count = len(content.split("\n"))
 
     async def before_stage(_: InternalStage) -> int:
         return 1
@@ -915,7 +951,7 @@ async def test_story_repair_allows_two_bounded_targeted_patch_corrections() -> N
         correction: str | None,
     ) -> StoryArtifactRepairPatch:
         corrections.append(correction)
-        line_number = 1 if len(corrections) == 3 else 99
+        line_number = conflict_line if len(corrections) == 3 else 99
         return StoryArtifactRepairPatch.model_validate(
             {
                 "stage": stage.value,
@@ -948,6 +984,8 @@ async def test_story_repair_allows_two_bounded_targeted_patch_corrections() -> N
     )
 
     repaired = await middleware._invoke_story_artifact_repair(
+        request=None,
+        handler=None,
         stage=InternalStage.GENERATING_STORY_OUTLINE,
         content=content,
         review=review,
@@ -956,7 +994,7 @@ async def test_story_repair_allows_two_bounded_targeted_patch_corrections() -> N
 
     assert len(corrections) == 3
     assert corrections[0] is None
-    assert all("Candidate has 3 numbered lines" in value for value in corrections[1:])
+    assert all(f"Candidate has {line_count} numbered lines" in value for value in corrections[1:])
     assert "唯一" not in repaired.content
 
 
@@ -1005,6 +1043,8 @@ async def test_story_repair_preserves_transport_failures_without_retry(failure: 
 
     with pytest.raises(type(failure)) as caught:
         await middleware._invoke_story_artifact_repair(
+            request=None,
+            handler=None,
             stage=InternalStage.GENERATING_STORY_OUTLINE,
             content="原始故事大纲。",
             review=review,
@@ -1041,6 +1081,16 @@ def test_canonical_workspace_replaces_stale_story_files_and_preserves_scratch() 
         InternalStage.GENERATING_STORY_OUTLINE: {
             "stage": "generating_story_outline",
             "content": "已批准大纲",
+            "character_biographies": None,
+            "relationship_logic": None,
+            "selected_l0_variant": None,
+            "selection_rationale": None,
+        },
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+            "stage": "generating_character_relationships",
+            "content": None,
+            "character_biographies": "已批准小传",
+            "relationship_logic": "已批准关系",
             "selected_l0_variant": None,
             "selection_rationale": None,
         },
@@ -1050,7 +1100,8 @@ def test_canonical_workspace_replaces_stale_story_files_and_preserves_scratch() 
     files = normalized.state["files"]
 
     assert files["/workspace/story_outline.md"]["content"] == "已批准大纲"
-    assert "/workspace/character_biographies.md" not in files
+    assert files["/workspace/character_biographies.md"]["content"] == "已批准小传"
+    assert files["/workspace/relationship_logic.md"]["content"] == "已批准关系"
     assert files["/workspace/scratch.md"]["content"] == "保留"
     assert "已批准大纲" in files["/workspace/approved-checkpoints.json"]["content"]
 
@@ -2400,8 +2451,9 @@ def test_structured_output_retry_reports_safe_validation_details() -> None:
     try:
         StoryArchitectResult.model_validate(
             {
-                "stage": "generating_story_outline",
-                "content": None,
+                "stage": "selecting_l0_variant",
+                "selected_l0_variant": None,
+                "selection_rationale": None,
             }
         )
     except ValidationError as error:
@@ -2410,7 +2462,7 @@ def test_structured_output_retry_reports_safe_validation_details() -> None:
         raise AssertionError("The invalid story result unexpectedly validated")
 
     assert "Correct these validation errors" in message
-    assert "Story artifact stages require only content" in message
+    assert "L0 selection requires only variant and rationale" in message
     assert "input_value" not in message
 
 
@@ -2502,11 +2554,13 @@ def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> No
         "canon_reviewer": ["/skills/canon-review"],
         "episode_reviewer": ["/skills/episode-continuity-review"],
         "episode_repair": ["/skills/continuity-repair"],
+        "story_repair": ["/skills/story-repair"],
     }
     assert set(load_agent_skill_files()) == {
         "/skills/canon-review/SKILL.md",
         "/skills/episode-continuity-review/SKILL.md",
         "/skills/continuity-repair/SKILL.md",
+        "/skills/story-repair/SKILL.md",
     }
     assert not {"story_architect", "episode_planner", "script_writer", "quality_reviewer"} & set(
         _SPECIALIST_SKILL_SOURCES
@@ -2593,6 +2647,7 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
         "episode_planner",
         "script_writer",
         "episode_repair",
+        "story_repair",
     }
     assert {name for name, model in subagent_models.items() if model is review_model} == {
         "quality_reviewer",
@@ -2639,8 +2694,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         assert [stage for kind, stage in events if kind == "before"] == [
             "selecting_l0_variant",
             "generating_story_outline",
-            "generating_character_biographies",
-            "generating_relationship_logic",
+            "generating_character_relationships",
             "generating_episode_outline",
             "accepting_l0",
             "accepting_l4",
@@ -2648,8 +2702,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         assert [stage for kind, stage in events if kind == "approve"] == [
             "selecting_l0_variant",
             "generating_story_outline",
-            "generating_character_biographies",
-            "generating_relationship_logic",
+            "generating_character_relationships",
             "generating_episode_outline",
             "generating_episode_scripts",
             "accepting_l0",
@@ -2697,12 +2750,8 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
         InternalStage.GENERATING_STORY_OUTLINE: {
             "stage": "generating_story_outline",
             "content": "程远海难时二十二岁，程屿二十岁。",
-            "selected_l0_variant": None,
-            "selection_rationale": None,
-        },
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
-            "stage": "generating_character_biographies",
-            "content": "程远二十二岁，比程屿大两岁。",
+            "character_biographies": None,
+            "relationship_logic": None,
             "selected_l0_variant": None,
             "selection_rationale": None,
         },
@@ -2710,63 +2759,29 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
     frozen_upstream = copy.deepcopy(approved_payloads)
     approvals: list[tuple[InternalStage, dict[str, Any]]] = []
     review_calls = 0
-    patch_calls = 0
+    repair_calls = 0
 
     async def before_stage(stage: InternalStage) -> int:
-        assert stage is InternalStage.GENERATING_RELATIONSHIP_LOGIC
+        assert stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
         return 1
 
     async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
         approvals.append((stage, payload))
         approved_payloads[stage] = payload
 
-    async def generate_story_patch(
-        stage: InternalStage,
-        content: str,
-        review: CanonReviewerResult,
-        repair_round: int,
-        correction: str | None,
-    ) -> StoryArtifactRepairPatch:
-        nonlocal patch_calls
-        patch_calls += 1
-        assert stage is InternalStage.GENERATING_RELATIONSHIP_LOGIC
-        assert repair_round == 1
-        assert correction is None
-        assert {issue.code for issue in review.issues} == {
-            "relative_age_conflict",
-            "call_participant_conflict",
-        }
-        assert "二十四岁" in content
-        return StoryArtifactRepairPatch.model_validate(
-            {
-                "stage": stage.value,
-                "line_replacements": [
-                    {
-                        "start_line": 1,
-                        "end_line": 1,
-                        "replacement": "程远二十二岁，比程屿大两岁。",
-                    },
-                    {
-                        "start_line": 2,
-                        "end_line": 2,
-                        "replacement": "通话记录确认电话对象写成程屿。",
-                    },
-                ],
-            }
-        )
-
     middleware = StageGuardMiddleware(
         before_stage=before_stage,
         approve_stage=approve_stage,
         approved_stages=set(approved_payloads),
         approved_payloads=approved_payloads,
-        generate_story_patch=generate_story_patch,
     )
     request = ToolCallRequest(
         tool_call={
             "name": "task",
             "args": {
-                "description": "[stage=generating_relationship_logic] write relationships",
+                "description": (
+                    "[stage=generating_character_relationships] write character + relationships"
+                ),
                 "subagent_type": "story_architect",
             },
             "id": "story-consistency",
@@ -2778,14 +2793,36 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
     )
 
     async def handler(candidate: ToolCallRequest) -> ToolMessage:
-        nonlocal review_calls
+        nonlocal review_calls, repair_calls
         subagent_type = candidate.tool_call["args"]["subagent_type"]
         if subagent_type == "story_architect":
             payload = {
-                "stage": "generating_relationship_logic",
-                "content": (
+                "stage": "generating_character_relationships",
+                "content": None,
+                "character_biographies": "程远二十二岁，比程屿大两岁。",
+                "relationship_logic": (
                     "程远二十四岁，比程屿大六岁。电话对象写成周砚。\n"
                     "通话记录确认电话对象写成周砚。\n"
+                    "两人的年龄关系影响程屿对兄长的依赖和调查选择，并约束后续全部情节。\n"
+                    "其余人物身份、秘密来源、证物链和时间线均保持已批准版本。"
+                ),
+                "selected_l0_variant": None,
+                "selection_rationale": None,
+            }
+        elif subagent_type == "story_repair":
+            # The c+r repair subagent returns the complete rewritten candidate
+            # (not a patch) with both confirmed conflicts resolved jointly.
+            repair_calls += 1
+            current = candidate.state["files"]["/workspace/current_story_candidate.md"]["content"]
+            assert "二十四岁" in current
+            assert "电话对象写成周砚" in current
+            payload = {
+                "stage": "generating_character_relationships",
+                "content": None,
+                "character_biographies": "程远二十二岁，比程屿大两岁。",
+                "relationship_logic": (
+                    "程远二十二岁，比程屿大两岁。电话对象写成程屿。\n"
+                    "通话记录确认电话对象写成程屿。\n"
                     "两人的年龄关系影响程屿对兄长的依赖和调查选择，并约束后续全部情节。\n"
                     "其余人物身份、秘密来源、证物链和时间线均保持已批准版本。"
                 ),
@@ -2836,7 +2873,7 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
     await middleware.awrap_tool_call(request, handler)
 
     assert review_calls == 4
-    assert patch_calls == 1
+    assert repair_calls == 1
     assert (
         approved_payloads | {key: value for key, value in frozen_upstream.items()}
         == approved_payloads
@@ -2844,15 +2881,15 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
     assert all(approved_payloads[stage] == payload for stage, payload in frozen_upstream.items())
     assert len(approvals) == 1
     stage, repaired = approvals[0]
-    assert stage is InternalStage.GENERATING_RELATIONSHIP_LOGIC
+    assert stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
     assert repaired["consistency_review"]["passed"] is True
     assert repaired["consistency_repair_rounds"] == 1
-    assert "二十二岁，比程屿大两岁" in repaired["content"]
-    assert "电话对象写成程屿" in repaired["content"]
+    assert "二十二岁，比程屿大两岁" in repaired["relationship_logic"]
+    assert "电话对象写成程屿" in repaired["relationship_logic"]
 
 
 @pytest.mark.asyncio
-async def test_story_consistency_uses_backstop_and_sixth_repair_round() -> None:
+async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_round() -> None:
     approvals: list[tuple[InternalStage, dict[str, Any]]] = []
     approved_payloads: dict[InternalStage, Any] = {
         InternalStage.SELECTING_L0_VARIANT: {
@@ -2860,144 +2897,41 @@ async def test_story_consistency_uses_backstop_and_sixth_repair_round() -> None:
             "content": None,
             "selected_l0_variant": "主动选择",
             "selection_rationale": "契合创意",
-        }
+        },
+        InternalStage.GENERATING_STORY_OUTLINE: {
+            "stage": "generating_story_outline",
+            "content": "林夏追查父亲承担责任的原因，旧表与救援站构成既有证物链。",
+            "character_biographies": None,
+            "relationship_logic": None,
+            "selected_l0_variant": None,
+            "selection_rationale": None,
+        },
     }
     review_calls = 0
-    patch_calls = 0
+    repair_calls = 0
     backstop_calls = 0
 
     async def before_stage(stage: InternalStage) -> int:
-        assert stage is InternalStage.GENERATING_STORY_OUTLINE
+        assert stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
         return 1
 
     async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
         approvals.append((stage, payload))
         approved_payloads[stage] = payload
 
-    async def generate_story_patch(
-        stage: InternalStage,
-        content: str,
-        review: CanonReviewerResult,
-        repair_round: int,
-        correction: str | None,
-    ) -> StoryArtifactRepairPatch:
-        nonlocal patch_calls
-        patch_calls += 1
-        assert stage is InternalStage.GENERATING_STORY_OUTLINE
-        assert correction is None
-        issue_codes = {issue.code for issue in review.issues}
-        if repair_round == 1:
-            assert issue_codes == {"call_participant_conflict"}
-            assert "电话打给周砚" in content
-            return StoryArtifactRepairPatch.model_validate(
-                {
-                    "stage": stage.value,
-                    "line_replacements": [
-                        {
-                            "start_line": 1,
-                            "end_line": 1,
-                            "replacement": ("电话改为打给程屿后，陈伯一直知情并准备在终局作证。"),
-                        }
-                    ],
-                }
-            )
-        if repair_round == 2:
-            assert issue_codes == {"knowledge_source_gap", "testimony_basis_gap"}
-            assert "陈伯一直知情并准备在终局作证" in content
-            return StoryArtifactRepairPatch.model_validate(
-                {
-                    "stage": stage.value,
-                    "line_replacements": [
-                        {
-                            "start_line": 1,
-                            "end_line": 1,
-                            "replacement": (
-                                "电话改为打给程屿；陈伯因保管周远的值班记录与手记而知情，"
-                                "并据此在终局作证。"
-                            ),
-                        }
-                    ],
-                }
-            )
-        if repair_round == 3:
-            assert issue_codes == {"repeated_knowledge_source_gap"}
-            assert "人物摘要仍称陈伯一直知情" in content
-            return StoryArtifactRepairPatch.model_validate(
-                {
-                    "stage": stage.value,
-                    "line_replacements": [
-                        {
-                            "start_line": 2,
-                            "end_line": 2,
-                            "replacement": (
-                                "人物摘要同步说明陈伯因保管周远的值班记录与手记而知情。"
-                            ),
-                        }
-                    ],
-                }
-            )
-        if repair_round == 4:
-            assert issue_codes == {"relationship_summary_knowledge_gap"}
-            assert "关系摘要仍称陈伯一直知情" in content
-            return StoryArtifactRepairPatch.model_validate(
-                {
-                    "stage": stage.value,
-                    "line_replacements": [
-                        {
-                            "start_line": 3,
-                            "end_line": 3,
-                            "replacement": (
-                                "关系摘要同步说明陈伯因保管周远的值班记录与手记而知情。"
-                            ),
-                        }
-                    ],
-                }
-            )
-        if repair_round == 5:
-            assert issue_codes == {"ending_summary_knowledge_gap"}
-            assert "结局摘要仍称陈伯一直知情" in content
-            return StoryArtifactRepairPatch.model_validate(
-                {
-                    "stage": stage.value,
-                    "line_replacements": [
-                        {
-                            "start_line": 4,
-                            "end_line": 4,
-                            "replacement": (
-                                "结局摘要同步说明陈伯因保管周远的值班记录与手记而知情。"
-                            ),
-                        }
-                    ],
-                }
-            )
-        assert repair_round == 6
-        assert issue_codes == {"evidence_summary_knowledge_gap"}
-        assert "证物摘要仍称陈伯一直知情" in content
-        return StoryArtifactRepairPatch.model_validate(
-            {
-                "stage": stage.value,
-                "line_replacements": [
-                    {
-                        "start_line": 5,
-                        "end_line": 5,
-                        "replacement": ("证物摘要同步说明陈伯因保管周远的值班记录与手记而知情。"),
-                    }
-                ],
-            }
-        )
-
     middleware = StageGuardMiddleware(
         before_stage=before_stage,
         approve_stage=approve_stage,
         approved_stages=set(approved_payloads),
         approved_payloads=approved_payloads,
-        generate_story_patch=generate_story_patch,
     )
     request = ToolCallRequest(
         tool_call={
             "name": "task",
             "args": {
-                "description": "[stage=generating_story_outline] write story outline",
+                "description": (
+                    "[stage=generating_character_relationships] write character + relationships"
+                ),
                 "subagent_type": "story_architect",
             },
             "id": "story-backstop",
@@ -3009,21 +2943,76 @@ async def test_story_consistency_uses_backstop_and_sixth_repair_round() -> None:
     )
 
     async def handler(candidate: ToolCallRequest) -> ToolMessage:
-        nonlocal review_calls, backstop_calls
+        nonlocal review_calls, repair_calls, backstop_calls
         subagent_type = candidate.tool_call["args"]["subagent_type"]
         if subagent_type == "story_architect":
             payload = {
-                "stage": "generating_story_outline",
-                "content": (
+                "stage": "generating_character_relationships",
+                "content": None,
+                "character_biographies": "陈伯是岛上救援站值班员，长期保管周远的值班记录与手记。",
+                "relationship_logic": (
                     "电话打给周砚后，陈伯决定在终局作证。\n"
                     "人物摘要仍称陈伯一直知情并准备在终局作证。\n"
                     "关系摘要仍称陈伯一直知情并准备在终局作证。\n"
-                    "结局摘要仍称陈伯一直知情并准备在终局作证。\n"
-                    "证物摘要仍称陈伯一直知情并准备在终局作证。\n"
-                    "林夏仍按已批准动机追查父亲承担责任的原因。\n"
-                    "旧表、值班记录与救援站构成贯穿全剧的既有证物链。\n"
                     "其余人物身份、时间线与结局选择保持上游版本。"
                 ),
+                "selected_l0_variant": None,
+                "selection_rationale": None,
+            }
+        elif subagent_type == "story_repair":
+            # The c+r repair subagent returns the complete rewritten candidate
+            # (not a patch). Each round cumulatively fixes the confirmed issues,
+            # mirroring what the old line-range patches produced.
+            repair_calls += 1
+            current = candidate.state["files"]["/workspace/current_story_candidate.md"]["content"]
+            if repair_calls == 1:
+                # Round 1 fixes only the call-participant conflict; the
+                # knowledge-source gap remains, so the post-repair review still
+                # fails and the convergence backstop fires at this checkpoint.
+                assert "电话打给周砚" in current
+                relationship_logic = (
+                    "电话改为打给程屿后，陈伯一直知情并准备在终局作证。\n"
+                    "人物摘要仍称陈伯一直知情并准备在终局作证。\n"
+                    "关系摘要仍称陈伯一直知情并准备在终局作证。\n"
+                    "其余人物身份、时间线与结局选择保持上游版本。"
+                )
+            elif repair_calls == 2:
+                # Round 2 closes the knowledge-source gap (and the testimony-basis
+                # gap the backstop surfaced) by supplying 陈伯's既有记录来源 on the
+                # main line; the two summaries still lack it.
+                assert "陈伯一直知情并准备在终局作证" in current
+                relationship_logic = (
+                    "电话改为打给程屿；陈伯因保管周远的值班记录与手记而知情，并据此在终局作证。\n"
+                    "人物摘要仍称陈伯一直知情并准备在终局作证。\n"
+                    "关系摘要仍称陈伯一直知情并准备在终局作证。\n"
+                    "其余人物身份、时间线与结局选择保持上游版本。"
+                )
+            elif repair_calls == 3:
+                # Round 3 fixes 人物摘要 to include the source; 关系摘要 still lacks it.
+                assert "值班记录与手记" in current
+                assert "人物摘要仍称陈伯一直知情" in current
+                relationship_logic = (
+                    "电话改为打给程屿；陈伯因保管周远的值班记录与手记而知情，并据此在终局作证。\n"
+                    "人物摘要同步说明陈伯因保管周远的值班记录与手记而知情。\n"
+                    "关系摘要仍称陈伯一直知情并准备在终局作证。\n"
+                    "其余人物身份、时间线与结局选择保持上游版本。"
+                )
+            else:
+                # Round 4 (the cap) closes the last residual gap, so both review
+                # lenses pass and the stage converges exactly at the maximum round.
+                assert repair_calls == 4
+                assert "关系摘要仍称陈伯一直知情" in current
+                relationship_logic = (
+                    "电话改为打给程屿；陈伯因保管周远的值班记录与手记而知情，并据此在终局作证。\n"
+                    "人物摘要同步说明陈伯因保管周远的值班记录与手记而知情。\n"
+                    "关系摘要同步说明陈伯因保管周远的值班记录与手记而知情。\n"
+                    "其余人物身份、时间线与结局选择保持上游版本。"
+                )
+            payload = {
+                "stage": "generating_character_relationships",
+                "content": None,
+                "character_biographies": "陈伯是岛上救援站值班员，长期保管周远的值班记录与手记。",
+                "relationship_logic": relationship_logic,
                 "selected_l0_variant": None,
                 "selection_rationale": None,
             }
@@ -3032,31 +3021,28 @@ async def test_story_consistency_uses_backstop_and_sixth_repair_round() -> None:
             description = candidate.tool_call["args"]["description"]
             current = candidate.state["files"]["/workspace/current_story_candidate.md"]["content"]
             if "convergence backstop" in description:
+                # The backstop fires once at the repair_rounds == 1 checkpoint: the
+                # call conflict was fixed but the testimony basis is still unsupported.
                 backstop_calls += 1
-                if backstop_calls == 1:
-                    assert "陈伯一直知情并准备在终局作证" in current
-                    payload = {
-                        "passed": False,
-                        "evidence": "终局作证依据仍未闭合",
-                        "issues": [
-                            {
-                                "code": "testimony_basis_gap",
-                                "message": "必须补出陈伯为何能作证的既有记录来源。",
-                                "script_excerpt": "陈伯一直知情并准备在终局作证。",
-                            }
-                        ],
-                    }
-                else:
-                    assert backstop_calls == 2
-                    assert "陈伯因保管周远的值班记录与手记而知情" in current
-                    payload = {
-                        "passed": True,
-                        "evidence": "收敛复核未发现新增矛盾",
-                        "issues": [],
-                    }
+                assert backstop_calls == 1
+                assert "电话改为打给程屿" in current
+                assert "陈伯一直知情并准备在终局作证" in current
+                payload = {
+                    "passed": False,
+                    "evidence": "终局作证依据仍未闭合",
+                    "issues": [
+                        {
+                            "code": "testimony_basis_gap",
+                            "message": "必须补出陈伯为何能作证的既有记录来源。",
+                            "script_excerpt": "陈伯一直知情并准备在终局作证。",
+                        }
+                    ],
+                }
             else:
                 review_calls += 1
-                if review_calls == 1:
+                if review_calls in {1, 2}:
+                    # repair_rounds == 0: both lenses flag the call-participant conflict.
+                    assert "电话打给周砚" in current
                     payload = {
                         "passed": False,
                         "evidence": "通话对象与上游冲突",
@@ -3068,9 +3054,9 @@ async def test_story_consistency_uses_backstop_and_sixth_repair_round() -> None:
                             }
                         ],
                     }
-                elif review_calls == 2:
-                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
-                elif review_calls == 3:
+                elif review_calls in {3, 4}:
+                    # repair_rounds == 1 (post-backstop): the knowledge gap and the
+                    # backstop's testimony-basis gap both remain.
                     assert "电话改为打给程屿后，陈伯一直知情并准备在终局作证。" in current
                     payload = {
                         "passed": False,
@@ -3080,12 +3066,17 @@ async def test_story_consistency_uses_backstop_and_sixth_repair_round() -> None:
                                 "code": "knowledge_source_gap",
                                 "message": "必须补出陈伯如何得知真相的既有来源。",
                                 "script_excerpt": "陈伯一直知情并准备在终局作证。",
-                            }
+                            },
+                            {
+                                "code": "testimony_basis_gap",
+                                "message": "必须补出陈伯为何能作证的既有记录来源。",
+                                "script_excerpt": "陈伯一直知情并准备在终局作证。",
+                            },
                         ],
                     }
-                elif review_calls == 4:
-                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
-                elif review_calls == 5:
+                elif review_calls in {5, 6}:
+                    # repair_rounds == 2: testimony basis closed, but the人物摘要 still
+                    # lacks the source.
                     assert "值班记录与手记" in current
                     assert "人物摘要仍称陈伯一直知情" in current
                     payload = {
@@ -3099,9 +3090,8 @@ async def test_story_consistency_uses_backstop_and_sixth_repair_round() -> None:
                             }
                         ],
                     }
-                elif review_calls == 6:
-                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
-                elif review_calls == 7:
+                elif review_calls in {7, 8}:
+                    # repair_rounds == 3: 人物摘要 closed, 关系摘要 still lacks it.
                     assert "值班记录与手记" in current
                     assert "关系摘要仍称陈伯一直知情" in current
                     payload = {
@@ -3115,46 +3105,13 @@ async def test_story_consistency_uses_backstop_and_sixth_repair_round() -> None:
                             }
                         ],
                     }
-                elif review_calls == 8:
-                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
-                elif review_calls == 9:
-                    assert "值班记录与手记" in current
-                    assert "结局摘要仍称陈伯一直知情" in current
-                    payload = {
-                        "passed": False,
-                        "evidence": "结局摘要仍缺少知情来源",
-                        "issues": [
-                            {
-                                "code": "ending_summary_knowledge_gap",
-                                "message": "第四行也必须同步写明陈伯知情的既有记录来源。",
-                                "script_excerpt": "结局摘要仍称陈伯一直知情",
-                            }
-                        ],
-                    }
-                elif review_calls == 10:
-                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
-                elif review_calls == 11:
-                    assert "值班记录与手记" in current
-                    assert "证物摘要仍称陈伯一直知情" in current
-                    payload = {
-                        "passed": False,
-                        "evidence": "证物摘要仍缺少知情来源",
-                        "issues": [
-                            {
-                                "code": "evidence_summary_knowledge_gap",
-                                "message": "第五行也必须同步写明陈伯知情的既有记录来源。",
-                                "script_excerpt": "证物摘要仍称陈伯一直知情",
-                            }
-                        ],
-                    }
-                elif review_calls == 12:
-                    payload = {"passed": True, "evidence": "时间与证据镜头一致", "issues": []}
                 else:
+                    # repair_rounds == 4 (the cap): every gap is closed, both lenses pass
+                    # and the stage converges exactly at the maximum repair round.
+                    assert review_calls in {9, 10}
                     assert "值班记录与手记" in current
                     assert "人物摘要仍称陈伯一直知情" not in current
                     assert "关系摘要仍称陈伯一直知情" not in current
-                    assert "结局摘要仍称陈伯一直知情" not in current
-                    assert "证物摘要仍称陈伯一直知情" not in current
                     payload = {"passed": True, "evidence": "故事工件一致", "issues": []}
             payload["prior_issue_closures"] = _resolved_prior_story_closures(candidate)
         return ToolMessage(
@@ -3165,22 +3122,23 @@ async def test_story_consistency_uses_backstop_and_sixth_repair_round() -> None:
 
     await middleware.awrap_tool_call(request, handler)
 
-    assert review_calls == 14
-    assert backstop_calls == 2
-    assert patch_calls == 6
+    assert review_calls == 10
+    assert backstop_calls == 1
+    assert repair_calls == 4
     assert len(approvals) == 1
     stage, repaired = approvals[0]
-    assert stage is InternalStage.GENERATING_STORY_OUTLINE
+    assert stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
     assert repaired["consistency_review"]["passed"] is True
-    assert repaired["consistency_repair_rounds"] == 6
-    assert "值班记录与手记" in repaired["content"]
+    assert repaired["consistency_repair_rounds"] == 4
+    assert "值班记录与手记" in repaired["relationship_logic"]
 
 
 @pytest.mark.asyncio
 async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    responses[16] = _tool_call(
+    outline_review_index = _index_of_tool_call(responses, "CanonReviewerResult", occurrence=4)
+    responses[outline_review_index] = _tool_call(
         "CanonReviewerResult",
         {
             "passed": False,
@@ -3194,10 +3152,10 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
                 }
             ],
         },
-        16,
+        outline_review_index,
     )
     responses.insert(
-        17,
+        outline_review_index + 1,
         _tool_call(
             "OutlineRepairPatch",
             {
@@ -3209,7 +3167,7 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
         ),
     )
     responses.insert(
-        18,
+        outline_review_index + 2,
         _tool_call(
             "CanonReviewerResult",
             {"passed": True, "evidence": "修复后合同一致", "issues": []},
@@ -3252,24 +3210,25 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
 async def test_contract_repair_stops_after_one_invalid_patch_correction(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    responses[16] = _tool_call(
+    outline_review_index = _index_of_tool_call(responses, "CanonReviewerResult", occurrence=4)
+    responses[outline_review_index] = _tool_call(
         "CanonReviewerResult",
         {
             "passed": False,
             "evidence": "合同遗漏一项上游承诺",
             "issues": [{"code": "missing_commitment", "message": "必须补齐承诺"}],
         },
-        16,
+        outline_review_index,
     )
     invalid_patch = {
         "stage": "generating_episode_outline",
         "content_replacements": [],
         "json_edits": [],
     }
-    responses.insert(17, _tool_call("OutlineRepairPatch", invalid_patch, 101))
-    responses.insert(18, _tool_call("OutlineRepairPatch", invalid_patch, 102))
+    responses.insert(outline_review_index + 1, _tool_call("OutlineRepairPatch", invalid_patch, 101))
+    responses.insert(outline_review_index + 2, _tool_call("OutlineRepairPatch", invalid_patch, 102))
     responses.insert(
-        19,
+        outline_review_index + 3,
         _tool_call(
             "OutlineRepairPatch",
             {
@@ -3411,7 +3370,9 @@ async def test_outline_canon_review_receives_structured_episode_plans() -> None:
 async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    writer_payload = responses[18].tool_calls[0]["args"]
+    writer_index = _index_of_tool_call(responses, "ScriptWriterResult", occurrence=1)
+    review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
+    writer_payload = responses[writer_index].tool_calls[0]["args"]
     failed_review = {
         "passed": False,
         "evidence": "人物身份与上游小传不一致",
@@ -3424,11 +3385,11 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
             }
         ],
     }
-    responses[19] = _tool_call("EpisodeReviewerResult", failed_review, 19)
-    responses.insert(20, _tool_call("ScriptWriterResult", writer_payload, 201))
-    responses.insert(21, _tool_call("EpisodeReviewerResult", failed_review, 202))
-    responses.insert(22, _tool_call("ScriptWriterResult", writer_payload, 203))
-    responses.insert(23, _tool_call("EpisodeReviewerResult", failed_review, 204))
+    responses[review_index] = _tool_call("EpisodeReviewerResult", failed_review, review_index)
+    responses.insert(review_index + 1, _tool_call("ScriptWriterResult", writer_payload, 201))
+    responses.insert(review_index + 2, _tool_call("EpisodeReviewerResult", failed_review, 202))
+    responses.insert(review_index + 3, _tool_call("ScriptWriterResult", writer_payload, 203))
+    responses.insert(review_index + 4, _tool_call("EpisodeReviewerResult", failed_review, 204))
     approved: list[InternalStage] = []
     episode_hooks, episode_attempts = _episode_hook_kwargs()
 
@@ -3469,11 +3430,13 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
 ) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    repaired_writer_payload = copy.deepcopy(responses[18].tool_calls[0]["args"])
+    writer_index = _index_of_tool_call(responses, "ScriptWriterResult", occurrence=1)
+    review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
+    repaired_writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
     invalid_writer_payload = copy.deepcopy(repaired_writer_payload)
     invalid_writer_payload["content"] = "钩子1"
-    responses[18] = _tool_call("ScriptWriterResult", invalid_writer_payload, 18)
-    responses[19] = _tool_call(
+    responses[writer_index] = _tool_call("ScriptWriterResult", invalid_writer_payload, writer_index)
+    responses[review_index] = _tool_call(
         "EpisodeReviewerResult",
         {
             "passed": False,
@@ -3486,11 +3449,14 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
                 }
             ],
         },
-        19,
+        review_index,
     )
-    responses.insert(20, _tool_call("ScriptWriterResult", repaired_writer_payload, 201))
     responses.insert(
-        21,
+        review_index + 1,
+        _tool_call("ScriptWriterResult", repaired_writer_payload, 201),
+    )
+    responses.insert(
+        review_index + 2,
         _tool_call(
             "EpisodeReviewerResult",
             {"passed": True, "evidence": "修复后分集一致", "issues": []},
@@ -3557,14 +3523,14 @@ async def test_last_episode_review_receives_complete_series_prefix_before_approv
         InternalStage.GENERATING_STORY_OUTLINE: {
             "stage": "generating_story_outline",
             "content": "故事大纲",
+            "character_biographies": None,
+            "relationship_logic": None,
         },
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
-            "stage": "generating_character_biographies",
-            "content": "人物小传",
-        },
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC: {
-            "stage": "generating_relationship_logic",
-            "content": "关系逻辑",
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+            "stage": "generating_character_relationships",
+            "content": None,
+            "character_biographies": "人物小传",
+            "relationship_logic": "关系逻辑",
         },
         InternalStage.GENERATING_EPISODE_OUTLINE: {
             "stage": "generating_episode_outline",
@@ -3694,14 +3660,14 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
         InternalStage.GENERATING_STORY_OUTLINE: {
             "stage": "generating_story_outline",
             "content": "故事大纲",
+            "character_biographies": None,
+            "relationship_logic": None,
         },
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
-            "stage": "generating_character_biographies",
-            "content": "人物小传",
-        },
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC: {
-            "stage": "generating_relationship_logic",
-            "content": "关系逻辑",
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+            "stage": "generating_character_relationships",
+            "content": None,
+            "character_biographies": "人物小传",
+            "relationship_logic": "关系逻辑",
         },
         InternalStage.GENERATING_EPISODE_OUTLINE: {
             "stage": "generating_episode_outline",
@@ -3840,7 +3806,9 @@ async def test_structured_output_validation_error_is_corrected_within_stage(
             "StoryArchitectResult",
             {
                 "stage": "selecting_l0_variant",
-                "content": "invalid for the selection stage",
+                "content": "invalid content for the selection stage",
+                "character_biographies": None,
+                "relationship_logic": None,
                 "selected_l0_variant": None,
                 "selection_rationale": None,
             },
@@ -4069,6 +4037,8 @@ async def test_chinese_language_mismatch_is_repaired_before_checkpoint() -> None
                 {
                     "stage": "selecting_l0_variant",
                     "content": None,
+                    "character_biographies": None,
+                    "relationship_logic": None,
                     "selected_l0_variant": "L0-B",
                     "selection_rationale": rationale,
                 },
@@ -4330,6 +4300,8 @@ async def test_l0_language_retry_receives_exact_result_and_translates_only() -> 
             payload = {
                 "stage": "selecting_l0_variant",
                 "content": None,
+                "character_biographies": None,
+                "relationship_logic": None,
                 "selected_l0_variant": "克制情感悬疑（Restrained Emotional Suspense）",
                 "selection_rationale": "用人物关系推动真相揭晓。",
             }
@@ -4404,8 +4376,7 @@ async def test_language_repair_cannot_change_quality_gate_decision(
         approved_stages={
             InternalStage.SELECTING_L0_VARIANT,
             InternalStage.GENERATING_STORY_OUTLINE,
-            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-            InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
             InternalStage.GENERATING_EPISODE_OUTLINE,
             InternalStage.GENERATING_EPISODE_SCRIPTS,
         },
@@ -5036,8 +5007,7 @@ async def test_wrong_stage_result_is_not_corrected() -> None:
         approved_stages={
             InternalStage.SELECTING_L0_VARIANT,
             InternalStage.GENERATING_STORY_OUTLINE,
-            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-            InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         },
     )
     request = ToolCallRequest(
@@ -5075,8 +5045,7 @@ async def test_quality_review_drops_stale_script_when_canonical_payload_is_missi
     approved_stages = {
         InternalStage.SELECTING_L0_VARIANT,
         InternalStage.GENERATING_STORY_OUTLINE,
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         InternalStage.GENERATING_EPISODE_SCRIPTS,
     }
@@ -5180,7 +5149,8 @@ async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> Non
 async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    responses[21] = _tool_call(
+    l0_gate_index = _index_of_tool_call(responses, "QualityReviewerResult", occurrence=1)
+    responses[l0_gate_index] = _tool_call(
         "QualityReviewerResult",
         {
             "stage": "accepting_l0",
@@ -5188,7 +5158,7 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
             "evidence": "成品没有通过 L0 闸门。",
             "feedback_handling": [],
         },
-        21,
+        l0_gate_index,
     )
     approved: list[InternalStage] = []
 
@@ -5223,8 +5193,7 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
     assert approved == [
         InternalStage.SELECTING_L0_VARIANT,
         InternalStage.GENERATING_STORY_OUTLINE,
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         InternalStage.GENERATING_EPISODE_SCRIPTS,
     ]
@@ -5254,7 +5223,8 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
 
     monkeypatch.setattr(ToolCallingFakeModel, "_generate", capture_reviewer_reads)
     responses = _successful_responses()
-    responses[23] = _tool_call(
+    l4_gate_index = _index_of_tool_call(responses, "QualityReviewerResult", occurrence=2)
+    responses[l4_gate_index] = _tool_call(
         "QualityReviewerResult",
         {
             "stage": "accepting_l4",
@@ -5262,10 +5232,10 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
             "evidence": "成品没有通过 L4 闸门。",
             "feedback_handling": [],
         },
-        23,
+        l4_gate_index,
     )
     responses.insert(
-        23,
+        l4_gate_index,
         _tool_call(
             "read_file",
             {"file_path": "/workspace/episode_scripts.md"},
@@ -5273,7 +5243,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
         ),
     )
     responses.insert(
-        24,
+        l4_gate_index + 1,
         _tool_call(
             "read_file",
             {"file_path": "/workspace/approved-checkpoints.json"},
@@ -5326,7 +5296,9 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
-        resumed_responses = _successful_responses()[22:]
+        fresh = _successful_responses()
+        l4_result_index = _index_of_tool_call(fresh, "QualityReviewerResult", occurrence=2)
+        resumed_responses = fresh[l4_result_index - 1 :]
         resumed_responses.insert(
             1,
             _tool_call(
@@ -5367,8 +5339,7 @@ async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
     assert first_attempts == [
         InternalStage.SELECTING_L0_VARIANT,
         InternalStage.GENERATING_STORY_OUTLINE,
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         InternalStage.ACCEPTING_L0,
         InternalStage.ACCEPTING_L4,
@@ -5433,8 +5404,7 @@ async def test_out_of_order_stage_is_rejected_without_attempt_and_can_recover(
     expected = [
         InternalStage.SELECTING_L0_VARIANT,
         InternalStage.GENERATING_STORY_OUTLINE,
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         InternalStage.GENERATING_EPISODE_SCRIPTS,
         InternalStage.ACCEPTING_L0,
@@ -5525,8 +5495,7 @@ async def test_restart_reuses_thread_checkpoint_and_skips_approved_stage(
     assert first_stage not in resumed_attempts
     assert resumed_attempts == [
         InternalStage.GENERATING_STORY_OUTLINE,
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         InternalStage.ACCEPTING_L0,
         InternalStage.ACCEPTING_L4,

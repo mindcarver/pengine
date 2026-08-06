@@ -27,6 +27,7 @@ from pengine.agents import (
     EpisodePlannerResult,
     OutlineRepairPatch,
     ScriptWriterResult,
+    StoryArchitectResult,
     StoryArtifactRepairPatch,
     StructuredResultMiddleware,
     _apply_outline_repair_patch,
@@ -38,6 +39,7 @@ from pengine.agents import (
     _story_repair_result,
     _structured_output_retry_message,
     _validate_outline_repair_patch_targets,
+    flatten_cr_candidate,
 )
 from pengine.config import Settings
 from pengine.language import SIMPLIFIED_CHINESE, has_obvious_language_mismatch
@@ -376,8 +378,7 @@ def _assert_story_consistency_checkpoints(
 ) -> None:
     expected_stages = {
         "generating_story_outline",
-        "generating_character_biographies",
-        "generating_relationship_logic",
+        "generating_character_relationships",
     }
     with sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True) as connection:
         rows = connection.execute(
@@ -972,12 +973,15 @@ async def test_real_model_story_artifact_repair_contract() -> None:
 
     settings = Settings()
     _require_dual_model_relay(settings, "Real-model story-artifact-patch probe")
-    stage = InternalStage.GENERATING_RELATIONSHIP_LOGIC
-    content = (
-        "# 人物关系\n"
+    stage = InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
+    relationship_logic = (
         "程远二十四岁，比程屿大六岁。\n"
         "两人的年龄关系影响程屿对兄长的依赖和调查选择。\n"
         "其余人物身份、秘密来源、时间线和证物约束均保持已批准版本。"
+    )
+    content = flatten_cr_candidate(
+        character_biographies="程远二十二岁，比程屿大两岁。",
+        relationship_logic=relationship_logic,
     )
     review = CanonReviewerResult(
         passed=False,
@@ -990,8 +994,10 @@ async def test_real_model_story_artifact_repair_contract() -> None:
             }
         ],
     )
+    # c+r repair rewrites the whole candidate via a structured StoryArchitectResult,
+    # resolving the confirmed issue across both sections jointly.
     structured = build_relay_adapter(settings, role="generation").model.with_structured_output(
-        StoryArtifactRepairPatch,
+        StoryArchitectResult,
         method="function_calling",
         include_raw=True,
     )
@@ -1000,32 +1006,36 @@ async def test_real_model_story_artifact_repair_contract() -> None:
             {
                 "role": "system",
                 "content": (
-                    "Return exactly one StoryArtifactRepairPatch tool call and no prose. Use the "
-                    "1-based candidate_lines. Repair only line 2: replace 二十四 with 二十二 and "
-                    "六 with 两. Return line 2's complete corrected text as replacement. Do not "
-                    "return or change any unrelated line."
+                    "Return exactly one StoryArchitectResult tool call and no prose. The stage "
+                    "is generating_character_relationships. Read the current candidate and the "
+                    "confirmed review issue, then return the complete corrected "
+                    "character_biographies and relationship_logic. Resolve the age conflict: "
+                    "程远 is 二十二岁 and 两岁 older than 程屿. Keep every unrelated detail."
                 ),
             },
             {
                 "role": "user",
                 "content": json.dumps(
-                    _story_repair_context(stage=stage, content=content, review=review),
+                    {
+                        "current_candidate": content,
+                        "confirmed_issues": [
+                            issue.model_dump(mode="json") for issue in review.issues
+                        ],
+                    },
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
             },
         ]
     )
-    patch = _story_repair_result(response, stage=stage)
-    repaired = _apply_story_artifact_repair_patch(
-        stage=stage,
-        content=content,
-        patch=patch,
-    )
+    parsed = _story_repair_result(response, stage=stage)
+    rewritten = StoryArchitectResult.model_validate(parsed)
 
-    assert isinstance(patch, StoryArtifactRepairPatch)
-    assert [(item.start_line, item.end_line) for item in patch.line_replacements] == [(2, 2)]
-    assert "程远二十二岁，比程屿大两岁" in repaired.content
+    assert rewritten.stage == "generating_character_relationships"
+    assert rewritten.character_biographies
+    assert rewritten.relationship_logic
+    assert "程远二十二岁" in rewritten.relationship_logic
+    assert "二十四岁" not in rewritten.relationship_logic
 
 
 @pytest.mark.live_model
@@ -1093,21 +1103,24 @@ async def test_real_model_dense_story_artifact_repair_contract() -> None:
         pytest.skip(f"set {_ENABLE_ENV}=1 to make real, potentially billable model requests")
 
     settings = Settings()
-    _require_dual_model_relay(settings, "Real-model dense story-artifact-patch probe")
+    _require_dual_model_relay(settings, "Real-model dense story-outline-patch probe")
     stage = InternalStage.GENERATING_STORY_OUTLINE
     target_lines = [f"- 事实{i:02d}：状态=旧。" for i in range(1, 18)]
     padding_lines = [
         f"- 背景{i:02d}：这段较长背景保持不变，用于约束修复范围并保护候选正文。"
         for i in range(1, 31)
     ]
-    content = "\n".join(["# 密集修复测试", *target_lines, *padding_lines])
+    # The outline candidate is a single content field; the dense target lines
+    # start at candidate line 1.
+    first_target_line = 1
+    content = "\n".join([*target_lines, *padding_lines])
     review = CanonReviewerResult(
         passed=False,
         evidence="十七个独立事实位置均含同一已确认状态错误。",
         issues=[
             {
                 "code": f"dense_fact_{i:02d}",
-                "message": f"第 {i + 1} 行的状态必须从旧改为新。",
+                "message": f"第 {first_target_line + i - 1} 行的状态必须从旧改为新。",
                 "script_excerpt": target_lines[i - 1],
             }
             for i in range(1, 18)
@@ -1124,10 +1137,11 @@ async def test_real_model_dense_story_artifact_repair_contract() -> None:
                 "role": "system",
                 "content": (
                     "Return exactly one StoryArtifactRepairPatch tool call and no prose. Return "
-                    "exactly seventeen separate one-line replacements for candidate lines 2 "
-                    "through 18, in order; do not combine ranges. In each selected line, replace "
-                    "only 状态=旧 with 状态=新 and return that line's complete corrected text. "
-                    "Do not include or change any other line."
+                    f"exactly seventeen separate one-line replacements for candidate lines "
+                    f"{first_target_line} through {first_target_line + 16}, in order; do not "
+                    "combine ranges. In each selected line, replace only 状态=旧 with 状态=新 "
+                    "and return that line's complete corrected text. Do not include or change "
+                    "any other line."
                 ),
             },
             {
@@ -1149,7 +1163,8 @@ async def test_real_model_dense_story_artifact_repair_contract() -> None:
 
     assert isinstance(patch, StoryArtifactRepairPatch)
     assert [(item.start_line, item.end_line) for item in patch.line_replacements] == [
-        (line_number, line_number) for line_number in range(2, 19)
+        (line_number, line_number)
+        for line_number in range(first_target_line, first_target_line + 17)
     ]
     assert "状态=旧" not in repaired.content
     assert repaired.content.count("状态=新") == 17

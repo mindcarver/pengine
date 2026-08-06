@@ -497,13 +497,10 @@ async def _approve_design_stages(repository: Repository, run_id) -> dict:
             "stage": "generating_story_outline",
             "content": "故事大纲",
         },
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
-            "stage": "generating_character_biographies",
-            "content": "林岚：回乡调查旧案的主角。",
-        },
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC: {
-            "stage": "generating_relationship_logic",
-            "content": "关系逻辑",
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+            "stage": "generating_character_relationships",
+            "character_biographies": "林岚：回乡调查旧案的主角。",
+            "relationship_logic": "关系逻辑",
         },
         InternalStage.GENERATING_EPISODE_OUTLINE: outline_payload,
     }
@@ -577,13 +574,10 @@ async def test_worker_never_syncs_a_legacy_outline_without_contract(tmp_path: Pa
             "stage": "generating_story_outline",
             "content": "大纲",
         },
-        InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
-            "stage": "generating_character_biographies",
-            "content": "小传",
-        },
-        InternalStage.GENERATING_RELATIONSHIP_LOGIC: {
-            "stage": "generating_relationship_logic",
-            "content": "关系",
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+            "stage": "generating_character_relationships",
+            "character_biographies": "小传",
+            "relationship_logic": "关系",
         },
         InternalStage.GENERATING_EPISODE_OUTLINE: {
             "stage": "generating_episode_outline",
