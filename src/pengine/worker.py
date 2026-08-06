@@ -64,8 +64,7 @@ logger = logging.getLogger(__name__)
 _SPECIALIST_STAGES = (
     InternalStage.SELECTING_L0_VARIANT,
     InternalStage.GENERATING_STORY_OUTLINE,
-    InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-    InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+    InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
     InternalStage.GENERATING_EPISODE_OUTLINE,
     InternalStage.GENERATING_EPISODE_SCRIPTS,
     InternalStage.ACCEPTING_L0,
@@ -791,10 +790,11 @@ class Worker:
         if outline is None or "story_contract" not in outline:
             return
         story_outline = approved.get(InternalStage.GENERATING_STORY_OUTLINE)
-        biographies = approved.get(InternalStage.GENERATING_CHARACTER_BIOGRAPHIES)
-        relationships = approved.get(InternalStage.GENERATING_RELATIONSHIP_LOGIC)
+        character_relationships = approved.get(
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
+        )
         l0_selection = approved.get(InternalStage.SELECTING_L0_VARIANT)
-        if not all((story_outline, biographies, relationships, l0_selection)):
+        if not story_outline or not character_relationships or not l0_selection:
             raise AgentProtocolError(
                 "SeriesBible assembly requires every approved design projection",
                 stage=InternalStage.GENERATING_EPISODE_OUTLINE,
@@ -806,8 +806,8 @@ class Worker:
             l0_variant=l0_selection["selected_l0_variant"],
             genre=detect_genre(work.story, work.requirements),
             story_outline=story_outline["content"],
-            character_biographies=biographies["content"],
-            relationship_logic=relationships["content"],
+            character_biographies=character_relationships["character_biographies"],
+            relationship_logic=character_relationships["relationship_logic"],
             episode_outline=outline["content"],
             story_contract_payload=outline["story_contract"],
             review_milestones=(
@@ -1153,18 +1153,16 @@ class Worker:
             l0_selection = approved[InternalStage.SELECTING_L0_VARIANT]
             l0_gate = approved[InternalStage.ACCEPTING_L0]
             l4_gate = approved[InternalStage.ACCEPTING_L4]
+            story_outline = approved[InternalStage.GENERATING_STORY_OUTLINE]
+            character_relationships = approved[
+                InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
+            ]
             expected = WorkflowResult.model_validate(
                 {
                     "content_package": {
-                        "story_outline": approved[InternalStage.GENERATING_STORY_OUTLINE][
-                            "content"
-                        ],
-                        "character_biographies": approved[
-                            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES
-                        ]["content"],
-                        "relationship_logic": approved[InternalStage.GENERATING_RELATIONSHIP_LOGIC][
-                            "content"
-                        ],
+                        "story_outline": story_outline["content"],
+                        "character_biographies": character_relationships["character_biographies"],
+                        "relationship_logic": character_relationships["relationship_logic"],
                         "episode_outline": approved[InternalStage.GENERATING_EPISODE_OUTLINE][
                             "content"
                         ],

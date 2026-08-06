@@ -291,15 +291,12 @@ class UnifiedWorkflow:
                 "stage": "generating_story_outline",
                 "content": "离乡者回到旧屋处理旧事。",
             },
-            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES: {
-                "stage": "generating_character_biographies",
-                "content": "\n".join(
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+                "stage": "generating_character_relationships",
+                "character_biographies": "\n".join(
                     f"{character.name}：主要人物。" for character in contract.characters
                 ),
-            },
-            InternalStage.GENERATING_RELATIONSHIP_LOGIC: {
-                "stage": "generating_relationship_logic",
-                "content": "主要人物围绕旧案形成合作关系。",
+                "relationship_logic": "主要人物围绕旧案形成合作关系。",
             },
             InternalStage.GENERATING_EPISODE_OUTLINE: {
                 "stage": "generating_episode_outline",
@@ -324,8 +321,7 @@ class UnifiedWorkflow:
         for stage in (
             InternalStage.SELECTING_L0_VARIANT,
             InternalStage.GENERATING_STORY_OUTLINE,
-            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-            InternalStage.GENERATING_RELATIONSHIP_LOGIC,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
             InternalStage.GENERATING_EPISODE_OUTLINE,
         ):
             if stage not in approved:
@@ -479,10 +475,12 @@ class UnifiedWorkflow:
         return WorkflowResult(
             content_package=ContentPackage(
                 story_outline=approved[InternalStage.GENERATING_STORY_OUTLINE]["content"],
-                character_biographies=approved[InternalStage.GENERATING_CHARACTER_BIOGRAPHIES][
-                    "content"
+                character_biographies=approved[InternalStage.GENERATING_CHARACTER_RELATIONSHIPS][
+                    "character_biographies"
                 ],
-                relationship_logic=approved[InternalStage.GENERATING_RELATIONSHIP_LOGIC]["content"],
+                relationship_logic=approved[InternalStage.GENERATING_CHARACTER_RELATIONSHIPS][
+                    "relationship_logic"
+                ],
                 episode_outline=approved[InternalStage.GENERATING_EPISODE_OUTLINE]["content"],
                 episode_scripts=aggregate,
             ),

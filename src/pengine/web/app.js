@@ -62,29 +62,23 @@ const DRAFT_ARTIFACTS = [
     overline: "DRAFT 02",
   },
   {
-    key: "character_biographies",
-    stage: "generating_character_biographies",
-    title: "人物小传",
+    key: "character_relationships",
+    stage: "generating_character_relationships",
+    title: "人物与关系",
     overline: "DRAFT 03",
-  },
-  {
-    key: "relationship_logic",
-    stage: "generating_relationships",
-    title: "关系逻辑",
-    overline: "DRAFT 04",
   },
   {
     key: "episode_outline",
     stage: "generating_episode_outline",
     title: "分集大纲",
-    overline: "DRAFT 05",
+    overline: "DRAFT 04",
   },
 ];
 
 const EPISODE_SCRIPTS_DRAFT = {
   key: "episode_scripts",
   title: "分集剧本",
-  overline: "DRAFT 06",
+  overline: "DRAFT 05",
   isEpisodeNavigator: true,
 };
 
@@ -103,8 +97,7 @@ const STAGE_ARTIFACT_KEYS = new Map([
 const USER_STAGES = [
   ["determining_direction", "确定创作方向"],
   ["generating_story_outline", "生成故事大纲"],
-  ["generating_character_biographies", "生成人物小传"],
-  ["generating_relationships", "生成人物关系"],
+  ["generating_character_relationships", "生成人物与关系"],
   ["generating_episode_outline", "生成分集大纲"],
   ["generating_episode_scripts", "生成分集剧本"],
   ["final_review", "成品审核"],

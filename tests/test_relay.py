@@ -527,7 +527,7 @@ def test_retryable_relay_interruption_recovers_provider_408_request_timeout() ->
     """A provider-side HTTP 408 request timeout (`timeout_error`) is transient
     congestion, not a terminal relay failure: the run recovers instead of failing
     on a single timed-out call (Issue #52 graph revision 10; E2E
-    20260804T131739Z-02ea1827 failed in `generating_character_biographies` after
+    20260804T131739Z-02ea1827 failed in `generating_story_outline` after
     one 408 with attempt_count=1, recovery_state=none)."""
     request = httpx.Request("POST", "https://relay.example/v1/chat/completions")
     body = {

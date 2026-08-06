@@ -662,7 +662,7 @@ state.creation = {
     progress: {
       ...progress,
       current_stage: "final_review",
-      completed_stages: USER_STAGES.slice(0, 6).map(([stage]) => stage),
+      completed_stages: USER_STAGES.slice(0, 4).map(([stage]) => stage),
       recovery_state: "paused",
       recovery_reason: "run_timeout",
       final_review: { l0: "passed", l4: "paused" },
@@ -802,8 +802,7 @@ const stageItems = USER_STAGES.map(([stage]) => button(stage, "stage"));
 const artifactButtons = [
   button("direction", "artifact"),
   button("story_outline", "artifact"),
-  button("character_biographies", "artifact"),
-  button("relationship_logic", "artifact"),
+  button("character_relationships", "artifact"),
   button("episode_outline", "artifact"),
   button("episode_scripts", "artifact"),
 ];
@@ -857,8 +856,8 @@ state.creation = {
   initial: {
     state: "running",
     progress: {
-      current_stage: "generating_character_biographies",
-      completed_stages: ["determining_direction", "generating_story_outline"],
+      current_stage: "generating_story_outline",
+      completed_stages: ["determining_direction"],
       elapsed_seconds: 4,
       recovery_state: "none",
       recovery_reason: "none",
@@ -883,7 +882,7 @@ renderProgress();
 if (stageItems[0].disabled || stageItems[1].disabled) {
   throw new Error("persisted stages were not selectable");
 }
-if (stageItems[2].disabled !== true || stageItems[6].disabled !== true) {
+if (stageItems[2].disabled !== true) {
   throw new Error("unpersisted stages became selectable");
 }
 handleStageClick({ target: { closest() { return stageItems[1]; } } });
@@ -950,8 +949,7 @@ const versionButtons = [button("initial", "version"), button("revision", "versio
 const artifactButtons = [
   button("direction", "artifact"),
   button("story_outline", "artifact"),
-  button("character_biographies", "artifact"),
-  button("relationship_logic", "artifact"),
+  button("character_relationships", "artifact"),
   button("episode_outline", "artifact"),
   button("episode_scripts", "artifact"),
 ];
@@ -1343,7 +1341,7 @@ const designRun = {
   progress: {
     episodes: { total: 2, completed: 0, current: null },
     current_stage: "generating_episode_scripts",
-    completed_stages: ["generating_story_outline", "generating_character_biographies"],
+    completed_stages: ["generating_story_outline"],
   },
   drafts: {
     artifacts: [

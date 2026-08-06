@@ -144,7 +144,7 @@ def locked_outline_payload():
 
 
 async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository) -> None:
-    assert SCHEMA_VERSION == 15
+    assert SCHEMA_VERSION == 17
     async with repository._connection() as connection:
         journal = await (await connection.execute("PRAGMA journal_mode")).fetchone()
         foreign_keys = await (await connection.execute("PRAGMA foreign_keys")).fetchone()
@@ -320,22 +320,42 @@ async def test_story_checkpoint_persists_sixth_semantic_repair_round(
     creation_request,
 ) -> None:
     _, lease = await create_and_lease_initial(repository, persona, creation_request)
-    stage = InternalStage.GENERATING_STORY_OUTLINE
-    await repository.record_stage_attempt(lease.run_id, stage)
-    payload = {
-        "stage": stage.value,
-        "content": "经六轮语义修订后通过的故事大纲。",
+    outline_stage = InternalStage.GENERATING_STORY_OUTLINE
+    character_relationships_stage = InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
+    await repository.record_stage_attempt(lease.run_id, outline_stage)
+    await repository.record_stage_attempt(lease.run_id, character_relationships_stage)
+    outline_payload = {
+        "stage": outline_stage.value,
+        "content": "经四轮语义修订后通过的故事大纲。",
         "consistency_review": {
             "passed": True,
-            "evidence": "第六轮修订后角色与时间线一致。",
+            "evidence": "第四轮修订后大纲与时间线一致。",
             "issues": [],
         },
-        "consistency_repair_rounds": 6,
+        "consistency_repair_rounds": 4,
+    }
+    character_relationships_payload = {
+        "stage": character_relationships_stage.value,
+        "character_biographies": "人物小传",
+        "relationship_logic": "关系逻辑",
+        "consistency_review": {
+            "passed": True,
+            "evidence": "第四轮修订后角色与时间线一致。",
+            "issues": [],
+        },
+        "consistency_repair_rounds": 4,
     }
 
-    await repository.approve_business_checkpoint(lease.run_id, stage, payload)
+    await repository.approve_business_checkpoint(lease.run_id, outline_stage, outline_payload)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        character_relationships_stage,
+        character_relationships_payload,
+    )
 
-    assert (await repository.get_business_checkpoints(lease.run_id))[stage] == payload
+    checkpoints = await repository.get_business_checkpoints(lease.run_id)
+    assert checkpoints[outline_stage] == outline_payload
+    assert checkpoints[character_relationships_stage] == character_relationships_payload
 
 
 async def test_failed_revision_retry_uses_frozen_feedback_and_new_thread(
@@ -512,12 +532,29 @@ async def test_expired_lease_requeues_same_thread_with_durable_business_state(
     creation_request,
 ) -> None:
     _, lease = await create_and_lease_initial(repository, persona, creation_request)
-    stage = InternalStage.GENERATING_STORY_OUTLINE
-    await repository.record_stage_attempt(lease.run_id, stage, now=NOW)
+    outline_stage = InternalStage.GENERATING_STORY_OUTLINE
+    character_relationships_stage = InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
+    outline_payload = {"content": "已批准的故事梗概"}
+    character_relationships_payload = {
+        "character_biographies": "已批准的人物小传",
+        "relationship_logic": "已批准的人物关系",
+    }
+    await repository.record_stage_attempt(lease.run_id, outline_stage, now=NOW)
     await repository.approve_business_checkpoint(
         lease.run_id,
-        stage,
-        {"content": "已批准的故事梗概"},
+        outline_stage,
+        outline_payload,
+        now=NOW,
+    )
+    await repository.record_stage_attempt(
+        lease.run_id,
+        character_relationships_stage,
+        now=NOW,
+    )
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        character_relationships_stage,
+        character_relationships_payload,
         now=NOW,
     )
 
@@ -526,8 +563,14 @@ async def test_expired_lease_requeues_same_thread_with_durable_business_state(
     )
     assert len(recoverable) == 1
     assert recoverable[0].thread_id == lease.thread_id
-    assert recoverable[0].stage_attempts == {stage: 1}
-    assert recoverable[0].business_checkpoints == {stage: {"content": "已批准的故事梗概"}}
+    assert recoverable[0].stage_attempts == {
+        outline_stage: 1,
+        character_relationships_stage: 1,
+    }
+    assert recoverable[0].business_checkpoints == {
+        outline_stage: outline_payload,
+        character_relationships_stage: character_relationships_payload,
+    }
 
     resumed = await repository.lease_next_job(
         worker_id="worker-after-restart",
@@ -778,9 +821,17 @@ async def test_quality_rejection_is_durable_and_retries_the_same_run(
             InternalStage.SELECTING_L0_VARIANT,
             {"selected_l0_variant": "归返", "selection_rationale": "匹配母题"},
         ),
-        (InternalStage.GENERATING_STORY_OUTLINE, {"content": "故事梗概"}),
-        (InternalStage.GENERATING_CHARACTER_BIOGRAPHIES, {"content": "人物小传"}),
-        (InternalStage.GENERATING_RELATIONSHIP_LOGIC, {"content": "人物关系"}),
+        (
+            InternalStage.GENERATING_STORY_OUTLINE,
+            {"content": "故事梗概"},
+        ),
+        (
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            {
+                "character_biographies": "人物小传",
+                "relationship_logic": "人物关系",
+            },
+        ),
         (
             InternalStage.GENERATING_EPISODE_OUTLINE,
             {
@@ -1000,6 +1051,8 @@ async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_draf
             DELETE FROM pengine_schema WHERE version = 13;
             DELETE FROM pengine_schema WHERE version = 14;
             DELETE FROM pengine_schema WHERE version = 15;
+            DELETE FROM pengine_schema WHERE version = 16;
+            DELETE FROM pengine_schema WHERE version = 17;
             ALTER TABLE creations DROP COLUMN output_language;
             """
         )
@@ -1094,9 +1147,17 @@ async def test_episode_drafts_are_ordered_and_isolate_a_revision(
             InternalStage.SELECTING_L0_VARIANT,
             {"selected_l0_variant": "新方向", "selection_rationale": "响应反馈"},
         ),
-        (InternalStage.GENERATING_STORY_OUTLINE, {"content": "修订故事大纲"}),
-        (InternalStage.GENERATING_CHARACTER_BIOGRAPHIES, {"content": "   "}),
-        (InternalStage.GENERATING_RELATIONSHIP_LOGIC, {"content": "修订人物关系"}),
+        (
+            InternalStage.GENERATING_STORY_OUTLINE,
+            {"content": "修订故事大纲"},
+        ),
+        (
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            {
+                "character_biographies": "修订人物小传",
+                "relationship_logic": "修订人物关系",
+            },
+        ),
         (
             InternalStage.GENERATING_EPISODE_OUTLINE,
             {
@@ -1138,7 +1199,13 @@ async def test_episode_drafts_are_ordered_and_isolate_a_revision(
             "selection_rationale": "响应反馈",
         },
         {"stage": "generating_story_outline", "content": "修订故事大纲"},
-        {"stage": "generating_relationships", "content": "修订人物关系"},
+        {
+            "stage": "generating_character_relationships",
+            "content": (
+                "# 人物小传 / Character Biographies\n修订人物小传\n\n"
+                "# 人物关系 / Relationship Logic\n修订人物关系"
+            ),
+        },
         {"stage": "generating_episode_outline", "content": "修订分集大纲"},
     ]
     revision_episodes = [
@@ -1560,10 +1627,9 @@ async def test_episode_outline_content_rejection_keeps_two_round_limit(
     [
         (InternalStage.GENERATING_STORY_OUTLINE, "generating_story_outline"),
         (
-            InternalStage.GENERATING_CHARACTER_BIOGRAPHIES,
-            "generating_character_biographies",
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            "generating_character_relationships",
         ),
-        (InternalStage.GENERATING_RELATIONSHIP_LOGIC, "generating_relationships"),
     ],
 )
 async def test_story_text_content_rejection_pauses_and_continues_without_episode(
@@ -1586,12 +1652,12 @@ async def test_story_text_content_rejection_pauses_and_continues_without_episode
             now=NOW + timedelta(seconds=1),
         )
 
-    with pytest.raises(ValueError, match="Story content rejection requires two to six"):
+    with pytest.raises(ValueError, match="Story content rejection requires two to four"):
         await repository.pause_content_rejection(
             lease.run_id,
             stage=stage,
             evidence="故事文本仍有内容冲突。",
-            repair_rounds=7,
+            repair_rounds=5,
             now=NOW + timedelta(seconds=1),
         )
 
@@ -1599,7 +1665,7 @@ async def test_story_text_content_rejection_pauses_and_continues_without_episode
         lease.run_id,
         stage=stage,
         evidence="故事文本仍有内容冲突。",
-        repair_rounds=6,
+        repair_rounds=4,
         now=NOW + timedelta(seconds=1),
     )
 
@@ -1625,8 +1691,8 @@ async def test_story_text_content_rejection_pauses_and_continues_without_episode
                 (str(lease.run_id),),
             )
         ).fetchone()
-    assert paused.initial.pause.content_repair_count == 6
-    assert tuple(rejection) == (stage.value, None, 6, "故事文本仍有内容冲突。")
+    assert paused.initial.pause.content_repair_count == 4
+    assert tuple(rejection) == (stage.value, None, 4, "故事文本仍有内容冲突。")
 
     continued = await repository.continue_run(
         creation_id=accepted.creation_id,
@@ -1839,6 +1905,8 @@ async def test_schema_v6_recovers_legacy_failed_episode_without_replacing_drafts
         await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 14")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 15")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 16")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -1883,6 +1951,8 @@ async def test_schema_v7_creation_is_backfilled_to_chinese_output_language(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 14")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 15")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 16")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -1926,6 +1996,8 @@ async def test_schema_v8_migration_resumes_when_column_already_exists(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 14")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 15")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 16")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute(
             "UPDATE creations SET output_language = NULL WHERE id = ?",
             (str(lease.creation_id),),
@@ -1999,6 +2071,8 @@ async def test_schema_v8_content_rejections_migrate_without_losing_rows(
             DELETE FROM pengine_schema WHERE version = 13;
             DELETE FROM pengine_schema WHERE version = 14;
             DELETE FROM pengine_schema WHERE version = 15;
+            DELETE FROM pengine_schema WHERE version = 16;
+            DELETE FROM pengine_schema WHERE version = 17;
             """
         )
         await connection.commit()
@@ -2127,6 +2201,7 @@ async def test_schema_v9_repair_limits_migrate_without_losing_pause(
                         'generating_story_outline',
                         'generating_character_biographies',
                         'generating_relationship_logic',
+                        'generating_story_design',
                         'generating_episode_outline',
                         'generating_episode_scripts'
                     )
@@ -2162,6 +2237,8 @@ async def test_schema_v9_repair_limits_migrate_without_losing_pause(
             DELETE FROM pengine_schema WHERE version = 13;
             DELETE FROM pengine_schema WHERE version = 14;
             DELETE FROM pengine_schema WHERE version = 15;
+            DELETE FROM pengine_schema WHERE version = 16;
+            DELETE FROM pengine_schema WHERE version = 17;
             """
         )
         await connection.commit()
@@ -2208,8 +2285,8 @@ async def test_schema_v9_repair_limits_migrate_without_losing_pause(
     await restarted.pause_content_rejection(
         lease.run_id,
         stage=stage,
-        evidence="第六轮故事语义修订后仍有冲突。",
-        repair_rounds=6,
+        evidence="第四轮故事语义修订后仍有冲突。",
+        repair_rounds=4,
         now=NOW + timedelta(seconds=4),
     )
     paused = await restarted.get_creation(
@@ -2217,7 +2294,7 @@ async def test_schema_v9_repair_limits_migrate_without_losing_pause(
         now=NOW + timedelta(seconds=4),
     )
     assert paused is not None
-    assert paused.initial.pause.content_repair_count == 6
+    assert paused.initial.pause.content_repair_count == 4
 
     async with restarted._connection() as connection:
         for repair_rounds in (3, 6):
@@ -2272,6 +2349,8 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 14")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 15")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 16")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.execute("DROP TABLE episode_timeouts")
@@ -2323,6 +2402,8 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 14")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 15")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 16")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.commit()
@@ -2402,6 +2483,8 @@ async def test_schema_v4_recovery_rows_gain_the_timeout_reason_without_losing_dr
         await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 14")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 15")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 16")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -2456,6 +2539,8 @@ async def test_schema_v10_to_v11_preserves_run_progress_and_model_calls(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 13")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 14")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 15")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 16")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
