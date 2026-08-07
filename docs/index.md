@@ -37,7 +37,7 @@ Pengine 把一个自由表达的故事想法、短剧要求和一份版本化人
 
 <div class="diagram">
 
-```text
+<pre><code>
 操作员 / 同源 Web 工作台
           │  HTTP + Idempotency-Key
           ▼
@@ -59,7 +59,7 @@ Pengine 把一个自由表达的故事想法、短剧要求和一份版本化人
   claude-opus-5                deepseek-v4-flash
           │                          │
           └────────────── 同一 relay URL / key ──────────────┘
-```
+</code></pre>
 
 </div>
 

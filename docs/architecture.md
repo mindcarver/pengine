@@ -41,7 +41,7 @@ Pengine 是一个**本地、单进程、单 Worker、SQLite 持久化、双角�
 
 <div class="diagram">
 
-```text
+<pre><code>
 ┌───────────────────────────────┐
 │ 浏览器：同源 Web 工作台         │
 │ 选择人格、创建、轮询、控制、阅览 │
@@ -80,7 +80,7 @@ Pengine 是一个**本地、单进程、单 Worker、SQLite 持久化、双角�
        │           └─────────────────────┘
        │
        └─ SQLite also stores model_calls and LangGraph checkpointer tables
-```
+</code></pre>
 
 </div>
 
