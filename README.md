@@ -25,9 +25,14 @@ SQLite。模型请求共用一组 relay URL 与密钥，但按角色固定为两
 使用 Anthropic Messages 的 `claude-opus-5`，审核使用 DeepSeek OpenAI-compatible 的
 `deepseek-v4-flash`。
 
-Web 原型只服务本机单操作员，并以约 1.8 秒轮询展示后端确认的七阶段进度、
+Web 原型只服务本机单操作员，并以约 1.8 秒轮询展示后端确认的六个用户阶段进度、
 已运行时长和超时恢复操作；V1 没有身份认证、公共部署、多用户隔离、SSE /
 WebSocket 或跨项目可写记忆。
+
+> 详细的设计、架构、数据模型、接口、恢复语义和开源贡献手册见
+> [Pengine GitHub Pages](https://mindcarver.github.io/pengine/)。Pages 的源文件位于
+> [`docs/`](docs/)，完整机器接口合同仍以 [`contracts/openapi.json`](contracts/openapi.json)
+> 为准。
 
 <h2 align="center">01 · 系统架构</h2>
 
@@ -58,7 +63,7 @@ WebSocket 或跨项目可写记忆。
 
 | 组件 | 负责什么 |
 |---|---|
-| 同源 Web 工作台 | 七阶段进度、初稿/修订结果和暂停任务操作 |
+| 同源 Web 工作台 | 六个用户阶段进度、初稿/修订结果和暂停任务操作 |
 | 接口服务（FastAPI） | 参数校验、幂等命令、状态、恢复操作与结果查询 |
 | 人格加载器 | 校验九文件人格包，生成内容寻址的不可变快照 |
 | 状态仓库 | 管理创作、运行、任务、反馈、检查点与交付物 |
