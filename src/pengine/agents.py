@@ -143,6 +143,9 @@ _CANONICAL_WORKSPACE_PATHS = frozenset(
         "/workspace/current_character_biographies.md",
         "/workspace/current_relationship_logic.md",
         "/workspace/current_story_candidate.md",
+        "/workspace/previous_character_biographies.md",
+        "/workspace/previous_relationship_logic.md",
+        "/workspace/previous_story_candidate.md",
         "/workspace/approved-checkpoints.json",
         "/workspace/story_contract.json",
         "/workspace/story_contract.md",
@@ -3111,26 +3114,61 @@ class StageGuardMiddleware(AgentMiddleware):
         current_content: str,
         current_review: CanonReviewerResult,
     ) -> CanonReviewerResult:
+        is_outline = stage is InternalStage.GENERATING_STORY_OUTLINE
+        if is_outline:
+            candidate_files = {
+                "/workspace/current_story_candidate.md": current_content,
+                "/workspace/previous_story_candidate.md": previous_content,
+            }
+            candidate_clause = (
+                " The candidate is in /workspace/current_story_candidate.md and the previous "
+                "candidate in /workspace/previous_story_candidate.md."
+            )
+        else:
+            # Split the merged candidate into per-section files so the backstop
+            # sees the same focused inputs as the regular review passes.
+            current_sections = split_cr_candidate(current_content)
+            previous_sections = split_cr_candidate(previous_content)
+            candidate_files = {
+                "/workspace/current_character_biographies.md": (
+                    current_sections["character_biographies"]
+                ),
+                "/workspace/current_relationship_logic.md": (
+                    current_sections["relationship_logic"]
+                ),
+                "/workspace/previous_character_biographies.md": (
+                    previous_sections["character_biographies"]
+                ),
+                "/workspace/previous_relationship_logic.md": (
+                    previous_sections["relationship_logic"]
+                ),
+            }
+            candidate_clause = (
+                " The candidate has two sections: character biographies in "
+                "/workspace/current_character_biographies.md and relationship logic in "
+                "/workspace/current_relationship_logic.md. The previous candidate's sections "
+                "are in /workspace/previous_character_biographies.md and "
+                "/workspace/previous_relationship_logic.md."
+            )
         return await self._invoke_semantic_reviewer(
             request=request,
             handler=handler,
             subagent_type="canon_reviewer",
             description=(
-                f"Review only the unlocked {stage.value} candidate in "
-                "/workspace/current_story_candidate.md as a convergence backstop at a repair "
-                "checkpoint. Consolidate every remaining blocking contradiction that "
-                "still exists in the current candidate after the previous repair, including any "
-                "dependency the repair introduced or exposed. Use the previous candidate and both "
-                "review JSON files only to find missed blocking issues and issue interactions; do "
-                "not require new facts that the approved upstream artifacts leave unspecified. "
-                "Focus especially on knowledge-source closure, introduced assumptions, renamed "
-                "entities, relationship direction, evidence provenance, causality gaps, and "
-                "ending statements. Return the complete union of remaining blocking issues in one "
-                "pass and no rewrite."
+                f"Review only the unlocked {stage.value} candidate as a convergence "
+                "backstop at a repair checkpoint."
+                + candidate_clause
+                + " Consolidate every remaining blocking contradiction that still exists in the "
+                "current candidate after the previous repair, including any dependency the repair "
+                "introduced or exposed. Use the previous candidate and both review JSON files only "
+                "to find missed blocking issues and issue interactions; do not require new facts "
+                "that the approved upstream artifacts leave unspecified. Focus especially on "
+                "knowledge-source closure, introduced assumptions, renamed entities, relationship "
+                "direction, evidence provenance, causality gaps, and ending statements. Return the "
+                "complete union of remaining blocking issues in one pass and no rewrite."
             ),
             files={
-                "/workspace/current_story_candidate.md": current_content,
-                "/workspace/previous_story_candidate.md": previous_content,
+                **candidate_files,
                 "/workspace/previous_story_review.json": json.dumps(
                     _canon_review_with_issue_ledger(previous_review),
                     ensure_ascii=False,
