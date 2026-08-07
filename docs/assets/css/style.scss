@@ -1,0 +1,166 @@
+---
+---
+
+@import "{{ site.theme }}";
+
+:root {
+  --ink: #20252a;
+  --muted: #66717b;
+  --paper: #fbfaf7;
+  --panel: #f2eee7;
+  --line: #d8d0c5;
+  --accent: #8e4334;
+  --accent-dark: #633126;
+  --teal: #365b61;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.75;
+}
+
+.page-header {
+  background: linear-gradient(130deg, #3a5052 0%, #8e4334 100%);
+  padding: 3rem 1rem 2.5rem;
+}
+
+.project-name,
+.project-tagline {
+  text-shadow: none;
+}
+
+.project-name {
+  letter-spacing: .08em;
+}
+
+.main-content {
+  max-width: 1120px;
+  padding: 2rem 1rem 4rem;
+}
+
+.main-content h2 {
+  border-top: 1px solid var(--line);
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+}
+
+.main-content h3 {
+  color: var(--accent-dark);
+  margin-top: 2rem;
+}
+
+.site-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .55rem;
+  margin: 0 auto 1.5rem;
+  max-width: 1120px;
+  padding: 0 1rem;
+}
+
+.site-nav a {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--accent-dark);
+  font-size: .9rem;
+  padding: .25rem .8rem;
+  text-decoration: none;
+}
+
+.site-nav a:hover,
+.site-nav a:focus {
+  background: var(--accent);
+  color: #fff;
+}
+
+.callout,
+.diagram,
+.contract-card {
+  background: var(--panel);
+  border-left: 4px solid var(--accent);
+  margin: 1.25rem 0;
+  padding: 1rem 1.25rem;
+}
+
+.callout.warning {
+  border-left-color: #b36b22;
+}
+
+.callout.safe {
+  border-left-color: var(--teal);
+}
+
+.diagram {
+  border-left-color: var(--teal);
+  overflow-x: auto;
+}
+
+.diagram pre {
+  background: transparent;
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+
+code,
+pre {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+pre {
+  border-color: var(--line);
+}
+
+table {
+  display: table;
+  width: 100%;
+}
+
+th {
+  background: var(--panel);
+}
+
+td,
+th {
+  vertical-align: top;
+}
+
+.label {
+  background: var(--teal);
+  border-radius: 999px;
+  color: #fff;
+  display: inline-block;
+  font-size: .78rem;
+  letter-spacing: .05em;
+  padding: .1rem .55rem;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.source-note {
+  color: var(--muted);
+  font-size: .9rem;
+}
+
+.page-footer {
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  margin: 2rem auto 0;
+  max-width: 1120px;
+  padding: 1.5rem 1rem 3rem;
+}
+
+@media screen and (max-width: 700px) {
+  .main-content {
+    padding-top: 1rem;
+  }
+
+  table {
+    display: block;
+    overflow-x: auto;
+  }
+}
