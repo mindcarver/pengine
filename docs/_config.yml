@@ -1,6 +1,6 @@
 title: Pengine 工程文档
 description: 本地短剧创作 Agent 的设计、架构、接口与运行手册
-url: https://mindcarver.github.io
+url: https://mindcarver.top
 baseurl: /pengine
 theme: jekyll-theme-cayman
 markdown: kramdown
