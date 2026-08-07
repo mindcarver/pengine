@@ -2620,12 +2620,18 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "free-form user request" in _EPISODE_PLANNER_PROMPT
     assert "Never ask the user" in _EPISODE_PLANNER_PROMPT
     assert "Leave genuinely unspecified details out" in _EPISODE_PLANNER_PROMPT
+    assert "preserve only the explicitly locked or formally committed facts" in (
+        _STORY_ARCHITECT_PROMPT
+    )
+    assert "Capture explicitly locked or formally committed aliases" in _EPISODE_PLANNER_PROMPT
     assert "Knowledge states are sparse cumulative snapshots" in _EPISODE_PLANNER_PROMPT
     assert "aliases, pronouns, ages, elapsed durations, call participants" in (
         _EPISODE_PLANNER_PROMPT
     )
     assert "exact dialogue-count claims" in _SCRIPT_WRITER_PROMPT
-    assert "Every upstream commitment must appear" in _SCRIPT_WRITER_PROMPT
+    assert "Every explicitly locked upstream commitment must appear" in _SCRIPT_WRITER_PROMPT
+    assert "Unspecified creative details remain the writer's choice" in _SCRIPT_WRITER_PROMPT
+    assert "explicitly locked or formally committed aliases" in _SCRIPT_WRITER_PROMPT
     assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
     assert "canonical contract names in every speaker label" in _SCRIPT_WRITER_PROMPT
     assert "call participants" in _SCRIPT_WRITER_PROMPT
@@ -2650,11 +2656,28 @@ def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> No
         _SPECIALIST_SKILL_SOURCES
     )
     skill_files = load_agent_skill_files()
-    assert "minimum continuity ledger" in skill_files["/skills/canon-review/SKILL.md"]
+    canon_skill = skill_files["/skills/canon-review/SKILL.md"]
+    assert "smallest set" in canon_skill
+    assert "explicit hard Canon" in canon_skill
+    assert "Ordinary approved prose" in canon_skill
+    assert (
+        "writer is free to choose unspecified details"
+        in skill_files["/skills/canon-review/SKILL.md"]
+    )
     assert (
         "complete committed series prefix"
         in skill_files["/skills/episode-continuity-review/SKILL.md"]
     )
+    episode_skill = skill_files["/skills/episode-continuity-review/SKILL.md"]
+    assert "Ordinary prose in an approved" in episode_skill
+    assert "leave unspecified" in episode_skill
+    assert "free" in episode_skill
+
+
+def test_review_prompts_do_not_turn_missing_creative_detail_into_failure() -> None:
+    assert "missing upstream commitment" not in _STORY_ARCHITECT_PROMPT
+    assert "missing upstream commitment" not in _EPISODE_PLANNER_PROMPT
+    assert "explicitly locked" in _SCRIPT_WRITER_PROMPT
 
 
 def test_calculate_arithmetic_preserves_exact_decimal_result() -> None:

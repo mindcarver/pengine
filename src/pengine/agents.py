@@ -164,8 +164,9 @@ _STORY_ARCHITECT_PROMPT = (
     "character_biographies and relationship_logic and leave every other field null; "
     "the two fields are one mutually consistent package, so reconcile every "
     "character identity, age, alias, motive, secret, family and relationship "
-    "direction, and causal logic across both before returning, and treat the "
-    "approved story outline as binding. Avoid unnecessary exact claims about future "
+    "direction, and causal logic across both before returning, and preserve only "
+    "the explicitly locked or formally committed facts from the approved story "
+    "outline. Avoid unnecessary exact claims about future "
     "dialogue counts or scene placement; when such a claim is required, make it an "
     "explicit downstream commitment. Use calculate_arithmetic for every derived "
     "numeric claim and copy its exact result."
@@ -179,8 +180,9 @@ _EPISODE_PLANNER_PROMPT = (
     "constraint from the script requirements. When the requirements do not "
     "specify an episode count, read the stage-specific persona L4 file and use "
     "its baseline; never invent a different count. Before returning, verify "
-    "that every episode-specific action promised by the character biographies "
-    "or relationship logic appears in the matching episode, and that dates, "
+    "that every episode-specific action explicitly promised as a locked upstream "
+    "commitment by the character biographies or relationship logic appears in the "
+    "matching episode, and that dates, "
     "countdowns, amounts, counts, and arithmetic agree across artifacts. Use "
     "calculate_arithmetic for every derived numeric claim. Never round a "
     "non-integral division unless the story states the rounding rule. Include a "
@@ -189,9 +191,10 @@ _EPISODE_PLANNER_PROMPT = (
     "is the only required creative input: automatically compile the minimum continuity ledger "
     "from facts established by the approved artifacts. Never ask the user for character sheets, "
     "timelines, or evidence tables. Leave genuinely unspecified details out instead of inventing "
-    "them only for validation. Capture established aliases, pronouns, ages, elapsed durations, "
-    "call participants, identity and relationship facts, and canonical clue meanings as typed "
-    "facts or existing structured contract fields. Compile the same approved facts into "
+    "them only for validation. Capture explicitly locked or formally committed aliases, "
+    "pronouns, ages, elapsed durations, call participants, identity and relationship facts, "
+    "and canonical clue meanings as typed facts or existing structured contract fields. "
+    "Compile the same hard-Canon facts into "
     "story_contract. Use unique lowercase snake_case IDs "
     "and a closed cast; every relationship, timeline participant, and knowledge entry "
     "must reference that cast. Use ISO dates/times. Numeric facts require exact decimal "
@@ -213,12 +216,13 @@ _SCRIPT_WRITER_PROMPT = (
     "locked episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
     "returning, reread every approved upstream artifact and audit this episode "
     "against them. Use canonical contract names in every speaker label, including when a "
-    "parenthetical delivery direction follows the name. Treat established aliases, pronouns, "
-    "ages, elapsed durations, call participants, identity and relationship facts, and clue "
-    "meanings as binding. "
+    "parenthetical delivery direction follows the name. Treat explicitly locked or formally "
+    "committed aliases, pronouns, ages, elapsed durations, call participants, identity and "
+    "relationship facts, and clue meanings as binding. "
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
     "exact dialogue-count claims, and episode-specific promised actions. Every "
-    "upstream commitment must appear in the scripts. Use calculate_arithmetic "
+    "explicitly locked upstream commitment must appear in the scripts. Unspecified "
+    "creative details remain the writer's choice. Use calculate_arithmetic "
     "for every derived numeric claim and copy its exact result. The tool accepts "
     "decimal operands only: convert clock times to elapsed minutes before subtracting "
     "them (for example, 22:50 becomes 1370 and 22:20 becomes 1340). Never round a "
@@ -2801,7 +2805,11 @@ class StageGuardMiddleware(AgentMiddleware):
                 )
             review_prefix = (
                 f"Review only the unlocked {stage.value} candidate against the creation "
-                "request, L0 selection, persona rules, and every approved upstream artifact."
+                "request, L0 selection, persona rules, and every approved upstream artifact. "
+                "Hard Canon is limited to user requirements, explicitly locked Contract or "
+                "SeriesBible values, formally committed prior episode/state facts, mandatory "
+                "episode obligations, and the output/schema protocol. Ordinary approved prose, "
+                "persona style, suggestions, and omitted fields are not locks."
             )
             if is_outline:
                 review_prefix += (
@@ -2809,17 +2817,20 @@ class StageGuardMiddleware(AgentMiddleware):
                     "outline for foundational consistency with the L0 selection and persona "
                     "rules: the protagonist, central conflict, key events, motivations, and "
                     "story arc must agree with the chosen direction, and every explicit numeric "
-                    "or commitment the outline makes must be internally consistent. Fail on "
-                    "every explicit contradiction or missing upstream commitment."
+                    "or locked commitment the outline makes must be internally consistent. "
+                    "Fail only on an explicit contradiction or an impossible locked binding; "
+                    "do not fail because an upstream artifact leaves a creative detail "
+                    "unspecified."
                 )
             else:
                 review_prefix += (
                     " The candidate has two sections: character biographies in "
                     "/workspace/current_character_biographies.md and relationship logic in "
                     "/workspace/current_relationship_logic.md. Each pass primarily audits one "
-                    "section but may cross-reference the other as read-only context. Fail on "
-                    "every explicit contradiction or missing upstream commitment. A repair must "
-                    "preserve both sections."
+                    "section but may cross-reference the other as read-only context. Fail only "
+                    "on an explicit contradiction or an impossible locked binding; do not fail "
+                    "because an upstream artifact leaves a creative detail unspecified. A "
+                    "repair must preserve both sections."
                 )
             review_prefix += (
                 " For each issue include the exact conflicting candidate excerpt, authoritative "
@@ -2857,11 +2868,10 @@ class StageGuardMiddleware(AgentMiddleware):
                         "/workspace/current_relationship_logic.md as cross-reference): names, "
                         "identities, roles, aliases, pronouns, absolute and relative ages, "
                         "family and relationship direction, motives, secrets, guilt, character "
-                        "arcs, status or whereabouts, and promised character actions. For every "
-                        "character who holds a secret, knows a fact, or gives testimony, audit "
-                        "the explicit causal source of that knowledge (direct observation, a "
-                        "named informant, discovered evidence, or participation); fail knowledge "
-                        "that has no stated acquisition source."
+                        "arcs, status or whereabouts, and promised character actions, but only "
+                        "when those details are explicitly locked or contradict locked Canon. "
+                        "Do not require a causal source, motive, or backstory for an otherwise "
+                        "unspecified creative detail."
                     ),
                     (
                         f"{review_prefix} This pass owns the timeline-and-evidence lens and "
@@ -2870,8 +2880,9 @@ class StageGuardMiddleware(AgentMiddleware):
                         "dates, times, durations, arithmetic, chronology, repeated event and "
                         "object names, clue meanings, evidence custody and provenance, call "
                         "participants, knowledge states, causal mechanisms, episode actions and "
-                        "hooks, prohibitions, and internal cross-reference consistency. Recheck "
-                        "every occurrence, not only the first matching sentence."
+                        "hooks, prohibitions, and internal cross-reference consistency, but only "
+                        "for explicit locked Canon or a direct contradiction. Recheck every locked "
+                        "occurrence, not optional creative detail."
                     ),
                 )
             reviews = []
@@ -3172,7 +3183,9 @@ class StageGuardMiddleware(AgentMiddleware):
                 f"Review only the unlocked {stage.value} candidate as a convergence "
                 "backstop at a repair checkpoint."
                 + candidate_clause
-                + " After the previous repair, identify only the most critical remaining blocking "
+                + " After the previous repair, identify only the most critical remaining "
+                "hard-Canon "
+                "blocking "
                 "contradictions that the regular review lenses missed — focus on issues that span "
                 "both sections or that the repair introduced. Do not re-list issues the regular "
                 "lenses already found; report only new or unresolved cross-section problems. Keep "
@@ -3227,11 +3240,12 @@ class StageGuardMiddleware(AgentMiddleware):
                 description=(
                     "Review the proposed minimum continuity ledger against every approved "
                     "upstream artifact. Check that the structured episode plans agree with the "
-                    "readable episode outline and story contract. Fail on contradictions, "
-                    "missing established identity, relationship, alias, pronoun, age, duration, "
-                    "call-participant, clue or causal facts, ambiguous typed numbers, unfair "
-                    "knowledge withholding, or incomplete clue lifecycle. Do not require facts "
-                    "that the upstream artifacts leave genuinely unspecified."
+                    "readable episode outline and story contract. Fail only on a contradiction in "
+                    "explicitly locked or formally committed identity, relationship, alias, "
+                    "pronoun, age, duration, call-participant, clue or causal facts, ambiguous "
+                    "typed numbers, unfair knowledge withholding, or incomplete required clue "
+                    "lifecycle. Do not require "
+                    "facts that the upstream artifacts leave genuinely unspecified."
                 ),
                 files={
                     "/workspace/story_contract.json": json.dumps(
@@ -3929,7 +3943,8 @@ class StageGuardMiddleware(AgentMiddleware):
                         description=(
                             f"Review episode {plan.episode_number} and the complete committed "
                             "series prefix against the locked contract and every approved upstream "
-                            "artifact. Compare identities, relationships, aliases, pronouns, ages, "
+                            "artifact. Compare only explicitly locked or formally committed "
+                            "identities, relationships, aliases, pronouns, ages, "
                             "durations, call participants, clue meanings, causal facts, viewpoint "
                             "knowledge, cast, and episode obligation across all prior scripts and "
                             "the current candidate. The candidate's final dramatic beat must "
@@ -4369,8 +4384,9 @@ class DeepAgentWorkflow:
                     "Independently reviews an unlocked story artifact or structured contract."
                 ),
                 "system_prompt": bind_language(
-                    "Use the canon-review skill. Treat every approved upstream artifact as "
-                    "frozen. Review only the explicitly named unlocked prose artifact or JSON "
+                    "Use the canon-review skill. Treat explicitly locked facts in approved "
+                    "upstream artifacts as immutable; treat unspecified prose details as free. "
+                    "Review only the explicitly named unlocked prose artifact or JSON "
                     "contract, and return structured evidence with precise issues. Never repair "
                     "or rewrite the candidate."
                 ),
@@ -4392,8 +4408,9 @@ class DeepAgentWorkflow:
                 "name": "episode_reviewer",
                 "description": "Independently reviews one episode against locked continuity.",
                 "system_prompt": bind_language(
-                    "Use the episode-continuity-review skill. The contract and prior state are "
-                    "immutable. Return only structured review evidence and never repair content."
+                    "Use the episode-continuity-review skill. Explicit contract facts and prior "
+                    "state are immutable; unspecified creative details remain free. Return only "
+                    "structured review evidence and never repair content."
                 ),
                 "model": self.review_model,
                 "tools": tools,
@@ -4453,9 +4470,10 @@ class DeepAgentWorkflow:
                     "resolve every confirmed canon-review issue."
                 ),
                 "system_prompt": bind_language(
-                    "Use the story-repair skill. Keep every approved upstream artifact "
-                    "unchanged. Read the current candidate and every confirmed review "
-                    "issue, then return the complete corrected character_biographies and "
+                    "Use the story-repair skill. Keep every approved upstream hard fact "
+                    "unchanged and preserve unspecified creative choices. Read the current "
+                    "candidate and every confirmed review issue, then return the complete "
+                    "corrected character_biographies and "
                     "relationship_logic in one structured result. Resolve issues jointly "
                     "across both sections rather than line by line."
                 ),

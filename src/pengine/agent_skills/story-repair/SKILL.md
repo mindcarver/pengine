@@ -11,17 +11,19 @@ Read the current unlocked candidate in
 the complete corrected `character_biographies` and `relationship_logic` in one
 structured result.
 
-Resolve issues jointly across both sections: when one issue's fix changes a
-fact that another section references, update every affected occurrence in both
-sections consistently. Prefer one coherent rewrite over many local edits. The
-two sections are one mutually consistent package, so re-audit identities, ages,
-aliases, motives, secrets, relationship direction, timelines, and causal logic
-across both before returning.
+Resolve confirmed hard-Canon issues jointly across both sections: when one
+issue's fix changes a fact that another section references, update every
+affected occurrence in both sections consistently. Prefer one coherent rewrite
+over many local edits. Preserve unspecified creative choices instead of
+expanding them. The two sections are one mutually consistent package, so
+re-audit only the identities, ages, aliases, motives, secrets, relationship
+direction, timelines, and causal logic that are explicitly locked or affected
+by a confirmed contradiction.
 
-Keep every approved upstream artifact unchanged. Never invent canon that the
-upstream artifacts leave unspecified. Copy authoritative corrected literals
-directly from the review issues; never recompute ages, durations, dates, or
-differences from the conflicting candidate.
+Keep every approved upstream artifact unchanged. Never invent canon merely to
+fill an unspecified detail. Copy authoritative corrected literals directly from
+the review issues; never recompute ages, durations, dates, or differences from
+the conflicting candidate.
 
 When `/workspace/previous_story_review.json` is supplied, it contains the
 confirmed issues that motivated the current candidate. Resolve every issue
