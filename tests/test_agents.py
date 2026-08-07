@@ -3105,9 +3105,8 @@ async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_ro
             assert subagent_type == "canon_reviewer"
             description = candidate.tool_call["args"]["description"]
             if "convergence backstop" in description:
-                current = candidate.state["files"]["/workspace/current_story_candidate.md"][
-                    "content"
-                ]
+                rl = candidate.state["files"].get("/workspace/current_relationship_logic.md", {})
+                current = rl.get("content", "")
                 # The backstop fires once at the repair_rounds == 1 checkpoint: the
                 # call conflict was fixed but the testimony basis is still unsupported.
                 backstop_calls += 1
