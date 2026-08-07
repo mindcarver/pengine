@@ -2974,7 +2974,7 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
 
 
 @pytest.mark.asyncio
-async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_round() -> None:
+async def test_story_consistency_converges_at_fourth_repair_round() -> None:
     approvals: list[tuple[InternalStage, dict[str, Any]]] = []
     approved_payloads: dict[InternalStage, Any] = {
         InternalStage.SELECTING_L0_VARIANT: {
@@ -2994,7 +2994,6 @@ async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_ro
     }
     review_calls = 0
     repair_calls = 0
-    backstop_calls = 0
 
     async def before_stage(stage: InternalStage) -> int:
         assert stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
@@ -3028,7 +3027,7 @@ async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_ro
     )
 
     async def handler(candidate: ToolCallRequest) -> ToolMessage:
-        nonlocal review_calls, repair_calls, backstop_calls
+        nonlocal review_calls, repair_calls
         subagent_type = candidate.tool_call["args"]["subagent_type"]
         if subagent_type == "story_architect":
             payload = {
@@ -3053,7 +3052,7 @@ async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_ro
             if repair_calls == 1:
                 # Round 1 fixes only the call-participant conflict; the
                 # knowledge-source gap remains, so the post-repair review still
-                # fails and the convergence backstop fires at this checkpoint.
+                # fails and the stage keeps repairing.
                 assert "电话打给周砚" in current
                 relationship_logic = (
                     "电话改为打给程屿后，陈伯一直知情并准备在终局作证。\n"
@@ -3062,9 +3061,8 @@ async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_ro
                     "其余人物身份、时间线与结局选择保持上游版本。"
                 )
             elif repair_calls == 2:
-                # Round 2 closes the knowledge-source gap (and the testimony-basis
-                # gap the backstop surfaced) by supplying 陈伯's既有记录来源 on the
-                # main line; the two summaries still lack it.
+                # Round 2 closes the knowledge-source gap on the main line by
+                # supplying 陈伯's既有记录来源; the two summaries still lack it.
                 assert "陈伯一直知情并准备在终局作证" in current
                 relationship_logic = (
                     "电话改为打给程屿；陈伯因保管周远的值班记录与手记而知情，并据此在终局作证。\n"
@@ -3103,105 +3101,77 @@ async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_ro
             }
         else:
             assert subagent_type == "canon_reviewer"
-            description = candidate.tool_call["args"]["description"]
-            if "convergence backstop" in description:
-                rl = candidate.state["files"].get("/workspace/current_relationship_logic.md", {})
-                current = rl.get("content", "")
-                # The backstop fires once at the repair_rounds == 1 checkpoint: the
-                # call conflict was fixed but the testimony basis is still unsupported.
-                backstop_calls += 1
-                assert backstop_calls == 1
-                assert "电话改为打给程屿" in current
-                assert "陈伯一直知情并准备在终局作证" in current
+            # c+r reviews now receive per-section files.
+            rl = candidate.state["files"].get("/workspace/current_relationship_logic.md", {})
+            current = rl.get("content", "")
+            review_calls += 1
+            if review_calls in {1, 2}:
+                # repair_rounds == 0: both lenses flag the call-participant conflict.
+                assert "电话打给周砚" in current
                 payload = {
                     "passed": False,
-                    "evidence": "终局作证依据仍未闭合",
+                    "evidence": "通话对象与上游冲突",
                     "issues": [
                         {
-                            "code": "testimony_basis_gap",
-                            "message": "必须补出陈伯为何能作证的既有记录来源。",
+                            "code": "call_participant_conflict",
+                            "message": "权威通话对象为程屿。",
+                            "script_excerpt": "电话打给周砚后，陈伯决定在终局作证。",
+                        }
+                    ],
+                }
+            elif review_calls in {3, 4}:
+                # repair_rounds == 1: call conflict closed, but the knowledge gap remains.
+                assert "电话改为打给程屿后，陈伯一直知情并准备在终局作证。" in current
+                payload = {
+                    "passed": False,
+                    "evidence": "知情来源缺口",
+                    "issues": [
+                        {
+                            "code": "knowledge_source_gap",
+                            "message": "必须补出陈伯如何得知真相的既有来源。",
                             "script_excerpt": "陈伯一直知情并准备在终局作证。",
+                        },
+                    ],
+                }
+            elif review_calls in {5, 6}:
+                # repair_rounds == 2: knowledge source closed on the main line, but the
+                # 人物摘要 still lacks the source.
+                assert "值班记录与手记" in current
+                assert "人物摘要仍称陈伯一直知情" in current
+                payload = {
+                    "passed": False,
+                    "evidence": "重复摘要仍缺少知情来源",
+                    "issues": [
+                        {
+                            "code": "repeated_knowledge_source_gap",
+                            "message": "第二行也必须同步写明陈伯知情的既有记录来源。",
+                            "script_excerpt": "人物摘要仍称陈伯一直知情",
+                        }
+                    ],
+                }
+            elif review_calls in {7, 8}:
+                # repair_rounds == 3: 人物摘要 closed, 关系摘要 still lacks it.
+                assert "值班记录与手记" in current
+                assert "关系摘要仍称陈伯一直知情" in current
+                payload = {
+                    "passed": False,
+                    "evidence": "关系摘要仍缺少知情来源",
+                    "issues": [
+                        {
+                            "code": "relationship_summary_knowledge_gap",
+                            "message": "第三行也必须同步写明陈伯知情的既有记录来源。",
+                            "script_excerpt": "关系摘要仍称陈伯一直知情",
                         }
                     ],
                 }
             else:
-                # Non-backstop c+r reviews now receive per-section files.
-                rl = candidate.state["files"].get("/workspace/current_relationship_logic.md", {})
-                current = rl.get("content", "")
-                review_calls += 1
-                if review_calls in {1, 2}:
-                    # repair_rounds == 0: both lenses flag the call-participant conflict.
-                    assert "电话打给周砚" in current
-                    payload = {
-                        "passed": False,
-                        "evidence": "通话对象与上游冲突",
-                        "issues": [
-                            {
-                                "code": "call_participant_conflict",
-                                "message": "权威通话对象为程屿。",
-                                "script_excerpt": "电话打给周砚后，陈伯决定在终局作证。",
-                            }
-                        ],
-                    }
-                elif review_calls in {3, 4}:
-                    # repair_rounds == 1 (post-backstop): the knowledge gap and the
-                    # backstop's testimony-basis gap both remain.
-                    assert "电话改为打给程屿后，陈伯一直知情并准备在终局作证。" in current
-                    payload = {
-                        "passed": False,
-                        "evidence": "知情来源缺口",
-                        "issues": [
-                            {
-                                "code": "knowledge_source_gap",
-                                "message": "必须补出陈伯如何得知真相的既有来源。",
-                                "script_excerpt": "陈伯一直知情并准备在终局作证。",
-                            },
-                            {
-                                "code": "testimony_basis_gap",
-                                "message": "必须补出陈伯为何能作证的既有记录来源。",
-                                "script_excerpt": "陈伯一直知情并准备在终局作证。",
-                            },
-                        ],
-                    }
-                elif review_calls in {5, 6}:
-                    # repair_rounds == 2: testimony basis closed, but the人物摘要 still
-                    # lacks the source.
-                    assert "值班记录与手记" in current
-                    assert "人物摘要仍称陈伯一直知情" in current
-                    payload = {
-                        "passed": False,
-                        "evidence": "重复摘要仍缺少知情来源",
-                        "issues": [
-                            {
-                                "code": "repeated_knowledge_source_gap",
-                                "message": "第二行也必须同步写明陈伯知情的既有记录来源。",
-                                "script_excerpt": "人物摘要仍称陈伯一直知情",
-                            }
-                        ],
-                    }
-                elif review_calls in {7, 8}:
-                    # repair_rounds == 3: 人物摘要 closed, 关系摘要 still lacks it.
-                    assert "值班记录与手记" in current
-                    assert "关系摘要仍称陈伯一直知情" in current
-                    payload = {
-                        "passed": False,
-                        "evidence": "关系摘要仍缺少知情来源",
-                        "issues": [
-                            {
-                                "code": "relationship_summary_knowledge_gap",
-                                "message": "第三行也必须同步写明陈伯知情的既有记录来源。",
-                                "script_excerpt": "关系摘要仍称陈伯一直知情",
-                            }
-                        ],
-                    }
-                else:
-                    # repair_rounds == 4 (the cap): every gap is closed, both lenses pass
-                    # and the stage converges exactly at the maximum repair round.
-                    assert review_calls in {9, 10}
-                    assert "值班记录与手记" in current
-                    assert "人物摘要仍称陈伯一直知情" not in current
-                    assert "关系摘要仍称陈伯一直知情" not in current
-                    payload = {"passed": True, "evidence": "故事工件一致", "issues": []}
+                # repair_rounds == 4 (the cap): every gap is closed, both lenses pass
+                # and the stage converges exactly at the maximum repair round.
+                assert review_calls in {9, 10}
+                assert "值班记录与手记" in current
+                assert "人物摘要仍称陈伯一直知情" not in current
+                assert "关系摘要仍称陈伯一直知情" not in current
+                payload = {"passed": True, "evidence": "故事工件一致", "issues": []}
             payload["prior_issue_closures"] = _resolved_prior_story_closures(candidate)
         return ToolMessage(
             content=json.dumps(payload, ensure_ascii=False),
@@ -3212,7 +3182,6 @@ async def test_story_consistency_uses_backstop_and_converges_at_fourth_repair_ro
     await middleware.awrap_tool_call(request, handler)
 
     assert review_calls == 10
-    assert backstop_calls == 1
     assert repair_calls == 4
     assert len(approvals) == 1
     stage, repaired = approvals[0]

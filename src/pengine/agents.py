@@ -2890,9 +2890,14 @@ class StageGuardMiddleware(AgentMiddleware):
                 )
                 reviews.append(review_result)
             review = _merge_story_canon_reviews(reviews, previous_review)
+            # The convergence backstop re-audits the candidate after the first
+            # repair to catch cross-section issues the regular lenses missed.
+            # It is disabled for c+r because the merged candidate's complexity
+            # causes the backstop to produce oversized outputs that re-inject
+            # issues faster than repair can close them, preventing convergence.
             if (
                 not review.passed
-                and not is_outline
+                and is_outline
                 and repair_rounds in {1, _PRIMARY_STORY_ARTIFACT_REPAIR_ROUNDS}
                 and previous_content is not None
                 and previous_review is not None
