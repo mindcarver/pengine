@@ -6,22 +6,26 @@ description: Review an unlocked short-drama story artifact or contract before it
 # Canon review
 
 Read every supplied approved upstream artifact and the complete unlocked
-candidate named in the task. The candidate may be a prose story outline,
-character biography set, relationship document, or the system-generated
-minimum continuity ledger. The user supplies only a free-form idea and optional
-requirements.
+candidate named in the task. Use those artifacts to identify the smallest set
+of explicit hard Canon that the candidate must preserve. Approved prose is
+context; it is not automatically a lock for every detail it omits. The user
+supplies only a free-form idea and optional requirements.
 
-Fail closed when any commitment is absent, ambiguous, or contradictory. Check:
+Fail only when explicit hard Canon is contradicted or a required locked binding
+is impossible. For this review, hard Canon comes only from user requirements,
+values explicitly marked locked in the Contract or SeriesBible, formally
+committed facts in prior approved episodes or state, mandatory episode
+obligations, and the output/schema protocol. Ordinary approved prose, persona
+style, suggestions, and omitted fields are not locks. Do not turn an omitted
+creative choice into a failure. Check only the applicable hard-Canon items:
 
-- one closed cast with stable identity and relationship direction;
-- every established alias, pronoun, age, elapsed duration, call participant,
-  identity and relationship fact, and canonical clue meaning;
-- dates, times, typed numbers, units, and arithmetic meanings;
-- chronological event order;
-- each character's knowledge after every episode;
-- every clue's visible or audible introduction, one explanation, and callback;
-- one effective new-information fact and one verifiable hook per episode;
-- prohibitions from the approved story and persona context.
+- the closed cast, stable identities, aliases, pronouns, and relationship
+  directions that are explicitly locked;
+- locked ages, elapsed durations, call participants, dates, times, typed
+  numbers, units, arithmetic meanings, and chronological order;
+- formally committed knowledge states and causal facts;
+- mandatory clue lifecycle, new-information beat, and verifiable hook items;
+- explicit prohibitions from the approved story and persona context.
 
 When the task assigns a review lens, stay within that lens but audit every
 candidate section, summary table, ending statement, and repeated mention.
@@ -38,16 +42,19 @@ remaining current-candidate evidence. Never omit an ID or invent a new one.
 Treat wording suggested by an earlier review as a hypothesis, not an authority:
 the creation request and approved upstream artifacts always take precedence.
 
-Every returned issue must be a blocking contradiction or missing binding
-commitment. Never put a preference, optional clarification, naming suggestion,
-or a condition explicitly described as "not a failure" into `issues`.
+Every returned issue must be a blocking contradiction to explicit hard Canon or
+an explicitly required locked binding. Never put a preference, optional
+clarification, naming suggestion, request to fill an unspecified detail, or a
+condition explicitly described as "not a failure" into `issues`.
 
 Leave genuinely unspecified creative details unspecified. Do not demand facts
 that exist only to make validation easier, and never ask the user to complete a
 character sheet, timeline, or evidence table.
 
-Return concrete structured evidence. A plausible outline is not enough: pass
-only when another writer can generate every episode without inventing canon.
+Return concrete structured evidence. A plausible contradiction claim is not
+enough: pass when the candidate does not violate hard Canon, even when the
+writer is free to choose unspecified details. A later writer may invent within
+that free space; it may not contradict locked Canon.
 For a prose candidate, cite the exact conflicting candidate excerpt and identify
 the authoritative upstream value and source. State the exact corrected literals
 or wording so the repair does not need to infer arithmetic. When alternatives

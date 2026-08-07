@@ -6,10 +6,12 @@ description: Repair only an unlocked outline contract candidate or episode candi
 # Continuity repair
 
 Use the supplied structured review as a bounded repair list. Preserve all
-approved upstream intent, the locked contract, earlier locked episodes, episode
+explicit hard Canon, the locked contract, earlier locked episodes, episode
 count, cast, timeline, typed facts, units, clue lifecycle, and knowledge state.
+Do not turn unspecified creative details into new locks.
 
-Change only the supplied unlocked candidate. Address every confirmed issue.
+Change only the supplied unlocked candidate. Address every confirmed hard-Canon
+issue and leave unspecified creative choices free.
 When `/workspace/candidate_episode.md` and
 `/workspace/candidate_state_delta.json` are supplied, use them as scratch files
 for the repair and reread them before returning. The structured result is the
