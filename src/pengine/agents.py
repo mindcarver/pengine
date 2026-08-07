@@ -3158,14 +3158,12 @@ class StageGuardMiddleware(AgentMiddleware):
                 f"Review only the unlocked {stage.value} candidate as a convergence "
                 "backstop at a repair checkpoint."
                 + candidate_clause
-                + " Consolidate every remaining blocking contradiction that still exists in the "
-                "current candidate after the previous repair, including any dependency the repair "
-                "introduced or exposed. Use the previous candidate and both review JSON files only "
-                "to find missed blocking issues and issue interactions; do not require new facts "
-                "that the approved upstream artifacts leave unspecified. Focus especially on "
-                "knowledge-source closure, introduced assumptions, renamed entities, relationship "
-                "direction, evidence provenance, causality gaps, and ending statements. Return the "
-                "complete union of remaining blocking issues in one pass and no rewrite."
+                + " After the previous repair, identify only the most critical remaining blocking "
+                "contradictions that the regular review lenses missed — focus on issues that span "
+                "both sections or that the repair introduced. Do not re-list issues the regular "
+                "lenses already found; report only new or unresolved cross-section problems. Keep "
+                "the issue list short and focused: at most the top blocking contradictions. Do not "
+                "require new facts that the approved upstream artifacts leave unspecified."
             ),
             files={
                 **candidate_files,
