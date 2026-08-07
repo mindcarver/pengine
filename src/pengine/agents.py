@@ -1288,8 +1288,17 @@ def _validate_result_language(
     output_language: OutputLanguage | None,
     stage: InternalStage | None,
 ) -> None:
+    # Story artifacts (character biographies, relationship logic) may contain
+    # character/place names in Latin script, so use a more permissive English
+    # dominance ratio. Outline, scripts, and review evidence stay strict.
+    is_story_artifact = (
+        isinstance(result, StoryArchitectResult)
+        and result.stage == InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
+    )
+    ratio = 4.0 if is_story_artifact else 2.0
     if not any(
-        has_obvious_language_mismatch(text, output_language) for text in _user_facing_texts(result)
+        has_obvious_language_mismatch(text, output_language, english_dominance_ratio=ratio)
+        for text in _user_facing_texts(result)
     ):
         return
     raise AgentProtocolError(

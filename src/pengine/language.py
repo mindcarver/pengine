@@ -42,8 +42,20 @@ def language_instruction(language: OutputLanguage | None) -> str:
     )
 
 
-def has_obvious_language_mismatch(text: str, language: OutputLanguage | None) -> bool:
-    """Detect English-only or overwhelmingly English user-facing Chinese output."""
+def has_obvious_language_mismatch(
+    text: str,
+    language: OutputLanguage | None,
+    *,
+    english_dominance_ratio: float = _ENGLISH_DOMINANCE_RATIO,
+) -> bool:
+    """Detect English-only or overwhelmingly English user-facing Chinese output.
+
+    ``english_dominance_ratio`` controls how much Latin content is tolerated
+    relative to Han characters. Story artifacts (character biographies,
+    relationship logic) may contain character/place names in Latin script, so
+    callers can raise the ratio to avoid false positives while still catching
+    genuinely English-dominated output.
+    """
     if language != SIMPLIFIED_CHINESE:
         return False
 
@@ -78,5 +90,5 @@ def has_obvious_language_mismatch(text: str, language: OutputLanguage | None) ->
     latin_count = len(_LATIN_LETTER.findall(language_sample))
     return (
         latin_count >= _LONG_ENGLISH_TEXT_LETTERS
-        and latin_count > han_count * _ENGLISH_DOMINANCE_RATIO
+        and latin_count > han_count * english_dominance_ratio
     )
