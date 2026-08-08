@@ -3,7 +3,7 @@ import json
 import logging
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict
 from typing import Any, Protocol
 from uuid import UUID, uuid4
@@ -13,6 +13,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 
 from pengine.agents import (
+    AgentExecutionLimitError,
     AgentProtocolError,
     CheckpointUnavailableError,
     ContentReviewRejectedError,
@@ -25,7 +26,13 @@ from pengine.config import Settings
 from pengine.continuity import EpisodeLock
 from pengine.errors import DomainError
 from pengine.language import OutputLanguage
-from pengine.model_calls import ModelCallState, ModelCallStore, new_call_id
+from pengine.model_calls import (
+    ModelCallState,
+    ModelCallStore,
+    StageCallBudgetExceeded,
+    new_call_id,
+)
+from pengine.observability import content_fingerprint, record_langfuse_event
 from pengine.personas import PersonaCatalog, PersonaPackageError
 from pengine.relay import (
     PreflightBlockedError,
@@ -60,6 +67,124 @@ from pengine.series_bible import (
 from pengine.series_review import active_prefix_hash
 
 logger = logging.getLogger(__name__)
+
+
+def _publish_langfuse_env(settings: Settings) -> None:
+    """Seed LANGFUSE_* process env vars so the SDK auto-configures itself.
+
+    pengine keeps its own PENGINE_LANGFUSE_* settings (prefix discipline), but the
+    Langfuse SDK reads LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL
+    from the environment. We mirror them here, once at worker startup and before
+    the relay models are built, so the callback handler picks them up.
+    """
+    if not settings.langfuse_configured:
+        return
+    assert settings.langfuse_public_key is not None  # noqa: S101 - narrowed by property
+    assert settings.langfuse_secret_key is not None  # noqa: S101 - narrowed by property
+    assert settings.langfuse_host is not None  # noqa: S101 - narrowed by property
+    import os
+
+    os.environ["LANGFUSE_PUBLIC_KEY"] = settings.langfuse_public_key.get_secret_value()
+    os.environ["LANGFUSE_SECRET_KEY"] = settings.langfuse_secret_key.get_secret_value()
+    os.environ["LANGFUSE_BASE_URL"] = settings.langfuse_host
+
+
+def _flush_langfuse(settings: Settings) -> None:
+    """Flush pending Langfuse traces at worker shutdown so nothing is lost."""
+    if not settings.langfuse_configured:
+        return
+    try:
+        from langfuse import get_client
+
+        get_client().flush()
+    except Exception as exc:  # pragma: no cover - tracing must never block shutdown
+        logger.warning("langfuse flush failed error_type=%s", type(exc).__name__)
+
+
+@contextmanager
+def _safe_langfuse_context(context_manager: Any):
+    """Suppress harmless OTel context-detach errors during async teardown."""
+    try:
+        with context_manager as value:
+            yield value
+    except ValueError as exc:
+        if "different Context" not in str(exc):
+            raise
+        logger.debug("langfuse context detach skipped after async teardown")
+
+
+def _langfuse_trace_context(settings: Settings, work: RunWorkItem):
+    """Return a context manager that scopes a run's traces in Langfuse.
+
+    When tracing is disabled this is a no-op :class:`contextlib.nullcontext`, so the
+    worker's control flow is unchanged. When enabled it does two things:
+
+    1. Opens a root ``agent`` observation named after the run, so every LangChain
+       callback the relay models fire (LLM generations, tool calls) nests under it
+       instead of becoming isolated flat traces. deepagents propagates the parent
+       OTel context to sub-agents automatically, so the supervisor + 9 specialists
+       form a single tree.
+    2. Stamps the trace with ``session_id`` = run id, ``user_id`` = creation id,
+       tags, and run lineage metadata. A run is the unit of workflow evidence;
+       creation-level grouping can be done through ``user_id``.
+
+    The worker processes one run at a time, so the ambient OTel context is
+    unambiguous across runs.
+    """
+    if not settings.langfuse_configured:
+        from contextlib import nullcontext
+
+        return nullcontext()
+    try:
+        from langfuse import get_client, propagate_attributes
+    except ImportError:  # pragma: no cover - langfuse optional
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+    @contextmanager
+    def _scoped():
+        # propagate_attributes sets trace-level attributes (session/user/tags) on
+        # whatever trace is current inside the block; the root observation opened
+        # next becomes that trace, and nested callback observations inherit it.
+        # Both are OTel agnostic context managers: synchronous enter/exit (context
+        # attach is sync), so the worker can use a plain ``with`` to scope a run.
+        with (
+            _safe_langfuse_context(
+                propagate_attributes(
+                    session_id=str(work.run_id),
+                    user_id=str(work.creation_id),
+                    metadata={
+                        "run_id": str(work.run_id),
+                        "run_kind": work.run_kind,
+                        "thread_id": work.thread_id,
+                        "trace_version": "pengine-1",
+                    },
+                    tags=["pengine", work.run_kind],
+                )
+            ),
+            _safe_langfuse_context(
+                get_client().start_as_current_observation(
+                    name=f"pengine.run:{work.run_kind}",
+                    as_type="agent",
+                    input={
+                        "run_id": str(work.run_id),
+                        "creation_id": str(work.creation_id),
+                        "run_kind": work.run_kind,
+                        "story_chars": len(work.story),
+                        "requirements_chars": len(work.requirements),
+                    },
+                    metadata={
+                        "thread_id": work.thread_id,
+                        "trace_version": "pengine-1",
+                    },
+                )
+            ),
+        ):
+            yield
+
+    return _scoped()
+
 
 _SPECIALIST_STAGES = (
     InternalStage.SELECTING_L0_VARIANT,
@@ -165,12 +290,13 @@ class Worker:
             self._saver = await self._saver_context.__aenter__()
             await self._saver.setup()
             if self.settings.relay_configured:
+                _publish_langfuse_env(self.settings)
                 routes = build_relay_routes(self.settings)
                 state = getattr(routes, "model_call_state", None)
                 if state is not None:
                     store = ModelCallStore(self.settings.database_path)
                     state.store = store
-                    state.context.reset()
+                    state.reset()
                     self._model_call_state = state
                     self._model_call_store = store
                 self.workflow = DeepAgentWorkflow(
@@ -180,6 +306,7 @@ class Worker:
                     recursion_limit=self.settings.agent_recursion_limit,
                     generation_provider_profile_key=routes.generation.provider_profile_key,
                     review_provider_profile_key=routes.review.provider_profile_key,
+                    model_call_state=state,
                 )
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop(), name="pengine-worker")
@@ -192,6 +319,7 @@ class Worker:
                 await self._task
             self._task = None
         await asyncio.to_thread(drain_audit_writes)
+        _flush_langfuse(self.settings)
         if self._saver_context is not None:
             await self._saver_context.__aexit__(None, None, None)
             self._saver_context = None
@@ -234,6 +362,52 @@ class Worker:
         return True
 
     async def _process_job(self, job: LeasedJob) -> None:
+        heartbeat = asyncio.create_task(
+            self._renew_job_lease(job),
+            name=f"pengine-lease-heartbeat-{job.run_id}",
+        )
+        try:
+            await self._process_job_body(job)
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+
+    async def _renew_job_lease(self, job: LeasedJob) -> None:
+        interval = max(1.0, self.settings.lease_seconds / 3)
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self.repository.renew_job_lease(
+                    job_id=job.job_id,
+                    worker_id=job.lease_owner,
+                    lease_seconds=self.settings.lease_seconds,
+                )
+                logger.debug(
+                    "job lease renewed worker_id=%s run_id=%s lease_seconds=%s",
+                    self.worker_id,
+                    job.run_id,
+                    self.settings.lease_seconds,
+                )
+            except asyncio.CancelledError:
+                raise
+            except DomainError as exc:
+                logger.error(
+                    "job lease renewal stopped worker_id=%s run_id=%s error_code=%s",
+                    self.worker_id,
+                    job.run_id,
+                    exc.code,
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    "job lease renewal failed worker_id=%s run_id=%s error_type=%s",
+                    self.worker_id,
+                    job.run_id,
+                    type(exc).__name__,
+                )
+
+    async def _process_job_body(self, job: LeasedJob) -> None:
         await self.repository.mark_run_running(job.run_id)
         work = await self.repository.get_run_work_item(job.run_id)
         approved: dict[InternalStage, Any] = dict(work.business_checkpoints)
@@ -257,7 +431,7 @@ class Worker:
         run_timeout_scope: asyncio.Timeout | None = None
         model_call_state = self._model_call_state
         if model_call_state is not None:
-            model_call_state.context.reset()
+            model_call_state.reset()
             model_call_state.context.run_id = str(work.run_id)
             model_call_state.context.creation_id = str(work.creation_id)
             model_call_state.context.thread_id = work.thread_id
@@ -270,79 +444,85 @@ class Worker:
             work.run_kind,
         )
 
-        try:
-            if InternalStage.LOADING_PERSONA not in approved:
-                await self.repository.record_stage_attempt(
-                    work.run_id,
-                    InternalStage.LOADING_PERSONA,
-                )
-            snapshot = self.catalog.resolve_snapshot(work.persona.snapshot_sha256)
-            if InternalStage.LOADING_PERSONA not in approved:
-                loading_payload = snapshot.summary.model_dump(mode="json")
-                await self.repository.approve_checkpoint(
-                    work.run_id,
-                    InternalStage.LOADING_PERSONA,
-                    loading_payload,
-                )
-                approved[InternalStage.LOADING_PERSONA] = loading_payload
+        trace_cm = _langfuse_trace_context(self.settings, work)
+        stage_cm: Any = None
+        stage_observation: Any = None
 
-            persona_files = self._persona_files(work)
-
-            if InternalStage.GENERATING_EPISODE_OUTLINE in approved and not work.episode_plans:
-                current_stage = InternalStage.GENERATING_EPISODE_SCRIPTS
-                raise CheckpointUnavailableError(
-                    "The approved legacy episode outline has no durable episode plan."
+        def close_stage_observation(*, status: str, error: str | None = None) -> None:
+            nonlocal stage_cm, stage_observation
+            if stage_observation is None or stage_cm is None:
+                return
+            try:
+                stage_observation.update(
+                    output={"status": status, **({"error": error} if error else {})}
                 )
+            except Exception as exc:  # pragma: no cover - observability must not fail runs
+                logger.debug("langfuse stage update failed error_type=%s", type(exc).__name__)
+            try:
+                stage_cm.__exit__(None, None, None)
+            except Exception as exc:  # pragma: no cover - observability must not fail runs
+                logger.debug("langfuse stage close failed error_type=%s", type(exc).__name__)
+            stage_cm = None
+            stage_observation = None
 
-            if InternalStage.GENERATING_EPISODE_OUTLINE in approved:
-                # Restart recovery: the outline checkpoint is durable and the
-                # approve hook that normally syncs the design only fires during
-                # live delegation. If the process died after the outline commit
-                # but before candidate promotion, re-run the idempotent sync so
-                # the run never proceeds without an active design (SDP-A8).
-                await self._sync_series_bible(work, approved)
-                if model_call_state is not None:
-                    active = await self.repository.get_run_series_bible(work.run_id)
-                    model_call_state.context.candidate = (
-                        active.candidate_id if active is not None else None
+        def open_stage_observation(stage: InternalStage, attempt: int) -> None:
+            nonlocal stage_cm, stage_observation
+            if not self.settings.langfuse_configured:
+                return
+            close_stage_observation(status="superseded")
+            try:
+                from langfuse import get_client
+
+                stage_cm = _safe_langfuse_context(
+                    get_client().start_as_current_observation(
+                        name=f"pengine.stage:{stage.value}",
+                        as_type="span",
+                        input={"stage": stage.value, "attempt": attempt},
+                        metadata={
+                            "run_id": str(work.run_id),
+                            "stage": stage.value,
+                            "attempt": attempt,
+                            "trace_version": "pengine-1",
+                        },
                     )
+                )
+                stage_observation = stage_cm.__enter__()
+            except Exception as exc:  # pragma: no cover - observability must not fail runs
+                logger.debug("langfuse stage open failed error_type=%s", type(exc).__name__)
+                stage_cm = None
+                stage_observation = None
 
-            if self.workflow is None:
-                current_stage = self._next_unapproved(approved)
-                if current_stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
-                    refreshed = await self.repository.get_run_work_item(work.run_id)
-                    await self.repository.record_episode_attempt(
+        with trace_cm:
+            try:
+                if InternalStage.LOADING_PERSONA not in approved:
+                    await self.repository.record_stage_attempt(
                         work.run_id,
-                        len(refreshed.episode_drafts) + 1,
+                        InternalStage.LOADING_PERSONA,
                     )
-                else:
-                    await self.repository.record_stage_attempt(work.run_id, current_stage)
-                raise RelayError(
-                    code="relay_unavailable",
-                    safe_message="The model relay is not configured.",
-                )
-            if (
-                isinstance(self.workflow, DeepAgentWorkflow)
-                and self._requires_langgraph_checkpoint(work)
-                and not await self.workflow.has_checkpoint(work.thread_id)
-            ):
-                raise CheckpointUnavailableError("The durable workflow checkpoint is missing.")
+                snapshot = self.catalog.resolve_snapshot(work.persona.snapshot_sha256)
+                if InternalStage.LOADING_PERSONA not in approved:
+                    loading_payload = snapshot.summary.model_dump(mode="json")
+                    await self.repository.approve_checkpoint(
+                        work.run_id,
+                        InternalStage.LOADING_PERSONA,
+                        loading_payload,
+                    )
+                    approved[InternalStage.LOADING_PERSONA] = loading_payload
 
-            async def before_stage(stage: InternalStage) -> int:
-                nonlocal current_stage
-                current_stage = stage
-                if model_call_state is not None:
-                    model_call_state.context.stage = stage.value
-                    model_call_state.context.episode_number = None
-                return await self.repository.record_stage_attempt(work.run_id, stage)
+                persona_files = self._persona_files(work)
 
-            async def approve_stage(
-                stage: InternalStage,
-                payload: Mapping[str, Any],
-            ) -> None:
-                await self.repository.approve_checkpoint(work.run_id, stage, payload)
-                approved[stage] = dict(payload)
-                if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+                if InternalStage.GENERATING_EPISODE_OUTLINE in approved and not work.episode_plans:
+                    current_stage = InternalStage.GENERATING_EPISODE_SCRIPTS
+                    raise CheckpointUnavailableError(
+                        "The approved legacy episode outline has no durable episode plan."
+                    )
+
+                if InternalStage.GENERATING_EPISODE_OUTLINE in approved:
+                    # Restart recovery: the outline checkpoint is durable and the
+                    # approve hook that normally syncs the design only fires during
+                    # live delegation. If the process died after the outline commit
+                    # but before candidate promotion, re-run the idempotent sync so
+                    # the run never proceeds without an active design (SDP-A8).
                     await self._sync_series_bible(work, approved)
                     if model_call_state is not None:
                         active = await self.repository.get_run_series_bible(work.run_id)
@@ -350,347 +530,418 @@ class Worker:
                             active.candidate_id if active is not None else None
                         )
 
-            async def before_episode(plan: EpisodePlan) -> int:
-                nonlocal current_stage
-                current_stage = InternalStage.GENERATING_EPISODE_SCRIPTS
-                if model_call_state is not None:
-                    model_call_state.context.stage = InternalStage.GENERATING_EPISODE_SCRIPTS.value
-                    model_call_state.context.episode_number = plan.episode_number
-                    model_call_state.context.call_id = new_call_id()
-                return await self.repository.record_episode_attempt(
-                    work.run_id,
-                    plan.episode_number,
-                )
+                if self.workflow is None:
+                    current_stage = self._next_unapproved(approved)
+                    if current_stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+                        refreshed = await self.repository.get_run_work_item(work.run_id)
+                        await self.repository.record_episode_attempt(
+                            work.run_id,
+                            len(refreshed.episode_drafts) + 1,
+                        )
+                    else:
+                        await self.repository.record_stage_attempt(work.run_id, current_stage)
+                    raise RelayError(
+                        code="relay_unavailable",
+                        safe_message="The model relay is not configured.",
+                    )
+                if (
+                    isinstance(self.workflow, DeepAgentWorkflow)
+                    and self._requires_langgraph_checkpoint(work)
+                    and not await self.workflow.has_checkpoint(work.thread_id)
+                ):
+                    raise CheckpointUnavailableError("The durable workflow checkpoint is missing.")
 
-            async def commit_episode(
-                episode_number: int,
-                content: str,
-                episode_lock: EpisodeLock | None = None,
-                *,
-                call_id: str | None = None,
-                writer_notes: str = "",
-            ) -> EpisodeDraft:
-                if episode_lock is None:
-                    # Legacy outline path without a locked story contract keeps the
-                    # immutable per-episode draft behavior unchanged.
-                    return await self.repository.commit_episode_draft(
+                async def before_stage(stage: InternalStage) -> int:
+                    nonlocal current_stage
+                    current_stage = stage
+                    if model_call_state is not None:
+                        model_call_state.context.stage = stage.value
+                        model_call_state.context.episode_number = None
+                    attempt = await self.repository.record_stage_attempt(work.run_id, stage)
+                    open_stage_observation(stage, attempt)
+                    return attempt
+
+                async def approve_stage(
+                    stage: InternalStage,
+                    payload: Mapping[str, Any],
+                ) -> None:
+                    await self.repository.approve_checkpoint(work.run_id, stage, payload)
+                    approved[stage] = dict(payload)
+                    close_stage_observation(status="approved")
+                    if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+                        await self._sync_series_bible(work, approved)
+                        if model_call_state is not None:
+                            active = await self.repository.get_run_series_bible(work.run_id)
+                            model_call_state.context.candidate = (
+                                active.candidate_id if active is not None else None
+                            )
+
+                async def before_episode(plan: EpisodePlan) -> int:
+                    nonlocal current_stage
+                    current_stage = InternalStage.GENERATING_EPISODE_SCRIPTS
+                    if model_call_state is not None:
+                        model_call_state.context.stage = (
+                            InternalStage.GENERATING_EPISODE_SCRIPTS.value
+                        )
+                        model_call_state.context.episode_number = plan.episode_number
+                        model_call_state.context.call_id = new_call_id()
+                    return await self.repository.record_episode_attempt(
                         work.run_id,
-                        episode_number,
-                        content,
+                        plan.episode_number,
+                    )
+
+                async def commit_episode(
+                    episode_number: int,
+                    content: str,
+                    episode_lock: EpisodeLock | None = None,
+                    *,
+                    call_id: str | None = None,
+                    writer_notes: str = "",
+                ) -> EpisodeDraft:
+                    if episode_lock is None:
+                        # Legacy outline path without a locked story contract keeps the
+                        # immutable per-episode draft behavior unchanged.
+                        return await self.repository.commit_episode_draft(
+                            work.run_id,
+                            episode_number,
+                            content,
+                            episode_lock=episode_lock,
+                        )
+                    active = await self.repository.get_run_series_bible(work.run_id)
+                    if active is None:
+                        raise AgentProtocolError(
+                            "Episode generation requires an active SeriesBible design",
+                            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        )
+                    await self.repository.create_script_batch(
+                        work.run_id,
+                        design_candidate_id=active.candidate_id,
+                        design_content_hash=active.content_hash,
+                        design_epoch=active.design_epoch,
+                    )
+                    resolved_call_id = (
+                        call_id
+                        or (
+                            model_call_state.context.call_id
+                            if model_call_state is not None
+                            else None
+                        )
+                        or f"{work.run_id}-episode-{episode_number}"
+                    )
+                    candidate = await self.repository.commit_episode_candidate(
+                        work.run_id,
+                        episode_number=episode_number,
+                        content=content,
                         episode_lock=episode_lock,
+                        call_id=resolved_call_id,
+                        writer_notes=writer_notes,
                     )
-                active = await self.repository.get_run_series_bible(work.run_id)
-                if active is None:
-                    raise AgentProtocolError(
-                        "Episode generation requires an active SeriesBible design",
+                    return EpisodeDraft(
+                        episode_number=candidate.episode_number,
+                        content=candidate.content,
+                        content_sha256=candidate.content_sha256,
+                        completed_at=candidate.created_at,
+                        contract_sha256=candidate.state_delta.contract_sha256,
+                        state_delta=candidate.state_delta,
+                        series_state=candidate.series_state,
+                        series_state_sha256=candidate.series_state_sha256,
+                        semantic_review=candidate.semantic_review,
+                        repair_rounds=candidate.repair_rounds,
+                    )
+
+                async def retrieve_references(query: str) -> str:
+                    hits = self.catalog.retrieve_references(
+                        work.persona.snapshot_sha256,
+                        query,
+                        limit=self.settings.retrieval_limit,
+                    )
+                    return json.dumps(
+                        [asdict(hit) for hit in hits],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+
+                async def register_series_review(
+                    *,
+                    review_type: str,
+                    episode_number: int,
+                    passed: bool,
+                    category: str,
+                    evidence: str,
+                    earliest_affected_episode: int | None,
+                ) -> str:
+                    """Bind and persist one structural review to the exact active lineage."""
+                    active = await self.repository.get_run_series_bible(work.run_id)
+                    batch = await self.repository.get_script_batch_lineage(work.run_id)
+                    if active is None or batch is None:
+                        raise AgentProtocolError(
+                            "A structural review requires an active SeriesBible and script batch",
+                            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        )
+                    prefix = await self.repository.get_active_episode_candidates(work.run_id)
+                    prefix_hash = active_prefix_hash(
+                        [
+                            {
+                                "episode_number": candidate.episode_number,
+                                "content_sha256": candidate.content_sha256,
+                            }
+                            for candidate in prefix
+                        ]
+                    )
+                    call_id = await self.repository.latest_review_call_id(
+                        work.run_id,
                         stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
                     )
-                await self.repository.create_script_batch(
-                    work.run_id,
-                    design_candidate_id=active.candidate_id,
-                    design_content_hash=active.content_hash,
-                    design_epoch=active.design_epoch,
-                )
-                resolved_call_id = (
-                    call_id
-                    or (model_call_state.context.call_id if model_call_state is not None else None)
-                    or f"{work.run_id}-episode-{episode_number}"
-                )
-                candidate = await self.repository.commit_episode_candidate(
-                    work.run_id,
-                    episode_number=episode_number,
-                    content=content,
-                    episode_lock=episode_lock,
-                    call_id=resolved_call_id,
-                    writer_notes=writer_notes,
-                )
-                return EpisodeDraft(
-                    episode_number=candidate.episode_number,
-                    content=candidate.content,
-                    content_sha256=candidate.content_sha256,
-                    completed_at=candidate.created_at,
-                    contract_sha256=candidate.state_delta.contract_sha256,
-                    state_delta=candidate.state_delta,
-                    series_state=candidate.series_state,
-                    series_state_sha256=candidate.series_state_sha256,
-                    semantic_review=candidate.semantic_review,
-                    repair_rounds=candidate.repair_rounds,
-                )
+                    bound = await self.repository.register_series_review(
+                        work.run_id,
+                        review_type=review_type,
+                        episode_number=episode_number,
+                        design_candidate_id=active.candidate_id,
+                        design_content_hash=active.content_hash,
+                        design_epoch=active.design_epoch,
+                        batch_id=batch.batch_id,
+                        batch_epoch=batch.batch_epoch,
+                        prefix_hash=prefix_hash,
+                        call_id=call_id or f"{work.run_id}-review-{episode_number}",
+                        passed=passed,
+                        category=category,
+                        evidence=evidence,
+                        earliest_affected_episode=earliest_affected_episode,
+                    )
+                    record_langfuse_event(
+                        "pengine.review.result",
+                        input={
+                            "run_id": str(work.run_id),
+                            "stage": current_stage.value,
+                            "review_type": review_type,
+                            "episode_number": episode_number,
+                            "passed": passed,
+                            "category": category,
+                            "evidence_chars": len(evidence),
+                        },
+                        metadata={
+                            "review_id": bound.review_id,
+                            "evidence_sha256": content_fingerprint(evidence),
+                            "trace_version": "pengine-1",
+                        },
+                    )
+                    return bound.review_id
 
-            async def retrieve_references(query: str) -> str:
-                hits = self.catalog.retrieve_references(
-                    work.persona.snapshot_sha256,
-                    query,
-                    limit=self.settings.retrieval_limit,
-                )
-                return json.dumps(
-                    [asdict(hit) for hit in hits],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
+                run_timeout_scope = asyncio.timeout(self.settings.run_timeout_seconds)
+                async with run_timeout_scope:
 
-            async def register_series_review(
-                *,
-                review_type: str,
-                episode_number: int,
-                passed: bool,
-                category: str,
-                evidence: str,
-                earliest_affected_episode: int | None,
-            ) -> str:
-                """Bind and persist one structural review to the exact active lineage."""
-                active = await self.repository.get_run_series_bible(work.run_id)
-                batch = await self.repository.get_script_batch_lineage(work.run_id)
-                if active is None or batch is None:
+                    async def reset_episode_deadline() -> None:
+                        run_timeout_scope.reschedule(
+                            asyncio.get_running_loop().time() + self.settings.run_timeout_seconds
+                        )
+
+                    result = await self.workflow.execute(
+                        thread_id=work.thread_id,
+                        story=work.story,
+                        requirements=work.requirements,
+                        persona_files=persona_files,
+                        before_stage=before_stage,
+                        approve_stage=approve_stage,
+                        approved_checkpoints=approved,
+                        episode_drafts=work.episode_drafts,
+                        before_episode=before_episode,
+                        commit_episode=commit_episode,
+                        assemble_episode_scripts=lambda: self.repository.assemble_episode_scripts(
+                            work.run_id
+                        ),
+                        episode_timeout_seconds=self.settings.run_timeout_seconds,
+                        reset_episode_deadline=reset_episode_deadline,
+                        output_language=work.output_language,
+                        feedback=work.frozen_feedback,
+                        retrieve_references=retrieve_references,
+                        series_bible=await self.repository.get_run_series_bible(work.run_id),
+                        register_series_review=register_series_review,
+                        get_series_bible=lambda: self.repository.get_run_series_bible(work.run_id),
+                    )
+                if work.run_kind == "revision" and not result.feedback_handling:
                     raise AgentProtocolError(
-                        "A structural review requires an active SeriesBible and script batch",
-                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        "Revision result omitted feedback handling",
+                        stage=InternalStage.ACCEPTING_L4,
                     )
-                prefix = await self.repository.get_active_episode_candidates(work.run_id)
-                prefix_hash = active_prefix_hash(
-                    [
-                        {
-                            "episode_number": candidate.episode_number,
-                            "content_sha256": candidate.content_sha256,
-                        }
-                        for candidate in prefix
-                    ]
-                )
-                call_id = await self.repository.latest_review_call_id(
-                    work.run_id,
-                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
-                )
-                bound = await self.repository.register_series_review(
-                    work.run_id,
-                    review_type=review_type,
-                    episode_number=episode_number,
-                    design_candidate_id=active.candidate_id,
-                    design_content_hash=active.content_hash,
-                    design_epoch=active.design_epoch,
-                    batch_id=batch.batch_id,
-                    batch_epoch=batch.batch_epoch,
-                    prefix_hash=prefix_hash,
-                    call_id=call_id or f"{work.run_id}-review-{episode_number}",
-                    passed=passed,
-                    category=category,
-                    evidence=evidence,
-                    earliest_affected_episode=earliest_affected_episode,
-                )
-                return bound.review_id
+                result = await self._validated_checkpoint_result(work, result, approved)
 
-            run_timeout_scope = asyncio.timeout(self.settings.run_timeout_seconds)
-            async with run_timeout_scope:
-
-                async def reset_episode_deadline() -> None:
-                    run_timeout_scope.reschedule(
-                        asyncio.get_running_loop().time() + self.settings.run_timeout_seconds
+                current_stage = InternalStage.ASSEMBLING_DELIVERY
+                if current_stage not in approved:
+                    await self.repository.record_stage_attempt(work.run_id, current_stage)
+                delivery = self._assemble_delivery(work, result)
+                if current_stage not in approved:
+                    assembly_payload = delivery.model_dump(mode="json")
+                    await self.repository.approve_checkpoint(
+                        work.run_id,
+                        current_stage,
+                        assembly_payload,
                     )
-
-                result = await self.workflow.execute(
-                    thread_id=work.thread_id,
-                    story=work.story,
-                    requirements=work.requirements,
-                    persona_files=persona_files,
-                    before_stage=before_stage,
-                    approve_stage=approve_stage,
-                    approved_checkpoints=approved,
-                    episode_drafts=work.episode_drafts,
-                    before_episode=before_episode,
-                    commit_episode=commit_episode,
-                    assemble_episode_scripts=lambda: self.repository.assemble_episode_scripts(
-                        work.run_id
-                    ),
-                    episode_timeout_seconds=self.settings.run_timeout_seconds,
-                    reset_episode_deadline=reset_episode_deadline,
-                    output_language=work.output_language,
-                    feedback=work.frozen_feedback,
-                    retrieve_references=retrieve_references,
-                    series_bible=await self.repository.get_run_series_bible(work.run_id),
-                    register_series_review=register_series_review,
-                    get_series_bible=lambda: self.repository.get_run_series_bible(work.run_id),
-                )
-            if work.run_kind == "revision" and not result.feedback_handling:
-                raise AgentProtocolError(
-                    "Revision result omitted feedback handling",
-                    stage=InternalStage.ACCEPTING_L4,
-                )
-            result = await self._validated_checkpoint_result(work, result, approved)
-
-            current_stage = InternalStage.ASSEMBLING_DELIVERY
-            if current_stage not in approved:
-                await self.repository.record_stage_attempt(work.run_id, current_stage)
-            delivery = self._assemble_delivery(work, result)
-            if current_stage not in approved:
-                assembly_payload = delivery.model_dump(mode="json")
-                await self.repository.approve_checkpoint(
+                    approved[current_stage] = assembly_payload
+                final_review_id = await self._resolve_final_review_id(work.run_id)
+                await self.repository.succeed_run(
                     work.run_id,
-                    current_stage,
-                    assembly_payload,
+                    delivery,
+                    final_review_id=final_review_id,
                 )
-                approved[current_stage] = assembly_payload
-            final_review_id = await self._resolve_final_review_id(work.run_id)
-            await self.repository.succeed_run(
-                work.run_id,
-                delivery,
-                final_review_id=final_review_id,
-            )
-            logger.info(
-                "workflow run succeeded run_id=%s creation_id=%s",
-                work.run_id,
-                work.creation_id,
-            )
-        except asyncio.CancelledError:
-            raise
-        except MilestoneRejectedError as exc:
-            await self._handle_milestone_rejection(work, exc)
-            return
-        except EpisodeTimeoutError as exc:
-            recovery_state = await self.repository.handle_episode_timeout(
-                work.run_id,
-                exc.episode_number,
-            )
-            logger.warning(
-                "episode script timed out run_id=%s creation_id=%s episode=%s state=%s",
-                work.run_id,
-                work.creation_id,
-                exc.episode_number,
-                recovery_state,
-            )
-            return
-        except ContentReviewRejectedError as exc:
-            await self.repository.pause_content_rejection(
-                work.run_id,
-                stage=exc.stage,
-                evidence=exc.evidence,
-                repair_rounds=exc.repair_rounds,
-                episode_number=exc.episode_number,
-            )
-            logger.info(
-                "content review paused run_id=%s creation_id=%s stage=%s episode=%s",
-                work.run_id,
-                work.creation_id,
-                exc.stage.value,
-                exc.episode_number,
-            )
-            return
-        except QualityGateRejectedError as exc:
-            rejection = await self.repository.reject_quality_gate(
-                work.run_id,
-                stage=exc.stage,
-                evidence=exc.evidence,
-            )
-            logger.info(
-                "quality gate rejected run_id=%s creation_id=%s stage=%s attempt=%s",
-                work.run_id,
-                work.creation_id,
-                rejection.stage,
-                rejection.attempt_count,
-            )
-            return
-        except PreflightBlockedError as exc:
-            await self.repository.pause_context_budget(
-                work.run_id,
-                stage=(InternalStage(exc.stage) if exc.stage else current_stage),
-                safe_message=exc.safe_message,
-                episode_number=exc.episode_number,
-            )
-            logger.warning(
-                "context preflight blocked run_id=%s creation_id=%s stage=%s episode=%s "
-                "required_tokens=%s verified_limit_tokens=%s",
-                work.run_id,
-                work.creation_id,
-                exc.stage,
-                exc.episode_number,
-                exc.required_tokens,
-                exc.verified_limit_tokens,
-            )
-            return
-        except TimeoutError as exc:
-            if run_timeout_scope is not None and run_timeout_scope.expired():
-                timeout_stage = self._failure_stage(exc, current_stage, approved)
-                if model_call_state is not None and model_call_state.store is not None:
-                    submit_store_write(
-                        model_call_state.store.mark_timed_out,
-                        run_id=str(work.run_id),
-                    )
-                if timeout_stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
-                    refreshed = await self.repository.get_run_work_item(work.run_id)
-                    episode_number = len(refreshed.episode_drafts) + 1
-                    if episode_number <= len(refreshed.episode_plans):
-                        recovery_state = await self.repository.handle_episode_timeout(
-                            work.run_id,
-                            episode_number,
-                        )
-                        logger.warning(
-                            "episode script timed out run_id=%s creation_id=%s episode=%s state=%s",
-                            work.run_id,
-                            work.creation_id,
-                            episode_number,
-                            recovery_state,
-                        )
-                        return
-                recovery_state = await self.repository.handle_run_timeout(
-                    work.run_id,
-                    timeout_stage,
-                )
-                logger.warning(
-                    "workflow run timed out run_id=%s creation_id=%s stage=%s state=%s",
+                logger.info(
+                    "workflow run succeeded run_id=%s creation_id=%s",
                     work.run_id,
                     work.creation_id,
-                    timeout_stage.value,
+                )
+            except asyncio.CancelledError:
+                raise
+            except MilestoneRejectedError as exc:
+                await self._handle_milestone_rejection(work, exc)
+                return
+            except EpisodeTimeoutError as exc:
+                recovery_state = await self.repository.handle_episode_timeout(
+                    work.run_id,
+                    exc.episode_number,
+                )
+                logger.warning(
+                    "episode script timed out run_id=%s creation_id=%s episode=%s state=%s",
+                    work.run_id,
+                    work.creation_id,
+                    exc.episode_number,
                     recovery_state,
                 )
                 return
-            failure_stage = self._failure_stage(exc, current_stage, approved)
-            failure = await self._safe_failure(work.run_id, failure_stage, exc)
-            await self.repository.fail_run(work.run_id, failure)
-            logger.warning(
-                "workflow run failed run_id=%s creation_id=%s stage=%s code=%s",
-                work.run_id,
-                work.creation_id,
-                failure.failed_stage.value,
-                failure.code,
-            )
-        except Exception as exc:
-            failure_stage = self._failure_stage(exc, current_stage, approved)
-            interruption = retryable_relay_interruption(exc)
-            if interruption is not None:
-                recovery_state, episode_number = await self._recover_relay_interruption(
-                    work,
-                    failure_stage,
-                    interruption.retry_delay_seconds,
+            except ContentReviewRejectedError as exc:
+                await self.repository.pause_content_rejection(
+                    work.run_id,
+                    stage=exc.stage,
+                    evidence=exc.evidence,
+                    repair_rounds=exc.repair_rounds,
+                    episode_number=exc.episode_number,
                 )
-                logger.warning(
-                    "relay interruption recovered run_id=%s creation_id=%s stage=%s episode=%s "
-                    "state=%s retry_delay_seconds=%s error_types=%s",
+                logger.info(
+                    "content review paused run_id=%s creation_id=%s stage=%s episode=%s",
                     work.run_id,
                     work.creation_id,
-                    failure_stage.value,
-                    episode_number,
-                    recovery_state,
-                    interruption.retry_delay_seconds,
+                    exc.stage.value,
+                    exc.episode_number,
+                )
+                return
+            except QualityGateRejectedError as exc:
+                rejection = await self.repository.reject_quality_gate(
+                    work.run_id,
+                    stage=exc.stage,
+                    evidence=exc.evidence,
+                )
+                logger.info(
+                    "quality gate rejected run_id=%s creation_id=%s stage=%s attempt=%s",
+                    work.run_id,
+                    work.creation_id,
+                    rejection.stage,
+                    rejection.attempt_count,
+                )
+                return
+            except PreflightBlockedError as exc:
+                await self.repository.pause_context_budget(
+                    work.run_id,
+                    stage=(InternalStage(exc.stage) if exc.stage else current_stage),
+                    safe_message=exc.safe_message,
+                    episode_number=exc.episode_number,
+                )
+                logger.warning(
+                    "context preflight blocked run_id=%s creation_id=%s stage=%s episode=%s "
+                    "required_tokens=%s verified_limit_tokens=%s",
+                    work.run_id,
+                    work.creation_id,
+                    exc.stage,
+                    exc.episode_number,
+                    exc.required_tokens,
+                    exc.verified_limit_tokens,
+                )
+                return
+            except TimeoutError as exc:
+                if run_timeout_scope is not None and run_timeout_scope.expired():
+                    timeout_stage = self._failure_stage(exc, current_stage, approved)
+                    if model_call_state is not None and model_call_state.store is not None:
+                        submit_store_write(
+                            model_call_state.store.mark_timed_out,
+                            run_id=str(work.run_id),
+                        )
+                    if timeout_stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+                        refreshed = await self.repository.get_run_work_item(work.run_id)
+                        episode_number = len(refreshed.episode_drafts) + 1
+                        if episode_number <= len(refreshed.episode_plans):
+                            recovery_state = await self.repository.handle_episode_timeout(
+                                work.run_id,
+                                episode_number,
+                            )
+                            logger.warning(
+                                "episode script timed out run_id=%s creation_id=%s "
+                                "episode=%s state=%s",
+                                work.run_id,
+                                work.creation_id,
+                                episode_number,
+                                recovery_state,
+                            )
+                            return
+                    recovery_state = await self.repository.handle_run_timeout(
+                        work.run_id,
+                        timeout_stage,
+                    )
+                    logger.warning(
+                        "workflow run timed out run_id=%s creation_id=%s stage=%s state=%s",
+                        work.run_id,
+                        work.creation_id,
+                        timeout_stage.value,
+                        recovery_state,
+                    )
+                    return
+                failure_stage = self._failure_stage(exc, current_stage, approved)
+                failure = await self._safe_failure(work.run_id, failure_stage, exc)
+                await self.repository.fail_run(work.run_id, failure)
+                logger.warning(
+                    "workflow run failed run_id=%s creation_id=%s stage=%s code=%s",
+                    work.run_id,
+                    work.creation_id,
+                    failure.failed_stage.value,
+                    failure.code,
+                )
+            except Exception as exc:
+                failure_stage = self._failure_stage(exc, current_stage, approved)
+                interruption = retryable_relay_interruption(exc)
+                if interruption is not None:
+                    recovery_state, episode_number = await self._recover_relay_interruption(
+                        work,
+                        failure_stage,
+                        interruption.retry_delay_seconds,
+                    )
+                    logger.warning(
+                        "relay interruption recovered run_id=%s creation_id=%s stage=%s episode=%s "
+                        "state=%s retry_delay_seconds=%s error_types=%s",
+                        work.run_id,
+                        work.creation_id,
+                        failure_stage.value,
+                        episode_number,
+                        recovery_state,
+                        interruption.retry_delay_seconds,
+                        _exception_type_chain(exc),
+                    )
+                    return
+                if await self._pause_recoverable_episode_error(work, failure_stage, exc):
+                    return
+                failure = await self._safe_failure(work.run_id, failure_stage, exc)
+                await self.repository.fail_run(work.run_id, failure)
+                logger.warning(
+                    "workflow run failed run_id=%s creation_id=%s stage=%s code=%s error_types=%s",
+                    work.run_id,
+                    work.creation_id,
+                    failure.failed_stage.value,
+                    failure.code,
                     _exception_type_chain(exc),
                 )
-                return
-            if await self._pause_recoverable_episode_error(work, failure_stage, exc):
-                return
-            failure = await self._safe_failure(work.run_id, failure_stage, exc)
-            await self.repository.fail_run(work.run_id, failure)
-            logger.warning(
-                "workflow run failed run_id=%s creation_id=%s stage=%s code=%s error_types=%s",
-                work.run_id,
-                work.creation_id,
-                failure.failed_stage.value,
-                failure.code,
-                _exception_type_chain(exc),
-            )
-        finally:
-            # The audit handler dispatches SQLite writes to a writer thread so it
-            # never deadlocks with the LangGraph checkpointer on the loop. Drain
-            # before this job's run state is observed so the durable model-call
-            # records (usage, stale, failed, blocked) are present for the API, UI,
-            # and evidence (Delivery #58 INT-A2/A6/A9).
-            await asyncio.to_thread(drain_audit_writes)
+            finally:
+                close_stage_observation(status="failed")
+                # The audit handler dispatches SQLite writes to a writer thread so it
+                # never deadlocks with the LangGraph checkpointer on the loop. Drain
+                # before this job's run state is observed so the durable model-call
+                # records (usage, stale, failed, blocked) are present for the API, UI,
+                # and evidence (Delivery #58 INT-A2/A6/A9).
+                await asyncio.to_thread(drain_audit_writes)
 
     async def _pause_recoverable_episode_error(
         self,
@@ -704,6 +955,8 @@ class Worker:
                 CheckpointUnavailableError,
                 PersonaPackageError,
                 DomainError,
+                AgentExecutionLimitError,
+                StageCallBudgetExceeded,
                 GraphRecursionError,
                 RelayError,
                 sqlite3.Error,
@@ -1260,6 +1513,8 @@ class Worker:
 
 
 def _classify_failure(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, (StageCallBudgetExceeded, AgentExecutionLimitError)):
+        return "agent_execution_limit", str(exc)
     if isinstance(exc, RelayError):
         return exc.code, exc.safe_message
     if isinstance(exc, AgentProtocolError):

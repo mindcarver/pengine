@@ -1224,6 +1224,52 @@ async def test_worker_pauses_on_context_preflight_block_without_losing_prior_wor
 
 
 @pytest.mark.asyncio
+async def test_worker_renews_a_long_running_job_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    settings = settings.model_copy(update={"lease_seconds": 5})
+    accepted = await repository.create_creation(
+        "lease-heartbeat",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+
+    class SlowWorkflow(DeterministicWorkflow):
+        async def execute(self, **kwargs: Any) -> WorkflowResult:
+            await asyncio.sleep(2.2)
+            return await super().execute(**kwargs)
+
+    renewals: list[int] = []
+    original_renew = repository.renew_job_lease
+
+    async def tracked_renewal(**kwargs: Any):
+        renewals.append(kwargs["lease_seconds"])
+        return await original_renew(**kwargs)
+
+    monkeypatch.setattr(repository, "renew_job_lease", tracked_renewal)
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=SlowWorkflow(),
+        worker_id="lease-heartbeat-worker",
+    )
+
+    assert await worker.run_once() is True
+    assert renewals
+    assert renewals[0] == 5
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "succeeded"
+
+
+@pytest.mark.asyncio
 async def test_paused_resource_exposes_blocked_model_call_lineage(tmp_path: Path) -> None:
     """The paused resource and workbench show required tokens, verified limit,
     route/model, and affected stage from the durable model-call envelope."""

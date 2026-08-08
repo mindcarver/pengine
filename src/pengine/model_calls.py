@@ -167,6 +167,7 @@ class ModelCallContext:
     run_kind: str | None = None
     stage: str | None = None
     episode_number: int | None = None
+    repair_round: int | None = None
     candidate: str | None = None
     batch: str | None = None
     call_id: str | None = None
@@ -178,9 +179,40 @@ class ModelCallContext:
         self.run_kind = None
         self.stage = None
         self.episode_number = None
+        self.repair_round = None
         self.candidate = None
         self.batch = None
         self.call_id = None
+
+
+class StageCallBudgetExceeded(RuntimeError):
+    """Raised before dispatch when one stage would exceed its model-call budget."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        role: str,
+        limit: int,
+        attempted: int,
+        budget_scope: str = "stage",
+        episode_number: int | None = None,
+    ) -> None:
+        self.stage = stage
+        self.role = role
+        self.limit = limit
+        self.attempted = attempted
+        self.budget_scope = budget_scope
+        self.episode_number = episode_number
+        subject = (
+            f"episode {episode_number}"
+            if budget_scope == "episode" and episode_number is not None
+            else "stage"
+        )
+        super().__init__(
+            f"The {stage} {subject} reached its {role} model-call budget "
+            f"({limit}); the next call was blocked before provider dispatch."
+        )
 
 
 @dataclass(slots=True)
@@ -541,3 +573,55 @@ class ModelCallState:
 
     store: ModelCallStore | None = None
     context: ModelCallContext = field(default_factory=ModelCallContext)
+    stage_call_counts: dict[str, int] = field(default_factory=dict)
+    stage_role_call_counts: dict[tuple[str, str], int] = field(default_factory=dict)
+    episode_role_call_counts: dict[tuple[str, int, str], int] = field(default_factory=dict)
+    _count_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def reset(self) -> None:
+        self.context.reset()
+        with self._count_lock:
+            self.stage_call_counts.clear()
+            self.stage_role_call_counts.clear()
+            self.episode_role_call_counts.clear()
+
+    def reserve_stage_call(
+        self,
+        *,
+        role: str,
+        limit: int | None,
+        total_limit: int | None = None,
+    ) -> int | None:
+        stage = self.context.stage
+        if stage is None or limit is None:
+            return None
+        with self._count_lock:
+            stage_key = (stage, role)
+            stage_attempted = self.stage_role_call_counts.get(stage_key, 0) + 1
+            effective_total_limit = total_limit or limit
+            if stage_attempted > effective_total_limit:
+                raise StageCallBudgetExceeded(
+                    stage=stage,
+                    role=role,
+                    limit=effective_total_limit,
+                    attempted=stage_attempted,
+                    budget_scope="stage",
+                )
+            episode_number = self.context.episode_number
+            episode_attempted: int | None = None
+            if episode_number is not None and total_limit is not None:
+                episode_key = (stage, episode_number, role)
+                episode_attempted = self.episode_role_call_counts.get(episode_key, 0) + 1
+                if episode_attempted > limit:
+                    raise StageCallBudgetExceeded(
+                        stage=stage,
+                        role=role,
+                        limit=limit,
+                        attempted=episode_attempted,
+                        budget_scope="episode",
+                        episode_number=episode_number,
+                    )
+                self.episode_role_call_counts[episode_key] = episode_attempted
+            self.stage_role_call_counts[stage_key] = stage_attempted
+            self.stage_call_counts[stage] = self.stage_call_counts.get(stage, 0) + 1
+            return episode_attempted or stage_attempted
