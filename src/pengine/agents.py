@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
 from fractions import Fraction
@@ -48,6 +49,8 @@ from pengine.language import (
     infer_output_language,
     language_instruction,
 )
+from pengine.model_calls import ModelCallState
+from pengine.observability import content_fingerprint, record_langfuse_event
 from pengine.relay import is_relay_exception, retryable_relay_interruption
 from pengine.schemas import (
     EpisodeDraft,
@@ -1269,6 +1272,105 @@ def _language_retry_matches(
     return matches(original, repaired)
 
 
+def _language_repair_ratio(stage: InternalStage | None) -> float:
+    # Mirrors _validate_result_language: story artifacts tolerate more Latin
+    # (character/place names); every other stage stays strict.
+    return 4.0 if stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS else 2.0
+
+
+def _strip_language_glosses(value: Any, *, ratio: float) -> Any:
+    """Deterministically repair `中文（English gloss）` values without a model call."""
+    if isinstance(value, str):
+        if not has_obvious_language_mismatch(value, "zh-CN", english_dominance_ratio=ratio):
+            return value
+        core = _BILINGUAL_GLOSS_SUFFIX.sub("", value).strip()
+        if core != value.strip() and not has_obvious_language_mismatch(
+            core, "zh-CN", english_dominance_ratio=ratio
+        ):
+            return core
+        return value
+    if isinstance(value, Mapping):
+        return {key: _strip_language_glosses(item, ratio=ratio) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_strip_language_glosses(item, ratio=ratio) for item in value]
+    return value
+
+
+_REPAIR_ALIGNMENT_KEYS = (
+    "character_id",
+    "fact_id",
+    "event_id",
+    "clue_id",
+    "obligation_id",
+    "episode_number",
+)
+
+
+def _align_repaired_items(original: list[Any], repaired: list[Any]) -> list[Any] | None:
+    """Pair repaired list items with originals by stable ID so a reordered
+    repair cannot splice one item's translation into another. Falls back to
+    positional pairing for same-length lists, else None (keep originals)."""
+    for key in _REPAIR_ALIGNMENT_KEYS:
+        if not all(
+            isinstance(item, Mapping) and key in item for item in [*original, *repaired]
+        ):
+            continue
+        try:
+            index = {item[key]: item for item in repaired}
+        except TypeError:
+            continue
+        if len(index) != len(repaired):
+            continue
+        return [index.get(item[key]) for item in original]
+    if len(original) == len(repaired):
+        return repaired
+    return None
+
+
+def _merge_language_repair(original: Any, repaired: Any, *, ratio: float) -> Any:
+    """Splice translated strings from `repaired` into `original`'s structure.
+
+    Only strings that violate the language gate in `original` are replaced, and
+    only when the repaired counterpart passes the gate. Structure, ordering,
+    and every locked fact come verbatim from `original`, so the repair cannot
+    change non-language fields by construction.
+    """
+    if isinstance(original, str):
+        if (
+            isinstance(repaired, str)
+            and has_obvious_language_mismatch(original, "zh-CN", english_dominance_ratio=ratio)
+            and not has_obvious_language_mismatch(
+                repaired, "zh-CN", english_dominance_ratio=ratio
+            )
+        ):
+            return repaired
+        return original
+    if isinstance(original, Mapping):
+        if not isinstance(repaired, Mapping):
+            return original
+        return {
+            key: (
+                _merge_language_repair(item, repaired[key], ratio=ratio)
+                if key in repaired
+                else item
+            )
+            for key, item in original.items()
+        }
+    if isinstance(original, list):
+        if not isinstance(repaired, list):
+            return original
+        aligned = _align_repaired_items(original, repaired)
+        if aligned is None:
+            return original
+        return [
+            item
+            if counterpart is None
+            else _merge_language_repair(item, counterpart, ratio=ratio)
+            for item, counterpart in zip(original, aligned, strict=True)
+        ]
+    return original
+
+
 class AgentProtocolError(RuntimeError):
     def __init__(
         self,
@@ -1284,6 +1386,10 @@ class AgentProtocolError(RuntimeError):
         self.repair_instruction = repair_instruction
         self.language_retry_fingerprint = language_retry_fingerprint
         self.safe_message = safe_message
+
+
+class AgentExecutionLimitError(AgentProtocolError):
+    """A bounded agent loop stopped before it could safely return a result."""
 
 
 def _validate_result_language(
@@ -2643,6 +2749,7 @@ class StageGuardMiddleware(AgentMiddleware):
         series_bible: SeriesBibleSummary | None = None,
         register_series_review: SeriesReviewRegistration | None = None,
         get_series_bible: SeriesBibleRetriever | None = None,
+        model_call_state: ModelCallState | None = None,
     ) -> None:
         self.before_stage = before_stage
         self.approve_stage = approve_stage
@@ -2661,6 +2768,19 @@ class StageGuardMiddleware(AgentMiddleware):
         self.series_bible = series_bible
         self.register_series_review = register_series_review
         self.get_series_bible = get_series_bible
+        self.model_call_state = model_call_state
+
+    @contextmanager
+    def _repair_round_context(self, repair_round: int | None):
+        if self.model_call_state is None:
+            yield
+            return
+        previous = self.model_call_state.context.repair_round
+        self.model_call_state.context.repair_round = repair_round
+        try:
+            yield
+        finally:
+            self.model_call_state.context.repair_round = previous
 
     async def awrap_tool_call(
         self,
@@ -3013,6 +3133,7 @@ class StageGuardMiddleware(AgentMiddleware):
                 files=review_files,
                 schema=StoryArchitectResult,
                 stage=stage,
+                repair_round=repair_round,
             )
             return StoryArchitectResult.model_validate(payload)
 
@@ -3062,6 +3183,17 @@ class StageGuardMiddleware(AgentMiddleware):
                     len(patch.line_replacements),
                     len(meaningful_ranges),
                     meaningful_ranges,
+                )
+                record_langfuse_event(
+                    "pengine.repair.result",
+                    input={
+                        "stage": stage.value,
+                        "repair_kind": "story_patch",
+                        "repair_round": repair_round,
+                        "succeeded": True,
+                        "candidate_chars": len(content),
+                    },
+                    metadata={"trace_version": "pengine-1"},
                 )
                 return repaired
             except AgentProtocolError as exc:
@@ -3337,17 +3469,29 @@ class StageGuardMiddleware(AgentMiddleware):
                         else "The episode-outline repair patch was invalid."
                     ),
                 ) from exc
+            record_langfuse_event(
+                "pengine.repair.result",
+                input={
+                    "stage": stage.value,
+                    "repair_kind": "outline_patch",
+                    "repair_round": repair_round,
+                    "succeeded": True,
+                },
+                metadata={"trace_version": "pengine-1"},
+            )
             return repaired.model_dump(mode="json")
 
         try:
-            return await generate_and_apply(None)
+            with self._repair_round_context(repair_round):
+                return await generate_and_apply(None)
         except AgentProtocolError as first_error:
             correction = (
                 "The previous patch could not be applied or did not validate. Return exactly "
                 "one corrected OutlineRepairPatch tool call now. Do not return analysis or the "
                 f"full candidate. {first_error.repair_instruction or ''}"
             )
-            return await generate_and_apply(correction)
+            with self._repair_round_context(repair_round):
+                return await generate_and_apply(correction)
 
     async def _call_structured_stage(
         self,
@@ -3376,6 +3520,27 @@ class StageGuardMiddleware(AgentMiddleware):
             if str(exc) != "Subagent returned invalid structured output":
                 raise
             language_only_retry = exc.language_retry_fingerprint is not None
+            ratio = _language_repair_ratio(stage)
+            original_raw: Mapping[str, Any] | None = None
+            if language_only_retry:
+                # First try the deterministic repair: strip appended English
+                # glosses in code. If that alone satisfies the gate, no model
+                # round-trip happens at all.
+                original_raw = _strip_language_glosses(
+                    _parse_stage_result(stage, json.loads(message.content)).model_dump(
+                        mode="json"
+                    ),
+                    ratio=ratio,
+                )
+                try:
+                    return result, _validated_stage_payload(
+                        stage,
+                        json.dumps(original_raw, ensure_ascii=False),
+                        expected_episode_number=expected_episode_number,
+                        output_language=self.output_language,
+                    )
+                except AgentProtocolError:
+                    pass  # genuinely English content remains; ask the model
             retry_description = (
                 f"{description}\n"
                 "The previous attempt did not produce an acceptable result. Reuse its "
@@ -3403,7 +3568,11 @@ class StageGuardMiddleware(AgentMiddleware):
             if language_only_retry:
                 retry_request = _request_with_files(
                     retry_request,
-                    {"/workspace/result_to_translate.json": message.content},
+                    {
+                        "/workspace/result_to_translate.json": json.dumps(
+                            original_raw, ensure_ascii=False
+                        )
+                    },
                 )
             result = await handler(retry_request)
             message = _tool_message(result)
@@ -3412,27 +3581,60 @@ class StageGuardMiddleware(AgentMiddleware):
                     "Subagent result was not JSON text",
                     stage=stage,
                 ) from exc
-            payload = _validated_stage_payload(
-                stage,
-                message.content,
-                expected_episode_number=expected_episode_number,
-                output_language=self.output_language,
-                enforce_quality_gate=False,
-            )
+            if language_only_retry:
+                assert original_raw is not None
+                try:
+                    repaired_parsed = _parse_stage_result(stage, json.loads(message.content))
+                except AgentProtocolError:
+                    raise
+                except Exception as parse_exc:
+                    raise AgentProtocolError(
+                        "Language repair returned invalid structured output",
+                        stage=stage,
+                        safe_message=(
+                            "语言修复返回的结构化结果无效。"
+                            if self.output_language == "zh-CN"
+                            else "Language repair returned invalid structured output."
+                        ),
+                    ) from parse_exc
+                # Splice only the translated strings back into the original
+                # structure; the model's rewrite can never touch locked fields.
+                merged = _merge_language_repair(
+                    original_raw,
+                    repaired_parsed.model_dump(mode="json"),
+                    ratio=ratio,
+                )
+                try:
+                    payload = _validated_stage_payload(
+                        stage,
+                        json.dumps(merged, ensure_ascii=False),
+                        expected_episode_number=expected_episode_number,
+                        output_language=self.output_language,
+                        enforce_quality_gate=False,
+                    )
+                except AgentProtocolError as merge_exc:
+                    # Deterministic dead end — a second identical round-trip
+                    # would fail the same way, so stop here with evidence
+                    # instead of burning further attempts.
+                    raise AgentProtocolError(
+                        "Language repair could not converge while preserving "
+                        "locked structure",
+                        stage=stage,
+                        safe_message=(
+                            "语言修复未能在保持锁定结构的前提下完成简体中文转换。"
+                            if self.output_language == "zh-CN"
+                            else "Language repair could not preserve locked structured fields."
+                        ),
+                    ) from merge_exc
+            else:
+                payload = _validated_stage_payload(
+                    stage,
+                    message.content,
+                    expected_episode_number=expected_episode_number,
+                    output_language=self.output_language,
+                    enforce_quality_gate=False,
+                )
             repaired_result = _parse_stage_result(stage, payload)
-            if exc.language_retry_fingerprint is not None and not _language_retry_matches(
-                exc.language_retry_fingerprint,
-                _language_retry_fingerprint(repaired_result),
-            ):
-                raise AgentProtocolError(
-                    "Language repair changed non-language fields",
-                    stage=stage,
-                    safe_message=(
-                        "语言修复改变了已锁定的结构化事实或审核结论。"
-                        if self.output_language == "zh-CN"
-                        else "Language repair changed locked structured fields."
-                    ),
-                ) from exc
             if isinstance(repaired_result, QualityReviewerResult) and not repaired_result.passed:
                 raise QualityGateRejectedError(
                     stage=stage,
@@ -3462,7 +3664,7 @@ class StageGuardMiddleware(AgentMiddleware):
             nonlocal call_count
             call_count += 1
             if call_count > _REVIEW_SUBAGENT_MAX_CALLS:
-                raise AgentProtocolError(
+                raise AgentExecutionLimitError(
                     "Review subagent exceeded its internal call budget without "
                     "returning a structured result",
                     stage=stage,
@@ -3504,6 +3706,8 @@ class StageGuardMiddleware(AgentMiddleware):
             return parsed, result
 
         review, review_result = await invoke(review_request)
+        review_issues = getattr(review, "issues", [])
+        review_issue_codes = [issue.code for issue in review_issues]
         try:
             _validate_result_language(
                 review,
@@ -3549,7 +3753,39 @@ class StageGuardMiddleware(AgentMiddleware):
                     stage=stage,
                     safe_message="语言修复改变了原审核结论。",
                 ) from exc
+            record_langfuse_event(
+                "pengine.review.semantic",
+                input={
+                    "stage": stage.value,
+                    "passed": repaired.passed,
+                    "issue_count": len(getattr(repaired, "issues", [])),
+                    "schema": schema.__name__,
+                    "language_repair": True,
+                },
+                metadata={
+                    "issue_codes": [issue.code for issue in getattr(repaired, "issues", [])],
+                    "category": getattr(repaired, "category", None),
+                    "evidence_sha256": content_fingerprint(repaired.evidence),
+                    "trace_version": "pengine-1",
+                },
+            )
             return repaired
+        record_langfuse_event(
+            "pengine.review.semantic",
+            input={
+                "stage": stage.value,
+                "passed": review.passed,
+                "issue_count": len(review_issues),
+                "schema": schema.__name__,
+                "language_repair": False,
+            },
+            metadata={
+                "issue_codes": review_issue_codes,
+                "category": getattr(review, "category", None),
+                "evidence_sha256": content_fingerprint(review.evidence),
+                "trace_version": "pengine-1",
+            },
+        )
         return review
 
     async def _invoke_repair_subagent(
@@ -3565,6 +3801,7 @@ class StageGuardMiddleware(AgentMiddleware):
         ),
         stage: InternalStage,
         expected_episode_number: int | None = None,
+        repair_round: int | None = None,
     ) -> tuple[ToolMessage | Command[Any], Mapping[str, Any]]:
         repair_request = _subagent_request(
             request,
@@ -3630,7 +3867,8 @@ class StageGuardMiddleware(AgentMiddleware):
             )
             return parsed_result
 
-        result = await handler(repair_request)
+        with self._repair_round_context(repair_round):
+            result = await handler(repair_request)
         try:
             parsed = parse_result(result)
         except AgentProtocolError as exc:
@@ -3670,7 +3908,8 @@ class StageGuardMiddleware(AgentMiddleware):
                     retry_request,
                     {"/workspace/result_to_translate.json": original_message.content},
                 )
-            result = await handler(retry_request)
+            with self._repair_round_context(repair_round):
+                result = await handler(retry_request)
             parsed = parse_result(result)
             if exc.language_retry_fingerprint is not None and not _language_retry_matches(
                 exc.language_retry_fingerprint,
@@ -3681,6 +3920,17 @@ class StageGuardMiddleware(AgentMiddleware):
                     stage=stage,
                     safe_message="语言修复改变了已锁定的合同或连续性状态。",
                 ) from exc
+        record_langfuse_event(
+            "pengine.repair.result",
+            input={
+                "stage": stage.value,
+                "repair_kind": subagent_type,
+                "succeeded": True,
+                "episode_number": expected_episode_number,
+                "repair_round": repair_round,
+            },
+            metadata={"trace_version": "pengine-1"},
+        )
         return result, parsed.model_dump(mode="json")
 
     async def _milestone_review(
@@ -4056,6 +4306,7 @@ class StageGuardMiddleware(AgentMiddleware):
                     schema=ScriptWriterResult,
                     stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
                     expected_episode_number=plan.episode_number,
+                    repair_round=repair_rounds,
                 )
                 parsed = ScriptWriterResult.model_validate(payload)
 
@@ -4095,6 +4346,7 @@ class DeepAgentWorkflow:
     recursion_limit: int = 80
     generation_provider_profile_key: str = "anthropic"
     review_provider_profile_key: str = "deepseek"
+    model_call_state: ModelCallState | None = None
 
     def __post_init__(self) -> None:
         register_pengine_harness_profile(self.generation_provider_profile_key)
@@ -4518,6 +4770,7 @@ class DeepAgentWorkflow:
                     series_bible=series_bible,
                     register_series_review=register_series_review,
                     get_series_bible=get_series_bible,
+                    model_call_state=self.model_call_state,
                 )
             ],
             subagents=subagents,

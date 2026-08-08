@@ -4344,7 +4344,66 @@ def test_chinese_language_guard_rejects_bilingual_l0_variant_title() -> None:
 
 
 @pytest.mark.asyncio
-async def test_l0_language_retry_receives_exact_result_and_translates_only() -> None:
+async def test_l0_language_gloss_is_repaired_deterministically_without_model_call() -> None:
+    descriptions: list[str] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The helper must not approve a stage")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=selecting_l0_variant] select L0",
+                "subagent_type": "story_architect",
+            },
+            "id": "call-l0-language",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(language_request: ToolCallRequest) -> ToolMessage:
+        descriptions.append(language_request.tool_call["args"]["description"])
+        payload = {
+            "stage": "selecting_l0_variant",
+            "content": None,
+            "character_biographies": None,
+            "relationship_logic": None,
+            "selected_l0_variant": "克制情感悬疑（Restrained Emotional Suspense）",
+            "selection_rationale": "用人物关系推动真相揭晓。",
+        }
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-l0-language",
+        )
+
+    _, payload = await middleware._call_structured_stage(
+        InternalStage.SELECTING_L0_VARIANT,
+        request,
+        handler,
+        request.tool_call["args"],
+    )
+
+    # The appended English gloss is stripped in code; no model retry happens.
+    assert len(descriptions) == 1
+    assert payload["selected_l0_variant"] == "克制情感悬疑"
+    assert payload["selection_rationale"] == "用人物关系推动真相揭晓。"
+
+
+@pytest.mark.asyncio
+async def test_l0_language_retry_merges_translation_and_keeps_locked_fields() -> None:
     descriptions: list[str] = []
     captured_source: list[dict[str, Any]] = []
 
@@ -4383,8 +4442,10 @@ async def test_l0_language_retry_receives_exact_result_and_translates_only() -> 
                 "content": None,
                 "character_biographies": None,
                 "relationship_logic": None,
-                "selected_l0_variant": "克制情感悬疑（Restrained Emotional Suspense）",
-                "selection_rationale": "用人物关系推动真相揭晓。",
+                "selected_l0_variant": "克制情感悬疑",
+                "selection_rationale": (
+                    "The relationships drive the reveal of the truth in every episode."
+                ),
             }
         else:
             files = language_request.state["files"]
@@ -4392,7 +4453,10 @@ async def test_l0_language_retry_receives_exact_result_and_translates_only() -> 
             captured_source.append(source)
             payload = {
                 **source,
-                "selected_l0_variant": "克制情感悬疑",
+                # The model translates the flagged field but also tampers with
+                # an already-Chinese locked field; the merge must ignore that.
+                "selected_l0_variant": "全新的创作方向",
+                "selection_rationale": "用人物关系推动真相揭晓。",
             }
         return ToolMessage(
             content=json.dumps(payload, ensure_ascii=False),
@@ -4409,7 +4473,8 @@ async def test_l0_language_retry_receives_exact_result_and_translates_only() -> 
     assert len(descriptions) == 2
     assert "translate only" in descriptions[1]
     assert "do not make a new creative choice" in descriptions[1]
-    assert captured_source[0]["selected_l0_variant"].endswith("（Restrained Emotional Suspense）")
+    assert captured_source[0]["selection_rationale"].startswith("The relationships")
+    assert payload["selection_rationale"] == "用人物关系推动真相揭晓。"
     assert payload["selected_l0_variant"] == "克制情感悬疑"
 
 
@@ -4444,12 +4509,13 @@ async def test_language_repair_cannot_change_quality_gate_decision(
     repaired_decision: bool,
 ) -> None:
     descriptions: list[str] = []
+    approved: list[dict[str, Any]] = []
 
     async def before_stage(_: InternalStage) -> int:
         return 1
 
-    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
-        raise AssertionError("A changed gate decision must not be approved")
+    async def approve_stage(_: InternalStage, payload: dict[str, Any]) -> None:
+        approved.append(payload)
 
     middleware = StageGuardMiddleware(
         before_stage=before_stage,
@@ -4494,8 +4560,16 @@ async def test_language_repair_cannot_change_quality_gate_decision(
             tool_call_id="call-gate-language-repair",
         )
 
-    with pytest.raises(AgentProtocolError, match="changed non-language fields"):
+    # The merge keeps the original decision by construction: the model's
+    # flipped verdict is ignored and only the translated evidence is spliced.
+    if initial_decision:
         await middleware.awrap_tool_call(request, handler)
+        assert approved and approved[0]["passed"] is True
+        assert approved[0]["evidence"] == "审核结论已翻译。"
+    else:
+        with pytest.raises(QualityGateRejectedError):
+            await middleware.awrap_tool_call(request, handler)
+        assert not approved
 
     assert len(descriptions) == 2
 
