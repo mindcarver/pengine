@@ -552,6 +552,47 @@ def test_episode_validation_does_not_treat_scene_heading_as_speaker(heading: str
 
 
 @pytest.mark.parametrize(
+    "format_line",
+    [
+        "特写：物证袋上的编号被胶带遮住。",
+        "人物：林岚站在长条桌前。",
+        "内景：审讯室。",
+        "外景：旧屋门前。",
+        "近景：林岚的手指。",
+        "远景：码头渐渐隐去。",
+        "全景：物证室一片安静。",
+        "中景：林岚合上笔记本。",
+        "画外音：门后传来一声轻响。",
+        "独白：我不能再等了。",
+        "闪回：雨夜的旧屋。",
+        "转场：翌日清晨。",
+        "镜头贴着装订线看进去：纸页边缘有撕裂痕迹。",
+        "长条桌上物证袋排成一列：林岚没有伸手。",
+        "所以结论我写下来：她把笔记本合上。",
+        "我一直照着一个假设查：林岚望向窗外。",
+    ],
+)
+def test_episode_validation_does_not_treat_format_or_narration_as_speaker(
+    format_line: str,
+) -> None:
+    contract = make_contract()
+    contract_hash = story_contract_sha256(contract)
+    issues = validate_episode_candidate(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=initial_series_state(contract, contract_hash),
+        content=(
+            f"{format_line}\n"
+            "林岚：我在2015-08-12的21:40到这里，监控持续80分钟。\n"
+            "门后传来第二次敲击"
+        ),
+        delta=make_delta(contract),
+    )
+
+    assert "unknown_speaker" not in {issue.code for issue in issues}
+
+
+@pytest.mark.parametrize(
     "invalid_line",
     [
         (
