@@ -47,7 +47,7 @@ _CONVERTIBLE_MEASURED_UNITS = {
     "米": ("length_millimeters", Decimal("1000")),
 }
 _SPEAKER = re.compile(
-    r"^\s*([A-Za-z\u3400-\u9fff][A-Za-z0-9_·\u3400-\u9fff]{0,15})"
+    r"^\s*([A-Za-z\u3400-\u9fff][A-Za-z0-9_·\u3400-\u9fff]{0,4})"
     r"(?:\s*[（(][^）)\r\n]{0,40}[）)])?\s*[：:]"
 )
 _SCENE_HEADING = re.compile(
@@ -64,6 +64,18 @@ _NON_CHARACTER_LABELS = {
     "同期声",
     "动作",
     "镜头",
+    "特写",
+    "人物",
+    "内景",
+    "外景",
+    "近景",
+    "远景",
+    "全景",
+    "中景",
+    "画外音",
+    "独白",
+    "闪回",
+    "转场",
 }
 
 
