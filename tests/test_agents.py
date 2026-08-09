@@ -4699,7 +4699,13 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
     responses = _successful_responses()
     writer_index = _index_of_tool_call(responses, "ScriptWriterResult", occurrence=1)
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
-    writer_payload = responses[writer_index].tool_calls[0]["args"]
+    writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
+    writer_payload["state_delta"]["evidence"] = [
+        item
+        for item in writer_payload["state_delta"]["evidence"]
+        if item["target_id"] != "fact_ep1"
+    ]
+    responses[writer_index] = _tool_call("ScriptWriterResult", writer_payload, writer_index)
     failed_review = {
         "passed": False,
         "evidence": "人物身份与上游小传不一致",
@@ -4707,7 +4713,7 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
             {
                 "code": "identity_drift",
                 "message": "剧本把母亲姓名改成了合同外角色",
-                "contract_refs": ["fact_ep1"],
+                "contract_refs": ["semantic_target"],
                 "script_excerpt": "事实1",
             }
         ],
@@ -4746,6 +4752,9 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
 
     assert error.value.episode_number == 1
     assert error.value.repair_rounds == 2
+    assert "missing_evidence_targets" in error.value.evidence
+    assert "目标：fact_ep1" in error.value.evidence
+    assert "审查目标：fact_ep1, semantic_target" in error.value.evidence
     assert episode_attempts == [1]
     assert InternalStage.GENERATING_EPISODE_SCRIPTS not in approved
 
@@ -4796,6 +4805,7 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
         ),
     )
     captured_files: list[Mapping[str, str]] = []
+    captured_descriptions: list[str] = []
     original_repair = StageGuardMiddleware._invoke_repair_subagent
 
     async def capture_repair(
@@ -4803,6 +4813,7 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
         **kwargs: Any,
     ) -> tuple[Any, dict[str, Any]]:
         captured_files.append(kwargs["files"])
+        captured_descriptions.append(kwargs["description"])
         return await original_repair(middleware, **kwargs)
 
     monkeypatch.setattr(StageGuardMiddleware, "_invoke_repair_subagent", capture_repair)
@@ -4840,6 +4851,9 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
         issue for issue in review["issues"] if issue["code"] == "missing_evidence_targets"
     )
     assert missing["contract_refs"] == ["fact_ep1"]
+    assert "exactly one state_delta.evidence entry" in captured_descriptions[0]
+    assert "remove every unexpected target" in captured_descriptions[0]
+    assert "verbatim" in captured_descriptions[0]
     assert captured_files[0]["/workspace/current_episode_plan.md"] == "第一集计划"
     obligation = json.loads(captured_files[0]["/workspace/current_episode_obligation.json"])
     assert obligation["end_hook"] == "钩子1"
