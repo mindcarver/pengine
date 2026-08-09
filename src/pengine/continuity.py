@@ -50,6 +50,8 @@ _SPEAKER = re.compile(
     r"^\s*([A-Za-z\u3400-\u9fff][A-Za-z0-9_·\u3400-\u9fff]{0,4})"
     r"(?:\s*[（(][^）)\r\n]{0,40}[）)])?\s*[：:]"
 )
+_CHARACTER_LABEL_QUALIFIER = re.compile(r"\s*[（(][^）)\r\n]{1,40}[）)]\s*$")
+_KNOWN_SPEAKER_SUFFIX = re.compile(r"^(?:\s*[（(][^）)\r\n]{0,40}[）)])*\s*[：:]")
 _SCENE_HEADING = re.compile(
     r"^(?:场景[零〇一二两三四五六七八九十百\d]+|第[零〇一二两三四五六七八九十百\d]+场)$"
 )
@@ -77,6 +79,22 @@ _NON_CHARACTER_LABELS = {
     "闪回",
     "转场",
 }
+
+
+def character_label_base(label: str) -> str:
+    """Return a display label without trailing role or state qualifiers."""
+    base = label.strip()
+    while match := _CHARACTER_LABEL_QUALIFIER.search(base):
+        base = base[: match.start()].rstrip()
+    return base
+
+
+def _is_known_speaker_line(line: str, character_names: set[str]) -> bool:
+    stripped = line.lstrip()
+    return any(
+        stripped.startswith(name) and _KNOWN_SPEAKER_SUFFIX.match(stripped[len(name) :]) is not None
+        for name in character_names
+    )
 
 
 class ContinuityModel(BaseModel):
@@ -827,6 +845,8 @@ def validate_episode_candidate(
 
     character_names = {character.name for character in contract.characters}
     for line in content.splitlines():
+        if _is_known_speaker_line(line, character_names):
+            continue
         match = _SPEAKER.match(line)
         if (
             match

@@ -551,6 +551,26 @@ def test_episode_validation_does_not_treat_scene_heading_as_speaker(heading: str
     assert "unknown_speaker" not in {issue.code for issue in issues}
 
 
+def test_episode_validation_accepts_exact_annotated_character_speaker_label() -> None:
+    payload = make_contract().model_dump(mode="json")
+    payload["characters"][0]["name"] = "林岚（主角）"
+    contract = StoryContract.model_validate(payload)
+    contract_hash = story_contract_sha256(contract)
+    issues = validate_episode_candidate(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=initial_series_state(contract, contract_hash),
+        content=(
+            "林岚（主角）：我在2015-08-12的21:40到这里，监控持续80分钟。\n"
+            "林岚（主角）（低声）：门后又响了一次。\n"
+            "门后传来第二次敲击"
+        ),
+        delta=make_delta(contract),
+    )
+
+    assert "unknown_speaker" not in {issue.code for issue in issues}
+
+
 @pytest.mark.parametrize(
     "format_line",
     [

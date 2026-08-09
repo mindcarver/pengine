@@ -98,6 +98,19 @@ EpisodeDeadlineReset = Callable[[], Awaitable[None]]
 SeriesReviewRegistration = Callable[..., Awaitable[str]]
 
 
+class StageValidationError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: InternalStage,
+        safe_message: str,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.safe_message = safe_message
+
+
 class WorkflowExecutor(Protocol):
     async def execute(
         self,
@@ -866,14 +879,20 @@ class Worker:
         if not evidence.passed:
             # A deterministically invalid candidate is retained as immutable
             # evidence but is never reviewed or promoted, so no active pointer
-            # can change (SDP-A3). The already-approved outline continues the run.
+            # can change (SDP-A3). Episode writing requires an active design, so
+            # stop at the design boundary instead of failing later during commit.
+            issue_codes = sorted(issue.code for issue in evidence.issues)
             logger.warning(
                 "series bible candidate rejected run_id=%s candidate=%s issues=%s",
                 work.run_id,
                 candidate.candidate_id,
-                sorted(issue.code for issue in evidence.issues),
+                issue_codes,
             )
-            return
+            raise StageValidationError(
+                "SeriesBible candidate failed deterministic validation: " + ", ".join(issue_codes),
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                safe_message="系列设计未通过确定性校验，未进入分集剧本生成。",
+            )
         review = await self._bind_global_design_review(work, candidate, outline)
         await self.repository.record_series_bible_review(
             work.run_id,
@@ -1262,6 +1281,8 @@ class Worker:
 def _classify_failure(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, RelayError):
         return exc.code, exc.safe_message
+    if isinstance(exc, StageValidationError):
+        return "stage_validation_failed", exc.safe_message
     if isinstance(exc, AgentProtocolError):
         return "structured_output_invalid", exc.safe_message
     if isinstance(exc, QualityGateRejectedError):
