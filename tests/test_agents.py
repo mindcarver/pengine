@@ -3676,6 +3676,8 @@ async def test_last_episode_review_receives_complete_series_prefix_before_approv
         else:
             assert subagent_type == "episode_reviewer"
             assert "complete committed series prefix" in description
+            assert "trusted runtime metadata" in description
+            assert "episodes[].content" in description
             for required_check in (
                 "identities",
                 "relationships",
@@ -3685,7 +3687,7 @@ async def test_last_episode_review_receives_complete_series_prefix_before_approv
             ):
                 assert required_check in description
             reviewed_prefixes.append(set(subagent_request.state["files"]))
-            prefix_file = subagent_request.state["files"]["/workspace/series_prefix.md"]
+            prefix_file = subagent_request.state["files"]["/workspace/series_prefix.json"]
             reviewed_prefix_contents.append(prefix_file["content"])
             payload = {"passed": True, "evidence": "完整前缀一致", "issues": []}
         return ToolMessage(
@@ -3705,10 +3707,15 @@ async def test_last_episode_review_receives_complete_series_prefix_before_approv
         "/workspace/relationship_logic.md",
         "/workspace/episode_outline.md",
         "/workspace/story_contract.json",
-        "/workspace/series_prefix.md",
+        "/workspace/series_prefix.json",
     } <= reviewed_prefixes[1]
-    assert "第 1 集\n事实1" in reviewed_prefix_contents[1]
-    assert "第 2 集\n事实2" in reviewed_prefix_contents[1]
+    assert json.loads(reviewed_prefix_contents[1]) == {
+        "episodes": [
+            {"episode_number": 1, "content": "事实1\n钩子1"},
+            {"episode_number": 2, "content": "事实2\n钩子2"},
+        ]
+    }
+    assert "第 1 集" not in reviewed_prefix_contents[1]
     assert InternalStage.GENERATING_EPISODE_SCRIPTS in approvals
 
 
@@ -3798,6 +3805,7 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
     )
     writer_inputs: list[dict[str, Any]] = []
     writer_descriptions: list[str] = []
+    series_review_inputs: list[dict[str, Any]] = []
 
     async def handler(subagent_request: ToolCallRequest) -> ToolMessage:
         description = subagent_request.tool_call["args"]["description"]
@@ -3815,6 +3823,9 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
             }
         elif subagent_type == "series_reviewer":
             # The final milestone (episode 2) fires the bound final structural review.
+            assert "trusted runtime metadata" in description
+            assert "episodes[].content" in description
+            series_review_inputs.append(dict(subagent_request.state["files"]))
             payload = {"passed": True, "category": "pass", "evidence": "全系列一致"}
         else:
             assert subagent_type == "episode_reviewer"
@@ -3827,6 +3838,14 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
     await middleware.awrap_tool_call(request, handler)
 
     assert attempts == [1, 2]
+    assert len(series_review_inputs) == 1
+    series_prefix = json.loads(series_review_inputs[0]["/workspace/series_prefix.json"]["content"])
+    assert series_prefix == {
+        "episodes": [
+            {"episode_number": 1, "content": "事实1\n钩子1"},
+            {"episode_number": 2, "content": "事实2\n钩子2"},
+        ]
+    }
     first_input = writer_inputs[0]
     second_input = writer_inputs[1]
 
