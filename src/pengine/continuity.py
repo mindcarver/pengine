@@ -659,6 +659,9 @@ def validate_episode_candidate(
     expected_resolved = {
         clue.clue_id for clue in contract.clues if clue.explained_episode == episode
     }
+    expected_callbacks = {
+        clue.clue_id for clue in contract.clues if clue.callback_episode == episode
+    }
     if set(delta.introduced_clue_ids) != expected_introduced:
         issues.append(
             _issue(
@@ -689,15 +692,31 @@ def validate_episode_candidate(
         )
 
     expected_evidence = (
-        expected_facts | expected_introduced | expected_resolved | {obligation.obligation_id}
+        expected_facts
+        | expected_introduced
+        | expected_resolved
+        | expected_callbacks
+        | {obligation.obligation_id}
+        | set(obligation.required_clue_ids)
     )
     evidence = {item.target_id: item.excerpt for item in delta.evidence}
-    if len(evidence) != len(delta.evidence) or set(evidence) != expected_evidence:
+    provided_targets = set(evidence)
+    missing_targets = sorted(expected_evidence - provided_targets)
+    if missing_targets:
         issues.append(
             _issue(
-                "evidence_coverage_mismatch",
-                "剧本证据未覆盖全部必需事实、线索和分集义务",
-                sorted(expected_evidence),
+                "missing_evidence_targets",
+                "剧本证据缺少必需的事实、线索或分集义务",
+                missing_targets,
+            )
+        )
+    unexpected_targets = sorted(provided_targets - expected_evidence)
+    if unexpected_targets:
+        issues.append(
+            _issue(
+                "unexpected_evidence_targets",
+                "剧本证据包含未声明的事实、线索或分集义务",
+                unexpected_targets,
             )
         )
     for target_id, excerpt in evidence.items():
