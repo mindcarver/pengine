@@ -4762,6 +4762,11 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     repaired_writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
     invalid_writer_payload = copy.deepcopy(repaired_writer_payload)
     invalid_writer_payload["content"] = "钩子1"
+    invalid_writer_payload["state_delta"]["evidence"] = [
+        item
+        for item in invalid_writer_payload["state_delta"]["evidence"]
+        if item["target_id"] != "fact_ep1"
+    ]
     responses[writer_index] = _tool_call("ScriptWriterResult", invalid_writer_payload, writer_index)
     responses[review_index] = _tool_call(
         "EpisodeReviewerResult",
@@ -4828,9 +4833,13 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
 
     review = json.loads(captured_files[0]["/workspace/episode_review.json"])
     assert {issue["code"] for issue in review["issues"]} >= {
-        "evidence_not_in_script",
+        "missing_evidence_targets",
         "identity_drift",
     }
+    missing = next(
+        issue for issue in review["issues"] if issue["code"] == "missing_evidence_targets"
+    )
+    assert missing["contract_refs"] == ["fact_ep1"]
     assert captured_files[0]["/workspace/current_episode_plan.md"] == "第一集计划"
     obligation = json.loads(captured_files[0]["/workspace/current_episode_obligation.json"])
     assert obligation["end_hook"] == "钩子1"
