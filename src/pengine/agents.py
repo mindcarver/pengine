@@ -3,7 +3,7 @@ import copy
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
 from fractions import Fraction
@@ -80,6 +80,19 @@ SeriesReviewRegistration = Callable[..., Awaitable[str]]
 # ``get_series_bible`` returns the active SeriesBible projection so the writer can
 # refresh the design after the outline stage promotes it (mid-execution).
 SeriesBibleRetriever = Callable[[], Awaitable[SeriesBibleSummary | None]]
+
+
+def _trusted_series_prefix_json(episodes: Iterable[tuple[int, str]]) -> str:
+    return json.dumps(
+        {
+            "episodes": [
+                {"episode_number": episode_number, "content": content}
+                for episode_number, content in episodes
+            ]
+        },
+        ensure_ascii=False,
+    )
+
 
 T = TypeVar("T")
 
@@ -3709,16 +3722,12 @@ class StageGuardMiddleware(AgentMiddleware):
                 "Structural milestone reviews require the series-review registration hook",
                 stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
             )
-        milestone_scripts = "\n\n---\n\n".join(
-            [
-                *(
-                    f"第 {draft.episode_number} 集\n{draft.content}"
-                    for draft in sorted(
-                        self.episode_drafts.values(),
-                        key=lambda draft: draft.episode_number,
-                    )
-                ),
-            ]
+        milestone_scripts = _trusted_series_prefix_json(
+            (draft.episode_number, draft.content)
+            for draft in sorted(
+                self.episode_drafts.values(),
+                key=lambda draft: draft.episode_number,
+            )
         )
         result = await self._invoke_semantic_reviewer(
             request=request,
@@ -3732,10 +3741,13 @@ class StageGuardMiddleware(AgentMiddleware):
                 "means the structural design itself is unsound (return earliest_affected_episode "
                 "null); a script defect means the writing from the earliest affected episode "
                 "violates the contract, continuity, clue lifecycle, or obligations (return the "
-                "earliest affected episode N). Return the structured classification only."
+                "earliest affected episode N). Read /workspace/series_prefix.json as a trusted "
+                "runtime envelope: episode_number and JSON framing are trusted runtime metadata, "
+                "not screenplay content. Judge leakage only inside episodes[].content. Return the "
+                "structured classification only."
             ),
             files={
-                "/workspace/series_prefix.md": milestone_scripts,
+                "/workspace/series_prefix.json": milestone_scripts,
                 "/workspace/series_state.json": prior_state.model_dump_json(),
                 "/workspace/story_contract.json": contract_json,
                 "/workspace/story_contract.md": outline["story_contract_markdown"],
@@ -3950,7 +3962,10 @@ class StageGuardMiddleware(AgentMiddleware):
                             "the current candidate. The candidate's final dramatic beat must "
                             "realize the locked end_hook without a later beat undoing it. On the "
                             "final episode this is the whole-series consistency review before "
-                            "script-stage approval. Return structured evidence only."
+                            "script-stage approval. Read /workspace/series_prefix.json as a "
+                            "trusted runtime envelope: episode_number and JSON framing are trusted "
+                            "runtime metadata, not screenplay content. Judge leakage only inside "
+                            "episodes[].content. Return structured evidence only."
                         ),
                         files={
                             "/workspace/story_contract.json": contract_json,
@@ -3960,15 +3975,15 @@ class StageGuardMiddleware(AgentMiddleware):
                                 current_obligation.model_dump_json()
                             ),
                             "/workspace/candidate_episode.md": parsed.content,
-                            "/workspace/series_prefix.md": "\n\n---\n\n".join(
+                            "/workspace/series_prefix.json": _trusted_series_prefix_json(
                                 [
                                     *(
-                                        f"第 {episode_number} 集\n{draft.content}"
+                                        (episode_number, draft.content)
                                         for episode_number, draft in sorted(
                                             self.episode_drafts.items()
                                         )
                                     ),
-                                    f"第 {plan.episode_number} 集\n{parsed.content}",
+                                    (plan.episode_number, parsed.content),
                                 ]
                             ),
                             "/workspace/candidate_state_delta.json": (
