@@ -245,6 +245,53 @@ def test_universal_validation_rejects_projection_mismatch() -> None:
     assert "projection_missing_biography" in codes
 
 
+def test_projection_validation_matches_unique_annotated_character_label() -> None:
+    payload = make_contract_payload()
+    payload["characters"][0]["name"] = "林岚（主角）"
+    candidate = make_candidate(
+        biographies="林岚（现用名／主角）：回乡调查旧案的主角。",
+        story_contract_payload=payload,
+    )
+
+    assert validate_series_bible(candidate).passed
+
+
+def test_projection_validation_requires_exact_label_when_bases_collide() -> None:
+    payload = make_contract_payload()
+    payload["characters"][0]["name"] = "林岚（青年）"
+    payload["characters"].append(
+        {
+            "character_id": "lin_lan_elder",
+            "name": "林岚（老年）",
+            "role": "多年后的调查者",
+            "initial_known_fact_ids": [],
+        }
+    )
+    payload["timeline"][0]["participant_ids"].append("lin_lan_elder")
+    payload["knowledge_states"].append(
+        {
+            "episode_number": 1,
+            "character_id": "lin_lan_elder",
+            "known_fact_ids": [fact["fact_id"] for fact in payload["facts"]],
+        }
+    )
+    candidate = make_candidate(
+        biographies="林岚（青年）：回乡调查旧案。",
+        story_contract_payload=payload,
+    )
+
+    evidence = validate_series_bible(candidate)
+
+    assert not evidence.passed
+    missing_refs = {
+        reference
+        for issue in evidence.issues
+        if issue.code == "projection_missing_biography"
+        for reference in issue.refs
+    }
+    assert missing_refs == {"lin_lan_elder"}
+
+
 def test_genre_activation_never_rejects_general_idea_for_missing_clues() -> None:
     general = make_candidate(genre="general")
     assert activated_rule_names(general) == frozenset()

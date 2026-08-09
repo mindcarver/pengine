@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -32,6 +33,7 @@ from pengine.continuity import (
     StableId,
     StoryContract,
     canonical_model_hash,
+    character_label_base,
     render_story_contract_markdown,
     story_contract_sha256,
 )
@@ -364,8 +366,18 @@ def _projection_issues(bible: SeriesBible) -> list[ValidationIssue]:
     biography = bible.content.character_biographies
     substantive = "\n" in biography or "：" in biography or ":" in biography
     if substantive:
+        base_counts = Counter(
+            character_label_base(character.name) for character in contract.characters
+        )
         for character in contract.characters:
-            if character.name not in biography:
+            base = character_label_base(character.name)
+            covered = character.name in biography or (
+                bool(base)
+                and base != character.name
+                and base_counts[base] == 1
+                and base in biography
+            )
+            if not covered:
                 issues.append(
                     ValidationIssue(
                         code="projection_missing_biography",
