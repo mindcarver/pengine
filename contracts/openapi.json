@@ -2654,6 +2654,17 @@
             "type": "string",
             "title": "Call Id"
           },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
           "role": {
             "type": "string",
             "enum": [

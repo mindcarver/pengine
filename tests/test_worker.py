@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import anthropic
 import httpx
@@ -1299,6 +1299,63 @@ async def test_paused_resource_exposes_blocked_model_call_lineage(tmp_path: Path
     assert blocked.verified_limit_tokens == 200_000
     assert blocked.usage.status == "unavailable"
     assert blocked.usage.input_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_worker_requires_exact_successful_physical_provenance(
+    tmp_path: Path,
+) -> None:
+    """A different operation's latest call must never be guessed as the producer."""
+    settings, catalog, repository, _snapshot = await _services(tmp_path)
+    from pengine.model_calls import ModelCallContext, ModelCallStore, build_started_record
+
+    run_id = uuid4()
+    store = ModelCallStore(settings.database_path)
+    record = build_started_record(
+        call_id="physical-generation-1",
+        role="generation",
+        adapter="anthropic",
+        provider="anthropic",
+        model="claude-opus-5",
+        context=ModelCallContext(
+            run_id=str(run_id),
+            stage="generating_episode_scripts",
+            episode_number=3,
+            operation_id="episode-3-operation",
+        ),
+        estimated_input_tokens=10,
+        estimated_output_tokens=20,
+        verified_limit_tokens=200_000,
+    )
+    record.status = "succeeded"
+    record.outcome = "success"
+    store.upsert(record)
+    store.close()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=DeterministicWorkflow(),
+    )
+
+    assert (
+        await worker._require_physical_call_id(
+            run_id=run_id,
+            role="generation",
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            episode_number=3,
+            operation_id="episode-3-operation",
+        )
+        == "physical-generation-1"
+    )
+    with pytest.raises(AgentProtocolError, match="successful physical generation call"):
+        await worker._require_physical_call_id(
+            run_id=run_id,
+            role="generation",
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            episode_number=3,
+            operation_id="different-operation",
+        )
 
 
 @pytest.mark.asyncio

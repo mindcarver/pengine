@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,12 @@ from pengine.continuity import (
     story_contract_sha256,
 )
 from pengine.language import SIMPLIFIED_CHINESE, language_instruction
+from pengine.model_calls import (
+    ModelCallState,
+    ModelCallStore,
+    build_started_record,
+    new_call_id,
+)
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import CreateCreationRequest, EpisodeDraft, EpisodePlan, InternalStage
@@ -102,14 +109,74 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         return self
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ProvenanceFakeWorkflow(DeepAgentWorkflow):
+    """Make artifact-producing fake calls obey the physical ledger contract."""
+
+    model_call_state: ModelCallState
+
+    def _record_succeeded_call(self, role: str) -> None:
+        state = self.model_call_state
+        assert state.store is not None
+        call_id = new_call_id()
+        state.claim_physical_call_id(call_id)
+        record = build_started_record(
+            call_id=call_id,
+            role=role,
+            adapter="fake",
+            provider="fake",
+            model="toolcallingfakemodel",
+            context=state.context,
+            estimated_input_tokens=10,
+            estimated_output_tokens=20,
+            verified_limit_tokens=200_000,
+        )
+        record.status = "succeeded"
+        record.outcome = "success"
+        state.store.upsert(record)
+        state.remember_succeeded(record)
+
+    async def execute(self, **kwargs: Any):
+        approve_stage = kwargs["approve_stage"]
+        commit_episode = kwargs.get("commit_episode")
+        register_series_review = kwargs.get("register_series_review")
+
+        async def approve_with_provenance(stage, payload):
+            if stage is InternalStage.GENERATING_EPISODE_OUTLINE and "story_contract" in payload:
+                self._record_succeeded_call("review")
+            await approve_stage(stage, payload)
+
+        async def commit_with_provenance(*args, **commit_kwargs):
+            assert commit_episode is not None
+            self._record_succeeded_call("generation")
+            return await commit_episode(*args, **commit_kwargs)
+
+        async def review_with_provenance(**review_kwargs):
+            assert register_series_review is not None
+            self._record_succeeded_call("review")
+            return await register_series_review(**review_kwargs)
+
+        return await DeepAgentWorkflow.execute(
+            self,
+            **{
+                **kwargs,
+                "approve_stage": approve_with_provenance,
+                "commit_episode": commit_with_provenance,
+                "register_series_review": review_with_provenance,
+            },
+        )
+
+
 def _fake_workflow(
     *,
     model: ToolCallingFakeModel,
     checkpointer: Any,
     recursion_limit: int = 80,
     provider_profile_key: str = "toolcallingfakemodel",
+    model_call_state: ModelCallState | None = None,
 ) -> DeepAgentWorkflow:
-    return DeepAgentWorkflow(
+    workflow_type = _ProvenanceFakeWorkflow if model_call_state is not None else DeepAgentWorkflow
+    kwargs = dict(
         generation_model=model,
         review_model=model,
         checkpointer=checkpointer,
@@ -117,6 +184,9 @@ def _fake_workflow(
         generation_provider_profile_key=provider_profile_key,
         review_provider_profile_key=provider_profile_key,
     )
+    if model_call_state is not None:
+        return workflow_type(**kwargs, model_call_state=model_call_state)
+    return workflow_type(**kwargs)
 
 
 def _tool_name(tool: Any) -> str:
@@ -6977,12 +7047,15 @@ async def test_restarted_worker_resumes_same_run_and_thread(
     assert set(await repository.get_business_checkpoints(lease.run_id)) == {first_stage}
     assert await repository.requeue_expired_jobs(now=stopped_at + timedelta(seconds=6)) == 1
 
+    model_call_store = ModelCallStore(settings.database_path)
+    model_call_state = ModelCallState(store=model_call_store)
     async with AsyncSqliteSaver.from_conn_string(str(settings.database_path)) as saver:
         await saver.setup()
         resumed_workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses[2:]),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
+            model_call_state=model_call_state,
         )
         restarted_worker = Worker(
             settings=settings,
@@ -6991,6 +7064,7 @@ async def test_restarted_worker_resumes_same_run_and_thread(
             workflow=resumed_workflow,
             worker_id="restarted-worker",
         )
+        restarted_worker._model_call_state = model_call_state
 
         assert await restarted_worker.run_once() is True
         checkpoint_after_restart = await saver.aget_tuple(
@@ -7011,6 +7085,7 @@ async def test_restarted_worker_resumes_same_run_and_thread(
     assert resource.initial.state == "succeeded"
     assert attempts[first_stage] == 1
     assert all(count == 1 for count in attempts.values())
+    model_call_store.close()
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import asdict
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 import aiosqlite
@@ -25,7 +25,7 @@ from pengine.config import Settings
 from pengine.continuity import EpisodeLock
 from pengine.errors import DomainError
 from pengine.language import OutputLanguage
-from pengine.model_calls import ModelCallState, ModelCallStore, new_call_id
+from pengine.model_calls import ModelCallState, ModelCallStore, new_operation_id
 from pengine.personas import PersonaCatalog, PersonaPackageError
 from pengine.relay import (
     PreflightBlockedError,
@@ -183,7 +183,7 @@ class Worker:
                 if state is not None:
                     store = ModelCallStore(self.settings.database_path)
                     state.store = store
-                    state.context.reset()
+                    state.reset()
                     self._model_call_state = state
                     self._model_call_store = store
                 self.workflow = DeepAgentWorkflow(
@@ -270,12 +270,13 @@ class Worker:
         run_timeout_scope: asyncio.Timeout | None = None
         model_call_state = self._model_call_state
         if model_call_state is not None:
-            model_call_state.context.reset()
+            model_call_state.reset()
             model_call_state.context.run_id = str(work.run_id)
             model_call_state.context.creation_id = str(work.creation_id)
             model_call_state.context.thread_id = work.thread_id
             model_call_state.context.run_kind = work.run_kind
             model_call_state.context.stage = current_stage.value
+            model_call_state.context.operation_id = new_operation_id()
         logger.info(
             "workflow run started run_id=%s creation_id=%s kind=%s",
             work.run_id,
@@ -347,14 +348,38 @@ class Worker:
                 if model_call_state is not None:
                     model_call_state.context.stage = stage.value
                     model_call_state.context.episode_number = None
+                    model_call_state.context.operation_id = new_operation_id()
                 return await self.repository.record_stage_attempt(work.run_id, stage)
 
             async def approve_stage(
                 stage: InternalStage,
                 payload: Mapping[str, Any],
             ) -> None:
-                await self.repository.approve_checkpoint(work.run_id, stage, payload)
-                approved[stage] = dict(payload)
+                approved_payload = dict(payload)
+                review_call_id = None
+                if (
+                    stage is InternalStage.GENERATING_EPISODE_OUTLINE
+                    and "story_contract" in approved_payload
+                ):
+                    operation_id = (
+                        model_call_state.context.operation_id
+                        if model_call_state is not None
+                        else None
+                    )
+                    review_call_id = await self._require_physical_call_id(
+                        run_id=work.run_id,
+                        role="review",
+                        stage=stage,
+                        episode_number=None,
+                        operation_id=operation_id,
+                    )
+                await self.repository.approve_checkpoint(
+                    work.run_id,
+                    stage,
+                    approved_payload,
+                    review_call_id=review_call_id,
+                )
+                approved[stage] = approved_payload
                 if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
                     await self._sync_series_bible(work, approved)
                     if model_call_state is not None:
@@ -369,7 +394,7 @@ class Worker:
                 if model_call_state is not None:
                     model_call_state.context.stage = InternalStage.GENERATING_EPISODE_SCRIPTS.value
                     model_call_state.context.episode_number = plan.episode_number
-                    model_call_state.context.call_id = new_call_id()
+                    model_call_state.context.operation_id = new_operation_id()
                 return await self.repository.record_episode_attempt(
                     work.run_id,
                     plan.episode_number,
@@ -404,11 +429,22 @@ class Worker:
                     design_content_hash=active.content_hash,
                     design_epoch=active.design_epoch,
                 )
-                resolved_call_id = (
-                    call_id
-                    or (model_call_state.context.call_id if model_call_state is not None else None)
-                    or f"{work.run_id}-episode-{episode_number}"
+                operation_id = (
+                    model_call_state.context.operation_id if model_call_state is not None else None
                 )
+                resolved_call_id = await self._require_physical_call_id(
+                    run_id=work.run_id,
+                    role="generation",
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    episode_number=episode_number,
+                    operation_id=operation_id,
+                )
+                if call_id is not None and call_id != resolved_call_id:
+                    raise AgentProtocolError(
+                        "Episode candidate call_id does not match its successful physical "
+                        "generation call",
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    )
                 candidate = await self.repository.commit_episode_candidate(
                     work.run_id,
                     episode_number=episode_number,
@@ -469,9 +505,15 @@ class Worker:
                         for candidate in prefix
                     ]
                 )
-                call_id = await self.repository.latest_review_call_id(
-                    work.run_id,
+                operation_id = (
+                    model_call_state.context.operation_id if model_call_state is not None else None
+                )
+                call_id = await self._require_physical_call_id(
+                    run_id=work.run_id,
+                    role="review",
                     stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    episode_number=episode_number,
+                    operation_id=operation_id,
                 )
                 bound = await self.repository.register_series_review(
                     work.run_id,
@@ -483,7 +525,7 @@ class Worker:
                     batch_id=batch.batch_id,
                     batch_epoch=batch.batch_epoch,
                     prefix_hash=prefix_hash,
-                    call_id=call_id or f"{work.run_id}-review-{episode_number}",
+                    call_id=call_id,
                     passed=passed,
                     category=category,
                     evidence=evidence,
@@ -541,6 +583,9 @@ class Worker:
                     assembly_payload,
                 )
                 approved[current_stage] = assembly_payload
+            # Publish succeeded state only after every physical model-call row is
+            # durable, so the first terminal API projection cannot omit ledger rows.
+            await asyncio.to_thread(drain_audit_writes)
             final_review_id = await self._resolve_final_review_id(work.run_id)
             await self.repository.succeed_run(
                 work.run_id,
@@ -704,6 +749,50 @@ class Worker:
             # records (usage, stale, failed, blocked) are present for the API, UI,
             # and evidence (Delivery #58 INT-A2/A6/A9).
             await asyncio.to_thread(drain_audit_writes)
+
+    async def _require_physical_call_id(
+        self,
+        *,
+        run_id: UUID,
+        role: Literal["generation", "review"],
+        stage: InternalStage,
+        episode_number: int | None,
+        operation_id: str | None,
+    ) -> str:
+        """Resolve one exact successful provider call, never synthetic provenance."""
+        if operation_id is None:
+            raise AgentProtocolError(
+                f"Missing successful physical {role} call for artifact provenance",
+                stage=stage,
+            )
+        expected_call_id = None
+        if self._model_call_state is not None:
+            expected_call_id = self._model_call_state.latest_succeeded_call_id(
+                role=role,
+                run_id=str(run_id),
+                stage=stage.value,
+                episode_number=episode_number,
+                operation_id=operation_id,
+            )
+        # The callback updates in-memory completion synchronously, while SQLite writes
+        # land on the audit thread. Drain before binding an immutable artifact so the
+        # referenced physical call is already durable if the process stops afterward.
+        await asyncio.to_thread(drain_audit_writes)
+        durable_call_id = await self.repository.latest_successful_model_call_id(
+            run_id,
+            role=role,
+            stage=stage,
+            episode_number=episode_number,
+            operation_id=operation_id,
+        )
+        if durable_call_id is None or (
+            expected_call_id is not None and expected_call_id != durable_call_id
+        ):
+            raise AgentProtocolError(
+                f"Missing successful physical {role} call for artifact provenance",
+                stage=stage,
+            )
+        return durable_call_id
 
     async def _pause_recoverable_episode_error(
         self,
@@ -918,12 +1007,26 @@ class Worker:
                 "A unified outline requires bound global design review evidence",
                 stage=InternalStage.GENERATING_EPISODE_OUTLINE,
             )
-        call_id = await self.repository.latest_review_call_id(
+        call_id = await self.repository.get_checkpoint_review_call_id(
             work.run_id,
-            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
         )
         if call_id is None:
-            call_id = f"{work.run_id}-outline-review"
+            raise AgentProtocolError(
+                "Global design review lacks a successful physical review call",
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            )
+        if not await self.repository.is_successful_model_call(
+            work.run_id,
+            call_id=call_id,
+            role="review",
+            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            episode_number=None,
+        ):
+            raise AgentProtocolError(
+                "Global design review lacks a successful physical review call",
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            )
 
         return bind_global_design_review(
             candidate,

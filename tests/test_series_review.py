@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 from test_script_batch import (
+    _approve_episode_outline,
     build_episode_lock_for,
     create_leased_run,
     initial_series_state,
@@ -409,6 +410,10 @@ async def test_worker_authorized_design_rebuild_promotes_a_fresh_design(
         idempotency_key="authorize-worker-1",
     )
 
+    rebuild_lease = await repository.lease_next_job("rebuild-worker", 30)
+    assert rebuild_lease is not None and rebuild_lease.run_id == lease.run_id
+    await repository.mark_run_running(lease.run_id)
+
     settings = Settings(
         persona_root=tmp_path / "personas",
         data_dir=tmp_path / "data",
@@ -421,11 +426,11 @@ async def test_worker_authorized_design_rebuild_promotes_a_fresh_design(
             settings.snapshot_root,
         ),
     )
-    work = await repository.get_run_work_item(lease.run_id)
     rebuilt_contract = three_episode_contract().model_copy(deep=True)
     for fact in rebuilt_contract.facts:
         fact.value = f"{fact.value}（重建版）"
-    approved = {
+    upstream = {
+        InternalStage.SELECTING_L0_VARIANT: {"selected_l0_variant": "归返"},
         InternalStage.GENERATING_STORY_OUTLINE: {
             "content": "新的完整故事梗概。\n其余人物设定与已批准大纲保持一致。",
         },
@@ -433,18 +438,12 @@ async def test_worker_authorized_design_rebuild_promotes_a_fresh_design(
             "character_biographies": "阿丽：回乡调查旧案的主角。\n阿博：见证旧事的证人。",
             "relationship_logic": "阿丽与阿博为搭档。",
         },
-        InternalStage.SELECTING_L0_VARIANT: {"selected_l0_variant": "归返"},
-        InternalStage.GENERATING_EPISODE_OUTLINE: {
-            "content": "三集连续写作。",
-            "story_contract": rebuilt_contract.model_dump(mode="json"),
-            "contract_review": {
-                "passed": True,
-                "evidence": "独立设计审查通过。",
-                "issues": [],
-            },
-        },
     }
-    await worker._sync_series_bible(work, approved)
+    for stage, payload in upstream.items():
+        await repository.approve_business_checkpoint(lease.run_id, stage, payload)
+    await _approve_episode_outline(repository, lease.run_id, rebuilt_contract)
+    work = await repository.get_run_work_item(lease.run_id)
+    await worker._sync_series_bible(work, work.business_checkpoints)
 
     fresh = await repository.get_run_series_bible(lease.run_id)
     assert fresh is not None

@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 from test_continuity import make_sparse_knowledge_contract
-from test_repository import create_and_lease_initial
+from test_repository import create_and_lease_initial, persist_succeeded_outline_review
 
 from pengine.continuity import (
     EpisodeStateDelta,
@@ -229,10 +229,12 @@ async def _approve_episode_outline(repository: Repository, run_id, contract: Sto
         InternalStage.GENERATING_EPISODE_OUTLINE,
         now=NOW,
     )
+    review_call_id = persist_succeeded_outline_review(repository, run_id)
     await repository.approve_business_checkpoint(
         run_id,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         payload,
+        review_call_id=review_call_id,
         now=NOW,
     )
 
@@ -638,7 +640,7 @@ async def test_incomplete_active_batch_cannot_assemble_formal_delivery(
 
 
 async def test_v13_migration_preserves_existing_database(repository) -> None:
-    assert SCHEMA_VERSION == 17
+    assert SCHEMA_VERSION == 18
     accepted, lease = await create_leased_run(repository)
     contract, active, committed = await seed_batch_with_episodes(repository, lease.run_id, up_to=1)
     async with repository._connection() as connection:

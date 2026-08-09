@@ -14,7 +14,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from test_continuity import make_contract
-from test_repository import create_and_lease_initial, locked_outline_payload
+from test_repository import (
+    create_and_lease_initial,
+    locked_outline_payload,
+    persist_succeeded_outline_review,
+)
 
 from pengine.config import Settings
 from pengine.errors import DomainError
@@ -551,8 +555,17 @@ async def _approve_design_stages(repository: Repository, run_id) -> dict:
         },
         InternalStage.GENERATING_EPISODE_OUTLINE: outline_payload,
     }
+    review_call_id = persist_succeeded_outline_review(repository, run_id)
     for stage, payload in design_payloads.items():
-        await repository.approve_business_checkpoint(run_id, stage, payload, now=NOW)
+        await repository.approve_business_checkpoint(
+            run_id,
+            stage,
+            payload,
+            review_call_id=(
+                review_call_id if stage is InternalStage.GENERATING_EPISODE_OUTLINE else None
+            ),
+            now=NOW,
+        )
     return {stage: dict(payload) for stage, payload in design_payloads.items()}
 
 

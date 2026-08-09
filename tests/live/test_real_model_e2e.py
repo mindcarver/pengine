@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -484,6 +485,20 @@ def _assert_unified_delivery_facts(
         assert review.get("review_model_id") == review_model_id, (
             "Global design review used the wrong role"
         )
+        global_review_call_id = review.get("review_call_id")
+        assert isinstance(global_review_call_id, str) and global_review_call_id
+        global_review_call = connection.execute(
+            "SELECT role, model, stage, episode_number, status FROM model_calls "
+            "WHERE call_id = ? AND run_id = ?",
+            (global_review_call_id, run_id),
+        ).fetchone()
+        assert global_review_call == (
+            "review",
+            review_model_id,
+            "generating_episode_outline",
+            None,
+            "succeeded",
+        ), "Global design review does not bind its producing physical review call"
 
         batches = connection.execute(
             """
@@ -509,6 +524,7 @@ def _assert_unified_delivery_facts(
             (run_id, batch[0]),
         ).fetchall()
         assert candidates, "No active episode candidates"
+        candidate_calls: dict[int, tuple[Any, ...]] = {}
         for index, candidate in enumerate(candidates):
             episode_number = candidate[1]
             assert episode_number == index + 1, "Episode candidates are not ordered 1..N"
@@ -517,10 +533,27 @@ def _assert_unified_delivery_facts(
                 assert candidate[4] == candidates[index - 1][0], (
                     "Candidate predecessor chain is broken"
                 )
+            producing_call = connection.execute(
+                "SELECT role, model, stage, episode_number, status, operation_id "
+                "FROM model_calls WHERE call_id = ? AND run_id = ?",
+                (candidate[5], run_id),
+            ).fetchone()
+            assert producing_call is not None, (
+                f"Episode {episode_number} candidate lacks a durable producing call"
+            )
+            assert producing_call[:5] == (
+                "generation",
+                generation_model_id,
+                "generating_episode_scripts",
+                episode_number,
+                "succeeded",
+            ), f"Episode {episode_number} candidate binds the wrong physical call"
+            candidate_calls[episode_number] = producing_call
 
         final_reviews = connection.execute(
             """
-            SELECT review_id, design_content_hash, batch_id, prefix_hash, passed
+            SELECT review_id, design_content_hash, batch_id, prefix_hash, passed,
+                   episode_number, call_id
             FROM series_reviews
             WHERE run_id = ? AND review_type = 'final' AND status = 'active'
             ORDER BY review_epoch DESC
@@ -532,6 +565,25 @@ def _assert_unified_delivery_facts(
         assert final[4] == 1, "Final review did not pass"
         assert final[1] == design[1], "Final review does not bind the active design hash"
         assert final[2] == batch[0], "Final review does not bind the active script batch"
+        final_review_call = connection.execute(
+            "SELECT role, model, stage, episode_number, status, operation_id "
+            "FROM model_calls WHERE call_id = ? AND run_id = ?",
+            (final[6], run_id),
+        ).fetchone()
+        assert final_review_call is not None, "Final review lacks a durable producing call"
+        assert final_review_call[:5] == (
+            "review",
+            review_model_id,
+            "generating_episode_scripts",
+            final[5],
+            "succeeded",
+        ), "Final series review binds the wrong physical call"
+        assert final[6] != candidates[final[5] - 1][5], (
+            "Episode candidate and final review reused one physical call ID"
+        )
+        assert final_review_call[5] == candidate_calls[final[5]][5], (
+            "Episode generation and its final review lost their logical operation grouping"
+        )
 
         deliveries = connection.execute(
             "SELECT content_package_json FROM deliveries WHERE run_id = ?", (run_id,)
@@ -574,7 +626,7 @@ def _assert_model_routing_audit(
         "generation": generation_model_id,
         "review": review_model_id,
     }
-    calls = {role: {"started": set(), "ended": set()} for role in expected_models}
+    calls = {role: {"started": [], "ended": []} for role in expected_models}
     audit_lines = [
         line
         for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -605,7 +657,7 @@ def _assert_model_routing_audit(
         )
         call_id = call_id_match.group(1)
         if event == "start":
-            calls[role]["started"].add(call_id)
+            calls[role]["started"].append(call_id)
             continue
 
         response_match = re.search(r"response_model_id=([^\s]+)", line)
@@ -616,16 +668,30 @@ def _assert_model_routing_audit(
             f"Unexpected {role} response model {response_match.group(1)!r}; "
             f"evidence: {evidence_dir}"
         )
-        calls[role]["ended"].add(call_id)
+        calls[role]["ended"].append(call_id)
+
+    all_started = [call_id for role in expected_models for call_id in calls[role]["started"]]
+    all_ended = [call_id for role in expected_models for call_id in calls[role]["ended"]]
+    duplicate_ids = sorted(
+        {
+            call_id
+            for call_id, count in (*Counter(all_started).items(), *Counter(all_ended).items())
+            if count != 1
+        }
+    )
+    assert not duplicate_ids, (
+        f"Model routing audit has duplicate physical call_id values: {duplicate_ids}; "
+        f"evidence: {evidence_dir}"
+    )
 
     summary: dict[str, Any] = {"status": "passed", "routes": {}}
     for role, model_id in expected_models.items():
         started = calls[role]["started"]
         ended = calls[role]["ended"]
         assert started, f"The {role} route was never called; evidence: {evidence_dir}"
-        assert started == ended, (
+        assert Counter(started) == Counter(ended), (
             f"The {role} route has incomplete calls: "
-            f"started_only={sorted(started - ended)}, ended_only={sorted(ended - started)}; "
+            f"started={started}, ended={ended}; "
             f"evidence: {evidence_dir}"
         )
         summary["routes"][role] = {
@@ -640,9 +706,10 @@ def _assert_durable_usage_evidence(
     log_path: Path,
     database_path: Path,
     *,
+    final_resource_path: Path,
     evidence_dir: Path,
 ) -> dict[str, Any]:
-    """The durable model-call envelope agrees across structured logs and SQLite."""
+    """Every physical call agrees across routes, records, SQLite, and the API."""
     record_lines = [
         line
         for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -650,7 +717,7 @@ def _assert_durable_usage_evidence(
     ]
     assert record_lines, f"No durable model-call records were captured; evidence: {evidence_dir}"
 
-    log_records: dict[str, dict[str, Any]] = {}
+    log_records: list[dict[str, Any]] = []
     for line in record_lines:
         fields = dict(
             token.split("=", 1)
@@ -659,52 +726,134 @@ def _assert_durable_usage_evidence(
         )
         call_id = fields.get("call_id")
         assert call_id, f"Unparseable model-call record: {line!r}; evidence: {evidence_dir}"
-        log_records[call_id] = fields
+        log_records.append(fields)
 
-    succeeded = {
-        call_id: fields
-        for call_id, fields in log_records.items()
-        if fields.get("status") == "succeeded"
-    }
+    started = [fields for fields in log_records if fields.get("status") == "started"]
+    succeeded = [fields for fields in log_records if fields.get("status") == "succeeded"]
     assert succeeded, f"No completed model calls with provider usage; evidence: {evidence_dir}"
+    for label, records in (("started", started), ("succeeded", succeeded)):
+        counts = Counter(str(fields["call_id"]) for fields in records)
+        duplicates = sorted(call_id for call_id, count in counts.items() if count != 1)
+        assert not duplicates, (
+            f"Model-call log has duplicate {label} record physical IDs: {duplicates}; "
+            f"evidence: {evidence_dir}"
+        )
+    started_ids = [str(fields["call_id"]) for fields in started]
+    succeeded_ids = [str(fields["call_id"]) for fields in succeeded]
+    assert Counter(started_ids) == Counter(succeeded_ids), (
+        "Structured model-call record lifecycles differ between started and succeeded: "
+        f"started={started_ids}, succeeded={succeeded_ids}; evidence: {evidence_dir}"
+    )
+    terminal_statuses = {
+        str(fields.get("status")) for fields in log_records if fields.get("status") != "started"
+    }
+    assert terminal_statuses == {"succeeded"}, (
+        f"Unexpected terminal model-call statuses: {sorted(terminal_statuses)}; "
+        f"evidence: {evidence_dir}"
+    )
     usage_mismatches = [
-        call_id
-        for call_id, fields in succeeded.items()
+        str(fields["call_id"])
+        for fields in succeeded
         if fields.get("usage_status") != "reported"
-        or not fields.get("actual_input_tokens")
-        or not fields.get("actual_output_tokens")
+        or fields.get("actual_input_tokens") in {None, "None"}
+        or fields.get("actual_output_tokens") in {None, "None"}
     ]
     assert not usage_mismatches, (
         f"Real calls are missing provider-reported usage: {sorted(usage_mismatches)}; "
         f"evidence: {evidence_dir}"
     )
 
+    route_end_ids: list[str] = []
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "model_call event=end " not in line:
+            continue
+        match = re.search(r"call_id=([^\s]+)", line)
+        assert match is not None, f"Unparseable route end: {line!r}; evidence: {evidence_dir}"
+        route_end_ids.append(match.group(1))
+    assert Counter(route_end_ids) == Counter(succeeded_ids), (
+        "Route ends and succeeded structured records have different physical calls: "
+        f"route_ends={route_end_ids}, succeeded={succeeded_ids}; evidence: {evidence_dir}"
+    )
+
     with sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True) as connection:
         rows = connection.execute(
-            "SELECT call_id, status, usage_status, actual_input_tokens, actual_output_tokens "
+            "SELECT call_id, operation_id, status, usage_status, "
+            "actual_input_tokens, actual_output_tokens "
             "FROM model_calls"
         ).fetchall()
-    db_records = {row[0]: row for row in rows}
-    assert set(log_records) <= set(db_records), (
-        f"SQLite model_calls missing log call_ids: {sorted(set(log_records) - set(db_records))}; "
+    db_ids = [str(row[0]) for row in rows]
+    assert len(db_ids) == len(set(db_ids)), (
+        f"SQLite has duplicate physical call IDs: {db_ids}; evidence: {evidence_dir}"
+    )
+    assert Counter(db_ids) == Counter(succeeded_ids), (
+        "SQLite and succeeded structured records have different physical calls: "
+        f"sqlite={db_ids}, succeeded={succeeded_ids}; evidence: {evidence_dir}"
+    )
+
+    final_resource = json.loads(final_resource_path.read_text(encoding="utf-8"))
+    final_calls = final_resource.get("initial", {}).get("progress", {}).get("model_calls")
+    assert isinstance(final_calls, list), (
+        f"Final resource lacks model_calls; evidence: {evidence_dir}"
+    )
+    final_ids = [str(call.get("call_id")) for call in final_calls]
+    assert len(final_ids) == len(set(final_ids)), (
+        f"Final resource has duplicate physical call IDs: {final_ids}; evidence: {evidence_dir}"
+    )
+    assert Counter(final_ids) == Counter(succeeded_ids), (
+        "Final resource and succeeded structured records have different physical calls: "
+        f"final={final_ids}, succeeded={succeeded_ids}; evidence: {evidence_dir}"
+    )
+
+    succeeded_by_id = {str(fields["call_id"]): fields for fields in succeeded}
+    db_records = {str(row[0]): row for row in rows}
+    final_records = {str(call["call_id"]): call for call in final_calls}
+    log_totals = {"input": 0, "output": 0}
+    db_totals = {"input": 0, "output": 0}
+    final_totals = {"input": 0, "output": 0}
+    for call_id, fields in succeeded_by_id.items():
+        row = db_records[call_id]
+        assert row[2] == "succeeded"
+        assert row[3] == "reported"
+        assert row[4] is not None and row[5] is not None
+        final_call = final_records[call_id]
+        final_usage = final_call.get("usage") or {}
+        assert final_call.get("status") == "succeeded"
+        assert final_usage.get("status") == "reported"
+        assert fields.get("operation_id") == row[1] == final_call.get("operation_id"), (
+            f"Final resource operation mismatch for {call_id}; evidence: {evidence_dir}"
+        )
+        log_input = int(fields["actual_input_tokens"])
+        log_output = int(fields["actual_output_tokens"])
+        assert (row[4], row[5]) == (log_input, log_output), (
+            f"SQLite token mismatch for {call_id}; evidence: {evidence_dir}"
+        )
+        assert (final_usage.get("input_tokens"), final_usage.get("output_tokens")) == (
+            log_input,
+            log_output,
+        ), f"Final resource token totals mismatch for {call_id}; evidence: {evidence_dir}"
+        log_totals["input"] += log_input
+        log_totals["output"] += log_output
+        db_totals["input"] += int(row[4])
+        db_totals["output"] += int(row[5])
+        final_totals["input"] += int(final_usage["input_tokens"])
+        final_totals["output"] += int(final_usage["output_tokens"])
+    assert log_totals == db_totals == final_totals, (
+        "Model-call token totals disagree across log, SQLite, and final resource: "
+        f"log={log_totals}, sqlite={db_totals}, final={final_totals}; "
         f"evidence: {evidence_dir}"
     )
-    for call_id, _fields in succeeded.items():
-        row = db_records[call_id]
-        assert row[1] == "succeeded"
-        assert row[2] == "reported"
-        assert row[3] is not None and row[4] is not None
 
     summary: dict[str, Any] = {
         "status": "passed",
-        "recorded_calls": len(log_records),
+        "recorded_calls": len(succeeded),
         "succeeded_with_usage": len(succeeded),
+        "token_totals": log_totals,
         "example": {
-            "call_id": next(iter(succeeded)),
-            "model": succeeded[next(iter(succeeded))].get("model"),
-            "input_tokens": succeeded[next(iter(succeeded))].get("actual_input_tokens"),
-            "output_tokens": succeeded[next(iter(succeeded))].get("actual_output_tokens"),
-            "finish_reason": succeeded[next(iter(succeeded))].get("finish_reason"),
+            "call_id": succeeded[0]["call_id"],
+            "model": succeeded[0].get("model"),
+            "input_tokens": succeeded[0].get("actual_input_tokens"),
+            "output_tokens": succeeded[0].get("actual_output_tokens"),
+            "finish_reason": succeeded[0].get("finish_reason"),
         },
     }
     return summary
@@ -832,22 +981,16 @@ def test_live_e2e_evidence_helpers_are_safe_and_validate_delivery(tmp_path: Path
     assert "visible-token" not in redacted
     _assert_evidence_has_no_secrets(tmp_path, "sk-examplepartial123")
 
-    log_path.write_text(
-        "\n".join(
-            (
-                "model_call event=start role=generation "
-                "requested_model_id=claude-opus-5 call_id=generation-1",
-                "model_call event=end role=generation requested_model_id=claude-opus-5 "
-                "response_model_id=claude-opus-5 call_id=generation-1",
-                "model_call event=start role=review "
-                "requested_model_id=deepseek-v4-flash call_id=review-1",
-                "model_call event=end role=review requested_model_id=deepseek-v4-flash "
-                "response_model_id=deepseek-v4-flash call_id=review-1",
-            )
-        )
-        + "\n",
-        encoding="utf-8",
+    routing_lines = (
+        "model_call event=start role=generation "
+        "requested_model_id=claude-opus-5 call_id=generation-1",
+        "model_call event=end role=generation requested_model_id=claude-opus-5 "
+        "response_model_id=claude-opus-5 call_id=generation-1",
+        "model_call event=start role=review requested_model_id=deepseek-v4-flash call_id=review-1",
+        "model_call event=end role=review requested_model_id=deepseek-v4-flash "
+        "response_model_id=deepseek-v4-flash call_id=review-1",
     )
+    log_path.write_text("\n".join(routing_lines) + "\n", encoding="utf-8")
     routing_audit = _assert_model_routing_audit(
         log_path,
         generation_model_id="claude-opus-5",
@@ -856,6 +999,18 @@ def test_live_e2e_evidence_helpers_are_safe_and_validate_delivery(tmp_path: Path
     )
     assert routing_audit["routes"]["generation"]["completed_calls"] == 1
     assert routing_audit["routes"]["review"]["completed_calls"] == 1
+
+    log_path.write_text(
+        "\n".join((*routing_lines, routing_lines[0], routing_lines[1])) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="duplicate physical call_id"):
+        _assert_model_routing_audit(
+            log_path,
+            generation_model_id="claude-opus-5",
+            review_model_id="deepseek-v4-flash",
+            evidence_dir=tmp_path,
+        )
 
     log_path.write_text(
         "model_call event=identity_mismatch role=review "
@@ -883,6 +1038,112 @@ def test_live_e2e_evidence_helpers_are_safe_and_validate_delivery(tmp_path: Path
     with pytest.raises(AssertionError, match="nested.sqlite3"):
         _assert_evidence_has_no_secrets(unsafe_dir, None)
     assert not unsafe_dir.exists()
+
+
+def test_durable_usage_audit_requires_exact_physical_call_cardinality_and_tokens(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "server.log"
+    database_path = tmp_path / "pengine.sqlite3"
+    final_resource_path = tmp_path / "final-resource.json"
+    lifecycle_lines = (
+        "model_call event=start role=generation requested_model_id=claude-opus-5 "
+        "call_id=generation-1",
+        "model_call_record call_id=generation-1 operation_id=operation-1 role=generation "
+        "model=claude-opus-5 status=started usage_status=unavailable "
+        "actual_input_tokens=None actual_output_tokens=None",
+        "model_call_record call_id=generation-1 operation_id=operation-1 role=generation "
+        "model=claude-opus-5 status=succeeded usage_status=reported "
+        "actual_input_tokens=101 actual_output_tokens=11",
+        "model_call event=end role=generation requested_model_id=claude-opus-5 "
+        "response_model_id=claude-opus-5 call_id=generation-1",
+        "model_call event=start role=review requested_model_id=gpt-5.5 call_id=review-1",
+        "model_call_record call_id=review-1 operation_id=operation-1 role=review "
+        "model=gpt-5.5 status=started usage_status=unavailable "
+        "actual_input_tokens=None actual_output_tokens=None",
+        "model_call_record call_id=review-1 operation_id=operation-1 role=review "
+        "model=gpt-5.5 status=succeeded usage_status=reported "
+        "actual_input_tokens=202 actual_output_tokens=22",
+        "model_call event=end role=review requested_model_id=gpt-5.5 "
+        "response_model_id=gpt-5.5 call_id=review-1",
+    )
+    log_path.write_text("\n".join(lifecycle_lines) + "\n", encoding="utf-8")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE model_calls (call_id TEXT PRIMARY KEY, operation_id TEXT, status TEXT, "
+            "usage_status TEXT, actual_input_tokens INTEGER, actual_output_tokens INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO model_calls VALUES (?, ?, 'succeeded', 'reported', ?, ?)",
+            (
+                ("generation-1", "operation-1", 101, 11),
+                ("review-1", "operation-1", 202, 22),
+            ),
+        )
+    _write_json(
+        final_resource_path,
+        {
+            "initial": {
+                "progress": {
+                    "model_calls": [
+                        {
+                            "call_id": "generation-1",
+                            "operation_id": "operation-1",
+                            "status": "succeeded",
+                            "usage": {
+                                "status": "reported",
+                                "input_tokens": 101,
+                                "output_tokens": 11,
+                            },
+                        },
+                        {
+                            "call_id": "review-1",
+                            "operation_id": "operation-1",
+                            "status": "succeeded",
+                            "usage": {
+                                "status": "reported",
+                                "input_tokens": 202,
+                                "output_tokens": 22,
+                            },
+                        },
+                    ]
+                }
+            }
+        },
+    )
+
+    audit = _assert_durable_usage_evidence(
+        log_path,
+        database_path,
+        final_resource_path=final_resource_path,
+        evidence_dir=tmp_path,
+    )
+    assert audit["succeeded_with_usage"] == 2
+    assert audit["token_totals"] == {"input": 303, "output": 33}
+
+    log_path.write_text(
+        "\n".join((*lifecycle_lines, lifecycle_lines[2])) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="duplicate succeeded record"):
+        _assert_durable_usage_evidence(
+            log_path,
+            database_path,
+            final_resource_path=final_resource_path,
+            evidence_dir=tmp_path,
+        )
+
+    log_path.write_text("\n".join(lifecycle_lines) + "\n", encoding="utf-8")
+    resource = json.loads(final_resource_path.read_text(encoding="utf-8"))
+    resource["initial"]["progress"]["model_calls"][1]["usage"]["output_tokens"] = 21
+    _write_json(final_resource_path, resource)
+    with pytest.raises(AssertionError, match="token totals"):
+        _assert_durable_usage_evidence(
+            log_path,
+            database_path,
+            final_resource_path=final_resource_path,
+            evidence_dir=tmp_path,
+        )
 
 
 def test_live_e2e_preflight_failure_creates_no_evidence_directory(
@@ -1288,6 +1549,7 @@ def test_real_model_initial_creation_black_box() -> None:
     )
     assert settings.generation_model_id is not None
     assert settings.review_model_id is not None
+    review_protocol = build_relay_adapter(settings, role="review").provider_profile_key
     metadata: dict[str, Any] = {
         "run_label": run_label,
         "started_at": _now(),
@@ -1302,7 +1564,7 @@ def test_real_model_initial_creation_black_box() -> None:
                 "max_output_tokens": settings.generation_max_output_tokens,
             },
             "review": {
-                "protocol": "deepseek",
+                "protocol": review_protocol,
                 "model_id": settings.review_model_id,
                 "max_output_tokens": settings.review_max_output_tokens,
             },
@@ -1430,6 +1692,7 @@ def test_real_model_initial_creation_black_box() -> None:
             usage_audit = _assert_durable_usage_evidence(
                 log_path,
                 data_dir / "pengine.sqlite3",
+                final_resource_path=evidence_dir / "final-resource.json",
                 evidence_dir=evidence_dir,
             )
             _write_json(evidence_dir / "model-usage-audit.json", usage_audit)

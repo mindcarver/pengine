@@ -145,6 +145,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         self.context_limit_tokens = context_limit_tokens
         self.reserved_output_tokens = reserved_output_tokens
         self._pending: dict[UUID, ModelCallRecord] = {}
+        self._seen_call_ids: set[str] = set()
 
     def on_chat_model_start(
         self,
@@ -154,12 +155,19 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         run_id: UUID,
         **kwargs: Any,
     ) -> None:
+        physical_call_id = str(run_id)
+        if self.state is not None:
+            self.state.claim_physical_call_id(physical_call_id)
+        elif physical_call_id in self._seen_call_ids:
+            raise RuntimeError(f"Duplicate physical model call id: {physical_call_id}")
+        self._seen_call_ids.add(physical_call_id)
         message_batch = messages[0] if messages else []
         context = self.state.context if self.state is not None else ModelCallContext()
         estimated_input = estimate_messages_tokens(message_batch)
         estimated_input += estimate_tools_tokens(_extract_tools(serialized, kwargs))
         estimated_total = estimated_input + self.reserved_output_tokens
         record = build_started_record(
+            call_id=physical_call_id,
             role=self.role,
             adapter=self.adapter,
             provider=self.provider,
@@ -183,7 +191,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 "estimated_total_tokens=%s verified_limit_tokens=%s",
                 self.role,
                 self.model_id,
-                run_id,
+                record.call_id,
                 estimated_total,
                 self.context_limit_tokens,
             )
@@ -210,7 +218,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             "stage=%s episode=%s estimated_input_tokens=%s estimated_output_tokens=%s",
             self.role,
             self.model_id,
-            run_id,
+            record.call_id,
             context.stage,
             context.episode_number,
             estimated_input,
@@ -220,6 +228,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
     def on_llm_end(self, response: LLMResult, *, run_id: UUID, **kwargs: Any) -> None:
         del kwargs
         record = self._pending.pop(run_id, None)
+        physical_call_id = record.call_id if record is not None else str(run_id)
         response_model_ids = _response_model_ids(response)
         tokens, finish_reason = extract_provider_usage(response)
         if {model_id.casefold() for model_id in response_model_ids} != {self.model_id.casefold()}:
@@ -240,7 +249,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 self.role,
                 self.model_id,
                 sorted(response_model_ids),
-                run_id,
+                physical_call_id,
             )
             raise RelayError(
                 code="relay_incompatible",
@@ -254,13 +263,15 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 tokens=tokens,
                 finish_reason=finish_reason,
             )
+            if self.state is not None:
+                self.state.remember_succeeded(record)
         _MODEL_CALL_LOGGER.info(
             "model_call event=end role=%s requested_model_id=%s response_model_id=%s "
             "call_id=%s usage_status=%s finish_reason=%s",
             self.role,
             self.model_id,
             self.model_id,
-            run_id,
+            physical_call_id,
             usage_status_from(tokens) if record is not None else "unavailable",
             finish_reason,
         )
@@ -268,6 +279,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         del kwargs
         record = self._pending.pop(run_id, None)
+        physical_call_id = record.call_id if record is not None else str(run_id)
         failure = _extract_provider_failure(error)
         http_status = failure.http_status if failure is not None else None
         if record is not None:
@@ -295,7 +307,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             "error_type=%s http_status=%s provider_error_code=%s redacted_response=%s",
             self.role,
             self.model_id,
-            run_id,
+            physical_call_id,
             type(error).__name__,
             http_status if http_status is not None else "none",
             (failure.provider_code if failure is not None else "none"),
@@ -350,13 +362,14 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
 
     def _log_record(self, record: ModelCallRecord) -> None:
         _MODEL_CALL_RECORD_LOGGER.info(
-            "model_call_record call_id=%s role=%s adapter=%s provider=%s model=%s "
+            "model_call_record call_id=%s operation_id=%s role=%s adapter=%s provider=%s model=%s "
             "stage=%s episode=%s status=%s preflight=%s estimated_input_tokens=%s "
             "estimated_output_tokens=%s estimated_total_tokens=%s verified_limit_tokens=%s "
             "usage_status=%s actual_input_tokens=%s actual_output_tokens=%s "
             "cache_read_tokens=%s cache_creation_tokens=%s duration_ms=%s "
             "finish_reason=%s outcome=%s error_code=%s error_type=%s supersedes_call_id=%s",
             record.call_id,
+            record.operation_id,
             record.role,
             record.adapter,
             record.provider,
