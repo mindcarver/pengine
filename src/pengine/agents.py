@@ -880,9 +880,16 @@ def _merge_episode_reviews(
     if deterministic_issues:
         evidence.append(
             "确定性审核："
-            + "; ".join(f"{issue.code}: {issue.message}" for issue in deterministic_issues)
+            + "; ".join(
+                f"{issue.code}: {issue.message}"
+                + (f"（目标：{', '.join(issue.contract_refs)}）" if issue.contract_refs else "")
+                for issue in deterministic_issues
+            )
         )
     evidence.append(f"语义审核：{semantic_review.evidence}")
+    referenced_targets = sorted({target for issue in issues for target in issue.contract_refs})
+    if referenced_targets:
+        evidence.append(f"审查目标：{', '.join(referenced_targets)}")
     return EpisodeReviewerResult(
         passed=not issues,
         evidence="；".join(evidence),
