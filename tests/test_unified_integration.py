@@ -1052,7 +1052,7 @@ async def test_int_a8_suffix_budget_exhaustion_and_one_cycle_authorization(
         assert authorized.json()["run_state"] == "queued"
         await worker.run_once()
 
-        # Exactly one cycle ran, then paused at the same evidence pause.
+        # Exactly one cycle ran, then the fresh review produced a new authorization pause.
         assert workflow.execution_count == cycles_before + 1
         paused_again = await repository.get_creation(creation_id)
         assert paused_again is not None
@@ -1137,8 +1137,8 @@ async def test_int_a8_design_budget_exhaustion_and_authorization_cycle(
 
         await worker.run_once()
 
-        # Exactly one authorized design-rebuild cycle ran, then the run paused
-        # again at the same repair-authorization evidence pause.
+        # Exactly one authorized design-rebuild cycle ran, then the fresh review
+        # produced a new repair-authorization pause.
         assert workflow.execution_count == cycles_before + 1
     still_paused = await repository.get_creation(accepted.creation_id)
     assert still_paused is not None

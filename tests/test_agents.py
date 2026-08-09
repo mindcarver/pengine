@@ -24,7 +24,10 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from pengine.agents import (
     _EPISODE_PLANNER_PROMPT,
+    _EPISODE_REVIEWER_PROMPT,
+    _QUALITY_REVIEWER_PROMPT,
     _SCRIPT_WRITER_PROMPT,
+    _SERIES_REVIEWER_PROMPT,
     _SPECIALIST_SKILL_SOURCES,
     _STORY_ARCHITECT_PROMPT,
     SKILLED_WRITE_PERMISSIONS,
@@ -77,6 +80,7 @@ from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import CreateCreationRequest, EpisodeDraft, EpisodePlan, InternalStage
 from pengine.series_bible import build_series_bible, project_series_bible
+from pengine.series_review import StructuralReviewResult
 from pengine.skill_assets import load_agent_skill_files
 from pengine.worker import Worker
 
@@ -2633,10 +2637,45 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "Unspecified creative details remain the writer's choice" in _SCRIPT_WRITER_PROMPT
     assert "explicitly locked or formally committed aliases" in _SCRIPT_WRITER_PROMPT
     assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
-    assert "canonical contract names in every speaker label" in _SCRIPT_WRITER_PROMPT
+    assert "continuity-bearing identities, not as a screenplay-label whitelist" in (
+        _SCRIPT_WRITER_PROMPT
+    )
+    assert "may use names, aliases, roles, generic or descriptive labels" in _SCRIPT_WRITER_PROMPT
+    assert "may show operands, equations, mental calculation" in _SCRIPT_WRITER_PROMPT
     assert "call participants" in _SCRIPT_WRITER_PROMPT
     assert "complete non-null state_delta" in _SCRIPT_WRITER_PROMPT
     assert "grandfathered pre-contract run" not in _SCRIPT_WRITER_PROMPT
+
+
+def test_review_prompts_allow_screenplay_form_and_require_proven_runtime_provenance() -> None:
+    for prompt in (
+        _QUALITY_REVIEWER_PROMPT,
+        _EPISODE_REVIEWER_PROMPT,
+        _SERIES_REVIEWER_PROMPT,
+    ):
+        assert "end markers such as 本集终" in prompt
+        assert "arithmetic, equations, mental calculation" in prompt
+        assert "depictions of JSON, code, paths, tools, models, AI, or validation" in prompt
+        assert "name the matching private source" in prompt
+        assert "If provenance is ambiguous, pass this dimension" in prompt
+
+    assert "matters of taste are not sufficient reasons" in _QUALITY_REVIEWER_PROMPT
+    assert "Screenplay formatting and story-world subject matter" in _EPISODE_REVIEWER_PROMPT
+    assert "Fail only for a direct contradiction to that hard Canon" in _SERIES_REVIEWER_PROMPT
+    assert "impossible required locked binding" in _SERIES_REVIEWER_PROMPT
+
+
+def test_structural_review_schema_describes_the_blocking_evidence_threshold() -> None:
+    properties = StructuralReviewResult.model_json_schema()["properties"]
+
+    assert "explicit hard-Canon contradiction" in properties["passed"]["description"]
+    assert "private-runtime leak" in properties["passed"]["description"]
+    assert "active design itself" in properties["category"]["description"]
+    assert "explicit authoritative source" in properties["evidence"]["description"]
+    assert (
+        "never derive this from format, style"
+        in (properties["earliest_affected_episode"]["description"])
+    )
 
 
 def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> None:
@@ -2672,6 +2711,10 @@ def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> No
     assert "Ordinary prose in an approved" in episode_skill
     assert "leave unspecified" in episode_skill
     assert "free" in episode_skill
+    assert "calculation or reasoning shown inside the story are not failures" in episode_skill
+    assert "because its execution is a matter of" in episode_skill
+    assert "viewpoint knowledge withheld unfairly" not in episode_skill
+    assert "weak locked end hook" not in episode_skill
 
 
 def test_review_prompts_do_not_turn_missing_creative_detail_into_failure() -> None:

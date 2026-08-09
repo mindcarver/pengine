@@ -500,9 +500,7 @@ def test_story_contract_hash_and_markdown_projection_are_deterministic() -> None
     assert "80 分钟 (duration)" in markdown
 
 
-def test_episode_validation_rejects_uncontracted_time_unknown_speaker_and_missing_evidence() -> (
-    None
-):
+def test_episode_validation_does_not_infer_semantics_from_unbound_content() -> None:
     contract = make_contract()
     contract_hash = story_contract_sha256(contract)
     prior = initial_series_state(contract, contract_hash)
@@ -527,82 +525,25 @@ def test_episode_validation_rejects_uncontracted_time_unknown_speaker_and_missin
         delta=delta,
     )
 
-    assert {issue.code for issue in issues} >= {
-        "evidence_coverage_mismatch",
-        "uncontracted_time",
-        "unknown_speaker",
-    }
+    codes = {issue.code for issue in issues}
+    assert "evidence_coverage_mismatch" in codes
+    assert "locked_temporal_evidence_mismatch" not in codes
+    assert "unknown_speaker" not in codes
 
 
 @pytest.mark.parametrize(
-    "heading",
+    "colon_form_line",
     [
         "场景一：旧屋",
-        "第2场：雨夜",
-        "第一集：归来",
-        "第12集：终局",
-        "EP01：归来",
+        "第一幕：归来",
+        "注：这里保留停顿。",
+        "陌生人：其实是22:12。",
+        "阿卜杜勒·卡迪尔：门外有人。",
+        "ALEXANDER：Cut the feed.",
     ],
 )
-def test_episode_validation_does_not_treat_scene_heading_as_speaker(heading: str) -> None:
-    contract = make_contract()
-    contract_hash = story_contract_sha256(contract)
-    issues = validate_episode_candidate(
-        contract=contract,
-        contract_sha256=contract_hash,
-        prior_state=initial_series_state(contract, contract_hash),
-        content=(
-            f"{heading}\n林岚：我在2015-08-12的21:40到这里，监控持续80分钟。\n门后传来第二次敲击"
-        ),
-        delta=make_delta(contract),
-    )
-
-    assert "unknown_speaker" not in {issue.code for issue in issues}
-
-
-def test_episode_validation_accepts_exact_annotated_character_speaker_label() -> None:
-    payload = make_contract().model_dump(mode="json")
-    payload["characters"][0]["name"] = "林岚（主角）"
-    contract = StoryContract.model_validate(payload)
-    contract_hash = story_contract_sha256(contract)
-    issues = validate_episode_candidate(
-        contract=contract,
-        contract_sha256=contract_hash,
-        prior_state=initial_series_state(contract, contract_hash),
-        content=(
-            "林岚（主角）：我在2015-08-12的21:40到这里，监控持续80分钟。\n"
-            "林岚（主角）（低声）：门后又响了一次。\n"
-            "门后传来第二次敲击"
-        ),
-        delta=make_delta(contract),
-    )
-
-    assert "unknown_speaker" not in {issue.code for issue in issues}
-
-
-@pytest.mark.parametrize(
-    "format_line",
-    [
-        "特写：物证袋上的编号被胶带遮住。",
-        "人物：林岚站在长条桌前。",
-        "内景：审讯室。",
-        "外景：旧屋门前。",
-        "近景：林岚的手指。",
-        "远景：码头渐渐隐去。",
-        "全景：物证室一片安静。",
-        "中景：林岚合上笔记本。",
-        "画外音：门后传来一声轻响。",
-        "独白：我不能再等了。",
-        "闪回：雨夜的旧屋。",
-        "转场：翌日清晨。",
-        "镜头贴着装订线看进去：纸页边缘有撕裂痕迹。",
-        "长条桌上物证袋排成一列：林岚没有伸手。",
-        "所以结论我写下来：她把笔记本合上。",
-        "我一直照着一个假设查：林岚望向窗外。",
-    ],
-)
-def test_episode_validation_does_not_treat_format_or_narration_as_speaker(
-    format_line: str,
+def test_episode_validation_does_not_parse_colon_forms_as_speakers(
+    colon_form_line: str,
 ) -> None:
     contract = make_contract()
     contract_hash = story_contract_sha256(contract)
@@ -611,7 +552,7 @@ def test_episode_validation_does_not_treat_format_or_narration_as_speaker(
         contract_sha256=contract_hash,
         prior_state=initial_series_state(contract, contract_hash),
         content=(
-            f"{format_line}\n"
+            f"{colon_form_line}\n"
             "林岚：我在2015-08-12的21:40到这里，监控持续80分钟。\n"
             "门后传来第二次敲击"
         ),
@@ -619,6 +560,28 @@ def test_episode_validation_does_not_treat_format_or_narration_as_speaker(
     )
 
     assert "unknown_speaker" not in {issue.code for issue in issues}
+
+
+def test_episode_validation_allows_screenplay_markers_reasoning_and_code_subject_matter() -> None:
+    contract = make_contract()
+    contract_hash = story_contract_sha256(contract)
+    content = (
+        "第一集《纸上的B型》\n"
+        '剪辑师：节目字幕里写着 JSON {"episode": 1}。\n'
+        "她把时间差默算了两遍：结果是一年零四个月。\n"
+        "林岚：我在2015-08-12的21:40到这里，监控持续80分钟。\n"
+        "门后传来第二次敲击\n（本集终）"
+    )
+
+    issues = validate_episode_candidate(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=initial_series_state(contract, contract_hash),
+        content=content,
+        delta=make_delta(contract),
+    )
+
+    assert issues == []
 
 
 @pytest.mark.parametrize(
@@ -634,7 +597,7 @@ def test_episode_validation_does_not_treat_format_or_narration_as_speaker(
         ),
     ],
 )
-def test_episode_validation_normalizes_chinese_continuity_values_and_parenthetical_speakers(
+def test_episode_validation_leaves_disputed_claims_and_speakers_to_semantic_review(
     invalid_line: str,
 ) -> None:
     contract = make_contract(
@@ -708,9 +671,9 @@ def test_episode_validation_normalizes_chinese_continuity_values_and_parenthetic
     )
 
     codes = [issue.code for issue in issues]
-    assert "unknown_speaker" in codes
-    assert codes.count("uncontracted_time") == 2
-    assert codes.count("uncontracted_number") == 2
+    assert "unknown_speaker" not in codes
+    assert "locked_temporal_evidence_mismatch" not in codes
+    assert "locked_numeric_evidence_mismatch" not in codes
 
 
 def test_episode_validation_accepts_chinese_equivalents_of_locked_values() -> None:
@@ -789,8 +752,8 @@ def test_episode_validation_accepts_chinese_equivalents_of_locked_values() -> No
     )
 
     assert not {
-        "uncontracted_time",
-        "uncontracted_number",
+        "locked_temporal_evidence_mismatch",
+        "locked_numeric_evidence_mismatch",
         "unknown_speaker",
     } & {issue.code for issue in issues}
 
@@ -826,19 +789,16 @@ def test_episode_validation_leaves_unlocked_units_to_semantic_review(
         delta=delta,
     )
 
-    assert "uncontracted_number" not in {issue.code for issue in issues}
+    assert "locked_numeric_evidence_mismatch" not in {issue.code for issue in issues}
 
 
-def test_episode_validation_rejects_wrong_value_for_locked_numeric_unit() -> None:
+def test_episode_validation_rejects_wrong_value_in_locked_numeric_evidence() -> None:
     contract = make_contract()
     contract_hash = story_contract_sha256(contract)
     prior = initial_series_state(contract, contract_hash)
     delta = make_delta(contract)
-    content = (
-        "林岚：我在2015-08-12的21:40到这里，监控持续80分钟。\n"
-        "林岚：另一份记录却写着监控记录的持续时间是81分钟。\n"
-        "门后传来第二次敲击"
-    )
+    next(item for item in delta.evidence if item.target_id == "locked_duration").excerpt = "81分钟"
+    content = "林岚：我在2015-08-12的21:40到这里，监控持续81分钟。\n门后传来第二次敲击"
 
     issues = validate_episode_candidate(
         contract=contract,
@@ -848,19 +808,16 @@ def test_episode_validation_rejects_wrong_value_for_locked_numeric_unit() -> Non
         delta=delta,
     )
 
-    assert "uncontracted_number" in {issue.code for issue in issues}
+    assert "locked_numeric_evidence_mismatch" in {issue.code for issue in issues}
 
 
-def test_episode_validation_rejects_wrong_cross_unit_duration() -> None:
+def test_episode_validation_rejects_wrong_cross_unit_locked_numeric_evidence() -> None:
     contract = make_contract()
     contract_hash = story_contract_sha256(contract)
     prior = initial_series_state(contract, contract_hash)
     delta = make_delta(contract)
-    content = (
-        "林岚：我在2015-08-12的21:40到这里，监控持续80分钟。\n"
-        "林岚：另一份记录却说监控记录的持续时间是2小时。\n"
-        "门后传来第二次敲击"
-    )
+    next(item for item in delta.evidence if item.target_id == "locked_duration").excerpt = "2小时"
+    content = "林岚：我在2015-08-12的21:40到这里，监控持续2小时。\n门后传来第二次敲击"
 
     issues = validate_episode_candidate(
         contract=contract,
@@ -870,7 +827,7 @@ def test_episode_validation_rejects_wrong_cross_unit_duration() -> None:
         delta=delta,
     )
 
-    assert "uncontracted_number" in {issue.code for issue in issues}
+    assert "locked_numeric_evidence_mismatch" in {issue.code for issue in issues}
 
 
 def test_episode_validation_accepts_equivalent_cross_unit_duration() -> None:
@@ -901,18 +858,26 @@ def test_episode_validation_accepts_equivalent_cross_unit_duration() -> None:
         delta=delta,
     )
 
-    assert "uncontracted_number" not in {issue.code for issue in issues}
+    assert "locked_numeric_evidence_mismatch" not in {issue.code for issue in issues}
 
 
-def test_episode_validation_rejects_wrong_standalone_calendar_year() -> None:
+@pytest.mark.parametrize(
+    "disputed_claim",
+    [
+        "林岚：另一份记录却写着监控记录的持续时间是81分钟。",
+        "林岚：另一份记录却说监控记录的持续时间是2小时。",
+        "林岚：另一份记录却说我的回乡日期是在2016年。",
+    ],
+)
+def test_episode_validation_does_not_treat_disputed_values_as_bound_evidence(
+    disputed_claim: str,
+) -> None:
     contract = make_contract()
     contract_hash = story_contract_sha256(contract)
     prior = initial_series_state(contract, contract_hash)
     delta = make_delta(contract)
     content = (
-        "林岚：我在2015-08-12的21:40到这里，监控持续80分钟。\n"
-        "林岚：另一份记录却说我的回乡日期是在2016年。\n"
-        "门后传来第二次敲击"
+        f"林岚：我在2015-08-12的21:40到这里，监控持续80分钟。\n{disputed_claim}\n门后传来第二次敲击"
     )
 
     issues = validate_episode_candidate(
@@ -923,7 +888,10 @@ def test_episode_validation_rejects_wrong_standalone_calendar_year() -> None:
         delta=delta,
     )
 
-    assert "uncontracted_number" in {issue.code for issue in issues}
+    assert not {
+        "locked_temporal_evidence_mismatch",
+        "locked_numeric_evidence_mismatch",
+    } & {issue.code for issue in issues}
 
 
 @pytest.mark.parametrize(
@@ -955,10 +923,10 @@ def test_episode_validation_leaves_unrelated_cross_unit_numbers_to_semantic_revi
         delta=delta,
     )
 
-    assert "uncontracted_number" not in {issue.code for issue in issues}
+    assert "locked_numeric_evidence_mismatch" not in {issue.code for issue in issues}
 
 
-def test_episode_validation_scopes_numeric_predicate_to_the_same_clause() -> None:
+def test_episode_validation_accepts_distinct_numeric_fact_evidence() -> None:
     contract = make_contract(
         numeric_facts=[
             {
@@ -994,7 +962,7 @@ def test_episode_validation_scopes_numeric_predicate_to_the_same_clause() -> Non
         delta=delta,
     )
 
-    assert "uncontracted_number" not in {issue.code for issue in issues}
+    assert "locked_numeric_evidence_mismatch" not in {issue.code for issue in issues}
 
 
 def test_episode_validation_allows_chinese_time_locked_as_text_fact() -> None:
@@ -1023,7 +991,7 @@ def test_episode_validation_allows_chinese_time_locked_as_text_fact() -> None:
         delta=delta,
     )
 
-    assert "uncontracted_time" not in {issue.code for issue in issues}
+    assert "locked_temporal_evidence_mismatch" not in {issue.code for issue in issues}
 
 
 def test_episode_validation_accepts_unqualified_twelve_hour_alias_for_locked_pm_time() -> None:
@@ -1042,10 +1010,10 @@ def test_episode_validation_accepts_unqualified_twelve_hour_alias_for_locked_pm_
         delta=delta,
     )
 
-    assert "uncontracted_time" not in {issue.code for issue in issues}
+    assert "locked_temporal_evidence_mismatch" not in {issue.code for issue in issues}
 
 
-def test_episode_validation_keeps_explicit_morning_distinct_from_locked_pm_time() -> None:
+def test_episode_validation_rejects_wrong_explicit_period_in_locked_time_evidence() -> None:
     contract = make_contract()
     contract_hash = story_contract_sha256(contract)
     prior = initial_series_state(contract, contract_hash)
@@ -1061,10 +1029,10 @@ def test_episode_validation_keeps_explicit_morning_distinct_from_locked_pm_time(
         delta=delta,
     )
 
-    assert "uncontracted_time" in {issue.code for issue in issues}
+    assert "locked_temporal_evidence_mismatch" in {issue.code for issue in issues}
 
 
-def test_episode_validation_keeps_numeric_am_time_distinct_from_locked_pm_time() -> None:
+def test_episode_validation_rejects_wrong_numeric_locked_time_evidence() -> None:
     contract = make_contract()
     contract_hash = story_contract_sha256(contract)
     prior = initial_series_state(contract, contract_hash)
@@ -1080,7 +1048,51 @@ def test_episode_validation_keeps_numeric_am_time_distinct_from_locked_pm_time()
         delta=delta,
     )
 
-    assert "uncontracted_time" in {issue.code for issue in issues}
+    assert "locked_temporal_evidence_mismatch" in {issue.code for issue in issues}
+
+
+@pytest.mark.parametrize(
+    ("excerpt", "rejected"),
+    [
+        ("2015-08-12 21:40", False),
+        ("二〇一五年八月十二日晚上九点四十分", False),
+        ("2015-08-12 08:00", True),
+        ("2015-08-12", True),
+        ("就在那一刻", False),
+    ],
+)
+def test_episode_validation_requires_all_parseable_locked_datetime_components(
+    excerpt: str,
+    rejected: bool,
+) -> None:
+    contract = make_contract(
+        numeric_facts=[
+            {
+                "fact_id": "arrival_moment",
+                "subject": "林岚",
+                "predicate": "抵达旧屋时刻",
+                "kind": "datetime",
+                "value": "2015-08-12T21:40",
+                "first_revealed_episode": 1,
+            }
+        ]
+    )
+    contract_hash = story_contract_sha256(contract)
+    prior = initial_series_state(contract, contract_hash)
+    delta = make_delta(contract)
+    delta.evidence[0].excerpt = excerpt
+    content = f"林岚：抵达旧屋时刻是{excerpt}。\n门后传来第二次敲击"
+
+    issues = validate_episode_candidate(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=prior,
+        content=content,
+        delta=delta,
+    )
+
+    codes = {issue.code for issue in issues}
+    assert ("locked_temporal_evidence_mismatch" in codes) is rejected
 
 
 def test_episode_validation_rejects_knowledge_gain_outside_locked_cast() -> None:

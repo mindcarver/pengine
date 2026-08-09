@@ -743,7 +743,7 @@ function renderCreation() {
       repairAuthorization
         ? authorization && authorization.kind === "design_rebuild"
           ? "设计需整体重建 · 自动预算已用尽"
-          : "分集后缀需重写 · 自动预算已用尽"
+          : "分集硬约束需修复 · 自动预算已用尽"
         : contextBudget
         ? "模型请求未发出，已完成的批准内容保持不变"
         : episodeError
@@ -883,7 +883,7 @@ function renderProgress() {
   elements["run-control-title"].textContent = repairAuthorization
     ? authorization && authorization.kind === "design_rebuild"
       ? "设计需整体重建 · 等待授权"
-      : "分集后缀需重写 · 等待授权"
+      : "分集硬约束需修复 · 等待授权"
     : contextBudget
     ? "模型上下文预算不足 · 已安全暂停"
     : episodeError
@@ -906,10 +906,10 @@ function renderProgress() {
         )
         .concat(
           authorization && authorization.estimated_tokens != null
-            ? ` 预计令牌：${authorization.estimated_tokens.toLocaleString()}。`
+            ? ` 参考上下文量：${authorization.estimated_tokens.toLocaleString()} tokens（仅统计暂停时的活动设计投影与保留前缀；不是下限、整轮用量或费用预测）。`
             : "",
         )
-        .concat(" 授权将执行一次生成加审查循环；失败会回到同一证据暂停。")
+        .concat(" 授权将执行一次生成加审查循环；若仍有硬约束冲突，将按最新审查证据再次暂停。")
     : contextBudget
     ? `${run.pause?.message || "请求未发出，未消耗任何额度。"} 请为对应路由配置更高的已验证上下文上限后继续当前阶段。`
     : episodeError

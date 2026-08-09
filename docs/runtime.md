@@ -165,7 +165,7 @@ script_writer
 
 ### Authorize repair
 
-只适用于内容审查给出的 `repair_authorization`。授权绑定设计候选、batch、影响集数、review id、证据和估算 token 数，只允许一次 generation + review cycle；该周期失败会回到同一证据暂停，不会无限自动循环。
+只适用于内容审查给出的 `repair_authorization`。授权绑定设计候选、batch、影响集数、review id、证据和参考上下文量，只允许一次 generation + review cycle。参考上下文量只统计暂停时的活动设计投影与保留前缀；这些文本不保证全部进入重建设计或每次逐集调用，因此它既不是下限，也不是整轮用量或费用预测。若仍有硬约束冲突，会按最新审查证据再次暂停，不会无限自动循环。
 
 ### End
 

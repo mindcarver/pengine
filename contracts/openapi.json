@@ -360,7 +360,7 @@
     "/creations/{creation_id}/runs/{run_kind}/authorize-repair": {
       "post": {
         "summary": "Authorize exactly one generation-plus-review cycle for a repair",
-        "description": "Grants the pending repair authorization bound to the active lineage and queues the run for exactly one cycle. A failure returns to the same evidence pause without automatic repetition. Generic Continue cannot spend a content-repair budget.",
+        "description": "Grants the pending repair authorization bound to the active lineage and queues the run for exactly one cycle. If a hard-constraint conflict remains, the run pauses again with the latest review evidence and no automatic repetition. Generic Continue cannot spend a content-repair budget.",
         "operationId": "authorizeRepair",
         "parameters": [
           {
@@ -3280,6 +3280,7 @@
                 "type": "null"
               }
             ],
+            "description": "Reference token count for active design projections and the retained prefix at the pause; neither a lower bound nor a total repair-cycle forecast.",
             "title": "Estimated Tokens"
           },
           "evidence": {
@@ -3331,7 +3332,7 @@
           "review_id"
         ],
         "title": "RepairAuthorization",
-        "description": "The exact one-cycle repair authorization shown at a repair-authorization pause.\n\nIt binds the active lineage and carries the review evidence, the affected\nrange, and the estimated token requirement so the operator can decide between\n``authorize once`` and ``end and preserve workspace`` (RPR-A8/A9)."
+        "description": "The exact one-cycle repair authorization shown at a repair-authorization pause.\n\nIt binds the active lineage and carries the review evidence, affected range,\nand a reference token count for the active design projections and retained\nprefix at the pause. This is neither a lower bound nor a total cycle forecast;\nactual repair input and output can differ (RPR-A8/A9)."
       }
     }
   },

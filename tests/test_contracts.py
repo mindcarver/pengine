@@ -137,8 +137,19 @@ def test_openapi_exposes_recovery_reasons_and_pause_evidence() -> None:
         "ScriptEvidence",
         "ReviewIssue",
         "SemanticReview",
+        "RepairAuthorization",
     ):
         assert schemas[name] == generated[name]
+
+
+def test_openapi_authorize_repair_description_matches_runtime() -> None:
+    path = "/creations/{creation_id}/runs/{run_kind}/authorize-repair"
+    documented = json.loads((ROOT / "contracts/openapi.json").read_text())["paths"][path]["post"]
+    generated = create_app(settings=Settings()).openapi()["paths"][path]["post"]
+
+    assert documented["description"] == generated["description"]
+    assert "latest review evidence" in documented["description"]
+    assert "same evidence" not in documented["description"]
 
 
 def test_pause_counts_cannot_mix_transport_and_content_recovery() -> None:

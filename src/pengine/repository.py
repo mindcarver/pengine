@@ -4885,8 +4885,9 @@ class Repository:
         """Pause the run for an exact one-cycle repair authorization.
 
         The authorization is bound to the active lineage and shows the evidence,
-        the affected range, and the estimated token requirement (RPR-A8). It grants
-        at most one generation-plus-review cycle (RPR-A9).
+        affected range, and reference context amount at the pause (neither a lower
+        bound nor a total cycle forecast) (RPR-A8). It grants at most one
+        generation-plus-review cycle (RPR-A9).
         """
         current = now or _utc_now()
         timestamp = _timestamp(current)
@@ -5027,8 +5028,8 @@ class Repository:
 
         The authorization is bound to the active lineage; if the active design or
         batch changed since the pause, it cannot be granted (RPR-A9). Granting
-        requeues the run for exactly one cycle; a subsequent failure returns to the
-        same evidence pause.
+        requeues the run for exactly one cycle; a subsequent hard-constraint
+        rejection pauses again with that fresh review's evidence.
         """
         timestamp = _timestamp(now or _utc_now())
         scope = f"run-control:{creation_id}:{run_kind}:authorize-repair"
