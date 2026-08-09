@@ -35,7 +35,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -55,6 +55,11 @@ from pengine.continuity import (
     initial_series_state,
     render_story_contract_markdown,
     story_contract_sha256,
+)
+from pengine.model_calls import (
+    ModelCallState,
+    ModelCallStore,
+    build_started_record,
 )
 from pengine.personas import PersonaCatalog
 from pengine.relay import PreflightBlockedError
@@ -263,6 +268,42 @@ class UnifiedWorkflow:
         self.outbound_content_calls = 0
         self.consumed_defects: set[int] = set()
         self.contract_a = _sparse_contract(episode_count)
+        self.model_call_state: ModelCallState | None = None
+        self.database_path: Path | None = None
+        self.generation_model_id = "claude-opus-5"
+        self.review_model_id = "gpt-5.5"
+
+    def record_physical_call(self, role: str) -> str:
+        """Persist one deterministic provider-call fixture with real physical lineage."""
+        assert self.model_call_state is not None
+        assert self.database_path is not None
+        model_id = self.generation_model_id if role == "generation" else self.review_model_id
+        provider = (
+            "anthropic"
+            if role == "generation"
+            else ("openai" if model_id.startswith("gpt-") else "deepseek")
+        )
+        record = build_started_record(
+            call_id=f"physical-{role}-{uuid4()}",
+            role=role,
+            adapter=provider,
+            provider=provider,
+            model=model_id,
+            context=self.model_call_state.context,
+            estimated_input_tokens=10,
+            estimated_output_tokens=20,
+            verified_limit_tokens=200_000,
+        )
+        record.status = "succeeded"
+        record.outcome = "success"
+        record.usage_status = "reported"
+        record.actual_input_tokens = 10
+        record.actual_output_tokens = 20
+        store = ModelCallStore(self.database_path)
+        store.upsert(record)
+        store.close()
+        self.model_call_state.remember_succeeded(record)
+        return record.call_id
 
     def _pick_contract(self, approved: dict[InternalStage, Any]) -> StoryContract:
         outline = approved.get(InternalStage.GENERATING_EPISODE_OUTLINE)
@@ -326,6 +367,8 @@ class UnifiedWorkflow:
         ):
             if stage not in approved:
                 await before_stage(stage)
+                if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+                    self.record_physical_call("review")
                 await approve_stage(stage, payloads[stage])
                 approved[stage] = payloads[stage]
 
@@ -381,11 +424,12 @@ class UnifiedWorkflow:
                 await before_episode(EpisodePlan(episode_number=episode_number, plan="测试计划"))
             lock = _episode_lock(contract, episode_number, prior_state)
             self.outbound_content_calls += 1
+            generation_call_id = self.record_physical_call("generation")
             draft = await commit_episode(
                 episode_number,
                 lock.content,
                 lock,
-                call_id=f"generation-episode-{episode_number}-pass{self.pass_count}",
+                call_id=generation_call_id,
                 writer_notes=f"第{episode_number}集写作备注",
             )
             self.committed.append(episode_number)
@@ -405,6 +449,7 @@ class UnifiedWorkflow:
                     decision = _PASS_DECISION
                 review_id = None
                 if register_series_review is not None:
+                    self.record_physical_call("review")
                     review_id = await register_series_review(
                         review_type=(
                             "final" if episode_number == contract.episode_count else "milestone"
@@ -524,6 +569,31 @@ async def _services(tmp_path: Path):
     return settings, catalog, repository
 
 
+def _audited_worker(
+    *,
+    settings: Settings,
+    repository: Repository,
+    catalog: PersonaCatalog,
+    workflow: UnifiedWorkflow,
+    worker_id: str,
+) -> Worker:
+    """Wire deterministic calls through the same operation-scoped ledger contract."""
+    state = ModelCallState()
+    workflow.model_call_state = state
+    workflow.database_path = settings.database_path
+    workflow.generation_model_id = settings.generation_model_id or "claude-opus-5"
+    workflow.review_model_id = settings.review_model_id or "gpt-5.5"
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id=worker_id,
+    )
+    worker._model_call_state = state
+    return worker
+
+
 async def _create_creation(repository: Repository, catalog: PersonaCatalog, key: str):
     snapshot = catalog.create_snapshot("test-persona")
     return await repository.create_creation(
@@ -556,7 +626,7 @@ async def test_int_a4_resume_after_episode_three_does_not_rewrite_prefix(
     """A controllable stop after episode 3 resumes the same run at episode 4."""
     settings, catalog, repository = await _services(tmp_path)
     workflow = UnifiedWorkflow(episode_count=4, stop_after_episode=3)
-    worker = Worker(
+    worker = _audited_worker(
         settings=settings,
         repository=repository,
         catalog=catalog,
@@ -571,6 +641,20 @@ async def test_int_a4_resume_after_episode_three_does_not_rewrite_prefix(
     timeout_resource = await repository.get_creation(accepted.creation_id)
     assert timeout_resource is not None
     assert timeout_resource.initial.state == "auto_resuming"
+    run_id = UUID(
+        _sqlite_rows(
+            settings.database_path,
+            "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+            (str(accepted.creation_id),),
+        )[0]["id"]
+    )
+    checkpoints = await repository.get_business_checkpoints(run_id)
+    outline = checkpoints[InternalStage.GENERATING_EPISODE_OUTLINE]
+    assert "review_call_id" not in outline
+    assert await repository.get_checkpoint_review_call_id(
+        run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+    )
 
     before = {
         row["episode_number"]: (row["candidate_id"], row["version"], row["status"])
@@ -622,7 +706,7 @@ async def test_int_a5_script_defect_preserves_prefix_and_replays_state(
             }
         },
     )
-    worker = Worker(
+    worker = _audited_worker(
         settings=settings,
         repository=repository,
         catalog=catalog,
@@ -698,7 +782,7 @@ async def test_int_a5_design_defect_builds_complete_new_design_and_supersedes_ol
         },
         rebuild_contract=_contract_b_rebuild(),
     )
-    worker = Worker(
+    worker = _audited_worker(
         settings=settings,
         repository=repository,
         catalog=catalog,
@@ -945,7 +1029,7 @@ async def test_int_a7_context_overflow_pauses_with_zero_outbound_calls(
     """An over-context request produces zero outbound calls and unchanged candidates."""
     settings, catalog, repository = await _services(tmp_path)
     workflow = UnifiedWorkflow(episode_count=3, preflight_block=True)
-    worker = Worker(
+    worker = _audited_worker(
         settings=settings,
         repository=repository,
         catalog=catalog,
@@ -1004,7 +1088,7 @@ async def test_int_a8_suffix_budget_exhaustion_and_one_cycle_authorization(
         },
         persistent_defects=True,
     )
-    worker = Worker(
+    worker = _audited_worker(
         settings=settings,
         repository=repository,
         catalog=catalog,
@@ -1084,7 +1168,7 @@ async def test_int_a8_design_budget_exhaustion_and_authorization_cycle(
         rebuild_contract=_contract_b_rebuild(),
         persistent_defects=True,
     )
-    worker = Worker(
+    worker = _audited_worker(
         settings=settings,
         repository=repository,
         catalog=catalog,
@@ -1249,7 +1333,7 @@ async def test_int_a10_migration_preserves_legacy_records_without_false_lineage(
     # No legacy generation path is maintained: a fresh unified run produces only
     # new-lineage records through the new worker path.
     new_workflow = UnifiedWorkflow(episode_count=3)
-    new_worker = Worker(
+    new_worker = _audited_worker(
         settings=settings,
         repository=migrated,
         catalog=catalog,
@@ -1292,7 +1376,7 @@ async def test_unified_delivery_facts_helper_validates_seeded_run(
 
     settings, catalog, repository = await _services(tmp_path)
     workflow = UnifiedWorkflow(episode_count=3)
-    worker = Worker(
+    worker = _audited_worker(
         settings=settings,
         repository=repository,
         catalog=catalog,

@@ -173,6 +173,7 @@ class ModelCallUsage(StrictModel):
 
 class ModelCallSummary(StrictModel):
     call_id: str
+    operation_id: str | None = None
     role: Literal["generation", "review"]
     adapter: str
     provider: str
