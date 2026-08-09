@@ -52,8 +52,10 @@ _SPEAKER = re.compile(
 )
 _CHARACTER_LABEL_QUALIFIER = re.compile(r"\s*[（(][^）)\r\n]{1,40}[）)]\s*$")
 _KNOWN_SPEAKER_SUFFIX = re.compile(r"^(?:\s*[（(][^）)\r\n]{0,40}[）)])*\s*[：:]")
-_SCENE_HEADING = re.compile(
-    r"^(?:场景[零〇一二两三四五六七八九十百\d]+|第[零〇一二两三四五六七八九十百\d]+场)$"
+_STRUCTURAL_HEADING = re.compile(
+    r"^(?:场景[零〇一二两三四五六七八九十百\d]+|"
+    r"第[零〇一二两三四五六七八九十百\d]+[场集]|EP\d+)$",
+    re.IGNORECASE,
 )
 _NON_CHARACTER_LABELS = {
     "画面",
@@ -851,7 +853,7 @@ def validate_episode_candidate(
         if (
             match
             and match.group(1) not in character_names | _NON_CHARACTER_LABELS
-            and _SCENE_HEADING.fullmatch(match.group(1)) is None
+            and _STRUCTURAL_HEADING.fullmatch(match.group(1)) is None
         ):
             issues.append(
                 _issue(

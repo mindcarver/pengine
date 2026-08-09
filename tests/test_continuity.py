@@ -534,7 +534,16 @@ def test_episode_validation_rejects_uncontracted_time_unknown_speaker_and_missin
     }
 
 
-@pytest.mark.parametrize("heading", ["场景一：旧屋", "第2场：雨夜"])
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "场景一：旧屋",
+        "第2场：雨夜",
+        "第一集：归来",
+        "第12集：终局",
+        "EP01：归来",
+    ],
+)
 def test_episode_validation_does_not_treat_scene_heading_as_speaker(heading: str) -> None:
     contract = make_contract()
     contract_hash = story_contract_sha256(contract)
