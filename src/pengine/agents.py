@@ -181,6 +181,28 @@ _GENERATION_TOOL_ALLOWLIST = frozenset(
 _REVIEW_TOOL_ALLOWLIST = frozenset({"read_file"})
 _REPAIR_TOOL_ALLOWLIST = frozenset({"read_file", "calculate_arithmetic"})
 
+_WORKFLOW_SCAFFOLDING_POLICY = (
+    "Workflow scaffolding is internal-only. Raw story-contract records or serialization, the "
+    "workflow episode index, workspace paths, fact/clue/obligation IDs, tool calls, validation "
+    "steps, and arithmetic operands or intermediate expressions must never appear in screenplay "
+    "content as scene descriptions, action, narration, or dialogue. The story-world facts "
+    "encoded by the contract are not scaffolding and should still appear when the story "
+    "naturally needs them. Use tools only for private verification. From arithmetic checks, "
+    "finished content may retain only the result or time expression naturally needed in the "
+    "story world, without operands, equations, or the verification process. Never turn workflow "
+    "labels such as 第N集, 上一集, "
+    "or episode N into a character's past experience. This episode-language rule is not a "
+    "blanket ban: such terms may appear naturally only when the user request or an approved "
+    "upstream artifact explicitly establishes a diegetic film, television, or serialized-program "
+    "production or an in-world discussion of program episodes. That exception applies only to "
+    "episode terminology, not to other workflow scaffolding."
+)
+
+
+def _with_workflow_scaffolding_policy(prompt: str) -> str:
+    return "\n\n".join((prompt, _WORKFLOW_SCAFFOLDING_POLICY))
+
+
 _STORY_ARCHITECT_PROMPT = (
     "Read the relevant /persona context. Return only the structured result for "
     "the stage named in the delegated request. For selecting_l0_variant, set "
@@ -241,7 +263,7 @@ _EPISODE_PLANNER_PROMPT = (
     "verbatim=true; leave verbatim=false otherwise."
 )
 
-_SCRIPT_WRITER_PROMPT = (
+_SCRIPT_WRITER_PROMPT = _with_workflow_scaffolding_policy(
     "Read /workspace/story_contract.json, /workspace/speaker_contract.json, and "
     "/workspace/series_state.json, then return a "
     "complete non-null state_delta bound to the supplied contract hash. Put only changes from "
@@ -269,8 +291,9 @@ _SCRIPT_WRITER_PROMPT = (
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
     "exact dialogue-count claims, and episode-specific promised actions. Every "
     "explicitly locked upstream commitment must appear in the scripts. Unspecified "
-    "creative details remain the writer's choice. Use calculate_arithmetic "
-    "for every derived numeric claim and copy its exact result. The tool accepts "
+    "creative details remain the writer's choice. Use calculate_arithmetic privately "
+    "for every derived numeric claim and copy only the exact result naturally needed in the "
+    "story world. The tool accepts "
     "decimal operands only: convert clock times to elapsed minutes before subtracting "
     "them (for example, 22:50 becomes 1370 and 22:20 becomes 1340). Never round a "
     "non-integral division unless the script states the rounding rule. Every required "
@@ -307,7 +330,7 @@ _EPISODE_REPAIR_PROMPT = (
     "structured script result only."
 )
 
-_QUALITY_REVIEWER_PROMPT = (
+_QUALITY_REVIEWER_PROMPT = _with_workflow_scaffolding_policy(
     "Read /workspace/story_contract.json and the relevant /persona context, then review only "
     "the named gate "
     "against the approved artifacts supplied in the delegated request. Always return "
@@ -319,7 +342,29 @@ _QUALITY_REVIEWER_PROMPT = (
     "only when that fact has verbatim=true. kind=text, the value field, quotation marks, "
     "or words such as 原文 in subject or predicate do not create a machine-executable "
     "verbatim requirement. Facts without verbatim=true must be reviewed for semantic "
-    "consistency only."
+    "consistency only. At accepting_l4, explicit workflow scaffolding leakage outside the "
+    "diegetic exception is a blocking defect: set passed=false and cite the leakage in concrete "
+    "evidence."
+)
+
+_EPISODE_REVIEWER_PROMPT = _with_workflow_scaffolding_policy(
+    "First read /skills/episode-continuity-review/SKILL.md. Follow that skill while treating "
+    "explicit contract facts and prior state as immutable and unspecified creative details as "
+    "free. Only a story_contract fact with verbatim=true requires its value to appear "
+    "contiguously word-for-word; all other facts, including kind=text facts, are reviewed for "
+    "semantic consistency only. Explicit workflow scaffolding leakage outside the diegetic "
+    "exception is blocking and the episode candidate must be rejected. Return only structured "
+    "review evidence and never repair content."
+)
+
+_SERIES_REVIEWER_PROMPT = _with_workflow_scaffolding_policy(
+    "Review the complete active series prefix against the active SeriesBible and locked story "
+    "contract. The design and every committed script are immutable. Classify the decision "
+    "exactly: pass requires concrete whole-series consistency evidence; a design defect returns "
+    "no affected episode; a script defect returns the earliest affected episode N. Explicit "
+    "workflow scaffolding leakage outside the diegetic exception is a script_defect: reject it "
+    "and return the earliest episode containing leakage, even when later episodes also leak. "
+    "Never repair content and never reinterpret the design to make the prefix pass."
 )
 
 
@@ -5308,22 +5353,8 @@ class DeepAgentWorkflow:
             "prose artifact or JSON contract, and return structured evidence with precise "
             "issues. Never repair or rewrite the candidate."
         )
-        episode_reviewer_prompt = bind_language(
-            "First read /skills/episode-continuity-review/SKILL.md. Follow that skill while "
-            "treating explicit contract facts and prior state as immutable and unspecified "
-            "creative details as free. Only a story_contract fact with verbatim=true requires "
-            "its value to appear contiguously word-for-word; all other facts, including kind=text "
-            "facts, are reviewed for semantic consistency only. Return only structured review "
-            "evidence and never repair content."
-        )
-        series_reviewer_prompt = bind_language(
-            "Review the complete active series prefix against the active SeriesBible "
-            "and locked story contract. The design and every committed script are "
-            "immutable. Classify the decision exactly: pass requires concrete "
-            "whole-series consistency evidence; a design defect returns no affected "
-            "episode; a script defect returns the earliest affected episode N. Never "
-            "repair content and never reinterpret the design to make the prefix pass."
-        )
+        episode_reviewer_prompt = bind_language(_EPISODE_REVIEWER_PROMPT)
+        series_reviewer_prompt = bind_language(_SERIES_REVIEWER_PROMPT)
         episode_repair_prompt = bind_language(_EPISODE_REPAIR_PROMPT)
         story_repair_prompt = bind_language(
             "First read /skills/story-repair/SKILL.md. Follow that skill while keeping every "

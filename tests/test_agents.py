@@ -26,11 +26,14 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from pengine.agents import (
     _EPISODE_PLANNER_PROMPT,
     _EPISODE_REPAIR_PROMPT,
+    _EPISODE_REVIEWER_PROMPT,
     _QUALITY_REVIEWER_PROMPT,
     _REPAIR_TOOL_ALLOWLIST,
     _SCRIPT_WRITER_PROMPT,
+    _SERIES_REVIEWER_PROMPT,
     _SPECIALIST_SKILL_SOURCES,
     _STORY_ARCHITECT_PROMPT,
+    _WORKFLOW_SCAFFOLDING_POLICY,
     REVIEW_FILE_PERMISSIONS,
     SKILLED_WRITE_PERMISSIONS,
     VIRTUAL_FILE_PERMISSIONS,
@@ -3048,6 +3051,50 @@ def test_l4_reviewer_prompt_only_locks_explicit_verbatim_facts() -> None:
     assert "semantic consistency only" in _QUALITY_REVIEWER_PROMPT
 
 
+def test_workflow_scaffolding_policy_keeps_internal_data_out_of_content() -> None:
+    policy = " ".join(_WORKFLOW_SCAFFOLDING_POLICY.split())
+
+    for internal_marker in (
+        "Raw story-contract records or serialization",
+        "workflow episode index",
+        "workspace paths",
+        "fact/clue/obligation IDs",
+        "tool calls",
+        "validation steps",
+        "arithmetic operands or intermediate expressions",
+    ):
+        assert internal_marker in policy
+    assert "internal-only" in policy
+    assert "must never appear in screenplay content" in policy
+    assert "scene descriptions, action, narration, or dialogue" in policy
+    assert "story-world facts encoded by the contract are not scaffolding" in policy
+    assert "Use tools only for private verification" in policy
+    assert "From arithmetic checks" in policy
+    assert "only the result or time expression naturally needed in the story world" in policy
+    assert "without operands, equations, or the verification process" in policy
+    assert "calculate_arithmetic" not in policy
+
+
+def test_workflow_scaffolding_policy_preserves_diegetic_episode_language() -> None:
+    policy = " ".join(_WORKFLOW_SCAFFOLDING_POLICY.split())
+
+    assert "Never turn workflow labels such as 第N集, 上一集, or episode N" in policy
+    assert "not a blanket ban" in policy
+    assert "user request or an approved upstream artifact explicitly establishes" in policy
+    assert "diegetic film, television, or serialized-program production" in policy
+    assert "in-world discussion of program episodes" in policy
+    assert "exception applies only to episode terminology" in policy
+
+
+def test_workflow_scaffolding_review_prompts_make_leakage_blocking() -> None:
+    assert "At accepting_l4" in _QUALITY_REVIEWER_PROMPT
+    assert "blocking defect: set passed=false" in _QUALITY_REVIEWER_PROMPT
+    assert "script_defect" in _SERIES_REVIEWER_PROMPT
+    assert "earliest episode containing leakage" in _SERIES_REVIEWER_PROMPT
+    assert "even when later episodes also leak" in _SERIES_REVIEWER_PROMPT
+    assert "episode candidate must be rejected" in _EPISODE_REVIEWER_PROMPT
+
+
 def test_evidence_contract_exposes_episode_verbatim_facts_and_rejected_issue() -> None:
     contract = _story_contract(verbatim_episodes={1})
     issue = EpisodeReviewerResult.model_validate(
@@ -3208,6 +3255,15 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
         "series_reviewer",
     }
     subagents_by_name = {spec["name"]: spec for spec in captured["subagents"]}
+    for name in (
+        "script_writer",
+        "quality_reviewer",
+        "episode_reviewer",
+        "series_reviewer",
+    ):
+        system_prompt = subagents_by_name[name]["system_prompt"]
+        assert system_prompt.count(_WORKFLOW_SCAFFOLDING_POLICY) == 1
+        assert f"\n\n{_WORKFLOW_SCAFFOLDING_POLICY}" in system_prompt
     assert subagents_by_name["episode_repair"]["permissions"] == REVIEW_FILE_PERMISSIONS
     assert subagents_by_name["story_repair"]["permissions"] == REVIEW_FILE_PERMISSIONS
     supervisor_allowlists = [
