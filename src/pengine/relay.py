@@ -1005,6 +1005,8 @@ def is_relay_exception(exc: BaseException) -> bool:
 
 
 def is_relay_connection_error(exc: BaseException) -> bool:
+    if _is_upstream_stream_error(exc):
+        return True
     if _is_retryable_transport(exc):
         return True
     return any(
@@ -1090,6 +1092,8 @@ def retryable_relay_interruption(exc: Exception) -> RetryableRelayInterruption |
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
     if _is_retryable_status_error(exc):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
+    if _is_upstream_stream_error(exc):
+        return RetryableRelayInterruption(_retry_delay_seconds(exc))
     return None
 
 
@@ -1133,6 +1137,40 @@ def _is_retryable_status_error(exc: BaseException) -> bool:
         )
         and getattr(exc, "status_code", None) in _RETRYABLE_RELAY_STATUSES
     )
+
+
+def _is_upstream_stream_error(exc: BaseException) -> bool:
+    """Recognize the provider's HTTP-200 streaming decode interruption only.
+
+    A successful HTTP status is otherwise not evidence of a transport failure. The
+    provider exception class and structured nested error type are both required so
+    ordinary API, auth, protocol, and structured-output errors remain terminal.
+    """
+    if not any(
+        base.__module__.startswith(("anthropic", "openai"))
+        and base.__name__ == "APIStatusError"
+        for base in type(exc).__mro__
+    ):
+        return False
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if status != 200:
+        return False
+    raw_body = _raw_body_from(exc)
+    if raw_body is None:
+        return False
+    try:
+        payload = json.loads(raw_body)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        return False
+    error = payload["error"]
+    return error.get("code") == "upstream_stream_error" or error.get(
+        "type"
+    ) == "upstream_stream_error"
 
 
 def _cause_chain(exc: BaseException):

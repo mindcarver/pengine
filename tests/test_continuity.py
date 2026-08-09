@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -498,6 +499,99 @@ def test_story_contract_hash_and_markdown_projection_are_deterministic() -> None
     markdown = render_story_contract_markdown(contract, contract_hash)
     assert f"SHA-256: `{contract_hash}`" in markdown
     assert "80 分钟 (duration)" in markdown
+    assert "verbatim=false" in markdown
+
+
+def test_legacy_story_contract_verbatim_default_preserves_hash() -> None:
+    contract = make_contract(
+        numeric_facts=[
+            {
+                "fact_id": "locked_phrase",
+                "subject": "旧案",
+                "predicate": "记录措辞",
+                "kind": "text",
+                "value": "原始措辞",
+                "first_revealed_episode": 1,
+            }
+        ]
+    )
+    legacy_payload = contract.model_dump(mode="json")
+    for fact in legacy_payload["facts"]:
+        fact.pop("verbatim", None)
+    legacy_hash = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+
+    parsed_legacy = StoryContract.model_validate(legacy_payload)
+    assert parsed_legacy.facts[0].verbatim is False
+    assert story_contract_sha256(parsed_legacy) == legacy_hash
+
+    verbatim_payload = json.loads(json.dumps(legacy_payload, ensure_ascii=False))
+    verbatim_payload["facts"][0]["verbatim"] = True
+    assert story_contract_sha256(StoryContract.model_validate(verbatim_payload)) != legacy_hash
+
+
+def test_story_fact_rejects_verbatim_for_non_text_kind() -> None:
+    payload = make_contract().model_dump(mode="json")
+    payload["facts"][0]["verbatim"] = True
+
+    with pytest.raises(ValidationError, match="Only text facts may require verbatim wording"):
+        StoryContract.model_validate(payload)
+
+
+def test_episode_validation_requires_only_explicit_verbatim_text() -> None:
+    payload = make_contract(
+        numeric_facts=[
+            {
+                "fact_id": "locked_phrase",
+                "subject": "旧案",
+                "predicate": "记录措辞",
+                "kind": "text",
+                "value": "原始措辞",
+                "first_revealed_episode": 1,
+            }
+        ]
+    ).model_dump(mode="json")
+    payload["facts"][0]["verbatim"] = False
+    semantic_contract = StoryContract.model_validate(payload)
+    semantic_hash = story_contract_sha256(semantic_contract)
+    semantic_content = "林岚：她用另一种说法表达了同一件事。\n事实证据\n门后传来第二次敲击"
+    semantic_issues = validate_episode_candidate(
+        contract=semantic_contract,
+        contract_sha256=semantic_hash,
+        prior_state=initial_series_state(semantic_contract, semantic_hash),
+        content=semantic_content,
+        delta=make_delta(semantic_contract),
+    )
+    assert "verbatim_fact_missing" not in {issue.code for issue in semantic_issues}
+
+    payload["facts"][0]["verbatim"] = True
+    verbatim_contract = StoryContract.model_validate(payload)
+    verbatim_hash = story_contract_sha256(verbatim_contract)
+    missing_issues = validate_episode_candidate(
+        contract=verbatim_contract,
+        contract_sha256=verbatim_hash,
+        prior_state=initial_series_state(verbatim_contract, verbatim_hash),
+        content=semantic_content,
+        delta=make_delta(verbatim_contract),
+    )
+    missing = next(issue for issue in missing_issues if issue.code == "verbatim_fact_missing")
+    assert missing.contract_refs == ["locked_phrase"]
+    assert "原始措辞" in missing.message
+
+    hit_issues = validate_episode_candidate(
+        contract=verbatim_contract,
+        contract_sha256=verbatim_hash,
+        prior_state=initial_series_state(verbatim_contract, verbatim_hash),
+        content="林岚：原始措辞。\n事实证据\n门后传来第二次敲击",
+        delta=make_delta(verbatim_contract),
+    )
+    assert "verbatim_fact_missing" not in {issue.code for issue in hit_issues}
 
 
 def test_episode_validation_rejects_uncontracted_time_unknown_speaker_and_missing_evidence() -> (

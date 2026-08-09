@@ -64,7 +64,11 @@ from pengine.series_bible import (
     detect_genre,
     validate_series_bible,
 )
-from pengine.series_review import active_prefix_hash
+from pengine.series_review import (
+    BoundStructuralReview,
+    active_prefix_hash,
+    aggregate_script_defect_evidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +240,39 @@ class StageValidationError(RuntimeError):
         self.safe_message = safe_message
 
 
+def _suffix_rewrite_feedback_payload(
+    reviews: list[BoundStructuralReview],
+    effective_earliest_episode: int,
+) -> dict[str, Any]:
+    """Serialize all unresolved bound defects for the next suffix writer."""
+    return {
+        "version": 1,
+        "effective_earliest_affected_episode": effective_earliest_episode,
+        "reviews": [
+            {
+                "review_id": review.review_id,
+                "category": review.category,
+                "evidence": review.evidence,
+                "earliest_affected_episode": review.earliest_affected_episode,
+                "binding": {
+                    "run_id": review.run_id,
+                    "review_epoch": review.review_epoch,
+                    "review_type": review.review_type,
+                    "episode_number": review.episode_number,
+                    "design_candidate_id": review.design_candidate_id,
+                    "design_content_hash": review.design_content_hash,
+                    "design_epoch": review.design_epoch,
+                    "batch_id": review.batch_id,
+                    "batch_epoch": review.batch_epoch,
+                    "prefix_hash": review.prefix_hash,
+                    "call_id": review.call_id,
+                },
+            }
+            for review in reviews
+        ],
+    }
+
+
 class WorkflowExecutor(Protocol):
     async def execute(
         self,
@@ -259,6 +296,7 @@ class WorkflowExecutor(Protocol):
         series_bible: SeriesBibleSummary | None = None,
         register_series_review: SeriesReviewRegistration | None = None,
         get_series_bible: Callable[[], Awaitable[SeriesBibleSummary | None]] | None = None,
+        suffix_rewrite_feedback: Mapping[str, Any] | None = None,
     ) -> WorkflowResult: ...
 
 
@@ -419,6 +457,32 @@ class Worker:
                     job.run_id,
                     type(exc).__name__,
                 )
+
+    async def _unresolved_suffix_reviews(
+        self,
+        run_id: UUID,
+    ) -> list[BoundStructuralReview]:
+        return await self.repository.get_unresolved_script_defect_reviews(run_id)
+
+    async def _suffix_rewrite_feedback_for_writer(
+        self,
+        run_id: UUID,
+    ) -> Mapping[str, Any] | None:
+        reviews = await self._unresolved_suffix_reviews(run_id)
+        if not reviews:
+            return None
+        affected_episodes = [
+            review.earliest_affected_episode
+            for review in reviews
+            if review.earliest_affected_episode is not None
+        ]
+        if not affected_episodes:
+            return None
+        effective_earliest = min(affected_episodes)
+        unfinished_episode = await self.repository.first_unfinished_episode(run_id)
+        if unfinished_episode is None or unfinished_episode < effective_earliest:
+            return None
+        return _suffix_rewrite_feedback_payload(reviews, effective_earliest)
 
     async def _process_job_body(self, job: LeasedJob) -> None:
         await self.repository.mark_run_running(job.run_id)
@@ -748,29 +812,37 @@ class Worker:
                             asyncio.get_running_loop().time() + self.settings.run_timeout_seconds
                         )
 
-                    result = await self.workflow.execute(
-                        thread_id=work.thread_id,
-                        story=work.story,
-                        requirements=work.requirements,
-                        persona_files=persona_files,
-                        before_stage=before_stage,
-                        approve_stage=approve_stage,
-                        approved_checkpoints=approved,
-                        episode_drafts=work.episode_drafts,
-                        before_episode=before_episode,
-                        commit_episode=commit_episode,
-                        assemble_episode_scripts=lambda: self.repository.assemble_episode_scripts(
+                    workflow_kwargs: dict[str, Any] = {
+                        "thread_id": work.thread_id,
+                        "story": work.story,
+                        "requirements": work.requirements,
+                        "persona_files": persona_files,
+                        "before_stage": before_stage,
+                        "approve_stage": approve_stage,
+                        "approved_checkpoints": approved,
+                        "episode_drafts": work.episode_drafts,
+                        "before_episode": before_episode,
+                        "commit_episode": commit_episode,
+                        "assemble_episode_scripts": (
+                            lambda: self.repository.assemble_episode_scripts(work.run_id)
+                        ),
+                        "episode_timeout_seconds": self.settings.run_timeout_seconds,
+                        "reset_episode_deadline": reset_episode_deadline,
+                        "output_language": work.output_language,
+                        "feedback": work.frozen_feedback,
+                        "retrieve_references": retrieve_references,
+                        "series_bible": await self.repository.get_run_series_bible(work.run_id),
+                        "register_series_review": register_series_review,
+                        "get_series_bible": lambda: self.repository.get_run_series_bible(
                             work.run_id
                         ),
-                        episode_timeout_seconds=self.settings.run_timeout_seconds,
-                        reset_episode_deadline=reset_episode_deadline,
-                        output_language=work.output_language,
-                        feedback=work.frozen_feedback,
-                        retrieve_references=retrieve_references,
-                        series_bible=await self.repository.get_run_series_bible(work.run_id),
-                        register_series_review=register_series_review,
-                        get_series_bible=lambda: self.repository.get_run_series_bible(work.run_id),
+                    }
+                    suffix_rewrite_feedback = await self._suffix_rewrite_feedback_for_writer(
+                        work.run_id
                     )
+                    if suffix_rewrite_feedback is not None:
+                        workflow_kwargs["suffix_rewrite_feedback"] = suffix_rewrite_feedback
+                    result = await self.workflow.execute(**workflow_kwargs)
                 if work.run_kind == "revision" and not result.feedback_handling:
                     raise AgentProtocolError(
                         "Revision result omitted feedback handling",
@@ -1273,9 +1345,30 @@ class Worker:
         """
         if exc.category == "script_defect":
             batch = await self.repository.get_script_batch_lineage(work.run_id)
+            unresolved_reviews = await self._unresolved_suffix_reviews(work.run_id)
+            affected_episodes = [
+                review.earliest_affected_episode
+                for review in unresolved_reviews
+                if review.earliest_affected_episode is not None
+            ]
+            effective_earliest = (
+                min(affected_episodes)
+                if affected_episodes
+                else exc.earliest_affected_episode
+            )
+            aggregated_evidence = (
+                aggregate_script_defect_evidence(unresolved_reviews)
+                if unresolved_reviews
+                else exc.evidence
+            )
+            latest_review_id = (
+                unresolved_reviews[-1].review_id
+                if unresolved_reviews
+                else exc.review_id
+            )
             if (
                 batch is not None
-                and exc.earliest_affected_episode is not None
+                and effective_earliest is not None
                 and await self.repository.has_automatic_suffix_budget(
                     work.run_id,
                     batch.batch_id,
@@ -1287,14 +1380,14 @@ class Worker:
                 )
                 await self.repository.rewrite_episode_suffix(
                     work.run_id,
-                    exc.earliest_affected_episode,
+                    effective_earliest,
                 )
                 await self.repository.requeue_run_job(work.run_id)
                 logger.info(
                     "automatic suffix rewrite run_id=%s creation_id=%s from_episode=%s",
                     work.run_id,
                     work.creation_id,
-                    exc.earliest_affected_episode,
+                    effective_earliest,
                 )
                 return
             await self.repository.pause_repair_authorization(
@@ -1305,18 +1398,18 @@ class Worker:
                 design_epoch=(batch.design_epoch if batch is not None else 1),
                 batch_id=(batch.batch_id if batch is not None else ""),
                 batch_epoch=(batch.batch_epoch if batch is not None else 1),
-                earliest_affected_episode=exc.earliest_affected_episode,
+                earliest_affected_episode=effective_earliest,
                 range_episodes=(
-                    len(await self.repository.get_active_episode_candidates(work.run_id))
-                    - (exc.earliest_affected_episode or 1)
+                    len(work.episode_plans)
+                    - (effective_earliest or 1)
                     + 1
                 ),
                 estimated_tokens=await self._repair_token_estimate(
                     work.run_id,
-                    from_episode=exc.earliest_affected_episode or 1,
+                    from_episode=effective_earliest or 1,
                 ),
-                evidence=exc.evidence,
-                review_id=exc.review_id or "",
+                evidence=aggregated_evidence,
+                review_id=latest_review_id or "",
             )
             logger.info(
                 "suffix-rewrite authorization required run_id=%s creation_id=%s",

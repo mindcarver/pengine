@@ -118,6 +118,20 @@ class BoundStructuralReview(ContinuityModel):
     consumed_at: datetime | None = None
 
 
+def aggregate_script_defect_evidence(
+    reviews: Sequence[BoundStructuralReview],
+) -> str:
+    """Render every unresolved script-defect review as one bounded pause reason."""
+    return "\n\n".join(
+        (
+            f"[review_id={review.review_id} review_epoch={review.review_epoch} "
+            f"earliest_affected_episode={review.earliest_affected_episode}]\n"
+            f"{review.evidence}"
+        )
+        for review in reviews
+    )
+
+
 def effective_milestones(declared: Sequence[int], episode_count: int) -> list[int]:
     """The review schedule: declared milestones plus the mandatory final episode.
 

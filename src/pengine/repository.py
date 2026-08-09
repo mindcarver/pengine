@@ -89,10 +89,11 @@ from pengine.series_bible import (
 )
 from pengine.series_review import (
     BoundStructuralReview,
+    aggregate_script_defect_evidence,
     new_review_id,
 )
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -1605,6 +1606,143 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 17
+            if schema_version == 17:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.execute("DROP TABLE IF EXISTS episode_attempts_v18")
+                    await connection.execute(
+                        """
+                        CREATE TABLE episode_attempts_v18 (
+                            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                            episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+                            attempt_cycle INTEGER NOT NULL CHECK (attempt_cycle >= 0),
+                            attempt_number INTEGER NOT NULL CHECK (
+                                attempt_number >= 1 AND attempt_number <= 3
+                            ),
+                            recorded_at TEXT NOT NULL,
+                            PRIMARY KEY (run_id, episode_number, attempt_cycle, attempt_number)
+                        )
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO episode_attempts_v18(
+                            run_id, episode_number, attempt_cycle, attempt_number, recorded_at
+                        )
+                        SELECT run_id, episode_number, 0, attempt_number, recorded_at
+                        FROM episode_attempts
+                        """
+                    )
+                    await connection.execute("DROP TABLE episode_attempts")
+                    await connection.execute(
+                        "ALTER TABLE episode_attempts_v18 RENAME TO episode_attempts"
+                    )
+                    await connection.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS episode_attempts_current
+                        ON episode_attempts(run_id, episode_number, attempt_cycle)
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS episode_attempt_cycles (
+                            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                            attempt_cycle INTEGER NOT NULL CHECK (attempt_cycle >= 0),
+                            from_episode INTEGER NOT NULL CHECK (from_episode >= 1),
+                            to_episode INTEGER NOT NULL CHECK (to_episode >= from_episode),
+                            started_at TEXT NOT NULL,
+                            PRIMARY KEY (run_id, attempt_cycle)
+                        )
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS episode_attempt_current (
+                            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                            episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+                            attempt_cycle INTEGER NOT NULL CHECK (attempt_cycle >= 0),
+                            PRIMARY KEY (run_id, episode_number),
+                            FOREIGN KEY (run_id, attempt_cycle)
+                                REFERENCES episode_attempt_cycles(run_id, attempt_cycle)
+                        )
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        INSERT OR IGNORE INTO episode_attempt_cycles(
+                            run_id, attempt_cycle, from_episode, to_episode, started_at
+                        )
+                        SELECT
+                            plans.run_id,
+                            0,
+                            1,
+                            MAX(plans.episode_number),
+                            runs.created_at
+                        FROM episode_plans AS plans
+                        JOIN runs ON runs.id = plans.run_id
+                        GROUP BY plans.run_id
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        INSERT OR IGNORE INTO episode_attempt_cycles(
+                            run_id, attempt_cycle, from_episode, to_episode, started_at
+                        )
+                        SELECT
+                            attempts.run_id,
+                            0,
+                            MIN(attempts.episode_number),
+                            MAX(attempts.episode_number),
+                            MIN(attempts.recorded_at)
+                        FROM episode_attempts AS attempts
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM episode_attempt_cycles AS cycles
+                            WHERE cycles.run_id = attempts.run_id
+                              AND cycles.attempt_cycle = 0
+                        )
+                        GROUP BY attempts.run_id
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        INSERT OR IGNORE INTO episode_attempt_current(
+                            run_id, episode_number, attempt_cycle
+                        )
+                        SELECT run_id, episode_number, 0
+                        FROM episode_plans
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM episode_attempt_cycles
+                            WHERE episode_attempt_cycles.run_id = episode_plans.run_id
+                              AND episode_attempt_cycles.attempt_cycle = 0
+                        )
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        INSERT OR IGNORE INTO episode_attempt_current(
+                            run_id, episode_number, attempt_cycle
+                        )
+                        SELECT DISTINCT run_id, episode_number, 0
+                        FROM episode_attempts
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM episode_attempt_cycles
+                            WHERE episode_attempt_cycles.run_id = episode_attempts.run_id
+                              AND episode_attempt_cycles.attempt_cycle = 0
+                        )
+                        """
+                    )
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (18)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 18
 
     async def setup(self) -> None:
         await self.initialize()
@@ -2183,13 +2321,19 @@ class Repository:
                     "Only the first unfinished episode can be generated.",
                     409,
                 )
+            attempt_cycle = await self._ensure_episode_attempt_current(
+                connection,
+                run_id,
+                episode_number,
+                timestamp=timestamp,
+            )
             cursor = await connection.execute(
                 """
                 SELECT COALESCE(MAX(attempt_number), 0)
                 FROM episode_attempts
-                WHERE run_id = ? AND episode_number = ?
+                WHERE run_id = ? AND episode_number = ? AND attempt_cycle = ?
                 """,
-                (str(run_id), episode_number),
+                (str(run_id), episode_number, attempt_cycle),
             )
             row = await cursor.fetchone()
             current_count = int(row[0]) if row is not None else 0
@@ -2202,10 +2346,12 @@ class Repository:
             attempt_number = current_count + 1
             await connection.execute(
                 """
-                INSERT INTO episode_attempts(run_id, episode_number, attempt_number, recorded_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO episode_attempts(
+                    run_id, episode_number, attempt_cycle, attempt_number, recorded_at
+                )
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (str(run_id), episode_number, attempt_number, timestamp),
+                (str(run_id), episode_number, attempt_cycle, attempt_number, timestamp),
             )
             await connection.execute(
                 """
@@ -2372,14 +2518,20 @@ class Repository:
                     "A legacy outline cannot accept unrelated contract lock data.",
                     409,
                 )
+            attempt_cycle = await self._ensure_episode_attempt_current(
+                connection,
+                run_id,
+                episode_number,
+                timestamp=timestamp,
+            )
             attempt = await self._fetchone(
                 connection,
                 """
                 SELECT 1 FROM episode_attempts
-                WHERE run_id = ? AND episode_number = ?
+                WHERE run_id = ? AND episode_number = ? AND attempt_cycle = ?
                 LIMIT 1
                 """,
-                (str(run_id), episode_number),
+                (str(run_id), episode_number, attempt_cycle),
             )
             if attempt is None:
                 raise DomainError(
@@ -2620,14 +2772,20 @@ class Repository:
                     "The episode is not in the approved outline.",
                     409,
                 )
+            attempt_cycle = await self._ensure_episode_attempt_current(
+                connection,
+                run_id,
+                episode_number,
+                timestamp=timestamp,
+            )
             attempt = await self._fetchone(
                 connection,
                 """
                 SELECT COUNT(*) AS attempt_count
                 FROM episode_attempts
-                WHERE run_id = ? AND episode_number = ?
+                WHERE run_id = ? AND episode_number = ? AND attempt_cycle = ?
                 """,
-                (str(run_id), episode_number),
+                (str(run_id), episode_number, attempt_cycle),
             )
             attempt_count = int(attempt["attempt_count"]) if attempt is not None else 0
             if attempt_count == 0:
@@ -2847,14 +3005,19 @@ class Repository:
                 (str(run_id), episode_number),
             )
             timeout_count = (int(timeout["timeout_count"]) if timeout is not None else 0) + 1
+            attempt_cycle = await self._current_episode_attempt_cycle(
+                connection,
+                run_id,
+                episode_number,
+            )
             attempt = await self._fetchone(
                 connection,
                 """
                 SELECT COUNT(*) AS attempt_count
                 FROM episode_attempts
-                WHERE run_id = ? AND episode_number = ?
+                WHERE run_id = ? AND episode_number = ? AND attempt_cycle = ?
                 """,
-                (str(run_id), episode_number),
+                (str(run_id), episode_number, attempt_cycle),
             )
             if attempt is None:
                 raise RuntimeError("Episode attempt count is unavailable")
@@ -2957,12 +3120,35 @@ class Repository:
                 SELECT episode_number, COUNT(*) AS attempt_count
                 FROM episode_attempts
                 WHERE run_id = ?
+                  AND attempt_cycle = COALESCE(
+                      (
+                          SELECT attempt_state.attempt_cycle
+                          FROM episode_attempt_current AS attempt_state
+                          WHERE attempt_state.run_id = episode_attempts.run_id
+                            AND attempt_state.episode_number = episode_attempts.episode_number
+                      ),
+                      0
+                  )
                 GROUP BY episode_number
                 """,
                 (str(run_id),),
             )
             rows = await cursor.fetchall()
         return {int(row["episode_number"]): int(row["attempt_count"]) for row in rows}
+
+    async def get_episode_attempt_cycles(self, run_id: UUID) -> dict[int, int]:
+        async with self._connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT episode_number, attempt_cycle
+                FROM episode_attempt_current
+                WHERE run_id = ?
+                ORDER BY episode_number
+                """,
+                (str(run_id),),
+            )
+            rows = await cursor.fetchall()
+        return {int(row["episode_number"]): int(row["attempt_cycle"]) for row in rows}
 
     async def assemble_episode_scripts(self, run_id: UUID) -> str:
         async with self._connection() as connection:
@@ -4233,6 +4419,13 @@ class Repository:
                     "The rewrite target is not in the approved outline.",
                     409,
                 )
+            await self._start_episode_attempt_cycle(
+                connection,
+                run_id,
+                from_episode,
+                plan_numbers,
+                timestamp=timestamp,
+            )
             active_pointers = json.loads(batch_row["active_pointers_json"])
             for episode, candidate_id in sorted(active_pointers.items()):
                 if int(episode) >= from_episode:
@@ -4711,6 +4904,134 @@ class Repository:
             rows = await cursor.fetchall()
         return [self._series_review_from_row(row) for row in rows]
 
+    async def get_unresolved_script_defect_reviews(
+        self,
+        run_id: UUID,
+    ) -> list[BoundStructuralReview]:
+        """Return all active script defects after the latest active-lineage pass.
+
+        A passing review closes every earlier script defect on the exact active
+        design/batch lineage. Reviews bound to a stale design or batch are never
+        eligible feedback, even when their rows remain queryable as evidence.
+        """
+        async with self._connection() as connection:
+            lineage = await self._fetch_series_bible_lineage(connection, run_id)
+            batch = await self._fetch_script_batch_lineage(connection, run_id)
+            if (
+                lineage is None
+                or lineage["active_candidate_id"] is None
+                or lineage["active_content_hash"] is None
+                or batch is None
+                or batch["status"] != "active"
+            ):
+                return []
+            candidate = await self._fetch_series_bible_candidate(
+                connection,
+                run_id,
+                lineage["active_candidate_id"],
+            )
+            if candidate is None or candidate["status"] != "active":
+                return []
+            if (
+                candidate["candidate_id"] != lineage["active_candidate_id"]
+                or candidate["content_hash"] != lineage["active_content_hash"]
+                or int(candidate["design_epoch"]) != int(lineage["active_design_epoch"])
+                or batch["design_candidate_id"] != candidate["candidate_id"]
+                or batch["design_content_hash"] != candidate["content_hash"]
+                or int(batch["design_epoch"]) != int(candidate["design_epoch"])
+            ):
+                return []
+            return await self._unresolved_script_defect_reviews_for_lineage(
+                connection,
+                run_id,
+                design_candidate_id=candidate["candidate_id"],
+                design_content_hash=candidate["content_hash"],
+                design_epoch=int(candidate["design_epoch"]),
+                batch_id=batch["batch_id"],
+                batch_epoch=int(batch["batch_epoch"]),
+            )
+
+    async def _unresolved_script_defect_reviews_for_lineage(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+        *,
+        design_candidate_id: str,
+        design_content_hash: str,
+        design_epoch: int,
+        batch_id: str,
+        batch_epoch: int,
+    ) -> list[BoundStructuralReview]:
+        """Read unresolved reviews while an existing transaction owns the lineage."""
+        binding = (
+            str(run_id),
+            design_candidate_id,
+            design_content_hash,
+            design_epoch,
+            batch_id,
+            batch_epoch,
+        )
+        latest = await self._fetchone(
+            connection,
+            """
+            SELECT passed
+            FROM series_reviews
+            WHERE run_id = ?
+              AND design_candidate_id = ?
+              AND design_content_hash = ?
+              AND design_epoch = ?
+              AND batch_id = ?
+              AND batch_epoch = ?
+              AND status = 'active'
+            ORDER BY review_epoch DESC
+            LIMIT 1
+            """,
+            binding,
+        )
+        if latest is None or bool(latest["passed"]):
+            return []
+        passing = await self._fetchone(
+            connection,
+            """
+            SELECT MAX(review_epoch) AS review_epoch
+            FROM series_reviews
+            WHERE run_id = ?
+              AND design_candidate_id = ?
+              AND design_content_hash = ?
+              AND design_epoch = ?
+              AND batch_id = ?
+              AND batch_epoch = ?
+              AND status = 'active'
+              AND passed = 1
+            """,
+            binding,
+        )
+        passing_epoch = (
+            int(passing["review_epoch"])
+            if passing is not None and passing["review_epoch"] is not None
+            else 0
+        )
+        cursor = await connection.execute(
+            """
+            SELECT *
+            FROM series_reviews
+            WHERE run_id = ?
+              AND design_candidate_id = ?
+              AND design_content_hash = ?
+              AND design_epoch = ?
+              AND batch_id = ?
+              AND batch_epoch = ?
+              AND status = 'active'
+              AND passed = 0
+              AND category = 'script_defect'
+              AND review_epoch > ?
+            ORDER BY review_epoch ASC
+            """,
+            (*binding, passing_epoch),
+        )
+        rows = await cursor.fetchall()
+        return [self._series_review_from_row(row) for row in rows]
+
     async def consume_automatic_suffix_budget(
         self,
         run_id: UUID,
@@ -5075,18 +5396,90 @@ class Repository:
                 )
             lineage = await self._fetch_series_bible_lineage(connection, UUID(run["id"]))
             active_batch = await self._fetch_script_batch_lineage(connection, UUID(run["id"]))
+            run_id = UUID(run["id"])
+            active_candidate = (
+                await self._fetch_series_bible_candidate(
+                    connection,
+                    run_id,
+                    lineage["active_candidate_id"],
+                )
+                if lineage is not None and lineage["active_candidate_id"] is not None
+                else None
+            )
             if (
                 lineage is None
+                or lineage["active_candidate_id"] is None
                 or lineage["active_content_hash"] != auth["design_content_hash"]
+                or active_candidate is None
+                or active_candidate["status"] != "active"
+                or active_candidate["candidate_id"] != auth["design_candidate_id"]
+                or active_candidate["content_hash"] != auth["design_content_hash"]
+                or int(active_candidate["design_epoch"]) != int(auth["design_epoch"])
                 or active_batch is None
+                or active_batch["status"] != "active"
                 or active_batch["batch_id"] != auth["batch_id"]
                 or int(active_batch["batch_epoch"]) != int(auth["batch_epoch"])
+                or active_batch["design_candidate_id"] != auth["design_candidate_id"]
+                or active_batch["design_content_hash"] != auth["design_content_hash"]
+                or int(active_batch["design_epoch"]) != int(auth["design_epoch"])
             ):
                 raise DomainError(
                     "repair_authorization_stale",
                     "The active lineage changed; the repair authorization is stale.",
                     409,
                 )
+            auth_kind = auth["kind"]
+            auth_episode = auth["earliest_affected_episode"]
+            auth_range = auth["range_episodes"]
+            auth_evidence = auth["evidence"]
+            auth_review_id = auth["review_id"]
+            if auth_kind == "suffix_rewrite":
+                unresolved = await self._unresolved_script_defect_reviews_for_lineage(
+                    connection,
+                    run_id,
+                    design_candidate_id=active_candidate["candidate_id"],
+                    design_content_hash=active_candidate["content_hash"],
+                    design_epoch=int(active_candidate["design_epoch"]),
+                    batch_id=active_batch["batch_id"],
+                    batch_epoch=int(active_batch["batch_epoch"]),
+                )
+                if unresolved:
+                    auth_episode = min(
+                        review.earliest_affected_episode
+                        for review in unresolved
+                        if review.earliest_affected_episode is not None
+                    )
+                    range_row = await self._fetchone(
+                        connection,
+                        """
+                        SELECT COUNT(*) AS episode_count
+                        FROM episode_plans
+                        WHERE run_id = ? AND episode_number >= ?
+                        """,
+                        (str(run_id), auth_episode),
+                    )
+                    planned_range = int(range_row["episode_count"]) if range_row else 0
+                    auth_range = planned_range or auth_range
+                    auth_evidence = aggregate_script_defect_evidence(unresolved)
+                    auth_review_id = unresolved[-1].review_id
+                    await connection.execute(
+                        """
+                        UPDATE repair_authorizations
+                        SET earliest_affected_episode = ?,
+                            range_episodes = ?,
+                            evidence = ?,
+                            review_id = ?
+                        WHERE run_id = ? AND authorization_epoch = ?
+                        """,
+                        (
+                            auth_episode,
+                            auth_range,
+                            auth_evidence,
+                            auth_review_id,
+                            str(run_id),
+                            int(auth["authorization_epoch"]),
+                        ),
+                    )
             await connection.execute(
                 """
                 UPDATE repair_authorizations
@@ -5114,9 +5507,6 @@ class Repository:
                 timestamp,
             )
             auth_kind = auth["kind"]
-            auth_episode = auth["earliest_affected_episode"]
-            auth_evidence = auth["evidence"]
-            run_id = UUID(run["id"])
 
         # RPR-A9: the authorization permits exactly one generation-plus-review cycle.
         # Perform the bound repair now so the run actually regenerates the affected
@@ -5729,6 +6119,17 @@ class Repository:
                         """
                         SELECT COUNT(*) FROM episode_attempts
                         WHERE run_id = ? AND episode_number = ?
+                          AND attempt_cycle = COALESCE(
+                              (
+                                  SELECT attempt_state.attempt_cycle
+                                  FROM episode_attempt_current AS attempt_state
+                                  WHERE attempt_state.run_id = episode_attempts.run_id
+                                    AND attempt_state.episode_number = (
+                                        episode_attempts.episode_number
+                                    )
+                              ),
+                              0
+                          )
                         """,
                         (run["id"], run["current_episode"]),
                     )
@@ -6245,6 +6646,202 @@ class Repository:
             episode_drafts=await self.get_episode_drafts(run_id),
         )
 
+    async def _reconcile_legacy_suffix_attempts(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        timestamp: str,
+    ) -> list[str]:
+        cursor = await connection.execute(
+            """
+            SELECT repair_authorizations.*,
+                   runs.state AS run_state,
+                   runs.failure_code,
+                   runs.failed_stage,
+                   run_progress.execution_state,
+                   run_progress.current_episode
+            FROM repair_authorizations
+            JOIN runs ON runs.id = repair_authorizations.run_id
+            JOIN run_progress ON run_progress.run_id = runs.id
+            WHERE repair_authorizations.kind = 'suffix_rewrite'
+              AND repair_authorizations.consumed_at IS NOT NULL
+              AND runs.state = 'failed'
+              AND runs.failure_code = 'attempts_exhausted'
+              AND runs.failed_stage = ?
+              AND run_progress.execution_state = 'failed'
+            ORDER BY repair_authorizations.run_id,
+                     repair_authorizations.authorization_epoch DESC
+            """,
+            (InternalStage.GENERATING_EPISODE_SCRIPTS.value,),
+        )
+        rows = await cursor.fetchall()
+        recovered: list[str] = []
+        seen_runs: set[str] = set()
+        for auth in rows:
+            run_id = auth["run_id"]
+            if run_id in seen_runs:
+                continue
+            seen_runs.add(run_id)
+            earliest = auth["earliest_affected_episode"]
+            current_episode = auth["current_episode"]
+            if earliest is None or current_episode is None:
+                continue
+            earliest = int(earliest)
+            if int(current_episode) < earliest:
+                continue
+
+            run_uuid = UUID(run_id)
+            lineage = await self._fetch_series_bible_lineage(connection, run_uuid)
+            active_batch = await self._fetch_script_batch_lineage(connection, run_uuid)
+            active_candidate = (
+                await self._fetch_series_bible_candidate(
+                    connection,
+                    run_uuid,
+                    lineage["active_candidate_id"],
+                )
+                if lineage is not None and lineage["active_candidate_id"] is not None
+                else None
+            )
+            if (
+                lineage is None
+                or lineage["active_candidate_id"] is None
+                or lineage["active_content_hash"] != auth["design_content_hash"]
+                or active_candidate is None
+                or active_candidate["status"] != "active"
+                or active_candidate["candidate_id"] != auth["design_candidate_id"]
+                or active_candidate["content_hash"] != auth["design_content_hash"]
+                or int(active_candidate["design_epoch"]) != int(auth["design_epoch"])
+                or active_batch is None
+                or active_batch["status"] != "active"
+                or active_batch["batch_id"] != auth["batch_id"]
+                or int(active_batch["batch_epoch"]) != int(auth["batch_epoch"])
+                or active_batch["design_candidate_id"] != auth["design_candidate_id"]
+                or active_batch["design_content_hash"] != auth["design_content_hash"]
+                or int(active_batch["design_epoch"]) != int(auth["design_epoch"])
+            ):
+                continue
+
+            plan_cursor = await connection.execute(
+                """
+                SELECT episode_number
+                FROM episode_plans
+                WHERE run_id = ?
+                ORDER BY episode_number
+                """,
+                (run_id,),
+            )
+            plan_numbers = [int(row["episode_number"]) for row in await plan_cursor.fetchall()]
+            if not any(number >= earliest for number in plan_numbers):
+                continue
+
+            current_cycle = await self._fetchone(
+                connection,
+                """
+                SELECT COALESCE(MAX(attempt_state.attempt_cycle), 0) AS attempt_cycle
+                FROM episode_plans AS plans
+                LEFT JOIN episode_attempt_current AS attempt_state
+                  ON attempt_state.run_id = plans.run_id
+                 AND attempt_state.episode_number = plans.episode_number
+                WHERE plans.run_id = ? AND plans.episode_number >= ?
+                """,
+                (run_id, earliest),
+            )
+            if current_cycle is not None and int(current_cycle["attempt_cycle"]) != 0:
+                continue
+
+            attempt_after = await self._fetchone(
+                connection,
+                """
+                SELECT 1
+                FROM episode_attempts
+                WHERE run_id = ?
+                  AND episode_number >= ?
+                  AND recorded_at > ?
+                LIMIT 1
+                """,
+                (run_id, earliest, auth["consumed_at"]),
+            )
+            if attempt_after is not None:
+                continue
+            candidate_after = await self._fetchone(
+                connection,
+                """
+                SELECT 1
+                FROM episode_candidates
+                WHERE run_id = ?
+                  AND batch_id = ?
+                  AND episode_number >= ?
+                  AND status = 'active'
+                  AND created_at > ?
+                LIMIT 1
+                """,
+                (run_id, auth["batch_id"], earliest, auth["consumed_at"]),
+            )
+            if candidate_after is not None:
+                continue
+
+            await self._start_episode_attempt_cycle(
+                connection,
+                run_uuid,
+                earliest,
+                plan_numbers,
+                timestamp=timestamp,
+            )
+            await connection.execute(
+                """
+                UPDATE runs
+                SET state = 'queued',
+                    failure_code = NULL,
+                    failure_message = NULL,
+                    failed_stage = NULL,
+                    failure_attempt_count = NULL,
+                    completed_at = NULL,
+                    updated_at = ?
+                WHERE id = ? AND state = 'failed'
+                """,
+                (timestamp, run_id),
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    execution_state = 'queued',
+                    active_started_at = NULL,
+                    timeout_stage = NULL,
+                    timeout_count = 0,
+                    recovery_reason = 'none',
+                    content_repair_count = NULL,
+                    pause_message = NULL,
+                    updated_at = ?
+                WHERE run_id = ? AND execution_state = 'failed'
+                """,
+                (InternalStage.GENERATING_EPISODE_SCRIPTS.value, timestamp, run_id),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued',
+                    available_at = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ? AND state = 'failed'
+                """,
+                (timestamp, timestamp, run_id),
+            )
+            run_creation = await self._fetchone(
+                connection,
+                "SELECT creation_id FROM runs WHERE id = ?",
+                (run_id,),
+            )
+            if run_creation is not None:
+                await connection.execute(
+                    "UPDATE creations SET updated_at = ? WHERE id = ?",
+                    (timestamp, run_creation["creation_id"]),
+                )
+            recovered.append(run_id)
+        return recovered
+
     async def reconcile_startup(
         self,
         *,
@@ -6252,6 +6849,18 @@ class Repository:
     ) -> list[RunRecovery]:
         await self.requeue_expired_jobs(now=now)
         timestamp = _timestamp(now or _utc_now())
+        async with self._connection() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            try:
+                await self._reconcile_legacy_suffix_attempts(
+                    connection,
+                    timestamp=timestamp,
+                )
+            except BaseException:
+                await connection.rollback()
+                raise
+            else:
+                await connection.commit()
         async with self._connection() as connection:
             cursor = await connection.execute(
                 """
@@ -6953,6 +7562,15 @@ class Repository:
                 """
                 SELECT COUNT(*) FROM episode_attempts
                 WHERE run_id = ? AND episode_number = ?
+                  AND attempt_cycle = COALESCE(
+                      (
+                          SELECT attempt_state.attempt_cycle
+                          FROM episode_attempt_current AS attempt_state
+                          WHERE attempt_state.run_id = episode_attempts.run_id
+                            AND attempt_state.episode_number = episode_attempts.episode_number
+                      ),
+                      0
+                  )
                 """,
                 (run_id, current_episode),
             )
@@ -6995,6 +7613,167 @@ class Repository:
             EpisodePlan(episode_number=int(row["episode_number"]), plan=row["plan"])
             for row in await cursor.fetchall()
         ]
+
+    @staticmethod
+    async def _current_episode_attempt_cycle(
+        connection: aiosqlite.Connection,
+        run_id: UUID | str,
+        episode_number: int,
+    ) -> int:
+        row = await Repository._fetchone(
+            connection,
+            """
+            SELECT attempt_cycle
+            FROM episode_attempt_current
+            WHERE run_id = ? AND episode_number = ?
+            """,
+            (str(run_id), episode_number),
+        )
+        return int(row["attempt_cycle"]) if row is not None else 0
+
+    @staticmethod
+    async def _ensure_episode_attempt_current(
+        connection: aiosqlite.Connection,
+        run_id: UUID | str,
+        episode_number: int,
+        *,
+        timestamp: str,
+    ) -> int:
+        current = await Repository._fetchone(
+            connection,
+            """
+            SELECT attempt_cycle
+            FROM episode_attempt_current
+            WHERE run_id = ? AND episode_number = ?
+            """,
+            (str(run_id), episode_number),
+        )
+        if current is not None:
+            return int(current["attempt_cycle"])
+
+        cycle_row = await Repository._fetchone(
+            connection,
+            """
+            SELECT MAX(attempt_cycle) AS attempt_cycle
+            FROM episode_attempt_cycles
+            WHERE run_id = ?
+            """,
+            (str(run_id),),
+        )
+        attempt_cycle = (
+            int(cycle_row["attempt_cycle"])
+            if cycle_row is not None and cycle_row["attempt_cycle"] is not None
+            else 0
+        )
+        boundary = await Repository._fetchone(
+            connection,
+            """
+            SELECT MIN(episode_number) AS from_episode,
+                   MAX(episode_number) AS to_episode
+            FROM episode_plans
+            WHERE run_id = ?
+            """,
+            (str(run_id),),
+        )
+        from_episode = (
+            int(boundary["from_episode"])
+            if boundary is not None and boundary["from_episode"] is not None
+            else episode_number
+        )
+        to_episode = (
+            max(int(boundary["to_episode"]), episode_number)
+            if boundary is not None and boundary["to_episode"] is not None
+            else episode_number
+        )
+        await connection.execute(
+            """
+            INSERT OR IGNORE INTO episode_attempt_cycles(
+                run_id, attempt_cycle, from_episode, to_episode, started_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (str(run_id), attempt_cycle, from_episode, to_episode, timestamp),
+        )
+        await connection.execute(
+            """
+            INSERT INTO episode_attempt_current(run_id, episode_number, attempt_cycle)
+            VALUES (?, ?, ?)
+            """,
+            (str(run_id), episode_number, attempt_cycle),
+        )
+        return attempt_cycle
+
+    @staticmethod
+    async def _start_episode_attempt_cycle(
+        connection: aiosqlite.Connection,
+        run_id: UUID | str,
+        from_episode: int,
+        plan_numbers: list[int],
+        *,
+        timestamp: str,
+    ) -> int:
+        affected = [number for number in plan_numbers if number >= from_episode]
+        if not affected:
+            raise DomainError(
+                "episode_not_planned",
+                "The rewrite target is not in the approved outline.",
+                409,
+            )
+        await connection.execute(
+            """
+            INSERT OR IGNORE INTO episode_attempt_cycles(
+                run_id, attempt_cycle, from_episode, to_episode, started_at
+            ) VALUES (?, 0, ?, ?, ?)
+            """,
+            (str(run_id), min(plan_numbers), max(plan_numbers), timestamp),
+        )
+        await connection.executemany(
+            """
+            INSERT OR IGNORE INTO episode_attempt_current(
+                run_id, episode_number, attempt_cycle
+            ) VALUES (?, ?, 0)
+            """,
+            [(str(run_id), number) for number in plan_numbers],
+        )
+        cycle_row = await Repository._fetchone(
+            connection,
+            """
+            SELECT MAX(attempt_cycle) AS attempt_cycle
+            FROM episode_attempt_cycles
+            WHERE run_id = ?
+            """,
+            (str(run_id),),
+        )
+        latest_cycle = (
+            int(cycle_row["attempt_cycle"])
+            if cycle_row is not None and cycle_row["attempt_cycle"] is not None
+            else 0
+        )
+        attempt_cycle = latest_cycle + 1
+        await connection.execute(
+            """
+            INSERT INTO episode_attempt_cycles(
+                run_id, attempt_cycle, from_episode, to_episode, started_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (str(run_id), attempt_cycle, from_episode, max(affected), timestamp),
+        )
+        await connection.executemany(
+            """
+            INSERT INTO episode_attempt_current(run_id, episode_number, attempt_cycle)
+            VALUES (?, ?, ?)
+            ON CONFLICT(run_id, episode_number) DO UPDATE SET
+                attempt_cycle = excluded.attempt_cycle
+            """,
+            [(str(run_id), number, attempt_cycle) for number in affected],
+        )
+        await connection.execute(
+            """
+            DELETE FROM episode_timeouts
+            WHERE run_id = ? AND episode_number >= ?
+            """,
+            (str(run_id), from_episode),
+        )
+        return attempt_cycle
 
     @staticmethod
     async def _episode_drafts(

@@ -537,6 +537,90 @@ def test_exception_mapping_does_not_echo_provider_body() -> None:
     assert "secret-value" not in mapped.safe_message
 
 
+@pytest.mark.parametrize("provider_error", [anthropic.APIStatusError, openai.APIStatusError])
+def test_http_200_upstream_stream_error_is_a_relay_interruption(provider_error) -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    body = {
+        "error": {
+            "message": "error decoding response body",
+            "type": "upstream_stream_error",
+        },
+        "type": "error",
+    }
+    response = httpx.Response(200, request=request, json=body)
+    error = provider_error("error decoding response body", response=response, body=body)
+
+    assert is_relay_exception(error)
+    assert is_relay_connection_error(error)
+    interruption = retryable_relay_interruption(error)
+    assert interruption is not None
+    assert interruption.retry_delay_seconds == MIN_RELAY_RETRY_DELAY_SECONDS
+
+    mapped = classify_relay_exception(error)
+    assert mapped.code == "relay_unavailable"
+    assert mapped.http_status == 200
+    assert mapped.provider_error_code == "upstream_stream_error"
+    assert mapped.redacted_body is not None
+    assert "upstream_stream_error" in mapped.redacted_body
+    assert "decoding response body" in mapped.safe_message
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body"),
+    [
+        (
+            200,
+            {"error": {"message": "error decoding response body", "type": "server_error"}},
+        ),
+        (
+            200,
+            {
+                "error": {
+                    "message": "error decoding response body",
+                    "type": "authentication_error",
+                }
+            },
+        ),
+        (
+            400,
+            {
+                "error": {
+                    "message": "error decoding response body",
+                    "type": "upstream_stream_error",
+                }
+            },
+        ),
+    ],
+)
+def test_http_200_stream_like_messages_and_http_400_are_not_retryable(
+    status_code: int,
+    body: dict[str, object],
+) -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    response = httpx.Response(status_code, request=request, json=body)
+    error = anthropic.APIStatusError("error decoding response body", response=response, body=body)
+
+    assert retryable_relay_interruption(error) is None
+    assert not is_relay_connection_error(error)
+
+
+def test_structured_output_validation_error_is_not_a_stream_interruption() -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    body = {
+        "error": {
+            "message": "error decoding response body",
+            "type": "upstream_stream_error",
+        }
+    }
+    error = anthropic.APIResponseValidationError(
+        httpx.Response(200, request=request, json=body),
+        body=body,
+    )
+
+    assert retryable_relay_interruption(error) is None
+    assert not is_relay_connection_error(error)
+
+
 @pytest.mark.parametrize(
     "error",
     [

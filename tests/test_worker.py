@@ -30,7 +30,7 @@ from pengine.schemas import (
     RevisionRequest,
     WorkflowResult,
 )
-from pengine.worker import Worker
+from pengine.worker import Worker, _episode_error_message
 
 
 class DeterministicWorkflow:
@@ -1114,6 +1114,26 @@ async def test_worker_reports_graph_and_quality_failures_separately(
     else:
         assert resource.initial.quality_rejection.code == expected_code
         assert resource.initial.quality_rejection.evidence == "L0 与已批准稿件的核心冲突。"
+
+
+def test_episode_upstream_stream_decode_error_uses_relay_connection_prompt() -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    body = {
+        "error": {
+            "message": "error decoding response body",
+            "type": "upstream_stream_error",
+        },
+        "type": "error",
+    }
+    error = anthropic.APIStatusError(
+        "error decoding response body",
+        response=httpx.Response(200, request=request, json=body),
+        body=body,
+    )
+
+    assert _episode_error_message(error) == (
+        "当前集与模型 Relay / 网络连接失败。已完成分集不受影响；继续时只会重试当前集。"
+    )
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,7 @@ import json
 import re
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
@@ -139,9 +139,18 @@ class StoryFact(ContinuityModel):
     )
     value: NonEmptyText = Field(
         description=(
-            "Exact value. Dates use YYYY-MM-DD, times use HH:MM[:SS], datetimes use ISO 8601, "
-            "and numeric kinds use a plain finite decimal without the unit."
+            "Canonical fact value. It is not required to appear as contiguous screenplay text "
+            "unless verbatim=true. Dates use YYYY-MM-DD, times use HH:MM[:SS], datetimes use "
+            "ISO 8601, and numeric kinds use a plain finite decimal without the unit."
         )
+    )
+    verbatim: bool = Field(
+        default=False,
+        description=(
+            "Set true only when the user request or an approved upstream artifact explicitly "
+            "requires this text value to appear contiguously and word-for-word in the "
+            "screenplay."
+        ),
     )
     unit: NonEmptyText | None = Field(
         default=None,
@@ -154,6 +163,8 @@ class StoryFact(ContinuityModel):
 
     @model_validator(mode="after")
     def validate_typed_value(self) -> StoryFact:
+        if self.verbatim and self.kind != "text":
+            raise ValueError("Only text facts may require verbatim wording")
         if self.kind in _NUMERIC_KINDS:
             try:
                 value = Decimal(self.value)
@@ -461,8 +472,25 @@ class ContinuityViolation(ValueError):
         return "; ".join(f"{issue.code}: {issue.message}" for issue in self.issues)
 
 
+def canonical_story_contract_payload(contract: StoryContract) -> dict[str, Any]:
+    """Serialize a story contract without hashing default-false verbatim fields."""
+    payload = contract.model_dump(mode="json")
+    # Old checkpoints omitted this field; only an explicit true changes their hash.
+    for fact in payload["facts"]:
+        if fact.get("verbatim") is False:
+            fact.pop("verbatim")
+    return payload
+
+
 def story_contract_sha256(contract: StoryContract) -> str:
-    return canonical_model_hash(contract)
+    payload = canonical_story_contract_payload(contract)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def canonical_model_hash(value: BaseModel) -> str:
@@ -495,7 +523,8 @@ def render_story_contract_markdown(contract: StoryContract, contract_sha256: str
         (
             f"- `{fact.fact_id}` Ep{fact.first_revealed_episode}: "
             f"{fact.subject} {fact.predicate} = {fact.value}"
-            f"{f' {fact.unit}' if fact.unit else ''} ({fact.kind})"
+            f"{f' {fact.unit}' if fact.unit else ''} ({fact.kind}); "
+            f"verbatim={'true' if fact.verbatim else 'false'}"
         )
         for fact in contract.facts
     )
@@ -749,6 +778,20 @@ def validate_episode_candidate(
                     "evidence_not_in_script",
                     f"证据 {target_id} 未逐字出现在剧本中",
                     [target_id],
+                )
+            )
+
+    for fact in contract.facts:
+        if (
+            fact.first_revealed_episode == episode
+            and fact.verbatim
+            and fact.value not in content
+        ):
+            issues.append(
+                _issue(
+                    "verbatim_fact_missing",
+                    f"逐字锁定事实 {fact.fact_id} 的值 {fact.value!r} 未逐字出现在本集剧本中",
+                    [fact.fact_id],
                 )
             )
 

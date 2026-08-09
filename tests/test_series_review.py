@@ -1,7 +1,12 @@
+import hashlib
+import json
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from test_continuity import make_contract
 from test_script_batch import (
+    NOW,
     build_episode_lock_for,
     create_leased_run,
     initial_series_state,
@@ -16,10 +21,13 @@ from pengine.config import Settings
 from pengine.errors import DomainError
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
-from pengine.schemas import InternalStage
+from pengine.schemas import InternalStage, RunFailure
 from pengine.series_bible import (
+    SeriesBible,
+    SeriesBibleContent,
     bind_global_design_review,
     build_series_bible,
+    canonical_series_bible_content_hash,
     validate_series_bible,
 )
 from pengine.series_review import active_prefix_hash, effective_milestones
@@ -40,6 +48,90 @@ def prefix_hash_of(candidates) -> str:
             for candidate in candidates
         ]
     )
+
+
+def test_series_bible_content_hash_preserves_legacy_verbatim_shape() -> None:
+    contract = make_contract(
+        numeric_facts=[
+            {
+                "fact_id": "locked_phrase",
+                "subject": "旧案",
+                "predicate": "记录措辞",
+                "kind": "text",
+                "value": "原始措辞",
+                "first_revealed_episode": 1,
+            }
+        ]
+    )
+    legacy_contract_payload = contract.model_dump(mode="json")
+    for fact in legacy_contract_payload["facts"]:
+        fact.pop("verbatim", None)
+    legacy_content_payload = {
+        "story_outline": "离乡者回到旧屋处理旧事。",
+        "character_biographies": "林岚：回乡调查旧案的主角。",
+        "relationship_logic": "林岚与旧屋守护者存在监护关系。",
+        "episode_outline": "第 1 集：林岚回到旧屋。",
+        "story_contract": legacy_contract_payload,
+        "review_milestones": [],
+    }
+    legacy_hash = hashlib.sha256(
+        json.dumps(
+            legacy_content_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+
+    legacy_content = SeriesBibleContent.model_validate(legacy_content_payload)
+    assert legacy_content.story_contract.facts[0].verbatim is False
+    assert canonical_series_bible_content_hash(legacy_content) == legacy_hash
+    legacy_candidate = SeriesBible.model_validate(
+        {
+            "candidate_id": "candidate_legacy",
+            "version": 1,
+            "design_epoch": 1,
+            "content_hash": legacy_hash,
+            "status": "unvalidated",
+            "l0_variant": "归返",
+            "genre": "general",
+            "lineage": {
+                "run_id": "run-legacy",
+                "run_kind": "initial",
+                "parent_candidate_id": None,
+                "rebuild_count": 0,
+            },
+            "content": legacy_content_payload,
+            "created_at": NOW,
+        }
+    )
+    assert legacy_candidate.content_hash == legacy_hash
+
+    verbatim_content_payload = json.loads(json.dumps(legacy_content_payload, ensure_ascii=False))
+    verbatim_content_payload["story_contract"]["facts"][0]["verbatim"] = True
+    verbatim_content = SeriesBibleContent.model_validate(verbatim_content_payload)
+    verbatim_hash = canonical_series_bible_content_hash(verbatim_content)
+    assert verbatim_hash != legacy_hash
+    verbatim_candidate = SeriesBible.model_validate(
+        {
+            "candidate_id": "candidate_verbatim",
+            "version": 1,
+            "design_epoch": 1,
+            "content_hash": verbatim_hash,
+            "status": "unvalidated",
+            "l0_variant": "归返",
+            "genre": "general",
+            "lineage": {
+                "run_id": "run-verbatim",
+                "run_kind": "initial",
+                "parent_candidate_id": None,
+                "rebuild_count": 0,
+            },
+            "content": verbatim_content_payload,
+            "created_at": NOW,
+        }
+    )
+    assert verbatim_candidate.content_hash == verbatim_hash
 
 
 # ---------------------------------------------------------------------------
@@ -104,10 +196,10 @@ async def test_new_lineage_review_marks_prior_active_reviews_stale(
         batch_epoch=batch.batch_epoch,
         prefix_hash="a" * 64,
         call_id="review-1",
-        passed=True,
-        category="pass",
-        evidence="第一份审查",
-        earliest_affected_episode=None,
+        passed=False,
+        category="script_defect",
+        evidence="旧 lineage 的脚本缺陷",
+        earliest_affected_episode=1,
     )
     # A review bound to a DIFFERENT design hash retires the prior active review.
     await repository.register_series_review(
@@ -130,6 +222,66 @@ async def test_new_lineage_review_marks_prior_active_reviews_stale(
     statuses = {review.call_id: review.status for review in reviews}
     assert statuses["review-1"] == "stale"
     assert statuses["review-2"] == "active"
+    assert await repository.get_unresolved_script_defect_reviews(lease.run_id) == []
+
+
+async def test_unresolved_script_defects_aggregate_until_a_same_lineage_pass(
+    repository: Repository,
+) -> None:
+    accepted, lease = await create_leased_run(repository)
+    contract, active = await seed_active_design_and_batch(repository, lease.run_id)
+    batch = await repository.get_script_batch_lineage(lease.run_id)
+
+    common = {
+        "run_id": lease.run_id,
+        "review_type": "milestone",
+        "episode_number": 10,
+        "design_candidate_id": active.candidate_id,
+        "design_content_hash": active.content_hash,
+        "design_epoch": active.design_epoch,
+        "batch_id": batch.batch_id,
+        "batch_epoch": batch.batch_epoch,
+        "prefix_hash": "a" * 64,
+    }
+    await repository.register_series_review(
+        **common,
+        call_id="passing-1",
+        passed=True,
+        category="pass",
+        evidence="前一轮通过",
+        earliest_affected_episode=None,
+    )
+    first = await repository.register_series_review(
+        **common,
+        call_id="reject-2",
+        passed=False,
+        category="script_defect",
+        evidence="第8集林砚校牌写错。",
+        earliest_affected_episode=8,
+    )
+    second = await repository.register_series_review(
+        **common,
+        call_id="reject-3",
+        passed=False,
+        category="script_defect",
+        evidence="第9集扣校牌动机错误。",
+        earliest_affected_episode=9,
+    )
+
+    unresolved = await repository.get_unresolved_script_defect_reviews(lease.run_id)
+    assert [review.review_epoch for review in unresolved] == [2, 3]
+    assert [review.review_id for review in unresolved] == [first.review_id, second.review_id]
+    assert min(review.earliest_affected_episode for review in unresolved) == 8
+
+    await repository.register_series_review(
+        **common,
+        call_id="passing-4",
+        passed=True,
+        category="pass",
+        evidence="修复后通过",
+        earliest_affected_episode=None,
+    )
+    assert await repository.get_unresolved_script_defect_reviews(lease.run_id) == []
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +348,19 @@ async def test_repair_authorization_pauses_and_grants_one_cycle(
     contract, active, committed = await seed_batch_with_episodes(repository, lease.run_id, up_to=3)
     first, second, third = committed
     batch = await repository.get_script_batch_lineage(lease.run_id)
+    async with repository._transaction() as connection:
+        await connection.executemany(
+            """
+            INSERT INTO episode_attempts(
+                run_id, episode_number, attempt_cycle, attempt_number, recorded_at
+            ) VALUES (?, ?, 0, ?, ?)
+            """,
+            [
+                (str(lease.run_id), episode, attempt, NOW.isoformat())
+                for episode in (2, 3)
+                for attempt in range(1, 4)
+            ],
+        )
 
     await repository.pause_repair_authorization(
         lease.run_id,
@@ -250,6 +415,14 @@ async def test_repair_authorization_pauses_and_grants_one_cycle(
     assert by_id[second.candidate_id].status == "superseded"
     assert by_id[third.candidate_id].status == "superseded"
     assert await repository.first_unfinished_episode(lease.run_id) == 2
+    assert await repository.get_episode_attempt_cycles(lease.run_id) == {1: 0, 2: 1, 3: 1}
+    assert await repository.get_episode_attempt_counts(lease.run_id) == {}
+    assert await repository.record_episode_attempt(lease.run_id, 2) == 1
+    assert await repository.record_episode_attempt(lease.run_id, 2) == 2
+    assert await repository.record_episode_attempt(lease.run_id, 2) == 3
+    with pytest.raises(DomainError) as exhausted:
+        await repository.record_episode_attempt(lease.run_id, 2)
+    assert exhausted.value.code == "attempts_exhausted"
 
     # A second grant for the same authorization epoch is refused.
     with pytest.raises(DomainError) as consumed:
@@ -259,6 +432,240 @@ async def test_repair_authorization_pauses_and_grants_one_cycle(
             idempotency_key="authorize-2",
         )
     assert consumed.value.code in {"run_not_controllable", "repair_authorization_stale"}
+
+
+async def test_startup_reconciles_legacy_consumed_suffix_before_new_writer_once(
+    repository: Repository,
+) -> None:
+    accepted, lease = await create_leased_run(repository)
+    _, active, committed = await seed_batch_with_episodes(repository, lease.run_id, up_to=3)
+    first, _, _ = committed
+    batch = await repository.get_script_batch_lineage(lease.run_id)
+    consumed_at = NOW + timedelta(seconds=10)
+    async with repository._transaction() as connection:
+        await connection.executemany(
+            """
+            INSERT INTO episode_attempts(
+                run_id, episode_number, attempt_cycle, attempt_number, recorded_at
+            ) VALUES (?, ?, 0, ?, ?)
+            """,
+            [
+                (str(lease.run_id), episode, attempt, NOW.isoformat())
+                for episode in (2, 3)
+                for attempt in range(1, 4)
+            ],
+        )
+
+    await repository.pause_repair_authorization(
+        lease.run_id,
+        kind="suffix_rewrite",
+        design_candidate_id=active.candidate_id,
+        design_content_hash=active.content_hash,
+        design_epoch=active.design_epoch,
+        batch_id=batch.batch_id,
+        batch_epoch=batch.batch_epoch,
+        earliest_affected_episode=2,
+        range_episodes=2,
+        estimated_tokens=12_000,
+        evidence="旧累计 attempt 计数阻塞授权后的新 writer。",
+        review_id="legacy-auth-review",
+        now=NOW + timedelta(seconds=5),
+    )
+    async with repository._transaction() as connection:
+        await connection.execute(
+            """
+            UPDATE repair_authorizations
+            SET granted_at = ?, consumed_at = ?
+            WHERE run_id = ? AND authorization_epoch = 1
+            """,
+            (consumed_at.isoformat(), consumed_at.isoformat(), str(lease.run_id)),
+        )
+        await connection.execute(
+            """
+            UPDATE episode_candidates
+            SET status = 'superseded', superseded_at = ?
+            WHERE batch_id = ? AND episode_number >= 2 AND status = 'active'
+            """,
+            (consumed_at.isoformat(), batch.batch_id),
+        )
+        await connection.execute(
+            """
+            UPDATE script_batches
+            SET active_pointers_json = ?
+            WHERE batch_id = ?
+            """,
+            (json.dumps({"1": first.candidate_id}), batch.batch_id),
+        )
+        await connection.execute(
+            "DELETE FROM episode_drafts WHERE run_id = ? AND episode_number >= 2",
+            (str(lease.run_id),),
+        )
+        await connection.execute(
+            """
+            UPDATE runs
+            SET state = 'failed',
+                failure_code = 'attempts_exhausted',
+                failure_message = 'The episode attempt limit has been exhausted.',
+                failed_stage = ?,
+                failure_attempt_count = 3,
+                completed_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                consumed_at.isoformat(),
+                consumed_at.isoformat(),
+                str(lease.run_id),
+            ),
+        )
+        await connection.execute(
+            """
+            UPDATE run_progress
+            SET current_stage = ?, current_episode = ?, execution_state = 'failed',
+                active_started_at = NULL, timeout_stage = NULL, timeout_count = 0,
+                recovery_reason = 'none', content_repair_count = NULL,
+                pause_message = NULL, updated_at = ?
+            WHERE run_id = ?
+            """,
+            (
+                InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                2,
+                consumed_at.isoformat(),
+                str(lease.run_id),
+            ),
+        )
+        await connection.execute(
+            """
+            UPDATE jobs
+            SET state = 'failed', lease_owner = NULL, lease_expires_at = NULL,
+                updated_at = ?
+            WHERE run_id = ?
+            """,
+            (consumed_at.isoformat(), str(lease.run_id)),
+        )
+
+    recovered = await repository.reconcile_startup(now=NOW + timedelta(seconds=20))
+    assert [item.run_id for item in recovered] == [lease.run_id]
+    assert await repository.get_episode_attempt_cycles(lease.run_id) == {1: 0, 2: 1, 3: 1}
+    auth = await repository.get_repair_authorization(lease.run_id)
+    assert auth is not None
+    assert auth["consumed_at"] == consumed_at.isoformat()
+
+    resumed = await repository.lease_next_job(
+        "legacy-recovery-worker",
+        30,
+        now=NOW + timedelta(seconds=21),
+    )
+    assert resumed is not None
+    assert (
+        await repository.record_episode_attempt(
+            resumed.run_id,
+            2,
+            now=NOW + timedelta(seconds=22),
+        )
+        == 1
+    )
+    assert await repository.reconcile_startup(now=NOW + timedelta(seconds=23)) == []
+
+    assert (
+        await repository.record_episode_attempt(
+            resumed.run_id,
+            2,
+            now=NOW + timedelta(seconds=24),
+        )
+        == 2
+    )
+    assert (
+        await repository.record_episode_attempt(
+            resumed.run_id,
+            2,
+            now=NOW + timedelta(seconds=25),
+        )
+        == 3
+    )
+    await repository.fail_run(
+        resumed.run_id,
+        RunFailure(
+            code="attempts_exhausted",
+            message="The episode attempt limit has been exhausted.",
+            failed_stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            attempt_count=3,
+        ),
+        now=NOW + timedelta(seconds=26),
+    )
+    assert await repository.reconcile_startup(now=NOW + timedelta(seconds=27)) == []
+    assert await repository.get_episode_attempt_cycles(lease.run_id) == {1: 0, 2: 1, 3: 1}
+    assert await repository.get_episode_attempt_counts(lease.run_id) == {2: 3}
+
+
+async def test_authorize_repair_recomputes_earliest_from_all_unresolved_reviews(
+    repository: Repository,
+) -> None:
+    accepted, lease = await create_leased_run(repository)
+    contract, active, committed = await seed_batch_with_episodes(repository, lease.run_id, up_to=3)
+    batch = await repository.get_script_batch_lineage(lease.run_id)
+    common = {
+        "run_id": lease.run_id,
+        "review_type": "final",
+        "episode_number": 3,
+        "design_candidate_id": active.candidate_id,
+        "design_content_hash": active.content_hash,
+        "design_epoch": active.design_epoch,
+        "batch_id": batch.batch_id,
+        "batch_epoch": batch.batch_epoch,
+        "prefix_hash": "b" * 64,
+    }
+    await repository.register_series_review(
+        **common,
+        call_id="pass-before-rejects",
+        passed=True,
+        category="pass",
+        evidence="前一轮通过",
+        earliest_affected_episode=None,
+    )
+    first = await repository.register_series_review(
+        **common,
+        call_id="reject-earliest-2",
+        passed=False,
+        category="script_defect",
+        evidence="第2集错误",
+        earliest_affected_episode=2,
+    )
+    second = await repository.register_series_review(
+        **common,
+        call_id="reject-earliest-3",
+        passed=False,
+        category="script_defect",
+        evidence="第3集错误",
+        earliest_affected_episode=3,
+    )
+    await repository.pause_repair_authorization(
+        lease.run_id,
+        kind="suffix_rewrite",
+        design_candidate_id=active.candidate_id,
+        design_content_hash=active.content_hash,
+        design_epoch=active.design_epoch,
+        batch_id=batch.batch_id,
+        batch_epoch=batch.batch_epoch,
+        earliest_affected_episode=3,
+        range_episodes=1,
+        estimated_tokens=12_000,
+        evidence=second.evidence,
+        review_id=second.review_id,
+    )
+
+    await repository.authorize_repair(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="authorize-recomputed-earliest",
+    )
+    authorization = await repository.get_repair_authorization(lease.run_id)
+    assert authorization is not None
+    assert authorization["earliest_affected_episode"] == 2
+    assert authorization["range_episodes"] == 2
+    assert first.evidence in authorization["evidence"]
+    assert second.evidence in authorization["evidence"]
 
 
 async def test_authorization_is_stale_when_lineage_changes(

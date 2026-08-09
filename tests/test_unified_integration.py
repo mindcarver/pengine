@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -260,6 +261,7 @@ class UnifiedWorkflow:
         self.execution_count = 0
         self.committed: list[int] = []
         self.registered_reviews: list[dict[str, Any]] = []
+        self.suffix_rewrite_feedbacks: list[Mapping[str, Any] | None] = []
         self.outbound_content_calls = 0
         self.consumed_defects: set[int] = set()
         self.contract_a = _sparse_contract(episode_count)
@@ -330,6 +332,7 @@ class UnifiedWorkflow:
                 approved[stage] = payloads[stage]
 
     async def execute(self, **kwargs: Any) -> WorkflowResult:
+        self.suffix_rewrite_feedbacks.append(kwargs.get("suffix_rewrite_feedback"))
         before_stage = kwargs["before_stage"]
         approve_stage = kwargs["approve_stage"]
         approved = dict(kwargs.get("approved_checkpoints") or {})
@@ -492,6 +495,18 @@ class UnifiedWorkflow:
         )
 
 
+class SequencedFinalReviewWorkflow(UnifiedWorkflow):
+    """Return two successive rejects without an intervening passing review."""
+
+    def __init__(self, decisions: list[dict[str, Any]]) -> None:
+        super().__init__(episode_count=3, persistent_defects=True)
+        self.review_decisions = decisions
+
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        self.decisions[self.episode_count] = self.review_decisions[self.execution_count]
+        return await super().execute(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Test services
 # ---------------------------------------------------------------------------
@@ -586,7 +601,6 @@ async def test_int_a4_resume_after_episode_three_does_not_rewrite_prefix(
     final = await repository.get_creation(accepted.creation_id)
     assert final is not None
     assert final.initial.state == "succeeded", final.initial.failure
-
     after = {
         row["episode_number"]: (row["candidate_id"], row["version"], row["status"])
         for row in _sqlite_rows(
@@ -650,6 +664,13 @@ async def test_int_a5_script_defect_preserves_prefix_and_replays_state(
     final = await repository.get_creation(accepted.creation_id)
     assert final is not None
     assert final.initial.state == "succeeded", final.initial.failure
+    assert workflow.suffix_rewrite_feedbacks[0] is None
+    assert workflow.suffix_rewrite_feedbacks[1] is not None
+    assert workflow.suffix_rewrite_feedbacks[1]["effective_earliest_affected_episode"] == 2
+    assert workflow.suffix_rewrite_feedbacks[1]["reviews"][0]["evidence"] == (
+        "第2集违背合同连续性与义务闭环。"
+    )
+    assert workflow.suffix_rewrite_feedbacks[1]["reviews"][0]["binding"]["batch_id"]
 
     after = {
         row["episode_number"]: (row["candidate_id"], row["version"], row["status"])
@@ -679,6 +700,66 @@ async def test_int_a5_script_defect_preserves_prefix_and_replays_state(
     )[0]
     assert ep2_row["predecessor_candidate_id"] == after[1][0]
     assert json.loads(ep2_row["series_state_json"])["locked_through_episode"] == 2
+
+
+@pytest.mark.asyncio
+async def test_int_a5_repeated_script_defects_rewrite_from_oldest_unresolved_episode(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository = await _services(tmp_path)
+    workflow = SequencedFinalReviewWorkflow(
+        [
+            {
+                "category": "script_defect",
+                "evidence": "第2集林砚校牌写错。",
+                "earliest_affected_episode": 2,
+            },
+            {
+                "category": "script_defect",
+                "evidence": "第3集扣校牌动机错误。",
+                "earliest_affected_episode": 3,
+            },
+            {"category": "pass", "evidence": "两个缺陷都已闭环。"},
+        ]
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="a5-aggregate-worker",
+    )
+    accepted = await _create_creation(repository, catalog, "a5-aggregate")
+
+    await worker.run_once()  # reject #1, automatic rewrite starts at episode 2
+    await worker.run_once()  # reject #2, pause authorization aggregates both reviews
+    paused = await repository.get_creation(accepted.creation_id)
+    assert paused is not None
+    assert paused.initial.state == "paused"
+    authorization = paused.initial.authorization
+    assert authorization is not None
+    assert authorization.earliest_affected_episode == 2
+    assert "第2集林砚校牌写错。" in authorization.evidence
+    assert "第3集扣校牌动机错误。" in authorization.evidence
+
+    await repository.authorize_repair(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="a5-aggregate-authorize",
+    )
+    await worker.run_once()  # authorized rewrite must start at episode 2
+
+    final = await repository.get_creation(accepted.creation_id)
+    assert final is not None
+    assert final.initial.state == "succeeded", final.initial.failure
+    feedback = workflow.suffix_rewrite_feedbacks[2]
+    assert feedback is not None
+    assert feedback["effective_earliest_affected_episode"] == 2
+    assert [item["binding"]["review_epoch"] for item in feedback["reviews"]] == [1, 2]
+    assert [item["evidence"] for item in feedback["reviews"]] == [
+        "第2集林砚校牌写错。",
+        "第3集扣校牌动机错误。",
+    ]
 
 
 @pytest.mark.asyncio
