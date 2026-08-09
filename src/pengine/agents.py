@@ -165,6 +165,32 @@ _CANONICAL_WORKSPACE_PATHS = frozenset(
     }
 )
 
+_INTERNAL_RUNTIME_LEAK_POLICY = (
+    "Screenplay form or story-world subject matter is not internal-runtime-leak evidence by "
+    "itself. Episode, chapter, act, and scene headings; title cards; recap labels; end markers "
+    "such as 本集终; screenplay directions; arithmetic, equations, mental calculation, checking, "
+    "and other reasoning; and depictions of JSON, code, paths, tools, models, AI, or validation "
+    "may all be legitimate content. Never reject or rewrite content merely because it uses one "
+    "of those forms or subjects, unless it directly violates an explicit hard-Canon requirement. "
+    "Keep this generation workflow's private runtime provenance out of the screenplay. "
+    "A reviewer may reject an internal-runtime leak only when the screenplay copies a concrete "
+    "runtime-only token or record from a supplied private workflow artifact, such as an exact "
+    "canonical /workspace path, a fact/clue/obligation stable ID, a tool-call or model-message "
+    "envelope, validation or retry status text, or raw contract serialization, and the same "
+    "material is not established as story-world content by the user request, an approved "
+    "upstream artifact, or the candidate screenplay's own clear dramatic context. Story-world "
+    "facts encoded by a contract are content, not runtime leakage. A match between a "
+    "screenplay's own episode label and the trusted envelope's episode_number is not provenance "
+    "evidence. Review evidence must quote the exact screenplay excerpt, name the matching private "
+    "source, and explain why the runtime provenance is unambiguous. If provenance is ambiguous, "
+    "pass this dimension."
+)
+
+
+def _with_internal_runtime_leak_policy(prompt: str) -> str:
+    return "\n\n".join((prompt, _INTERNAL_RUNTIME_LEAK_POLICY))
+
+
 _STORY_ARCHITECT_PROMPT = (
     "Read the relevant /persona context. Return only the structured result for "
     "the stage named in the task. For selecting_l0_variant, set "
@@ -221,22 +247,29 @@ _EPISODE_PLANNER_PROMPT = (
     "is that episode."
 )
 
-_SCRIPT_WRITER_PROMPT = (
+_SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
     "Read /workspace/story_contract.json and /workspace/series_state.json, then return a "
     "complete non-null state_delta bound to the supplied contract hash. Put only changes from "
     "the requested episode in every state_delta list; never copy cumulative prior state into a "
     "delta. Follow the single episode plan and persona rules without changing any "
     "locked episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
     "returning, reread every approved upstream artifact and audit this episode "
-    "against them. Use canonical contract names in every speaker label, including when a "
-    "parenthetical delivery direction follows the name. Treat explicitly locked or formally "
+    "against them. Treat contract characters as continuity-bearing identities, not as a "
+    "screenplay-label whitelist. Surface speaker labels may use names, aliases, roles, generic "
+    "or descriptive labels, or another notation established by the screenplay. Never normalize "
+    "a label merely because it precedes a colon. A cast defect requires contextual evidence "
+    "that the script introduced a genuinely new continuity-bearing character in direct conflict "
+    "with explicit hard Canon. Treat explicitly locked or formally "
     "committed aliases, pronouns, ages, elapsed durations, call participants, identity and "
     "relationship facts, and clue meanings as binding. "
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
     "exact dialogue-count claims, and episode-specific promised actions. Every "
     "explicitly locked upstream commitment must appear in the scripts. Unspecified "
-    "creative details remain the writer's choice. Use calculate_arithmetic "
-    "for every derived numeric claim and copy its exact result. The tool accepts "
+    "creative details remain the writer's choice. Use calculate_arithmetic to verify every "
+    "derived numeric claim. The tool interaction stays private, but it does not constrain "
+    "dramatic presentation: the screenplay may show operands, equations, mental calculation, "
+    "checking, and reasoning when the story needs them. Never copy a tool-call envelope or "
+    "private validation log into the screenplay. The tool accepts "
     "decimal operands only: convert clock times to elapsed minutes before subtracting "
     "them (for example, 22:50 becomes 1370 and 22:20 becomes 1340). Never round a "
     "non-integral division unless the script states the rounding rule. Every required "
@@ -244,6 +277,48 @@ _SCRIPT_WRITER_PROMPT = (
     "excerpt that exists in the script. Return only the structured episode-script "
     "result for the requested episode number, with the complete verbatim screenplay in "
     "content rather than a completion summary, status report, or file path."
+)
+
+_QUALITY_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
+    "Read the relevant /persona context and review only the named gate against the approved "
+    "artifacts supplied in the task. Always return the structured stage, passed decision, and "
+    "concrete evidence; never return prose instead. Keep feedback_handling empty for "
+    "accepting_l0 and for an initial run. For a revision's accepting_l4 gate, itemize every "
+    "frozen feedback item. A rejection must identify a direct conflict with a user requirement, "
+    "an applicable explicit persona gate rule, locked Contract or SeriesBible data, a frozen "
+    "revision-feedback item, or the output/schema protocol. Ordinary screenplay format, style, "
+    "or matters of taste are not sufficient reasons to set passed=false. At accepting_l4, only "
+    "an internal-runtime leak that meets the policy's provenance and evidence standard is a "
+    "blocking leakage defect."
+)
+
+_EPISODE_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
+    "Use the episode-continuity-review skill. Treat explicit contract facts and prior state as "
+    "immutable and unspecified creative details as free. Only an internal-runtime leak that "
+    "meets the policy's provenance and evidence standard is blocking. Screenplay formatting and "
+    "story-world subject matter named in the policy are never defects on their own. "
+    "/workspace/series_prefix.json is a trusted runtime envelope: episode_number and JSON "
+    "framing are trusted runtime metadata, not screenplay content. Judge leakage only inside "
+    "episodes[].content. Return only structured review evidence and never repair content."
+)
+
+_SERIES_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
+    "Review the complete active series prefix against the active SeriesBible and locked story "
+    "contract. The design and every committed script are immutable. Hard Canon is limited to "
+    "user requirements, explicitly locked Contract or SeriesBible values, formally committed "
+    "facts and state in the prefix, mandatory episode obligations, and the output/schema "
+    "protocol. Ordinary SeriesBible prose, screenplay format or style, and omitted creative "
+    "details are not locks. Fail only for a direct contradiction to that hard Canon, an "
+    "impossible required locked binding, or an internal-runtime leak that meets the policy's "
+    "provenance and evidence standard. Classify the decision exactly: pass requires concrete "
+    "evidence that no such blocker exists; a design_defect means the active SeriesBible itself "
+    "contains the blocking contradiction or impossible binding and returns no affected episode; "
+    "a script_defect means the current prefix contains the blocker and returns the earliest "
+    "affected episode N. Collect every current blocking defect in the evidence. "
+    "/workspace/series_prefix.json is a trusted runtime envelope: episode_number and JSON framing "
+    "are trusted runtime metadata, not screenplay content. Judge leakage only inside "
+    "episodes[].content. Never repair content and never reinterpret the design to make the "
+    "prefix pass."
 )
 
 VIRTUAL_FILE_PERMISSIONS = [
@@ -3736,12 +3811,14 @@ class StageGuardMiddleware(AgentMiddleware):
             description=(
                 f"Review the complete active series prefix through episode {episode_number} "
                 "against the active SeriesBible and locked story contract. Treat the design "
-                "and every committed script as immutable. Classify the decision exactly: a "
-                "pass requires concrete whole-series consistency evidence; a design defect "
-                "means the structural design itself is unsound (return earliest_affected_episode "
-                "null); a script defect means the writing from the earliest affected episode "
-                "violates the contract, continuity, clue lifecycle, or obligations (return the "
-                "earliest affected episode N). Read /workspace/series_prefix.json as a trusted "
+                "and every committed script as immutable. Fail only for a direct contradiction "
+                "to explicit hard Canon, an impossible required locked binding, or a proven "
+                "private-runtime leak. Ordinary SeriesBible prose, screenplay format or style, "
+                "reasoning shown inside the story, and unspecified creative choices are not "
+                "locks. Classify the decision exactly: a design defect means the active "
+                "SeriesBible itself contains the blocker (return earliest_affected_episode "
+                "null); a script defect means the current prefix contains the blocker (return "
+                "the earliest affected episode N). Read /workspace/series_prefix.json as a trusted "
                 "runtime envelope: episode_number and JSON framing are trusted runtime metadata, "
                 "not screenplay content. Judge leakage only inside episodes[].content. Return the "
                 "structured classification only."
@@ -3955,12 +4032,16 @@ class StageGuardMiddleware(AgentMiddleware):
                         description=(
                             f"Review episode {plan.episode_number} and the complete committed "
                             "series prefix against the locked contract and every approved upstream "
-                            "artifact. Compare only explicitly locked or formally committed "
+                            "artifact. Reject only a direct explicit hard-Canon contradiction, "
+                            "an impossible required locked binding, or a proven private-runtime "
+                            "leak. Compare only explicitly locked or formally committed "
                             "identities, relationships, aliases, pronouns, ages, "
                             "durations, call participants, clue meanings, causal facts, viewpoint "
                             "knowledge, cast, and episode obligation across all prior scripts and "
                             "the current candidate. The candidate's final dramatic beat must "
                             "realize the locked end_hook without a later beat undoing it. On the "
+                            "other hand, screenplay format, labels, calculation or reasoning, "
+                            "and ordinary creative choices are not defects by themselves. On the "
                             "final episode this is the whole-series consistency review before "
                             "script-stage approval. Read /workspace/series_prefix.json as a "
                             "trusted runtime envelope: episode_number and JSON framing are trusted "
@@ -4053,7 +4134,9 @@ class StageGuardMiddleware(AgentMiddleware):
                         "Change only the unlocked candidate and state delta. Keep the locked "
                         "contract and earlier episodes unchanged, and address every review issue. "
                         "The final dramatic beat must realize the locked end_hook, with no later "
-                        "beat that cancels or replaces it."
+                        "beat that cancels or replaces it. Preserve the candidate's established "
+                        "screenplay notation; do not normalize a surface label unless the review "
+                        "proves a new continuity-bearing character violates explicit hard Canon."
                     ),
                     files={
                         "/workspace/story_contract.json": contract_json,
@@ -4376,14 +4459,7 @@ class DeepAgentWorkflow:
                 "description": (
                     "Reviews the L0 and L4 gates and itemizes revision-feedback coverage."
                 ),
-                "system_prompt": bind_language(
-                    "Read the relevant /persona context and review only the named gate "
-                    "against the approved artifacts supplied in the task. Always return "
-                    "the structured stage, passed decision, and concrete evidence; never "
-                    "return prose instead. Keep feedback_handling empty for accepting_l0 "
-                    "and for an initial run. For a revision's accepting_l4 gate, itemize "
-                    "every frozen feedback item."
-                ),
+                "system_prompt": bind_language(_QUALITY_REVIEWER_PROMPT),
                 "model": self.review_model,
                 "tools": tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
@@ -4422,11 +4498,7 @@ class DeepAgentWorkflow:
             {
                 "name": "episode_reviewer",
                 "description": "Independently reviews one episode against locked continuity.",
-                "system_prompt": bind_language(
-                    "Use the episode-continuity-review skill. Explicit contract facts and prior "
-                    "state are immutable; unspecified creative details remain free. Return only "
-                    "structured review evidence and never repair content."
-                ),
+                "system_prompt": bind_language(_EPISODE_REVIEWER_PROMPT),
                 "model": self.review_model,
                 "tools": tools,
                 "permissions": REVIEW_FILE_PERMISSIONS,
@@ -4444,14 +4516,7 @@ class DeepAgentWorkflow:
                     "structural milestone or the final completion and returns a deterministic "
                     "classification."
                 ),
-                "system_prompt": bind_language(
-                    "Review the complete active series prefix against the active SeriesBible "
-                    "and locked story contract. The design and every committed script are "
-                    "immutable. Classify the decision exactly: pass requires concrete "
-                    "whole-series consistency evidence; a design defect returns no affected "
-                    "episode; a script defect returns the earliest affected episode N. Never "
-                    "repair content and never reinterpret the design to make the prefix pass."
-                ),
+                "system_prompt": bind_language(_SERIES_REVIEWER_PROMPT),
                 "model": self.review_model,
                 "tools": tools,
                 "permissions": REVIEW_FILE_PERMISSIONS,
@@ -4466,7 +4531,11 @@ class DeepAgentWorkflow:
                 "description": "Repairs only the current unlocked episode candidate.",
                 "system_prompt": bind_language(
                     "Use the continuity-repair skill. Keep the locked contract and earlier "
-                    "episodes unchanged. Return the complete structured script result only."
+                    "episodes unchanged. Treat character identities as continuity constraints, "
+                    "not a surface-label whitelist: do not normalize aliases, roles, generic or "
+                    "descriptive labels, or colon-form lines unless contextual evidence proves "
+                    "a genuinely new character contradicting explicit hard Canon. Return the "
+                    "complete structured script result only."
                 ),
                 "model": self.generation_model,
                 "tools": tools,

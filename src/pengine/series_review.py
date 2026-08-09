@@ -70,10 +70,34 @@ def active_prefix_hash(episodes: Sequence[Mapping[str, str]]) -> str:
 class StructuralReviewResult(ContinuityModel):
     """The structured DeepSeek review decision for one milestone or final prefix."""
 
-    passed: bool
-    category: Literal["pass", "design_defect", "script_defect"]
-    evidence: NonEmptyText
-    earliest_affected_episode: int | None = Field(default=None, ge=1)
+    passed: bool = Field(
+        description=(
+            "False only for a direct explicit hard-Canon contradiction, an impossible required "
+            "locked binding, or a proven private-runtime leak in the current reviewed prefix."
+        )
+    )
+    category: Literal["pass", "design_defect", "script_defect"] = Field(
+        description=(
+            "design_defect only when the active design itself contains the blocker; "
+            "script_defect only when the current script prefix contains it."
+        )
+    )
+    evidence: NonEmptyText = Field(
+        description=(
+            "On pass, state the checked hard-Canon scope and that no blocker exists. On failure, "
+            "list every current blocker with the conflicting screenplay or design excerpt and "
+            "its explicit authoritative source; for a runtime leak, also name the matching "
+            "private source."
+        )
+    )
+    earliest_affected_episode: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "The earliest episode containing a current script blocker; never derive this from "
+            "format, style, or a prior superseded prefix."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_decision(self) -> StructuralReviewResult:

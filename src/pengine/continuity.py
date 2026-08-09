@@ -46,41 +46,7 @@ _CONVERTIBLE_MEASURED_UNITS = {
     "厘米": ("length_millimeters", Decimal("10")),
     "米": ("length_millimeters", Decimal("1000")),
 }
-_SPEAKER = re.compile(
-    r"^\s*([A-Za-z\u3400-\u9fff][A-Za-z0-9_·\u3400-\u9fff]{0,4})"
-    r"(?:\s*[（(][^）)\r\n]{0,40}[）)])?\s*[：:]"
-)
 _CHARACTER_LABEL_QUALIFIER = re.compile(r"\s*[（(][^）)\r\n]{1,40}[）)]\s*$")
-_KNOWN_SPEAKER_SUFFIX = re.compile(r"^(?:\s*[（(][^）)\r\n]{0,40}[）)])*\s*[：:]")
-_STRUCTURAL_HEADING = re.compile(
-    r"^(?:场景[零〇一二两三四五六七八九十百\d]+|"
-    r"第[零〇一二两三四五六七八九十百\d]+[场集]|EP\d+)$",
-    re.IGNORECASE,
-)
-_NON_CHARACTER_LABELS = {
-    "画面",
-    "字幕",
-    "场景",
-    "地点",
-    "时间",
-    "音效",
-    "旁白",
-    "同期声",
-    "动作",
-    "镜头",
-    "特写",
-    "人物",
-    "内景",
-    "外景",
-    "近景",
-    "远景",
-    "全景",
-    "中景",
-    "画外音",
-    "独白",
-    "闪回",
-    "转场",
-}
 
 
 def character_label_base(label: str) -> str:
@@ -89,14 +55,6 @@ def character_label_base(label: str) -> str:
     while match := _CHARACTER_LABEL_QUALIFIER.search(base):
         base = base[: match.start()].rstrip()
     return base
-
-
-def _is_known_speaker_line(line: str, character_names: set[str]) -> bool:
-    stripped = line.lstrip()
-    return any(
-        stripped.startswith(name) and _KNOWN_SPEAKER_SUFFIX.match(stripped[len(name) :]) is not None
-        for name in character_names
-    )
 
 
 class ContinuityModel(BaseModel):
@@ -752,115 +710,81 @@ def validate_episode_candidate(
                 )
             )
 
-    allowed_temporal: set[str] = set()
     for fact in contract.facts:
-        if fact.kind not in _TEMPORAL_KINDS:
-            for text_value in (fact.subject, fact.predicate, fact.value):
-                allowed_temporal.update(
-                    normalized for _, normalized, _ in _temporal_tokens(text_value)
-                )
+        if fact.kind not in _TEMPORAL_KINDS or fact.first_revealed_episode != episode:
             continue
-        allowed_temporal.add(fact.value)
+        excerpt = evidence.get(fact.fact_id)
+        if excerpt is None:
+            continue
         temporal_value = _parse_temporal(fact.kind, fact.value)
         if isinstance(temporal_value, datetime):
-            allowed_temporal.add(temporal_value.date().isoformat())
-            allowed_temporal.add(temporal_value.time().isoformat(timespec="minutes"))
+            expected_temporal_groups = (
+                {temporal_value.date().isoformat()},
+                {temporal_value.time().isoformat(timespec="minutes")},
+            )
         elif isinstance(temporal_value, date):
-            allowed_temporal.add(temporal_value.isoformat())
+            expected_temporal_groups = ({temporal_value.isoformat()},)
         else:
-            allowed_temporal.add(temporal_value.isoformat(timespec="minutes"))
-    temporal_tokens = _temporal_tokens(content)
-    for token, normalized, _ in temporal_tokens:
-        if normalized not in allowed_temporal and not _matches_unqualified_clock_alias(
-            token,
-            normalized,
-            allowed_temporal,
+            expected_temporal_groups = ({temporal_value.isoformat(timespec="minutes")},)
+        excerpt_tokens = _temporal_tokens(excerpt)
+        if excerpt_tokens and not all(
+            any(
+                normalized in expected_values
+                or _matches_unqualified_clock_alias(token, normalized, expected_values)
+                for token, normalized, _ in excerpt_tokens
+            )
+            for expected_values in expected_temporal_groups
         ):
             issues.append(
                 _issue(
-                    "uncontracted_time",
-                    f"剧本包含合同外日期或时间 {token}（{normalized}）",
+                    "locked_temporal_evidence_mismatch",
+                    f"事实证据 {fact.fact_id} 中的日期或时间与锁定值 {fact.value} 不一致",
+                    [fact.fact_id],
                 )
             )
 
-    converted_facts = [
-        (fact, converted)
-        for fact in contract.facts
-        if fact.kind in _NUMERIC_KINDS
-        and (converted := _converted_measurement(fact.value, fact.unit or "")) is not None
-    ]
-    calendar_year_facts: list[tuple[StoryFact, str]] = []
     for fact in contract.facts:
-        if fact.kind not in {"date", "datetime"}:
+        if fact.kind not in _NUMERIC_KINDS or fact.first_revealed_episode != episode:
             continue
-        temporal_value = _parse_temporal(fact.kind, fact.value)
-        normalized_year = _normalized_decimal(str(temporal_value.year))
-        calendar_year_facts.append((fact, normalized_year))
-    temporal_spans = [span for _, _, span in temporal_tokens]
-    for match in _MEASURED_NUMBER.finditer(content):
-        if any(_spans_overlap(match.span(), temporal_span) for temporal_span in temporal_spans):
+        excerpt = evidence.get(fact.fact_id)
+        if excerpt is None:
             continue
-        raw_value, unit = match.groups()
-        value = _normalized_number(raw_value)
-        if value is None:
-            continue
-        is_calendar_year = unit == "年" and Decimal(value) >= 1000
-        converted = _converted_measurement(value, unit)
-        context = _clause_at_span(content, match.span())
-        relevant_exact = {
-            (_normalized_decimal(fact.value), fact.unit or "")
-            for fact in contract.facts
-            if fact.kind in _NUMERIC_KINDS
-            and fact.unit == unit
-            and _fact_anchor_matches(context, fact)
-        }
-        if is_calendar_year and calendar_year_facts:
-            relevant_years = {
-                year for fact, year in calendar_year_facts if _fact_anchor_matches(context, fact)
-            }
-            if relevant_years:
-                allowed = value in relevant_years
-            elif relevant_exact:
-                allowed = (value, unit) in relevant_exact
-            else:
+        locked_value = _normalized_decimal(fact.value)
+        locked_unit = fact.unit or ""
+        locked_converted = _converted_measurement(fact.value, locked_unit)
+        temporal_spans = [span for _, _, span in _temporal_tokens(excerpt)]
+        relevant_values: list[tuple[str, str, tuple[str, str] | None]] = []
+        for match in _MEASURED_NUMBER.finditer(excerpt):
+            if any(_spans_overlap(match.span(), temporal_span) for temporal_span in temporal_spans):
                 continue
-        elif relevant_exact:
-            allowed = (value, unit) in relevant_exact
-        elif converted is not None:
-            relevant_converted = {
-                locked_value
-                for fact, locked_value in converted_facts
-                if locked_value[0] == converted[0] and _fact_anchor_matches(context, fact)
-            }
-            if not relevant_converted:
+            raw_value, unit = match.groups()
+            value = _normalized_number(raw_value)
+            if value is None:
                 continue
-            allowed = converted in relevant_converted
-        else:
-            continue
-        if not allowed:
-            issues.append(
-                _issue(
-                    "uncontracted_number",
-                    f"剧本包含合同外计量值 {raw_value}{unit}（{value}{unit}）",
-                )
+            converted = _converted_measurement(value, unit)
+            if unit == locked_unit or (
+                converted is not None
+                and locked_converted is not None
+                and converted[0] == locked_converted[0]
+            ):
+                relevant_values.append((value, unit, converted))
+        if relevant_values and not any(
+            (value, unit) == (locked_value, locked_unit)
+            or (
+                converted is not None
+                and locked_converted is not None
+                and converted == locked_converted
             )
-
-    character_names = {character.name for character in contract.characters}
-    for line in content.splitlines():
-        if _is_known_speaker_line(line, character_names):
-            continue
-        match = _SPEAKER.match(line)
-        if (
-            match
-            and match.group(1) not in character_names | _NON_CHARACTER_LABELS
-            and _STRUCTURAL_HEADING.fullmatch(match.group(1)) is None
+            for value, unit, converted in relevant_values
         ):
             issues.append(
                 _issue(
-                    "unknown_speaker",
-                    f"剧本引入了锁定角色表之外的说话人 {match.group(1)}",
+                    "locked_numeric_evidence_mismatch",
+                    f"事实证据 {fact.fact_id} 中的数值与锁定值 {fact.value}{locked_unit} 不一致",
+                    [fact.fact_id],
                 )
             )
+
     return issues
 
 
@@ -951,23 +875,6 @@ def _converted_measurement(value: str, unit: str) -> tuple[str, str] | None:
         return None
     dimension, multiplier = conversion
     return dimension, _normalized_decimal(str(Decimal(value) * multiplier))
-
-
-def _clause_at_span(content: str, span: tuple[int, int]) -> str:
-    boundaries = "\n\r，。；！？!?"
-    start = max(content.rfind(boundary, 0, span[0]) for boundary in boundaries) + 1
-    ends = [content.find(boundary, span[1]) for boundary in boundaries]
-    end = (
-        min(position for position in ends if position != -1)
-        if any(position != -1 for position in ends)
-        else len(content)
-    )
-    return content[start:end]
-
-
-def _fact_anchor_matches(context: str, fact: StoryFact) -> bool:
-    predicate = fact.predicate.strip()
-    return len(predicate) >= 2 and predicate in context
 
 
 _CHINESE_DIGITS = {

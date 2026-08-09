@@ -1058,7 +1058,7 @@ class Worker:
                     - (exc.earliest_affected_episode or 1)
                     + 1
                 ),
-                estimated_tokens=await self._repair_token_estimate(
+                estimated_tokens=await self._repair_reference_context_tokens(
                     work.run_id,
                     from_episode=exc.earliest_affected_episode or 1,
                 ),
@@ -1095,7 +1095,7 @@ class Worker:
                 batch_epoch=(batch.batch_epoch if batch else 1),
                 earliest_affected_episode=None,
                 range_episodes=None,
-                estimated_tokens=await self._repair_token_estimate(
+                estimated_tokens=await self._repair_reference_context_tokens(
                     work.run_id,
                     from_episode=1,
                 ),
@@ -1114,11 +1114,12 @@ class Worker:
             exc.category,
         )
 
-    async def _repair_token_estimate(self, run_id: UUID, *, from_episode: int) -> int:
-        """A deterministic token estimate for the one authorized generation+review cycle.
+    async def _repair_reference_context_tokens(self, run_id: UUID, *, from_episode: int) -> int:
+        """Return the reference context amount shown at authorization.
 
-        The estimate covers the retained active prefix scripts plus the active design
-        projections that the writer must carry into the regenerated range (RPR-A8).
+        It counts the retained active prefix plus the active design projections at the pause.
+        Those texts are not guaranteed to be the exact input of a design rebuild or every
+        suffix call, so this is neither a lower bound nor a total cycle forecast (RPR-A8).
         """
         from pengine.model_calls import estimate_text_tokens
 

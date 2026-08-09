@@ -18,11 +18,17 @@ artifact is context, not an automatic lock. Fail only when the candidate
 contradicts that hard Canon: identity or alias drift,
 changed relationships, wrong pronouns, changed dates or measured numbers,
 changed ages or elapsed durations, changed call participants, clue-meaning
-substitution, causal contradiction, viewpoint knowledge withheld unfairly,
+substitution, causal contradiction, contradiction of a formally committed
+viewpoint-knowledge state,
 missing visible or audible evidence for a required clue, an unresolved required
-clue, a missing required new-information beat, or a weak locked end hook. A
+clue, a missing required new-information beat, or a missing or directly
+contradicted locked end hook. A
 detail that the contract and committed prefix leave unspecified is free for the
 writer to choose and is not a review failure.
+Episode or scene headings, titles, recap or end markers, screenplay directions,
+and calculation or reasoning shown inside the story are not failures by
+themselves. Do not fail a locked end hook because its execution is a matter of
+taste.
 Compare the candidate to every prior script, not only the latest state summary.
 Cite the exact contract identifiers and script excerpts.
 
