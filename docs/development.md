@@ -16,7 +16,8 @@ permalink: /development/
 
 - Python `>=3.12,<3.13`；
 - [`uv`](https://docs.astral.sh/uv/)；
-- 若执行真实模型路径，需要一个能同时接受 Anthropic Messages 和 OpenAI-compatible chat completions 的 relay；
+- 若执行真实模型路径，需要一个能同时接受 Anthropic Messages 生成路由和所选审核
+  模型协议的 relay；
 - 若启用可选 Langfuse tracing，需要 Docker Compose 和本地 Langfuse 服务。
 
 ```bash
@@ -42,16 +43,24 @@ PENGINE_REVIEW_MODEL_ID=deepseek-v4-flash
 PENGINE_GENERATION_MAX_OUTPUT_TOKENS=128000
 PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS=200000
 PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS=64000
+PENGINE_STAGE_MODEL_CALL_LIMIT=48
+PENGINE_STAGE_REVIEW_CALL_LIMIT=32
+PENGINE_SCRIPT_STAGE_MODEL_CALL_TOTAL_LIMIT=192
+PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 ```
 
 配置规则：
 
 - generation model 必须是 `claude-opus-5`，生成输出上限不能超过 `128000`；
-- 默认 review model 是 `deepseek-v4-flash`；当前 Settings 还允许代码声明的其他审核模型值，但不能仅凭配置通过就声称 provider 能力已验证；
+- `.env.example` 选择 `deepseek-v4-flash`；Settings 允许的审核模型完整集合是
+  `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra` 和 `claude-opus-5`，分别走
+  DeepSeek、OpenAI 和 Anthropic 客户端；不能仅凭配置通过就声称 provider 能力已验证；
 - generation/review 上下文上限必须是实际验证过的 token window；没有可信上限时请求前阻断；
 - relay URL 必须使用 HTTPS，loopback relay 才允许 HTTP；
 - URL、key、任一角色模型缺失时，服务可以启动，但真实模型工作流不会静默降级；
 - 旧的单路由变量不能覆盖角色路由：`PENGINE_RELAY_ADAPTER`、`PENGINE_RELAY_MODEL_ID`、`PENGINE_RELAY_MAX_OUTPUT_TOKENS` 不属于当前配置合同；
+- stage call limit 是出站模型调用预算，不是 LangGraph recursion limit 或三次业务尝试；
+  剧本阶段同时受单集角色上限和整轮 generation/review 总上限约束；
 - Langfuse 是可选观测，不改变业务状态权威性：
 
 ```dotenv
@@ -121,7 +130,9 @@ uv build --no-sources
 - SQLite schema/migration 与备份恢复；
 - retry 分类、模型路由和结构化输出；
 - business checkpoint、active pointer 和 stale-write fence；
-- 浏览器只读展示是否误报未提交内容为正式交付。
+- 浏览器只读展示是否误报未提交内容为正式交付；
+- 物理 `call_id`/`operation_id`/checkpoint `review_call_id` 是否仍能证明产物来源；
+- 长篇幅改动是否误把当前一次性全量 `EpisodePlannerResult` 宣称为 60–100 集可靠支持。
 
 ## 6. GitHub Pages 发布
 

@@ -32,7 +32,7 @@ from pengine.continuity import (
     Sha256,
     StableId,
     StoryContract,
-    canonical_model_hash,
+    canonical_story_contract_payload,
     character_label_base,
     render_story_contract_markdown,
     story_contract_sha256,
@@ -253,7 +253,15 @@ class SeriesBibleSummary(ContinuityModel):
 
 def canonical_series_bible_content_hash(content: SeriesBibleContent) -> str:
     """SHA-256 of the canonical serialized design content (immutable identity)."""
-    return canonical_model_hash(content)
+    payload = content.model_dump(mode="json")
+    payload["story_contract"] = canonical_story_contract_payload(content.story_contract)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def canonical_series_bible_hash(bible: SeriesBible) -> str:

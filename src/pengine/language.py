@@ -81,7 +81,9 @@ def has_obvious_language_mismatch(
     )
     han_count = len(_HAN_CHARACTER.findall(language_sample))
     if han_count == 0:
-        return True
+        # Letter-free values (times like "21:00—22:00", ranges, symbols) are
+        # language-neutral regardless of punctuation flavor.
+        return len(_LATIN_LETTER.findall(language_sample)) >= _LONG_ENGLISH_TEXT_LETTERS
 
     traditional_count = len(_TRADITIONAL_ONLY_CHARACTER.findall(language_sample))
     if traditional_count >= 2 and traditional_count * 3 >= han_count:

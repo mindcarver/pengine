@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -17,7 +18,7 @@ from langchain.agents.structured_output import (
     ToolStrategy,
 )
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
@@ -26,12 +27,16 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from pengine.agents import (
     _EPISODE_PLANNER_PROMPT,
+    _EPISODE_REPAIR_PROMPT,
     _EPISODE_REVIEWER_PROMPT,
+    _INTERNAL_RUNTIME_LEAK_POLICY,
     _QUALITY_REVIEWER_PROMPT,
+    _REPAIR_TOOL_ALLOWLIST,
     _SCRIPT_WRITER_PROMPT,
     _SERIES_REVIEWER_PROMPT,
     _SPECIALIST_SKILL_SOURCES,
     _STORY_ARCHITECT_PROMPT,
+    REVIEW_FILE_PERMISSIONS,
     SKILLED_WRITE_PERMISSIONS,
     VIRTUAL_FILE_PERMISSIONS,
     AgentProtocolError,
@@ -48,6 +53,7 @@ from pengine.agents import (
     StoryArchitectResult,
     StoryArtifactRepairPatch,
     StructuredResultMiddleware,
+    ToolAllowlistMiddleware,
     WorkflowCompletion,
     _apply_outline_repair_patch,
     _apply_story_artifact_repair_patch,
@@ -55,7 +61,9 @@ from pengine.agents import (
     _bind_outline_contract_repairs,
     _calculate_arithmetic,
     _canon_issue_ledger,
+    _compact_supervisor_messages,
     _drop_dangling_tool_call_messages,
+    _evidence_contract,
     _language_retry_fingerprint,
     _language_retry_matches,
     _merge_story_canon_reviews,
@@ -67,6 +75,7 @@ from pengine.agents import (
     _story_repair_context,
     _structured_output_retry_message,
     _structured_result_validation_correction,
+    _suffix_rewrite_feedback_for_episode,
     _supervisor_prompt,
     _validate_outline_repair_patch_targets,
     _validate_result_language,
@@ -90,7 +99,6 @@ from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import CreateCreationRequest, EpisodeDraft, EpisodePlan, InternalStage
 from pengine.series_bible import build_series_bible, project_series_bible
-from pengine.series_review import StructuralReviewResult
 from pengine.skill_assets import load_agent_skill_files
 from pengine.worker import Worker
 
@@ -98,6 +106,7 @@ from pengine.worker import Worker
 class ToolCallingFakeModel(FakeMessagesListChatModel):
     bound_tool_names: list[list[str]] = Field(default_factory=list)
     bound_tool_descriptions: list[list[str]] = Field(default_factory=list)
+    model_system_prompts: list[str] = Field(default_factory=list)
 
     def bind_tools(
         self,
@@ -107,6 +116,23 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         self.bound_tool_names.append([_tool_name(tool) for tool in tools])
         self.bound_tool_descriptions.append([getattr(tool, "description", "") for tool in tools])
         return self
+
+    def _generate(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        self.model_system_prompts.append(
+            "\n\n".join(message.text for message in messages if isinstance(message, SystemMessage))
+        )
+        return super()._generate(
+            messages,
+            stop=stop,
+            run_manager=run_manager,
+            **kwargs,
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -199,6 +225,27 @@ def _tool_name(tool: Any) -> str:
     return ""
 
 
+def _prompt_mentions_tool(prompt: str, tool_name: str) -> bool:
+    return (
+        re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(tool_name)}(?![A-Za-z0-9_])",
+            prompt,
+        )
+        is not None
+    )
+
+
+def _assert_task_lists_exact_workspace_paths(request: ToolCallRequest) -> None:
+    description = request.tool_call["args"]["description"]
+    files = request.state.get("files", {})
+    workspace_paths = sorted(path for path in files if path.startswith("/workspace/"))
+    assert workspace_paths
+    assert "Workspace inputs for this delegated task are exactly" in description
+    assert "do not probe directories, roots, or alternate paths" in description
+    for path in workspace_paths:
+        assert path in description
+
+
 def _tool_call(name: str, args: dict[str, Any], index: int) -> AIMessage:
     return AIMessage(
         content="",
@@ -213,7 +260,12 @@ def _tool_call(name: str, args: dict[str, Any], index: int) -> AIMessage:
     )
 
 
-def _story_contract(episode_count: int = 1) -> StoryContract:
+def _story_contract(
+    episode_count: int = 1,
+    *,
+    verbatim_episodes: set[int] | None = None,
+) -> StoryContract:
+    verbatim_episodes = verbatim_episodes or set()
     facts = [
         {
             "fact_id": f"fact_ep{episode}",
@@ -221,6 +273,7 @@ def _story_contract(episode_count: int = 1) -> StoryContract:
             "predicate": "确认事实",
             "kind": "text",
             "value": f"事实{episode}",
+            "verbatim": episode in verbatim_episodes,
             "first_revealed_episode": episode,
         }
         for episode in range(1, episode_count + 1)
@@ -299,8 +352,8 @@ def _state_delta(contract: StoryContract, episode_number: int) -> dict[str, Any]
     }
 
 
-def _successful_responses() -> list[AIMessage]:
-    contract = _story_contract()
+def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMessage]:
+    contract = contract or _story_contract()
     stages = [
         (
             "selecting_l0_variant",
@@ -2267,6 +2320,148 @@ async def test_structured_result_middleware_forces_result_after_prose() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_allowlist_filters_model_request_and_keeps_result_tool() -> None:
+    class Result(BaseModel):
+        value: str
+
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call("read_file", {"file_path": "/workspace/candidate.md"}, 1),
+            _tool_call("Result", {"value": "done"}, 2),
+        ]
+    )
+    read_file = StructuredTool.from_function(
+        lambda file_path: f"contents for {file_path}",
+        name="read_file",
+        description="Read one explicitly named workspace file.",
+    )
+    list_files = StructuredTool.from_function(
+        lambda: "candidate.md",
+        name="ls",
+        description="List workspace files.",
+    )
+    agent = create_agent(
+        model,
+        tools=[read_file, list_files],
+        middleware=[
+            ToolAllowlistMiddleware(
+                frozenset({"read_file"}),
+                system_prompt="Read the explicitly named candidate and return the result.",
+            )
+        ],
+        response_format=ToolStrategy(Result),
+    )
+
+    result = await agent.ainvoke({"messages": [HumanMessage(content="Read the candidate.")]})
+
+    assert result["structured_response"] == Result(value="done")
+    assert model.bound_tool_names == [["read_file", "Result"], ["read_file", "Result"]]
+    assert len(model.model_system_prompts) == 2
+    assert all(_prompt_mentions_tool(prompt, "read_file") for prompt in model.model_system_prompts)
+    assert all(_prompt_mentions_tool(prompt, "Result") for prompt in model.model_system_prompts)
+    assert all(not _prompt_mentions_tool(prompt, "ls") for prompt in model.model_system_prompts)
+
+
+@pytest.mark.asyncio
+async def test_repair_tool_allowlist_is_read_only_and_keeps_result_tool() -> None:
+    class Result(BaseModel):
+        value: str
+
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call(
+                "read_file",
+                {"file_path": "/workspace/candidate.md"},
+                1,
+            ),
+            _tool_call("Result", {"value": "repaired"}, 2),
+        ]
+    )
+    read_file = StructuredTool.from_function(
+        lambda file_path: f"contents for {file_path}",
+        name="read_file",
+        description="Read one explicitly named workspace file.",
+    )
+    edit_file = StructuredTool.from_function(
+        lambda file_path, old_string, new_string: f"edited {file_path}",
+        name="edit_file",
+        description="Edit one explicitly named workspace file.",
+    )
+    list_files = StructuredTool.from_function(
+        lambda: "candidate.md",
+        name="ls",
+        description="List workspace files.",
+    )
+    agent = create_agent(
+        model,
+        tools=[read_file, _arithmetic_tool(), edit_file, list_files],
+        middleware=[
+            ToolAllowlistMiddleware(
+                _REPAIR_TOOL_ALLOWLIST,
+                system_prompt="Read the candidate and return the complete repaired result.",
+            )
+        ],
+        response_format=ToolStrategy(Result),
+    )
+
+    result = await agent.ainvoke({"messages": [HumanMessage(content="Repair the candidate.")]})
+
+    assert result["structured_response"] == Result(value="repaired")
+    assert model.bound_tool_names == [
+        ["read_file", "calculate_arithmetic", "Result"],
+        ["read_file", "calculate_arithmetic", "Result"],
+    ]
+    assert all(
+        not _prompt_mentions_tool(prompt, "edit_file") for prompt in model.model_system_prompts
+    )
+    assert all(not _prompt_mentions_tool(prompt, "ls") for prompt in model.model_system_prompts)
+
+
+@pytest.mark.asyncio
+async def test_tool_allowlist_prompt_tracks_result_only_correction_request() -> None:
+    class Result(BaseModel):
+        value: str
+
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(content="The work is complete in prose."),
+            _tool_call("Result", {"value": "done"}, 1),
+        ]
+    )
+    read_file = StructuredTool.from_function(
+        lambda file_path: f"contents for {file_path}",
+        name="read_file",
+        description="Read one explicitly named workspace file.",
+    )
+    list_files = StructuredTool.from_function(
+        lambda: "candidate.md",
+        name="ls",
+        description="List workspace files.",
+    )
+    agent = create_agent(
+        model,
+        tools=[read_file, list_files],
+        middleware=[
+            StructuredResultMiddleware(),
+            ToolAllowlistMiddleware(
+                frozenset({"read_file"}),
+                system_prompt="Read the candidate with read_file, then return the result.",
+            ),
+        ],
+        response_format=ToolStrategy(Result),
+    )
+
+    result = await agent.ainvoke({"messages": [HumanMessage(content="Read the candidate.")]})
+
+    assert result["structured_response"] == Result(value="done")
+    assert model.bound_tool_names[-2:] == [["read_file", "Result"], ["Result"]]
+    assert _prompt_mentions_tool(model.model_system_prompts[-2], "read_file")
+    assert not _prompt_mentions_tool(model.model_system_prompts[-1], "read_file")
+    assert _prompt_mentions_tool(model.model_system_prompts[-1], "Result")
+    assert not _prompt_mentions_tool(model.model_system_prompts[-1], "ls")
+
+
+@pytest.mark.asyncio
 async def test_structured_result_middleware_corrects_invalid_forced_result() -> None:
     class Result(BaseModel):
         value: str = Field(min_length=1)
@@ -2515,6 +2710,93 @@ async def test_structured_result_middleware_allows_layered_schema_corrections() 
     response = await StructuredResultMiddleware().awrap_model_call(request, handler)
 
     assert response.structured_response == Result(value="corrected")
+
+
+@pytest.mark.asyncio
+async def test_structured_result_middleware_keeps_only_latest_large_failed_result() -> None:
+    valid_args = {
+        "stage": "generating_episode_outline",
+        "content": "完整分集大纲" * 4_000,
+        "episode_count": 2,
+        "episodes": [
+            {"episode_number": 1, "plan": "第一集计划"},
+            {"episode_number": 2, "plan": "第二集计划"},
+        ],
+        "story_contract": _story_contract(episode_count=2).model_dump(mode="json"),
+    }
+    first_invalid = copy.deepcopy(valid_args)
+    first_invalid["story_contract"]["clues"] = [
+        {
+            "clue_id": "clue_watch",
+            "description": "旧表",
+            "introduced_episode": 1,
+            "explained_episode": 2,
+            "callback_episode": 1,
+            "introduction_is_visible_or_audible": True,
+        }
+    ]
+    second_invalid = copy.deepcopy(valid_args)
+    second_invalid["story_contract"]["knowledge_states"][1]["known_fact_ids"] = []
+    first_result = _tool_call("EpisodePlannerResult", first_invalid, 201)
+    second_result = _tool_call("EpisodePlannerResult", second_invalid, 202)
+    prior_correction = HumanMessage(
+        content=(
+            "Correct these validation errors: story_contract.clues.0: "
+            "A clue callback cannot precede its explanation."
+        )
+    )
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[
+            HumanMessage(content="Create the complete episode outline."),
+            _tool_call("read_file", {"file_path": "/workspace/story_outline.md"}, 200),
+            ToolMessage(
+                content="source material" * 2_000,
+                tool_call_id="call-200",
+                name="read_file",
+            ),
+            first_result,
+            ToolMessage(
+                content="Return a valid structured result.",
+                tool_call_id="call-201",
+                name="EpisodePlannerResult",
+            ),
+            prior_correction,
+            second_result,
+            ToolMessage(
+                content="Return a valid structured result.",
+                tool_call_id="call-202",
+                name="EpisodePlannerResult",
+            ),
+        ],
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+        response_format=ToolStrategy(EpisodePlannerResult),
+    )
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        assert candidate.tools == []
+        assert len(candidate.messages) == 5
+        assert candidate.messages[0] == request.messages[0]
+        assert prior_correction in candidate.messages
+        assert second_result in candidate.messages
+        assert first_result not in candidate.messages
+        assert not any(
+            isinstance(message, ToolMessage) and message.name == "read_file"
+            for message in candidate.messages
+        )
+        assert isinstance(candidate.messages[-1], HumanMessage)
+        assert (
+            "Character knowledge cannot silently disappear between episodes"
+            in candidate.messages[-1].content
+        )
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=EpisodePlannerResult.model_validate(valid_args),
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert isinstance(response.structured_response, EpisodePlannerResult)
 
 
 @pytest.mark.asyncio
@@ -3052,6 +3334,96 @@ def test_drop_dangling_tool_call_messages_cleans_mixed_valid_and_invalid_calls()
     assert cleaned == [messages[0], messages[3]]
 
 
+def test_compact_supervisor_messages_keeps_latest_complete_exchange_and_feedback() -> None:
+    initial_task = HumanMessage(content="Execute the bounded workflow.")
+    old_call = _tool_call("task", {"description": "old task"}, 101)
+    old_result = ToolMessage(
+        content="old task result " * 4_000,
+        tool_call_id="call-101",
+        name="task",
+    )
+    old_feedback = HumanMessage(content="Old correction should be discarded.")
+    latest_call = _tool_call("WorkflowCompletion", {"completed": True}, 102)
+    latest_result = ToolMessage(
+        content="latest completion result",
+        tool_call_id="call-102",
+        name="WorkflowCompletion",
+    )
+    correction = HumanMessage(content="Continue with the latest completed state.")
+    messages = [
+        initial_task,
+        old_call,
+        old_result,
+        old_feedback,
+        latest_call,
+        latest_result,
+        correction,
+    ]
+
+    compacted = _compact_supervisor_messages(messages)
+
+    assert compacted == [initial_task, latest_call, latest_result, correction]
+    assert old_result not in compacted
+    assert old_feedback not in compacted
+    assert not any(
+        isinstance(message, ToolMessage) and message.tool_call_id == "call-101"
+        for message in compacted
+    )
+
+
+def test_compact_supervisor_messages_leaves_incomplete_history_untouched() -> None:
+    messages = [
+        HumanMessage(content="Execute the bounded workflow."),
+        _tool_call("task", {"description": "unfinished"}, 103),
+        ToolMessage(content="orphan", tool_call_id="orphan-call", name="task"),
+        HumanMessage(content="Retry safely."),
+    ]
+
+    assert _compact_supervisor_messages(messages) == messages
+
+
+def test_supervisor_history_compaction_overrides_only_model_messages() -> None:
+    initial_task = HumanMessage(content="Execute the bounded workflow.")
+    old_call = _tool_call("task", {"description": "old task"}, 104)
+    old_result = ToolMessage(
+        content="old result " * 2_000,
+        tool_call_id="call-104",
+        name="task",
+    )
+    latest_call = _tool_call("WorkflowCompletion", {"completed": True}, 105)
+    latest_result = ToolMessage(
+        content="latest result",
+        tool_call_id="call-105",
+        name="WorkflowCompletion",
+    )
+    state = {"checkpoint_marker": "unchanged", "files": {"/workspace/task.md": "same"}}
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[initial_task, old_call, old_result, latest_call, latest_result],
+        tools=[{"type": "function", "function": {"name": "task"}}],
+        state=state,
+    )
+
+    supervisor_middleware = ToolAllowlistMiddleware(
+        frozenset({"task"}),
+        system_prompt="Run the workflow.",
+        compact_tool_history=True,
+    )
+    compacted_request = supervisor_middleware._filter_request(request)
+
+    assert compacted_request.messages == [initial_task, latest_call, latest_result]
+    assert compacted_request.state is request.state
+    assert compacted_request.state == state
+
+    specialist_middleware = ToolAllowlistMiddleware(
+        frozenset({"task"}),
+        system_prompt="Run the specialist task.",
+    )
+    specialist_request = specialist_middleware._filter_request(request)
+    assert specialist_middleware.compact_tool_history is False
+    assert specialist_request.messages == request.messages
+
+
 @pytest.mark.asyncio
 async def test_structured_result_middleware_cleans_dangling_history_before_retry() -> None:
     class Result(BaseModel):
@@ -3584,6 +3956,8 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     )
     assert "Capture explicitly locked or formally committed aliases" in _EPISODE_PLANNER_PROMPT
     assert "Knowledge states are sparse cumulative snapshots" in _EPISODE_PLANNER_PROMPT
+    assert "verbatim=true only when" in _EPISODE_PLANNER_PROMPT
+    assert "Do not infer verbatim=true from quotation marks" in _EPISODE_PLANNER_PROMPT
     assert "aliases, pronouns, ages, elapsed durations, call participants" in (
         _EPISODE_PLANNER_PROMPT
     )
@@ -3595,42 +3969,140 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "continuity-bearing identities, not as a screenplay-label whitelist" in (
         _SCRIPT_WRITER_PROMPT
     )
-    assert "may use names, aliases, roles, generic or descriptive labels" in _SCRIPT_WRITER_PROMPT
-    assert "may show operands, equations, mental calculation" in _SCRIPT_WRITER_PROMPT
+    assert "Surface speaker labels may use names, aliases, roles" in _SCRIPT_WRITER_PROMPT
+    assert "/workspace/speaker_contract.json" not in _SCRIPT_WRITER_PROMPT
+    assert "allowed_speaker_labels" not in _SCRIPT_WRITER_PROMPT
+    assert "/workspace/evidence_contract.json" in _SCRIPT_WRITER_PROMPT
+    assert "exact-set self-check" in _SCRIPT_WRITER_PROMPT
+    assert "required_evidence_target_ids" in _SCRIPT_WRITER_PROMPT
+    assert "required_verbatim_facts" in _SCRIPT_WRITER_PROMPT
+    assert "all other facts require semantic consistency only" in _SCRIPT_WRITER_PROMPT
     assert "call participants" in _SCRIPT_WRITER_PROMPT
     assert "complete non-null state_delta" in _SCRIPT_WRITER_PROMPT
+    assert "/workspace/suffix_rewrite_review.json" in _SCRIPT_WRITER_PROMPT
+    assert "read-only bound" in _SCRIPT_WRITER_PROMPT
+    assert "do not reproduce the named defect" in _SCRIPT_WRITER_PROMPT
     assert "grandfathered pre-contract run" not in _SCRIPT_WRITER_PROMPT
+    assert "/workspace/speaker_contract.json" not in _EPISODE_REPAIR_PROMPT
+    assert "/workspace/evidence_contract.json" in _EPISODE_REPAIR_PROMPT
+    assert "evidence_coverage_mismatch" in _EPISODE_REPAIR_PROMPT
+    assert "issue.contract_refs" in _EPISODE_REPAIR_PROMPT
+    assert "no extras" in _EPISODE_REPAIR_PROMPT
+    assert "no duplicates" in _EPISODE_REPAIR_PROMPT
+    assert "unknown_speaker" in _EPISODE_REPAIR_PROMPT
+    assert "contextually proven new continuity-bearing character" in _EPISODE_REPAIR_PROMPT
+    assert "without normalizing screenplay notation" in _EPISODE_REPAIR_PROMPT
+    assert "alias" in _EPISODE_REPAIR_PROMPT
+    assert "occupational title" in _EPISODE_REPAIR_PROMPT
+    assert "state_delta" in _EPISODE_REPAIR_PROMPT
+    assert "/workspace/suffix_rewrite_review.json" in _EPISODE_REPAIR_PROMPT
+    assert "locked story contract priority" in _EPISODE_REPAIR_PROMPT
+    assert "verbatim_fact_missing" in _EPISODE_REPAIR_PROMPT
+    assert "required_verbatim_facts" in _EPISODE_REPAIR_PROMPT
 
 
-def test_review_prompts_allow_screenplay_form_and_require_proven_runtime_provenance() -> None:
-    for prompt in (
-        _QUALITY_REVIEWER_PROMPT,
-        _EPISODE_REVIEWER_PROMPT,
-        _SERIES_REVIEWER_PROMPT,
+def test_l4_reviewer_prompt_only_locks_explicit_verbatim_facts() -> None:
+    assert "/workspace/story_contract.json" in _QUALITY_REVIEWER_PROMPT
+    assert "only when that fact has verbatim=true" in _QUALITY_REVIEWER_PROMPT
+    assert "kind=text" in _QUALITY_REVIEWER_PROMPT
+    assert "quotation marks" in _QUALITY_REVIEWER_PROMPT
+    assert "subject or predicate" in _QUALITY_REVIEWER_PROMPT
+    assert "semantic consistency only" in _QUALITY_REVIEWER_PROMPT
+
+
+def test_internal_runtime_leak_policy_requires_unambiguous_source_evidence() -> None:
+    policy = " ".join(_INTERNAL_RUNTIME_LEAK_POLICY.split())
+
+    for internal_marker in (
+        "exact canonical /workspace path",
+        "fact/clue/obligation stable ID",
+        "tool-call or model-message envelope",
+        "validation or retry status text",
+        "raw contract serialization",
     ):
-        assert "end markers such as 本集终" in prompt
-        assert "arithmetic, equations, mental calculation" in prompt
-        assert "depictions of JSON, code, paths, tools, models, AI, or validation" in prompt
-        assert "name the matching private source" in prompt
-        assert "If provenance is ambiguous, pass this dimension" in prompt
-
-    assert "matters of taste are not sufficient reasons" in _QUALITY_REVIEWER_PROMPT
-    assert "Screenplay formatting and story-world subject matter" in _EPISODE_REVIEWER_PROMPT
-    assert "Fail only for a direct contradiction to that hard Canon" in _SERIES_REVIEWER_PROMPT
-    assert "impossible required locked binding" in _SERIES_REVIEWER_PROMPT
+        assert internal_marker in policy
+    assert "concrete runtime-only token or record" in policy
+    assert "not established as story-world content" in policy
+    assert "quote the exact screenplay excerpt" in policy
+    assert "name the matching private source" in policy
+    assert "runtime provenance is unambiguous" in policy
+    assert "If provenance is ambiguous, pass this dimension" in policy
+    assert "Story-world facts encoded by a contract are content" in policy
 
 
-def test_structural_review_schema_describes_the_blocking_evidence_threshold() -> None:
-    properties = StructuralReviewResult.model_json_schema()["properties"]
+def test_internal_runtime_leak_policy_accepts_diverse_screenplay_forms() -> None:
+    policy = " ".join(_INTERNAL_RUNTIME_LEAK_POLICY.split())
 
-    assert "explicit hard-Canon contradiction" in properties["passed"]["description"]
-    assert "private-runtime leak" in properties["passed"]["description"]
-    assert "active design itself" in properties["category"]["description"]
-    assert "explicit authoritative source" in properties["evidence"]["description"]
-    assert (
-        "never derive this from format, style"
-        in (properties["earliest_affected_episode"]["description"])
+    for legitimate_content in (
+        "Episode, chapter, act, and scene headings",
+        "title cards",
+        "recap labels",
+        "end markers such as 本集终",
+        "screenplay directions",
+        "arithmetic, equations, mental calculation, checking, and other reasoning",
+        "JSON, code, paths, tools, models, AI, or validation",
+    ):
+        assert legitimate_content in policy
+    assert "Never reject or rewrite content merely because" in policy
+    assert "episode_number is not provenance evidence" in policy
+    assert "the screenplay may show operands, equations, mental calculation" in (
+        _SCRIPT_WRITER_PROMPT
     )
+    assert "Never copy a tool-call envelope or private validation log" in _SCRIPT_WRITER_PROMPT
+
+
+def test_internal_runtime_leak_review_prompts_apply_proof_standard() -> None:
+    assert "At accepting_l4" in _QUALITY_REVIEWER_PROMPT
+    assert "applicable explicit persona gate rule" in _QUALITY_REVIEWER_PROMPT
+    assert "matters of taste are not sufficient reasons" in _QUALITY_REVIEWER_PROMPT
+    assert "provenance and evidence standard is a blocking leakage defect" in (
+        _QUALITY_REVIEWER_PROMPT
+    )
+    assert "script_defect" in _SERIES_REVIEWER_PROMPT
+    assert "current prefix contains the blocker" in _SERIES_REVIEWER_PROMPT
+    assert "earliest affected episode N" in _SERIES_REVIEWER_PROMPT
+    assert "Ordinary SeriesBible prose, screenplay format or style" in _SERIES_REVIEWER_PROMPT
+    assert "never defects on their own" in _EPISODE_REVIEWER_PROMPT
+    for prompt in (_EPISODE_REVIEWER_PROMPT, _SERIES_REVIEWER_PROMPT):
+        assert "/workspace/series_prefix.json" in prompt
+        assert "trusted runtime metadata" in prompt
+        assert "episodes[].content" in prompt
+
+
+def test_evidence_contract_exposes_episode_verbatim_facts_and_rejected_issue() -> None:
+    contract = _story_contract(verbatim_episodes={1})
+    issue = EpisodeReviewerResult.model_validate(
+        {
+            "passed": False,
+            "evidence": "事实未逐字出现",
+            "issues": [
+                {
+                    "code": "verbatim_fact_missing",
+                    "message": "事实值未出现",
+                    "contract_refs": ["fact_ep1"],
+                }
+            ],
+        }
+    ).issues[0]
+
+    evidence_contract = _evidence_contract(
+        contract,
+        1,
+        rejected_issues=[issue],
+        phase="episode_repair",
+    )
+
+    assert evidence_contract["required_verbatim_facts"] == [
+        {"fact_id": "fact_ep1", "value": "事实1"}
+    ]
+    assert evidence_contract["rejected_issues"] == [
+        {
+            "code": "verbatim_fact_missing",
+            "contract_refs": ["fact_ep1"],
+            "message": "事实值未出现",
+            "script_excerpt": None,
+        }
+    ]
 
 
 def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> None:
@@ -3666,10 +4138,6 @@ def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> No
     assert "Ordinary prose in an approved" in episode_skill
     assert "leave unspecified" in episode_skill
     assert "free" in episode_skill
-    assert "calculation or reasoning shown inside the story are not failures" in episode_skill
-    assert "because its execution is a matter of" in episode_skill
-    assert "viewpoint knowledge withheld unfairly" not in episode_skill
-    assert "weak locked end hook" not in episode_skill
 
 
 def test_review_prompts_do_not_turn_missing_creative_detail_into_failure() -> None:
@@ -3760,6 +4228,226 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
         "episode_reviewer",
         "series_reviewer",
     }
+    subagents_by_name = {spec["name"]: spec for spec in captured["subagents"]}
+    for name in (
+        "script_writer",
+        "quality_reviewer",
+        "episode_reviewer",
+        "series_reviewer",
+    ):
+        system_prompt = subagents_by_name[name]["system_prompt"]
+        assert system_prompt.count(_INTERNAL_RUNTIME_LEAK_POLICY) == 1
+        assert f"\n\n{_INTERNAL_RUNTIME_LEAK_POLICY}" in system_prompt
+    assert subagents_by_name["episode_repair"]["permissions"] == REVIEW_FILE_PERMISSIONS
+    assert subagents_by_name["story_repair"]["permissions"] == REVIEW_FILE_PERMISSIONS
+    supervisor_allowlists = [
+        middleware
+        for middleware in captured["middleware"]
+        if isinstance(middleware, ToolAllowlistMiddleware)
+    ]
+    assert len(supervisor_allowlists) == 1
+    assert supervisor_allowlists[0].compact_tool_history is True
+    for spec in captured["subagents"]:
+        for middleware in spec["middleware"]:
+            if isinstance(middleware, ToolAllowlistMiddleware):
+                assert middleware.compact_tool_history is False
+
+
+@pytest.mark.asyncio
+async def test_episode_writer_treats_speaker_labels_as_format_not_a_whitelist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "format-agnostic-speaker-checkpoints.sqlite3"
+    contract = _story_contract(verbatim_episodes={1})
+    captured_requests: list[ToolCallRequest] = []
+    original_call = StageGuardMiddleware._call_structured_stage
+
+    async def capture_call(
+        middleware: StageGuardMiddleware,
+        stage: InternalStage,
+        request: ToolCallRequest,
+        handler: Any,
+        args: Mapping[str, Any],
+        *,
+        expected_episode_number: int | None = None,
+    ) -> tuple[Any, Mapping[str, Any]]:
+        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+            captured_requests.append(request)
+        return await original_call(
+            middleware,
+            stage,
+            request,
+            handler,
+            args,
+            expected_episode_number=expected_episode_number,
+        )
+
+    monkeypatch.setattr(StageGuardMiddleware, "_call_structured_stage", capture_call)
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        return None
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = _fake_workflow(
+            model=ToolCallingFakeModel(responses=_successful_responses(contract=contract)),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+        await workflow.execute(
+            thread_id="format-agnostic-speaker-writer-thread",
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+            **_episode_hook_kwargs()[0],
+        )
+
+    assert len(captured_requests) == 1
+    request = captured_requests[0]
+    files = request.state["files"]
+    assert "/workspace/speaker_contract.json" not in files
+    evidence_contract = json.loads(files["/workspace/evidence_contract.json"]["content"])
+    assert evidence_contract["episode_number"] == 1
+    assert evidence_contract["required_evidence_target_ids"] == [
+        "fact_ep1",
+        "obligation_ep1",
+    ]
+    assert evidence_contract["required_verbatim_facts"] == [
+        {"fact_id": "fact_ep1", "value": "事实1"}
+    ]
+    assert evidence_contract["rejected_issues"] == []
+    assert "/workspace/suffix_rewrite_review.json" not in files
+    description = request.tool_call["args"]["description"]
+    assert "Screenplay labels and dialogue notation are format choices" in description
+    assert "without normalizing aliases, roles, generic labels" in description
+    assert "Allowed exact speaker labels" not in description
+    assert 'required_evidence_target_ids=["fact_ep1", "obligation_ep1"]' in description
+    assert 'required_verbatim_facts=[{"fact_id": "fact_ep1", "value": "事实1"}]' in description
+    assert "exact-set self-check" in description
+
+
+@pytest.mark.asyncio
+async def test_suffix_rewrite_feedback_is_injected_only_from_effective_episode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "suffix-rewrite-checkpoints.sqlite3"
+    captured_requests: list[ToolCallRequest] = []
+    original_call = StageGuardMiddleware._call_structured_stage
+
+    async def capture_call(
+        middleware: StageGuardMiddleware,
+        stage: InternalStage,
+        request: ToolCallRequest,
+        handler: Any,
+        args: Mapping[str, Any],
+        *,
+        expected_episode_number: int | None = None,
+    ) -> tuple[Any, Mapping[str, Any]]:
+        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+            captured_requests.append(request)
+        return await original_call(
+            middleware,
+            stage,
+            request,
+            handler,
+            args,
+            expected_episode_number=expected_episode_number,
+        )
+
+    monkeypatch.setattr(StageGuardMiddleware, "_call_structured_stage", capture_call)
+    feedback = {
+        "version": 1,
+        "effective_earliest_affected_episode": 1,
+        "reviews": [
+            {
+                "review_id": "review-2",
+                "category": "script_defect",
+                "evidence": "第1集校牌事实错误。",
+                "earliest_affected_episode": 1,
+                "binding": {
+                    "review_epoch": 2,
+                    "design_candidate_id": "design-1",
+                    "batch_id": "batch-1",
+                },
+            },
+            {
+                "review_id": "review-3",
+                "category": "script_defect",
+                "evidence": "第2集后续动机错误。",
+                "earliest_affected_episode": 2,
+                "binding": {
+                    "review_epoch": 3,
+                    "design_candidate_id": "design-1",
+                    "batch_id": "batch-1",
+                },
+            },
+        ],
+    }
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = _fake_workflow(
+            model=ToolCallingFakeModel(responses=_successful_responses()),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+        await workflow.execute(
+            thread_id="suffix-rewrite-writer-thread",
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=lambda _stage: _async_one(),
+            approve_stage=lambda _stage, _payload: _async_none(),
+            suffix_rewrite_feedback=feedback,
+            **_episode_hook_kwargs()[0],
+        )
+
+    assert len(captured_requests) == 1
+    request = captured_requests[0]
+    injected_feedback = json.loads(
+        request.state["files"]["/workspace/suffix_rewrite_review.json"]["content"]
+    )
+    assert injected_feedback == _suffix_rewrite_feedback_for_episode(feedback, 1)
+    assert [item["review_id"] for item in injected_feedback["reviews"]] == ["review-2"]
+    description = request.tool_call["args"]["description"]
+    assert "suffix rewrite" in description
+    assert "fix every named conflict" in description
+    assert "locked story contract has priority" in description
+    assert "do not reproduce the named defect" in description
+    assert _suffix_rewrite_feedback_for_episode(feedback, 0) is None
+    assert _suffix_rewrite_feedback_for_episode(feedback, 1)["reviews"] == [feedback["reviews"][0]]
+    assert _suffix_rewrite_feedback_for_episode(feedback, 2) == feedback
+
+
+def test_suffix_rewrite_feedback_filters_future_reviews_per_episode() -> None:
+    feedback = {
+        "version": 1,
+        "effective_earliest_affected_episode": 8,
+        "reviews": [
+            {"review_id": "review-2", "earliest_affected_episode": 8},
+            {"review_id": "review-3", "earliest_affected_episode": 9},
+        ],
+    }
+
+    assert _suffix_rewrite_feedback_for_episode(feedback, 7) is None
+    episode_eight = _suffix_rewrite_feedback_for_episode(feedback, 8)
+    assert episode_eight is not None
+    assert episode_eight["effective_earliest_affected_episode"] == 8
+    assert [review["review_id"] for review in episode_eight["reviews"]] == ["review-2"]
+    episode_nine = _suffix_rewrite_feedback_for_episode(feedback, 9)
+    assert episode_nine is not None
+    assert episode_nine["effective_earliest_affected_episode"] == 8
+    assert [review["review_id"] for review in episode_nine["reviews"]] == [
+        "review-2",
+        "review-3",
+    ]
 
 
 @pytest.mark.asyncio
@@ -3822,6 +4510,76 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         assert "execute" not in all_tool_names
         assert "task" in all_tool_names
         assert "calculate_arithmetic" in all_tool_names
+        assert not all_tool_names & {
+            "write_todos",
+            "ls",
+            "write_file",
+            "edit_file",
+            "glob",
+            "grep",
+        }
+        assert len(model.bound_tool_names) == len(model.model_system_prompts)
+        known_tool_names = {
+            "task",
+            "read_file",
+            "calculate_arithmetic",
+            "retrieve_persona_references",
+            "write_todos",
+            "ls",
+            "write_file",
+            "edit_file",
+            "glob",
+            "grep",
+            "execute",
+        }
+        for offered_tools, system_prompt in zip(
+            model.bound_tool_names,
+            model.model_system_prompts,
+            strict=True,
+        ):
+            assert system_prompt
+            for tool_name in known_tool_names:
+                assert _prompt_mentions_tool(system_prompt, tool_name) is (
+                    tool_name in offered_tools
+                ), (tool_name, offered_tools, system_prompt)
+            for tool_name in offered_tools:
+                assert _prompt_mentions_tool(system_prompt, tool_name), (
+                    tool_name,
+                    offered_tools,
+                    system_prompt,
+                )
+
+        def bindings_for(result_tool: str) -> list[set[str]]:
+            return [set(names) for names in model.bound_tool_names if result_tool in names]
+
+        workflow_bindings = bindings_for("WorkflowCompletion")
+        assert workflow_bindings
+        assert all(names <= {"task", "WorkflowCompletion"} for names in workflow_bindings)
+        assert {"task", "WorkflowCompletion"} in workflow_bindings
+
+        for result_tool in (
+            "StoryArchitectResult",
+            "EpisodePlannerResult",
+            "ScriptWriterResult",
+            "QualityReviewerResult",
+            "CanonReviewerResult",
+            "EpisodeReviewerResult",
+        ):
+            result_bindings = bindings_for(result_tool)
+            assert result_bindings, result_tool
+            assert all("read_file" in names for names in result_bindings), result_tool
+            assert all(
+                result_tool in names
+                and names
+                <= {
+                    result_tool,
+                    "read_file",
+                    "calculate_arithmetic",
+                    "retrieve_persona_references",
+                }
+                for names in result_bindings
+            ), result_tool
+
         task_descriptions = [
             description
             for names, descriptions in zip(
@@ -3917,6 +4675,7 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
         elif subagent_type == "story_repair":
             # The c+r repair subagent returns the complete rewritten candidate
             # (not a patch) with both confirmed conflicts resolved jointly.
+            _assert_task_lists_exact_workspace_paths(candidate)
             repair_calls += 1
             current = candidate.state["files"]["/workspace/current_story_candidate.md"]["content"]
             assert "二十四岁" in current
@@ -3936,6 +4695,7 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
             }
         else:
             assert subagent_type == "canon_reviewer"
+            _assert_task_lists_exact_workspace_paths(candidate)
             review_calls += 1
             rl = candidate.state["files"].get("/workspace/current_relationship_logic.md", {})
             current = rl.get("content", "")
@@ -4734,8 +5494,9 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
+        model = ToolCallingFakeModel(responses=responses)
         workflow = _fake_workflow(
-            model=ToolCallingFakeModel(responses=responses),
+            model=model,
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
         )
@@ -4757,6 +5518,20 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
     assert "审查目标：fact_ep1, semantic_target" in error.value.evidence
     assert episode_attempts == [1]
     assert InternalStage.GENERATING_EPISODE_SCRIPTS not in approved
+    repair_requests = [
+        (set(tool_names), system_prompt)
+        for tool_names, system_prompt in zip(
+            model.bound_tool_names,
+            model.model_system_prompts,
+            strict=True,
+        )
+        if "/skills/continuity-repair/SKILL.md" in system_prompt
+    ]
+    assert len(repair_requests) == 2
+    for tool_names, system_prompt in repair_requests:
+        assert tool_names == {"read_file", "calculate_arithmetic", "ScriptWriterResult"}
+        for hidden_tool in ("ls", "glob", "grep", "write_todos", "write_file", "edit_file"):
+            assert not _prompt_mentions_tool(system_prompt, hidden_tool)
 
 
 @pytest.mark.asyncio
@@ -4765,7 +5540,8 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = tmp_path / "checkpoints.sqlite3"
-    responses = _successful_responses()
+    contract = _story_contract(verbatim_episodes={1})
+    responses = _successful_responses(contract=contract)
     writer_index = _index_of_tool_call(responses, "ScriptWriterResult", occurrence=1)
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
     repaired_writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
@@ -4787,7 +5563,17 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
                     "code": "identity_drift",
                     "message": "人物身份与上游不一致",
                     "script_excerpt": "钩子1",
-                }
+                },
+                {
+                    "code": "unknown_speaker",
+                    "message": "剧本引入了锁定角色表之外的说话人 年轻协办",
+                    "script_excerpt": "年轻协办：我来开车。",
+                },
+                {
+                    "code": "evidence_coverage_mismatch",
+                    "message": "剧本证据未覆盖全部必需事实、线索和分集义务",
+                    "contract_refs": ["fact_ep1", "obligation_ep1"],
+                },
             ],
         },
         review_index,
@@ -4839,6 +5625,19 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
             persona_files={"/persona/project.md": "规则"},
             before_stage=before_stage,
             approve_stage=approve_stage,
+            suffix_rewrite_feedback={
+                "version": 1,
+                "effective_earliest_affected_episode": 1,
+                "reviews": [
+                    {
+                        "review_id": "suffix-review",
+                        "category": "script_defect",
+                        "evidence": "重写原因：校牌事实冲突。",
+                        "earliest_affected_episode": 1,
+                        "binding": {"review_epoch": 1, "batch_id": "batch-1"},
+                    }
+                ],
+            },
             **_episode_hook_kwargs()[0],
         )
 
@@ -4857,6 +5656,51 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     assert captured_files[0]["/workspace/current_episode_plan.md"] == "第一集计划"
     obligation = json.loads(captured_files[0]["/workspace/current_episode_obligation.json"])
     assert obligation["end_hook"] == "钩子1"
+    assert "/workspace/speaker_contract.json" not in captured_files[0]
+    evidence_contract = json.loads(captured_files[0]["/workspace/evidence_contract.json"])
+    assert evidence_contract["episode_number"] == 1
+    assert evidence_contract["phase"] == "episode_repair"
+    assert evidence_contract["required_evidence_target_ids"] == [
+        "fact_ep1",
+        "obligation_ep1",
+    ]
+    assert evidence_contract["required_verbatim_facts"] == [
+        {"fact_id": "fact_ep1", "value": "事实1"}
+    ]
+    evidence_issues = evidence_contract["rejected_issues"]
+    assert {issue["code"] for issue in evidence_issues} == {
+        "evidence_coverage_mismatch",
+        "verbatim_fact_missing",
+    }
+    coverage_issue = next(
+        issue for issue in evidence_issues if issue["code"] == "evidence_coverage_mismatch"
+    )
+    assert coverage_issue["contract_refs"] == ["fact_ep1", "obligation_ep1"]
+    assert coverage_issue["message"] == "剧本证据未覆盖全部必需事实、线索和分集义务"
+    verbatim_issue = next(
+        issue for issue in evidence_issues if issue["code"] == "verbatim_fact_missing"
+    )
+    assert verbatim_issue["contract_refs"] == ["fact_ep1"]
+    assert "事实1" in verbatim_issue["message"]
+    suffix_review = json.loads(captured_files[0]["/workspace/suffix_rewrite_review.json"])
+    assert suffix_review["reviews"][0]["evidence"] == "重写原因：校牌事实冲突。"
+    assert len(captured_descriptions) == 1
+    repair_description = captured_descriptions[0]
+    assert "suffix_rewrite_review.json" in repair_description
+    assert "fix every named conflict" in repair_description
+    assert "unknown_speaker" in repair_description
+    assert "genuinely new continuity-bearing character" in repair_description
+    assert "preserving surface notation" in repair_description
+    assert "Do not rewrite a label merely because it is an alias" in repair_description
+    assert "generic or descriptive label" in repair_description
+    assert "speaker_contract.json" not in repair_description
+    assert 'issue.contract_refs: ["fact_ep1", "obligation_ep1"]' in repair_description
+    assert "exact set" in repair_description
+    assert "no extras" in repair_description
+    assert "no duplicates" in repair_description
+    assert "every required target exactly once" in repair_description
+    assert "Verbatim fact repair is mandatory" in repair_description
+    assert "fact.value" in repair_description
     assert InternalStage.GENERATING_EPISODE_SCRIPTS in approved
 
 
@@ -4944,6 +5788,7 @@ async def test_last_episode_review_receives_complete_series_prefix_before_approv
             }
         else:
             assert subagent_type == "episode_reviewer"
+            _assert_task_lists_exact_workspace_paths(subagent_request)
             assert "complete committed series prefix" in description
             assert "trusted runtime metadata" in description
             assert "episodes[].content" in description
@@ -5092,6 +5937,7 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
             }
         elif subagent_type == "series_reviewer":
             # The final milestone (episode 2) fires the bound final structural review.
+            _assert_task_lists_exact_workspace_paths(subagent_request)
             assert "trusted runtime metadata" in description
             assert "episodes[].content" in description
             series_review_inputs.append(dict(subagent_request.state["files"]))
@@ -5671,7 +6517,66 @@ def test_chinese_language_guard_rejects_bilingual_l0_variant_title() -> None:
 
 
 @pytest.mark.asyncio
-async def test_l0_language_retry_receives_exact_result_and_translates_only() -> None:
+async def test_l0_language_gloss_is_repaired_deterministically_without_model_call() -> None:
+    descriptions: list[str] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("The helper must not approve a stage")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=selecting_l0_variant] select L0",
+                "subagent_type": "story_architect",
+            },
+            "id": "call-l0-language",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(language_request: ToolCallRequest) -> ToolMessage:
+        descriptions.append(language_request.tool_call["args"]["description"])
+        payload = {
+            "stage": "selecting_l0_variant",
+            "content": None,
+            "character_biographies": None,
+            "relationship_logic": None,
+            "selected_l0_variant": "克制情感悬疑（Restrained Emotional Suspense）",
+            "selection_rationale": "用人物关系推动真相揭晓。",
+        }
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-l0-language",
+        )
+
+    _, payload = await middleware._call_structured_stage(
+        InternalStage.SELECTING_L0_VARIANT,
+        request,
+        handler,
+        request.tool_call["args"],
+    )
+
+    # The appended English gloss is stripped in code; no model retry happens.
+    assert len(descriptions) == 1
+    assert payload["selected_l0_variant"] == "克制情感悬疑"
+    assert payload["selection_rationale"] == "用人物关系推动真相揭晓。"
+
+
+@pytest.mark.asyncio
+async def test_l0_language_retry_merges_translation_and_keeps_locked_fields() -> None:
     descriptions: list[str] = []
     captured_source: list[dict[str, Any]] = []
 
@@ -5710,8 +6615,10 @@ async def test_l0_language_retry_receives_exact_result_and_translates_only() -> 
                 "content": None,
                 "character_biographies": None,
                 "relationship_logic": None,
-                "selected_l0_variant": "克制情感悬疑（Restrained Emotional Suspense）",
-                "selection_rationale": "用人物关系推动真相揭晓。",
+                "selected_l0_variant": "克制情感悬疑",
+                "selection_rationale": (
+                    "The relationships drive the reveal of the truth in every episode."
+                ),
             }
         else:
             files = language_request.state["files"]
@@ -5719,7 +6626,10 @@ async def test_l0_language_retry_receives_exact_result_and_translates_only() -> 
             captured_source.append(source)
             payload = {
                 **source,
-                "selected_l0_variant": "克制情感悬疑",
+                # The model translates the flagged field but also tampers with
+                # an already-Chinese locked field; the merge must ignore that.
+                "selected_l0_variant": "全新的创作方向",
+                "selection_rationale": "用人物关系推动真相揭晓。",
             }
         return ToolMessage(
             content=json.dumps(payload, ensure_ascii=False),
@@ -5736,7 +6646,8 @@ async def test_l0_language_retry_receives_exact_result_and_translates_only() -> 
     assert len(descriptions) == 2
     assert "translate only" in descriptions[1]
     assert "do not make a new creative choice" in descriptions[1]
-    assert captured_source[0]["selected_l0_variant"].endswith("（Restrained Emotional Suspense）")
+    assert captured_source[0]["selection_rationale"].startswith("The relationships")
+    assert payload["selection_rationale"] == "用人物关系推动真相揭晓。"
     assert payload["selected_l0_variant"] == "克制情感悬疑"
 
 
@@ -5771,12 +6682,13 @@ async def test_language_repair_cannot_change_quality_gate_decision(
     repaired_decision: bool,
 ) -> None:
     descriptions: list[str] = []
+    approved: list[dict[str, Any]] = []
 
     async def before_stage(_: InternalStage) -> int:
         return 1
 
-    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
-        raise AssertionError("A changed gate decision must not be approved")
+    async def approve_stage(_: InternalStage, payload: dict[str, Any]) -> None:
+        approved.append(payload)
 
     middleware = StageGuardMiddleware(
         before_stage=before_stage,
@@ -5806,6 +6718,7 @@ async def test_language_repair_cannot_change_quality_gate_decision(
     )
 
     async def handler(review_request: ToolCallRequest) -> ToolMessage:
+        _assert_task_lists_exact_workspace_paths(review_request)
         descriptions.append(review_request.tool_call["args"]["description"])
         is_repair = len(descriptions) == 2
         return ToolMessage(
@@ -5821,8 +6734,16 @@ async def test_language_repair_cannot_change_quality_gate_decision(
             tool_call_id="call-gate-language-repair",
         )
 
-    with pytest.raises(AgentProtocolError, match="changed non-language fields"):
+    # The merge keeps the original decision by construction: the model's
+    # flipped verdict is ignored and only the translated evidence is spliced.
+    if initial_decision:
         await middleware.awrap_tool_call(request, handler)
+        assert approved and approved[0]["passed"] is True
+        assert approved[0]["evidence"] == "审核结论已翻译。"
+    else:
+        with pytest.raises(QualityGateRejectedError):
+            await middleware.awrap_tool_call(request, handler)
+        assert not approved
 
     assert len(descriptions) == 2
 
@@ -6326,6 +7247,7 @@ async def test_repair_subagent_gets_one_bounded_language_retry() -> None:
     contract_payload = _story_contract().model_dump(mode="json")
 
     async def handler(repair_request: ToolCallRequest) -> ToolMessage:
+        _assert_task_lists_exact_workspace_paths(repair_request)
         descriptions.append(repair_request.tool_call["args"]["description"])
         if len(descriptions) == 1:
             result_payload = {
@@ -6353,7 +7275,7 @@ async def test_repair_subagent_gets_one_bounded_language_retry() -> None:
         handler=handler,
         subagent_type="canon_repair",
         description="Repair the contract.",
-        files={},
+        files={"/workspace/story_contract.json": "{}"},
         schema=EpisodePlannerResult,
         stage=InternalStage.GENERATING_EPISODE_OUTLINE,
     )
@@ -6398,6 +7320,7 @@ async def test_episode_repair_corrects_missing_state_delta_once() -> None:
     contract = _story_contract()
 
     async def handler(repair_request: ToolCallRequest) -> ToolMessage:
+        _assert_task_lists_exact_workspace_paths(repair_request)
         descriptions.append(repair_request.tool_call["args"]["description"])
         if len(descriptions) == 2:
             assert "state_delta: missing" in descriptions[-1]
@@ -6418,7 +7341,7 @@ async def test_episode_repair_corrects_missing_state_delta_once() -> None:
         handler=handler,
         subagent_type="episode_repair",
         description="Repair episode 1.",
-        files={},
+        files={"/workspace/candidate_episode.md": "事实1\n钩子1"},
         schema=ScriptWriterResult,
         stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
         expected_episode_number=1,

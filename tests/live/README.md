@@ -3,9 +3,10 @@
 This test starts a real Pengine server on a random loopback port, copies no
 shared database state, and calls both configured model routes from the current
 environment or repository `.env`. Generation and creative repair are fixed to
-`claude-opus-5` over Anthropic Messages; review is fixed to
-`deepseek-v4-flash` over the DeepSeek OpenAI-compatible client. Both routes use
-the same `PENGINE_RELAY_BASE_URL` and `PENGINE_RELAY_API_KEY`. Missing either
+`claude-opus-5` over Anthropic Messages. Review may be `deepseek-v4-flash`,
+`gpt-5.5`, `gpt-5.6-terra`, or `claude-opus-5`; Pengine selects the matching
+DeepSeek, OpenAI, or Anthropic client. Both routes use the same
+`PENGINE_RELAY_BASE_URL` and `PENGINE_RELAY_API_KEY`. Missing either
 route fails closed; there is no single-model or cross-role fallback. The test is
 deliberately skipped unless explicitly enabled because it makes billable model
 requests and can take a long time.
@@ -18,6 +19,10 @@ PENGINE_RELAY_API_KEY=replace-with-your-key
 PENGINE_GENERATION_MODEL_ID=claude-opus-5
 PENGINE_REVIEW_MODEL_ID=deepseek-v4-flash
 ```
+
+The review value above is an example matching `.env.example`, not the only
+accepted review model. The selected relay route must support the matching tool
+protocol and report that exact model identity.
 
 `PENGINE_RELAY_ADAPTER`, `PENGINE_RELAY_MODEL_ID`, and
 `PENGINE_RELAY_MAX_OUTPUT_TOKENS` are obsolete and ignored. Optional caps, when
@@ -64,3 +69,8 @@ story outline, character biographies, and relationship logic checkpoints. Any
 ordinary failed, paused, ended, or quality-rejected run keeps its evidence and
 fails the test; credential-bearing evidence is the deliberate exception and is
 deleted as described above.
+
+The harness accepts arbitrary user requirements, but it does not certify the
+current single-call episode-outline planner for 60–100 episode production. A
+long-series run must be evaluated separately for structured-output size,
+call-budget headroom, recovery behavior, and whole-series consistency.

@@ -30,7 +30,7 @@ from pengine.schemas import (
     RevisionRequest,
     WorkflowResult,
 )
-from pengine.worker import Worker
+from pengine.worker import Worker, _episode_error_message
 
 
 class DeterministicWorkflow:
@@ -1116,6 +1116,26 @@ async def test_worker_reports_graph_and_quality_failures_separately(
         assert resource.initial.quality_rejection.evidence == "L0 与已批准稿件的核心冲突。"
 
 
+def test_episode_upstream_stream_decode_error_uses_relay_connection_prompt() -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    body = {
+        "error": {
+            "message": "error decoding response body",
+            "type": "upstream_stream_error",
+        },
+        "type": "error",
+    }
+    error = anthropic.APIStatusError(
+        "error decoding response body",
+        response=httpx.Response(200, request=request, json=body),
+        body=body,
+    )
+
+    assert _episode_error_message(error) == (
+        "当前集与模型 Relay / 网络连接失败。已完成分集不受影响；继续时只会重试当前集。"
+    )
+
+
 @pytest.mark.asyncio
 async def test_quality_rejection_retries_only_missing_final_gates_on_the_same_run(
     tmp_path: Path,
@@ -1221,6 +1241,52 @@ async def test_worker_pauses_on_context_preflight_block_without_losing_prior_wor
     assert resource.initial.drafts.artifacts[0].selected_l0_variant == "主动选择"
     assert resource.initial.progress.can_continue is True
     assert workflow.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_renews_a_long_running_job_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    settings = settings.model_copy(update={"lease_seconds": 5})
+    accepted = await repository.create_creation(
+        "lease-heartbeat",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+
+    class SlowWorkflow(DeterministicWorkflow):
+        async def execute(self, **kwargs: Any) -> WorkflowResult:
+            await asyncio.sleep(2.2)
+            return await super().execute(**kwargs)
+
+    renewals: list[int] = []
+    original_renew = repository.renew_job_lease
+
+    async def tracked_renewal(**kwargs: Any):
+        renewals.append(kwargs["lease_seconds"])
+        return await original_renew(**kwargs)
+
+    monkeypatch.setattr(repository, "renew_job_lease", tracked_renewal)
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=SlowWorkflow(),
+        worker_id="lease-heartbeat-worker",
+    )
+
+    assert await worker.run_once() is True
+    assert renewals
+    assert renewals[0] == 5
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "succeeded"
 
 
 @pytest.mark.asyncio

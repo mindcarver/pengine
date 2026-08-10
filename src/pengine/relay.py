@@ -21,17 +21,27 @@ from langchain_core.outputs import LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 
+try:
+    # Optional agent observability. The import is guarded so pengine still runs
+    # when tracing is disabled or the langfuse package is absent. The handler is
+    # only constructed when settings.langfuse_configured is true.
+    from langfuse.langchain import CallbackHandler as _LangfuseCallbackHandler
+except ImportError:  # pragma: no cover - exercised only without langfuse installed
+    _LangfuseCallbackHandler = None  # type: ignore[assignment,misc]
+
 from pengine.config import Settings
 from pengine.model_calls import (
     ModelCallContext,
     ModelCallRecord,
     ModelCallState,
+    StageCallBudgetExceeded,
     build_started_record,
     estimate_messages_tokens,
     estimate_tools_tokens,
     extract_provider_usage,
     usage_status_from,
 )
+from pengine.observability import record_model_call_event
 
 _AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 # Uvicorn owns the runtime log handlers. This child logger keeps the safe model-call
@@ -113,6 +123,22 @@ class _SerialChatOpenAI(ChatOpenAI):
         return super().bind_tools(tools, **kwargs)
 
 
+def _build_langfuse_handler(settings: Settings) -> BaseCallbackHandler | None:
+    """Build a Langfuse trace handler when tracing is configured, else None.
+
+    The handler rides on the ChatModel instance, so a single construction per role
+    covers the supervisor and every sub-agent that reuses that model — deepagents
+    propagates the parent's callbacks to sub-agents automatically. Run-level
+    association (session_id, run_id) is stamped from the worker via
+    :func:`langfuse.propagate_attributes`, not here.
+    """
+    if not settings.langfuse_configured or _LangfuseCallbackHandler is None:
+        return None
+    # Credentials reach the SDK via LANGFUSE_* env vars set by the worker at
+    # startup, so the handler needs no arguments here.
+    return _LangfuseCallbackHandler()
+
+
 class _ModelCallAuditHandler(BaseCallbackHandler):
     """Preflight + durable audit at the common outbound model-call boundary.
 
@@ -136,6 +162,10 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         model_call_state: ModelCallState | None = None,
         context_limit_tokens: int | None = None,
         reserved_output_tokens: int = 0,
+        stage_call_limit: int | None = None,
+        stage_review_call_limit: int | None = None,
+        script_stage_model_call_total_limit: int | None = None,
+        script_stage_review_call_total_limit: int | None = None,
     ) -> None:
         self.role = role
         self.model_id = model_id
@@ -144,7 +174,12 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         self.state = model_call_state
         self.context_limit_tokens = context_limit_tokens
         self.reserved_output_tokens = reserved_output_tokens
+        self.stage_call_limit = stage_call_limit
+        self.stage_review_call_limit = stage_review_call_limit
+        self.script_stage_model_call_total_limit = script_stage_model_call_total_limit
+        self.script_stage_review_call_total_limit = script_stage_review_call_total_limit
         self._pending: dict[UUID, ModelCallRecord] = {}
+        self._pending_lineage: dict[UUID, tuple[int | None, int | None]] = {}
         self._seen_call_ids: set[str] = set()
 
     def on_chat_model_start(
@@ -177,14 +212,82 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             estimated_output_tokens=self.reserved_output_tokens,
             verified_limit_tokens=self.context_limit_tokens,
         )
+        role_limit = (
+            self.stage_review_call_limit if self.role == "review" else self.stage_call_limit
+        )
+        script_stage = context.stage == "generating_episode_scripts"
+        role_total_limit = (
+            (
+                self.script_stage_review_call_total_limit
+                if self.role == "review"
+                else self.script_stage_model_call_total_limit
+            )
+            if script_stage
+            else None
+        )
+        stage_sequence: int | None = None
+        try:
+            if self.state is not None:
+                stage_sequence = self.state.reserve_stage_call(
+                    role=self.role,
+                    limit=role_limit,
+                    total_limit=role_total_limit,
+                )
+        except StageCallBudgetExceeded as exc:
+            record.preflight = "blocked"
+            record.status = "preflight_blocked"
+            record.outcome = "blocked"
+            record.error_code = "agent_execution_limit"
+            record.error_type = type(exc).__name__
+            record.safe_message = str(exc)
+            record.finished_at = _utc_now().isoformat()
+            record.duration_seconds = 0.0
+            self._persist(record)
+            record_model_call_event(
+                phase="blocked",
+                role=self.role,
+                stage=context.stage,
+                episode_number=context.episode_number,
+                sequence=exc.attempted,
+                outcome="blocked",
+                call_id=record.call_id,
+                model=self.model_id,
+                repair_round=context.repair_round,
+                error_code="agent_execution_limit",
+            )
+            _MODEL_CALL_LOGGER.warning(
+                "model_call event=error role=%s requested_model_id=%s call_id=%s "
+                "error_type=%s stage=%s limit=%s attempted=%s",
+                self.role,
+                self.model_id,
+                run_id,
+                type(exc).__name__,
+                exc.stage,
+                exc.limit,
+                exc.attempted,
+            )
+            raise
         blocked = self.context_limit_tokens is None or estimated_total > self.context_limit_tokens
         if blocked:
             record.preflight = "blocked"
             record.status = "preflight_blocked"
             record.outcome = "blocked"
+            record.error_code = "preflight_blocked"
             record.finished_at = _utc_now().isoformat()
             record.duration_seconds = 0.0
             self._persist(record)
+            record_model_call_event(
+                phase="blocked",
+                role=self.role,
+                stage=context.stage,
+                episode_number=context.episode_number,
+                sequence=stage_sequence,
+                outcome="blocked",
+                call_id=record.call_id,
+                model=self.model_id,
+                repair_round=context.repair_round,
+                error_code="preflight_blocked",
+            )
             _MODEL_CALL_LOGGER.info(
                 "model_call event=error role=%s requested_model_id=%s call_id=%s "
                 "error_type=preflight_blocked http_status=none "
@@ -204,6 +307,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 verified_limit_tokens=self.context_limit_tokens,
             )
         self._pending[run_id] = record
+        self._pending_lineage[run_id] = (stage_sequence, context.repair_round)
         # Supersede any prior still-started call for this run/role BEFORE persisting
         # the current record, so the current in-flight call is never self-superseded.
         if self.state is not None and self.state.store is not None and context.run_id is not None:
@@ -213,6 +317,17 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 role=self.role,
             )
         self._persist(record)
+        record_model_call_event(
+            phase="start",
+            role=record.role,
+            stage=record.stage,
+            episode_number=record.episode_number,
+            sequence=stage_sequence,
+            outcome="started",
+            call_id=record.call_id,
+            model=record.model,
+            repair_round=context.repair_round,
+        )
         _MODEL_CALL_LOGGER.info(
             "model_call event=start role=%s requested_model_id=%s call_id=%s "
             "stage=%s episode=%s estimated_input_tokens=%s estimated_output_tokens=%s",
@@ -228,6 +343,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
     def on_llm_end(self, response: LLMResult, *, run_id: UUID, **kwargs: Any) -> None:
         del kwargs
         record = self._pending.pop(run_id, None)
+        sequence, repair_round = self._pending_lineage.pop(run_id, (None, None))
         physical_call_id = record.call_id if record is not None else str(run_id)
         response_model_ids = _response_model_ids(response)
         tokens, finish_reason = extract_provider_usage(response)
@@ -242,6 +358,8 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                     error_code="relay_incompatible",
                     error_type="RelayError",
                     safe_message="The relay returned an unexpected model for the configured role.",
+                    sequence=sequence,
+                    repair_round=repair_round,
                 )
             _MODEL_CALL_LOGGER.error(
                 "model_call event=identity_mismatch role=%s requested_model_id=%s "
@@ -262,6 +380,8 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 outcome="success",
                 tokens=tokens,
                 finish_reason=finish_reason,
+                sequence=sequence,
+                repair_round=repair_round,
             )
             if self.state is not None:
                 self.state.remember_succeeded(record)
@@ -279,6 +399,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         del kwargs
         record = self._pending.pop(run_id, None)
+        sequence, repair_round = self._pending_lineage.pop(run_id, (None, None))
         physical_call_id = record.call_id if record is not None else str(run_id)
         failure = _extract_provider_failure(error)
         http_status = failure.http_status if failure is not None else None
@@ -300,6 +421,8 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 http_status=http_status,
                 provider_error_code=(failure.provider_code if failure is not None else None),
                 redacted_body=(failure.redacted_body if failure is not None else None),
+                sequence=sequence,
+                repair_round=repair_round,
             )
         redacted = failure.redacted_body if failure is not None else None
         _MODEL_CALL_LOGGER.warning(
@@ -333,6 +456,8 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         http_status: int | None = None,
         provider_error_code: str | None = None,
         redacted_body: str | None = None,
+        sequence: int | None = None,
+        repair_round: int | None = None,
     ) -> None:
         now = _utc_now()
         record.status = status  # type: ignore[assignment]
@@ -359,6 +484,20 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         record.provider_error_code = provider_error_code
         record.redacted_response = redacted_body
         self._persist(record)
+        record_model_call_event(
+            phase="end",
+            role=record.role,
+            stage=record.stage,
+            episode_number=record.episode_number,
+            sequence=sequence,
+            outcome=record.outcome,
+            call_id=record.call_id,
+            model=record.model,
+            repair_round=repair_round,
+            error_code=record.error_code,
+            finish_reason=record.finish_reason,
+            duration_seconds=record.duration_seconds,
+        )
 
     def _log_record(self, record: ModelCallRecord) -> None:
         _MODEL_CALL_RECORD_LOGGER.info(
@@ -808,7 +947,12 @@ def build_relay_adapter(
                 model_call_state=model_call_state,
                 context_limit_tokens=context_limit_tokens,
                 reserved_output_tokens=reserved_output_tokens,
-            )
+                stage_call_limit=settings.stage_model_call_limit,
+                stage_review_call_limit=settings.stage_review_call_limit,
+                script_stage_model_call_total_limit=settings.script_stage_model_call_total_limit,
+                script_stage_review_call_total_limit=settings.script_stage_review_call_total_limit,
+            ),
+            *([handler] if (handler := _build_langfuse_handler(settings)) is not None else []),
         ],
     }
     if role == "review":
@@ -849,6 +993,11 @@ def build_relay_adapter(
         model=_SerialChatAnthropic(
             **common,
             max_tokens=max_output_tokens,
+            # The relay 408s non-streaming requests at ~300s; long generation
+            # calls (episode outlines/scripts) legitimately exceed that, so
+            # stream and aggregate. model_timeout_seconds then bounds the gap
+            # between chunks instead of the whole response.
+            streaming=True,
         ),
         role=role,
         model_id=model_id,
@@ -869,6 +1018,8 @@ def is_relay_exception(exc: BaseException) -> bool:
 
 
 def is_relay_connection_error(exc: BaseException) -> bool:
+    if _is_upstream_stream_error(exc):
+        return True
     if _is_retryable_transport(exc):
         return True
     return any(
@@ -954,6 +1105,8 @@ def retryable_relay_interruption(exc: Exception) -> RetryableRelayInterruption |
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
     if _is_retryable_status_error(exc):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
+    if _is_upstream_stream_error(exc):
+        return RetryableRelayInterruption(_retry_delay_seconds(exc))
     return None
 
 
@@ -996,6 +1149,39 @@ def _is_retryable_status_error(exc: BaseException) -> bool:
             for base in type(exc).__mro__
         )
         and getattr(exc, "status_code", None) in _RETRYABLE_RELAY_STATUSES
+    )
+
+
+def _is_upstream_stream_error(exc: BaseException) -> bool:
+    """Recognize the provider's HTTP-200 streaming decode interruption only.
+
+    A successful HTTP status is otherwise not evidence of a transport failure. The
+    provider exception class and structured nested error type are both required so
+    ordinary API, auth, protocol, and structured-output errors remain terminal.
+    """
+    if not any(
+        base.__module__.startswith(("anthropic", "openai")) and base.__name__ == "APIStatusError"
+        for base in type(exc).__mro__
+    ):
+        return False
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if status != 200:
+        return False
+    raw_body = _raw_body_from(exc)
+    if raw_body is None:
+        return False
+    try:
+        payload = json.loads(raw_body)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        return False
+    error = payload["error"]
+    return (
+        error.get("code") == "upstream_stream_error" or error.get("type") == "upstream_stream_error"
     )
 
 

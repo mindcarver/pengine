@@ -233,10 +233,66 @@ async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository)
         "episode_plans",
         "episode_drafts",
         "episode_attempts",
+        "episode_attempt_cycles",
+        "episode_attempt_current",
         "episode_timeouts",
         "quality_gate_rejections",
         "model_calls",
     } <= {row[0] for row in rows}
+
+
+async def test_schema_v18_migrates_episode_attempts_to_cycle_zero(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    _, lease = await create_and_lease_initial(repository, persona, creation_request)
+    _, outline = locked_outline_payload()
+    review_call_id = persist_succeeded_outline_review(repository, lease.run_id)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        outline,
+        review_call_id=review_call_id,
+        now=NOW,
+    )
+    await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
+
+    async with repository._transaction() as connection:
+        await connection.execute(
+            """
+            CREATE TABLE episode_attempts_legacy (
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+                attempt_number INTEGER NOT NULL CHECK (
+                    attempt_number >= 1 AND attempt_number <= 3
+                ),
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, episode_number, attempt_number)
+            )
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO episode_attempts_legacy(
+                run_id, episode_number, attempt_number, recorded_at
+            )
+            SELECT run_id, episode_number, attempt_number, recorded_at
+            FROM episode_attempts
+            """
+        )
+        await connection.execute("DROP TABLE episode_attempts")
+        await connection.execute("ALTER TABLE episode_attempts_legacy RENAME TO episode_attempts")
+        await connection.execute("DROP TABLE episode_attempt_current")
+        await connection.execute("DROP TABLE episode_attempt_cycles")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
+
+    await repository.initialize()
+    assert await repository.get_episode_attempt_counts(lease.run_id) == {1: 1}
+    assert await repository.get_episode_attempt_cycles(lease.run_id) == {1: 0}
+    async with repository._connection() as connection:
+        columns = await (await connection.execute("PRAGMA table_info(episode_attempts)")).fetchall()
+    assert "attempt_cycle" in {row["name"] for row in columns}
 
 
 async def test_creation_is_idempotent_and_payload_conflicts(
@@ -1401,6 +1457,7 @@ async def test_episode_drafts_require_ordered_attempts_and_complete_aggregate(
         now=NOW + timedelta(seconds=3),
     )
     assert await repository.get_episode_attempt_counts(lease.run_id) == {1: 1, 2: 3}
+    assert await repository.get_episode_attempt_cycles(lease.run_id) == {1: 0, 2: 0}
 
     aggregate = "第 1 集\n第一集剧本\n\n---\n\n第 2 集\n第二集剧本"
     assert await repository.assemble_episode_scripts(lease.run_id) == aggregate

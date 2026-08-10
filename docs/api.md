@@ -23,7 +23,8 @@ Pengine 的机器接口是本地 JSON HTTP API。完整字段合同在 [`contrac
 | 错误体 | `{ "code": "稳定代码", "message": "安全说明" }` |
 | 认证 | V1 没有认证，只可在本机使用 |
 
-`Idempotency-Key` 长度为 1–128 个字符。它不是 creation id，也不是 provider request id；它只标识一次调用方命令。模型调用的 `call_id` 由服务内部生成并在资源里展示。
+`Idempotency-Key` 长度为 1–128 个字符。它不是 creation id，也不是 provider request id；它只标识一次调用方命令。模型调用的 `call_id` 由服务内部按物理调用生成，
+`operation_id` 则把同一次业务产物操作关联到对应的调用尝试，两者都会在运行进度中展示。
 
 ## 2. 端点总览
 
@@ -121,7 +122,7 @@ curl --fail-with-body \
 - 已运行秒数、`recovery_state`、`recovery_reason`；
 - L0/L4 最终审核子状态；
 - 总集数、已完成集数、当前集和已提交 `episode_drafts`；
-- `model_calls` 的估算/实际用量、角色、模型、结束原因和安全错误；
+- `model_calls` 的物理 `call_id`、`operation_id`、估算/实际用量、角色、模型、结束原因和安全错误；
 - `can_continue`、`can_end` 和暂停/拒绝证据；
 - 只有 `succeeded` 才有完整 `delivery`。
 
@@ -209,6 +210,10 @@ curl --fail-with-body -X POST \
 ### Model call
 
 每个调用的 `status` 可能为 `started`、`succeeded`、`failed`、`timed_out`、`stale`、`superseded` 或 `preflight_blocked`；`usage.status` 为 `reported`、`partial` 或 `unavailable`。这两种状态不能混读：一个调用成功但 provider 缺 usage，仍然可能是 `succeeded + unavailable`。
+
+锁定后的剧情合同、分集候选和结构审核只接受真实 `succeeded` 物理调用作为来源。API
+不会返回用 run/episode 拼接出来的合成 `call_id` 来填补缺失审计；来源缺失会使工作流
+安全失败，而不是把候选升级为正式状态。
 
 ## 9. 稳定错误代码
 

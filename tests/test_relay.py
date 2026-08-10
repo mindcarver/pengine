@@ -6,13 +6,14 @@ import httpx
 import openai
 import pytest
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr
 
 from pengine.config import Settings
+from pengine.model_calls import ModelCallState, StageCallBudgetExceeded
 from pengine.relay import (
     MIN_RELAY_RETRY_DELAY_SECONDS,
     RelayError,
@@ -103,6 +104,110 @@ def test_model_call_audit_requires_exact_response_model_identity(caplog) -> None
 
     assert "requested_model_id=claude-opus-5" in caplog.text
     assert "response_model_id=claude-opus-5" in caplog.text
+
+
+def test_model_call_audit_enforces_the_review_budget_before_dispatch() -> None:
+    state = ModelCallState()
+    state.context.stage = "generating_character_relationships"
+    handler = _ModelCallAuditHandler(
+        role="review",
+        model_id="gpt-5.5",
+        model_call_state=state,
+        context_limit_tokens=1_000,
+        stage_review_call_limit=2,
+    )
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="ok",
+                        response_metadata={"model": "gpt-5.5"},
+                    )
+                )
+            ]
+        ]
+    )
+
+    for _ in range(2):
+        call_id = uuid4()
+        handler.on_chat_model_start(
+            {},
+            [[HumanMessage(content="review this candidate")]],
+            run_id=call_id,
+        )
+        handler.on_llm_end(response, run_id=call_id)
+
+    with pytest.raises(StageCallBudgetExceeded, match="model-call budget"):
+        handler.on_chat_model_start(
+            {},
+            [[HumanMessage(content="review this candidate again")]],
+            run_id=uuid4(),
+        )
+
+
+def test_model_call_audit_scopes_script_budget_per_episode_and_stage(monkeypatch) -> None:
+    state = ModelCallState()
+    state.context.stage = "generating_episode_scripts"
+    state.context.episode_number = 1
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "pengine.relay.record_model_call_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+    handler = _ModelCallAuditHandler(
+        role="generation",
+        model_id="claude-opus-5",
+        model_call_state=state,
+        context_limit_tokens=1_000,
+        stage_call_limit=2,
+        script_stage_model_call_total_limit=5,
+    )
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="ok",
+                        response_metadata={"model": "claude-opus-5"},
+                    )
+                )
+            ]
+        ]
+    )
+
+    def call() -> None:
+        call_id = uuid4()
+        handler.on_chat_model_start(
+            {},
+            [[HumanMessage(content="write the episode")]],
+            run_id=call_id,
+        )
+        handler.on_llm_end(response, run_id=call_id)
+
+    call()
+    call()
+    state.context.episode_number = 2
+    call()
+    call()
+    state.context.episode_number = 1
+    with pytest.raises(StageCallBudgetExceeded, match="episode 1"):
+        call()
+
+    state.context.episode_number = 3
+    call()
+    with pytest.raises(StageCallBudgetExceeded, match="stage reached"):
+        call()
+
+    assert [event["phase"] for event in events[:2]] == ["start", "end"]
+    assert events[0]["stage"] == "generating_episode_scripts"
+    assert events[0]["episode_number"] == 1
+    assert events[0]["sequence"] == 1
+    assert events[1]["outcome"] == "success"
+    blocked = [event for event in events if event["phase"] == "blocked"]
+    assert blocked[0]["episode_number"] == 1
+    assert blocked[0]["sequence"] == 3
+    assert blocked[0]["error_code"] == "agent_execution_limit"
 
 
 @pytest.mark.parametrize("response_model", [None, "deepseek-v4-flash"])
@@ -430,6 +535,90 @@ def test_exception_mapping_does_not_echo_provider_body() -> None:
     assert mapped.http_status is None
     assert raw not in mapped.safe_message
     assert "secret-value" not in mapped.safe_message
+
+
+@pytest.mark.parametrize("provider_error", [anthropic.APIStatusError, openai.APIStatusError])
+def test_http_200_upstream_stream_error_is_a_relay_interruption(provider_error) -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    body = {
+        "error": {
+            "message": "error decoding response body",
+            "type": "upstream_stream_error",
+        },
+        "type": "error",
+    }
+    response = httpx.Response(200, request=request, json=body)
+    error = provider_error("error decoding response body", response=response, body=body)
+
+    assert is_relay_exception(error)
+    assert is_relay_connection_error(error)
+    interruption = retryable_relay_interruption(error)
+    assert interruption is not None
+    assert interruption.retry_delay_seconds == MIN_RELAY_RETRY_DELAY_SECONDS
+
+    mapped = classify_relay_exception(error)
+    assert mapped.code == "relay_unavailable"
+    assert mapped.http_status == 200
+    assert mapped.provider_error_code == "upstream_stream_error"
+    assert mapped.redacted_body is not None
+    assert "upstream_stream_error" in mapped.redacted_body
+    assert "decoding response body" in mapped.safe_message
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body"),
+    [
+        (
+            200,
+            {"error": {"message": "error decoding response body", "type": "server_error"}},
+        ),
+        (
+            200,
+            {
+                "error": {
+                    "message": "error decoding response body",
+                    "type": "authentication_error",
+                }
+            },
+        ),
+        (
+            400,
+            {
+                "error": {
+                    "message": "error decoding response body",
+                    "type": "upstream_stream_error",
+                }
+            },
+        ),
+    ],
+)
+def test_http_200_stream_like_messages_and_http_400_are_not_retryable(
+    status_code: int,
+    body: dict[str, object],
+) -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    response = httpx.Response(status_code, request=request, json=body)
+    error = anthropic.APIStatusError("error decoding response body", response=response, body=body)
+
+    assert retryable_relay_interruption(error) is None
+    assert not is_relay_connection_error(error)
+
+
+def test_structured_output_validation_error_is_not_a_stream_interruption() -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    body = {
+        "error": {
+            "message": "error decoding response body",
+            "type": "upstream_stream_error",
+        }
+    }
+    error = anthropic.APIResponseValidationError(
+        httpx.Response(200, request=request, json=body),
+        body=body,
+    )
+
+    assert retryable_relay_interruption(error) is None
+    assert not is_relay_connection_error(error)
 
 
 @pytest.mark.parametrize(

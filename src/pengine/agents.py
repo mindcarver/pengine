@@ -3,7 +3,8 @@ import copy
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
 from fractions import Fraction
@@ -22,7 +23,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
 from langchain.agents.structured_output import OutputToolBinding, ToolStrategy
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool, ToolException
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
@@ -57,6 +58,8 @@ from pengine.language import (
     infer_output_language,
     language_instruction,
 )
+from pengine.model_calls import ModelCallState
+from pengine.observability import content_fingerprint, record_langfuse_event
 from pengine.relay import is_relay_exception, retryable_relay_interruption
 from pengine.schemas import (
     EpisodeDraft,
@@ -174,6 +177,19 @@ _CANONICAL_WORKSPACE_PATHS = frozenset(
     }
 )
 
+# DeepAgents adds its built-in tools after the caller's ``tools`` argument is
+# processed.  These stage-level allowlists are enforced by
+# ``ToolAllowlistMiddleware`` at the model-request boundary below.  The
+# structured result tool is intentionally not listed here: LangChain derives
+# it from the request's ``ToolStrategy`` after middleware has prepared the
+# working-tool schemas.
+_SUPERVISOR_TOOL_ALLOWLIST = frozenset({"task"})
+_GENERATION_TOOL_ALLOWLIST = frozenset(
+    {"read_file", "calculate_arithmetic", "retrieve_persona_references"}
+)
+_REVIEW_TOOL_ALLOWLIST = frozenset({"read_file"})
+_REPAIR_TOOL_ALLOWLIST = frozenset({"read_file", "calculate_arithmetic"})
+
 _INTERNAL_RUNTIME_LEAK_POLICY = (
     "Screenplay form or story-world subject matter is not internal-runtime-leak evidence by "
     "itself. Episode, chapter, act, and scene headings; title cards; recap labels; end markers "
@@ -189,10 +205,10 @@ _INTERNAL_RUNTIME_LEAK_POLICY = (
     "material is not established as story-world content by the user request, an approved "
     "upstream artifact, or the candidate screenplay's own clear dramatic context. Story-world "
     "facts encoded by a contract are content, not runtime leakage. A match between a "
-    "screenplay's own episode label and the trusted envelope's episode_number is not provenance "
-    "evidence. Review evidence must quote the exact screenplay excerpt, name the matching private "
-    "source, and explain why the runtime provenance is unambiguous. If provenance is ambiguous, "
-    "pass this dimension."
+    "screenplay's own episode label and the trusted envelope's "
+    "episode_number is not provenance evidence. Review evidence must quote the exact screenplay "
+    "excerpt, name the matching private source, and explain why the runtime provenance is "
+    "unambiguous. If provenance is ambiguous, pass this dimension."
 )
 
 
@@ -202,7 +218,7 @@ def _with_internal_runtime_leak_policy(prompt: str) -> str:
 
 _STORY_ARCHITECT_PROMPT = (
     "Read the relevant /persona context. Return only the structured result for "
-    "the stage named in the task. For selecting_l0_variant, set "
+    "the stage named in the delegated request. For selecting_l0_variant, set "
     "selected_l0_variant and selection_rationale, and leave every content field "
     "null. When the locked output language is zh-CN, write the variant title and "
     "rationale in Simplified Chinese only. Never append an English translation, "
@@ -253,7 +269,11 @@ _EPISODE_PLANNER_PROMPT = (
     "clue must first be visible or audible, with introduction no later than explanation "
     "or callback. Include exactly one obligation and hook per episode; its "
     "new_information_fact_ids must exactly equal all facts whose first_revealed_episode "
-    "is that episode."
+    "is that episode. Set a fact's verbatim=true only when the user request or an approved "
+    "upstream artifact explicitly requires its text value to appear contiguously word-for-word "
+    "in the screenplay. Do not infer verbatim=true from quotation marks, kind=text, the value "
+    "field, or words such as 原文 in subject or predicate. Non-text facts must never have "
+    "verbatim=true; leave verbatim=false otherwise."
 )
 
 _SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
@@ -268,7 +288,16 @@ _SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
     "or descriptive labels, or another notation established by the screenplay. Never normalize "
     "a label merely because it precedes a colon. A cast defect requires contextual evidence "
     "that the script introduced a genuinely new continuity-bearing character in direct conflict "
-    "with explicit hard Canon. Treat explicitly locked or formally "
+    "with explicit hard Canon. "
+    "Read /workspace/evidence_contract.json as the evidence authority. Before returning, "
+    "perform an exact-set self-check: state_delta.evidence.target_id values must equal "
+    "required_evidence_target_ids exactly, each target must occur once, no earlier or later "
+    "episode target may be added, and every evidence excerpt must appear verbatim in content. "
+    "Only facts listed in required_verbatim_facts require their fact.value to appear as one "
+    "contiguous verbatim substring in content; all other facts require semantic consistency "
+    "only. Do not infer a verbatim requirement from kind=text, quotation marks, the value "
+    "field, or wording such as 原文 in subject or predicate. "
+    "Treat explicitly locked or formally "
     "committed aliases, pronouns, ages, elapsed durations, call participants, identity and "
     "relationship facts, and clue meanings as binding. "
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
@@ -285,16 +314,49 @@ _SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
     "fact, clue event, and episode obligation must cite a verbatim "
     "excerpt that exists in the script. Return only the structured episode-script "
     "result for the requested episode number, with the complete verbatim screenplay in "
-    "content rather than a completion summary, status report, or file path."
+    "content rather than a completion summary, status report, or file path. When "
+    "/workspace/suffix_rewrite_review.json is present, read it as the read-only bound "
+    "rewrite cause, fix every conflict named in every review evidence entry, give the locked "
+    "story contract priority, and do not reproduce the named defect."
+)
+
+_EPISODE_REPAIR_PROMPT = (
+    "First read /skills/continuity-repair/SKILL.md. Follow that skill while keeping the locked "
+    "contract and earlier episodes unchanged. Read /workspace/evidence_contract.json together "
+    "with the explicitly named candidate, upstream files, "
+    "and review. For evidence_coverage_mismatch, use the issue.contract_refs collection as the "
+    "exact required evidence target set: rebuild evidence with no extras, no duplicates, every "
+    "required target exactly once, and every excerpt copied verbatim from the screenplay. When "
+    "the review contains "
+    "unknown_speaker issues, repair only a contextually proven new continuity-bearing character "
+    "that directly conflicts with explicit hard Canon. Resolve the narrative identity conflict "
+    "without normalizing screenplay notation. An alias, occupational title, generic or "
+    "descriptive label, or colon-form line is not an unknown character by itself. Keep the "
+    "screenplay and state_delta mutually consistent. When "
+    "the review contains verbatim_fact_missing issues, use each issue.contract_refs entry to "
+    "find the matching required_verbatim_facts item and restore its exact fact.value as a "
+    "contiguous substring in content. Do not impose exact wording on facts not listed there. "
+    "When /workspace/suffix_rewrite_review.json is present, read it as the read-only bound "
+    "rewrite "
+    "cause, fix every conflict named in every review evidence entry, give the locked story "
+    "contract priority, and do not reproduce the named defect. Then return the complete "
+    "structured script result only."
 )
 
 _QUALITY_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
-    "Read the relevant /persona context and review only the named gate against the approved "
-    "artifacts supplied in the task. Always return the structured stage, passed decision, and "
-    "concrete evidence; never return prose instead. Keep feedback_handling empty for "
-    "accepting_l0 and for an initial run. For a revision's accepting_l4 gate, itemize every "
-    "frozen feedback item. A rejection must identify a direct conflict with a user requirement, "
-    "an applicable explicit persona gate rule, locked Contract or SeriesBible data, a frozen "
+    "Read /workspace/story_contract.json and the relevant /persona context, then review only "
+    "the named gate "
+    "against the approved artifacts supplied in the delegated request. Always return "
+    "the structured stage, passed decision, and concrete evidence; never "
+    "return prose instead. Keep feedback_handling empty for accepting_l0 "
+    "and for an initial run. For a revision's accepting_l4 gate, itemize "
+    "every frozen feedback item. For accepting_l4, story_contract.json is authoritative "
+    "for exact fact wording: reject a fact for not appearing contiguously word-for-word "
+    "only when that fact has verbatim=true. kind=text, the value field, quotation marks, "
+    "or words such as 原文 in subject or predicate do not create a machine-executable "
+    "verbatim requirement. Facts without verbatim=true must be reviewed for semantic "
+    "consistency only. A rejection must identify a direct conflict with a user requirement, an "
+    "applicable explicit persona gate rule, locked Contract or SeriesBible data, a frozen "
     "revision-feedback item, or the output/schema protocol. Ordinary screenplay format, style, "
     "or matters of taste are not sufficient reasons to set passed=false. At accepting_l4, only "
     "an internal-runtime leak that meets the policy's provenance and evidence standard is a "
@@ -302,10 +364,13 @@ _QUALITY_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
 )
 
 _EPISODE_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
-    "Use the episode-continuity-review skill. Treat explicit contract facts and prior state as "
-    "immutable and unspecified creative details as free. Only an internal-runtime leak that "
-    "meets the policy's provenance and evidence standard is blocking. Screenplay formatting and "
-    "story-world subject matter named in the policy are never defects on their own. "
+    "First read /skills/episode-continuity-review/SKILL.md. Follow that skill while treating "
+    "explicit contract facts and prior state as immutable and unspecified creative details as "
+    "free. Only a story_contract fact with verbatim=true requires its value to appear "
+    "contiguously word-for-word; all other facts, including kind=text facts, are reviewed for "
+    "semantic consistency only. Only an internal-runtime leak that meets the policy's provenance "
+    "and evidence standard is blocking. Screenplay formatting and story-world subject matter "
+    "named in the policy are never defects on their own. "
     "/workspace/series_prefix.json is a trusted runtime envelope: episode_number and JSON "
     "framing are trusted runtime metadata, not screenplay content. Judge leakage only inside "
     "episodes[].content. Return only structured review evidence and never repair content."
@@ -329,6 +394,115 @@ _SERIES_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "episodes[].content. Never repair content and never reinterpret the design to make the "
     "prefix pass."
 )
+
+
+def _suffix_rewrite_feedback_for_episode(
+    feedback: Mapping[str, Any] | None,
+    episode_number: int,
+) -> dict[str, Any] | None:
+    """Return only review evidence that affects the current episode."""
+    if not isinstance(feedback, Mapping):
+        return None
+    reviews = feedback.get("reviews")
+    if not isinstance(reviews, list):
+        return None
+    current_reviews = [
+        review
+        for review in reviews
+        if isinstance(review, Mapping)
+        and isinstance(review.get("earliest_affected_episode"), int)
+        and review["earliest_affected_episode"] <= episode_number
+    ]
+    if not current_reviews:
+        return None
+    effective = min(review["earliest_affected_episode"] for review in current_reviews)
+    return {
+        **feedback,
+        "effective_earliest_affected_episode": effective,
+        "reviews": current_reviews,
+    }
+
+
+def _evidence_contract(
+    contract: StoryContract,
+    episode_number: int,
+    *,
+    rejected_issues: list[Any] | None = None,
+    phase: str,
+) -> dict[str, Any]:
+    obligation = next(
+        item for item in contract.episode_obligations if item.episode_number == episode_number
+    )
+    required_target_ids = sorted(
+        {
+            *(
+                fact.fact_id
+                for fact in contract.facts
+                if fact.first_revealed_episode == episode_number
+            ),
+            *(
+                clue.clue_id
+                for clue in contract.clues
+                if clue.introduced_episode == episode_number
+                or clue.explained_episode == episode_number
+            ),
+            obligation.obligation_id,
+        }
+    )
+    required_verbatim_facts = [
+        {
+            "fact_id": fact.fact_id,
+            "value": fact.value,
+        }
+        for fact in contract.facts
+        if fact.first_revealed_episode == episode_number and fact.verbatim
+    ]
+    return {
+        "version": 1,
+        "phase": phase,
+        "episode_number": episode_number,
+        "required_evidence_target_ids": required_target_ids,
+        "required_verbatim_facts": required_verbatim_facts,
+        "rules": {
+            "target_id_set": "must_exactly_equal_required_evidence_target_ids",
+            "target_occurrences": "exactly_once",
+            "extra_targets": "not_allowed",
+            "excerpt": "must_appear_verbatim_in_content",
+            "verbatim_fact_value": (
+                "only_required_verbatim_facts_must_appear_contiguously_in_content"
+            ),
+        },
+        "rule_text": [
+            "The state_delta.evidence.target_id set must exactly equal "
+            "required_evidence_target_ids.",
+            "Use every required target exactly once; do not add targets from an earlier or "
+            "later episode.",
+            "Every evidence excerpt must appear verbatim in the episode content.",
+            "Only required_verbatim_facts[].value must appear contiguously and verbatim in the "
+            "episode content; all other facts are checked for semantic consistency only.",
+        ],
+        "rejected_issues": [issue.model_dump(mode="json") for issue in (rejected_issues or [])],
+    }
+
+
+def _evidence_contract_json(
+    contract: StoryContract,
+    episode_number: int,
+    *,
+    rejected_issues: list[Any] | None = None,
+    phase: str,
+) -> str:
+    return json.dumps(
+        _evidence_contract(
+            contract,
+            episode_number,
+            rejected_issues=rejected_issues,
+            phase=phase,
+        ),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
 
 VIRTUAL_FILE_PERMISSIONS = [
     FilesystemPermission(operations=["read"], paths=["/persona", "/persona/**"]),
@@ -928,6 +1102,7 @@ _SAFE_VALIDATION_MESSAGES = frozenset(
         "Numeric facts require an exact decimal value",
         "Numeric facts require a finite value and explicit unit",
         "Non-numeric facts cannot declare a unit",
+        "Only text facts may require verbatim wording",
         "Invalid date value",
         "Invalid time value",
         "Invalid datetime value",
@@ -1005,6 +1180,7 @@ _SAFE_VALIDATION_LOCATIONS = frozenset(
         "first_revealed_episode",
         "kind",
         "value",
+        "verbatim",
         "unit",
         "contract_refs",
         "contract_mutation_required",
@@ -1179,6 +1355,77 @@ def _structured_validation_failure_turns(
     # unmatched messages separately preserves a safe budget for synthetic or
     # partially restored histories without charging multiple calls in one turn.
     return failure_turns + len(failed_calls - matched_calls)
+
+
+def _compact_structured_validation_messages(
+    messages: list[Any],
+    result_tool_names: set[str],
+) -> list[Any]:
+    """Keep one complete failed result plus compact layered correction context.
+
+    ToolStrategy persists every failed structured result in agent state. Large
+    result schemas can therefore add another complete artifact on every retry.
+    The next model call only needs the original user context, prior short human
+    corrections, and the latest failed result turn with its tool feedback.
+    """
+
+    latest_error = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, ToolMessage) and message.name in result_tool_names
+        ),
+        None,
+    )
+    if latest_error is None:
+        return messages
+
+    latest_result_index: int | None = None
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, AIMessage):
+            continue
+        if any(
+            call.get("id") == latest_error.tool_call_id and call.get("name") == latest_error.name
+            for call in message.tool_calls
+        ):
+            latest_result_index = index
+            break
+    if latest_result_index is None:
+        return messages
+
+    first_tool_turn = next(
+        (
+            index
+            for index, message in enumerate(messages)
+            if isinstance(message, AIMessage)
+            and (message.tool_calls or getattr(message, "invalid_tool_calls", []))
+        ),
+        latest_result_index,
+    )
+    base_user_context = [
+        message for message in messages[:first_tool_turn] if isinstance(message, HumanMessage)
+    ]
+    prior_corrections = [
+        message
+        for message in messages[first_tool_turn:latest_result_index]
+        if isinstance(message, HumanMessage)
+    ]
+    latest_result = messages[latest_result_index]
+    latest_call_ids = {
+        call.get("id") for call in latest_result.tool_calls if call.get("id") is not None
+    }
+    latest_feedback = [
+        message
+        for message in messages[latest_result_index + 1 :]
+        if isinstance(message, ToolMessage) and message.tool_call_id in latest_call_ids
+    ]
+    return [
+        *base_user_context,
+        *prior_corrections,
+        latest_result,
+        *latest_feedback,
+    ]
 
 
 def _work_tool_stop_reason(
@@ -1523,6 +1770,99 @@ def _language_retry_matches(
     return matches(original, repaired)
 
 
+def _language_repair_ratio(stage: InternalStage | None) -> float:
+    # Mirrors _validate_result_language: story artifacts tolerate more Latin
+    # (character/place names); every other stage stays strict.
+    return 4.0 if stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS else 2.0
+
+
+def _strip_language_glosses(value: Any, *, ratio: float) -> Any:
+    """Deterministically repair `中文（English gloss）` values without a model call."""
+    if isinstance(value, str):
+        if not has_obvious_language_mismatch(value, "zh-CN", english_dominance_ratio=ratio):
+            return value
+        core = _BILINGUAL_GLOSS_SUFFIX.sub("", value).strip()
+        if core != value.strip() and not has_obvious_language_mismatch(
+            core, "zh-CN", english_dominance_ratio=ratio
+        ):
+            return core
+        return value
+    if isinstance(value, Mapping):
+        return {key: _strip_language_glosses(item, ratio=ratio) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_strip_language_glosses(item, ratio=ratio) for item in value]
+    return value
+
+
+_REPAIR_ALIGNMENT_KEYS = (
+    "character_id",
+    "fact_id",
+    "event_id",
+    "clue_id",
+    "obligation_id",
+    "episode_number",
+)
+
+
+def _align_repaired_items(original: list[Any], repaired: list[Any]) -> list[Any] | None:
+    """Pair repaired list items with originals by stable ID so a reordered
+    repair cannot splice one item's translation into another. Falls back to
+    positional pairing for same-length lists, else None (keep originals)."""
+    for key in _REPAIR_ALIGNMENT_KEYS:
+        if not all(isinstance(item, Mapping) and key in item for item in [*original, *repaired]):
+            continue
+        try:
+            index = {item[key]: item for item in repaired}
+        except TypeError:
+            continue
+        if len(index) != len(repaired):
+            continue
+        return [index.get(item[key]) for item in original]
+    if len(original) == len(repaired):
+        return repaired
+    return None
+
+
+def _merge_language_repair(original: Any, repaired: Any, *, ratio: float) -> Any:
+    """Splice translated strings from `repaired` into `original`'s structure.
+
+    Only strings that violate the language gate in `original` are replaced, and
+    only when the repaired counterpart passes the gate. Structure, ordering,
+    and every locked fact come verbatim from `original`, so the repair cannot
+    change non-language fields by construction.
+    """
+    if isinstance(original, str):
+        if (
+            isinstance(repaired, str)
+            and has_obvious_language_mismatch(original, "zh-CN", english_dominance_ratio=ratio)
+            and not has_obvious_language_mismatch(repaired, "zh-CN", english_dominance_ratio=ratio)
+        ):
+            return repaired
+        return original
+    if isinstance(original, Mapping):
+        if not isinstance(repaired, Mapping):
+            return original
+        return {
+            key: (
+                _merge_language_repair(item, repaired[key], ratio=ratio)
+                if key in repaired
+                else item
+            )
+            for key, item in original.items()
+        }
+    if isinstance(original, list):
+        if not isinstance(repaired, list):
+            return original
+        aligned = _align_repaired_items(original, repaired)
+        if aligned is None:
+            return original
+        return [
+            item if counterpart is None else _merge_language_repair(item, counterpart, ratio=ratio)
+            for item, counterpart in zip(original, aligned, strict=True)
+        ]
+    return original
+
+
 class AgentProtocolError(RuntimeError):
     def __init__(
         self,
@@ -1538,6 +1878,10 @@ class AgentProtocolError(RuntimeError):
         self.repair_instruction = repair_instruction
         self.language_retry_fingerprint = language_retry_fingerprint
         self.safe_message = safe_message
+
+
+class AgentExecutionLimitError(AgentProtocolError):
+    """A bounded agent loop stopped before it could safely return a result."""
 
 
 def _validate_result_language(
@@ -1835,6 +2179,21 @@ def _request_with_canonical_workspace(
     )
 
 
+def _description_with_workspace_paths(
+    description: str,
+    files: Mapping[str, Any],
+) -> str:
+    paths = sorted(path for path in files if path.startswith("/workspace/"))
+    if not paths:
+        return description
+    manifest = "\n".join(f"- {path}" for path in paths)
+    return (
+        f"{description}\nWorkspace inputs for this delegated task are exactly the following "
+        "paths. Use read_file directly on these paths as needed; do not probe directories, "
+        f"roots, or alternate paths:\n{manifest}"
+    )
+
+
 def _subagent_request(
     request: ToolCallRequest,
     *,
@@ -1842,12 +2201,17 @@ def _subagent_request(
     description: str,
     files: Mapping[str, str],
 ) -> ToolCallRequest:
+    existing_files = request.state.get("files") if isinstance(request.state, Mapping) else None
+    task_files = {
+        **(dict(existing_files) if isinstance(existing_files, Mapping) else {}),
+        **files,
+    }
     with_files = _request_with_files(request, files)
     return with_files.override(
         tool_call={
             **request.tool_call,
             "args": {
-                "description": description,
+                "description": _description_with_workspace_paths(description, task_files),
                 "subagent_type": subagent_type,
             },
         }
@@ -2692,6 +3056,216 @@ def _drop_dangling_tool_call_messages(messages: list[Any]) -> list[Any]:
     ]
 
 
+_SUPERVISOR_CORRECTION_MAX_CHARS = 4_000
+
+
+def _assistant_tool_call_ids(message: Any) -> set[Any] | None:
+    if not isinstance(message, AIMessage):
+        return None
+    calls = [*message.tool_calls, *getattr(message, "invalid_tool_calls", [])]
+    if not calls:
+        return set()
+    call_ids = [call.get("id") if isinstance(call, Mapping) else None for call in calls]
+    if any(call_id is None or call_id == "" for call_id in call_ids):
+        return None
+    try:
+        ids = set(call_ids)
+    except TypeError:
+        return None
+    return ids if len(ids) == len(call_ids) else None
+
+
+def _message_content_chars(message: HumanMessage) -> int:
+    content = message.content
+    if isinstance(content, str):
+        return len(content)
+    try:
+        return len(json.dumps(content, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return len(str(content))
+
+
+def _compact_supervisor_messages(messages: Sequence[Any]) -> list[Any]:
+    """Keep the initial task and the latest complete supervisor tool exchange.
+
+    The returned model view deliberately excludes prior assistant/tool work and
+    keeps only short human feedback after the retained exchange. Incomplete
+    histories are left untouched so a caller can apply its existing protocol
+    recovery instead of losing the latest task context.
+    """
+
+    original = list(messages)
+    latest_exchange: tuple[int, set[Any], set[int]] | None = None
+    for assistant_index in range(len(original) - 1, -1, -1):
+        call_ids = _assistant_tool_call_ids(original[assistant_index])
+        if not call_ids:
+            continue
+        matching_tool_indices = {
+            index
+            for index in range(assistant_index + 1, len(original))
+            if isinstance(original[index], ToolMessage) and original[index].tool_call_id in call_ids
+        }
+        answered_ids = {original[index].tool_call_id for index in matching_tool_indices}
+        if call_ids <= answered_ids:
+            latest_exchange = (assistant_index, call_ids, matching_tool_indices)
+            break
+
+    if latest_exchange is None:
+        return original
+
+    assistant_index, call_ids, matching_tool_indices = latest_exchange
+    first_tool_index = next(
+        (
+            index
+            for index, message in enumerate(original)
+            if (call_ids_at_index := _assistant_tool_call_ids(message)) and call_ids_at_index
+        ),
+        assistant_index,
+    )
+    exchange_end = max(matching_tool_indices)
+    short_corrections = [
+        message
+        for message in original[exchange_end + 1 :]
+        if isinstance(message, HumanMessage)
+        and _message_content_chars(message) <= _SUPERVISOR_CORRECTION_MAX_CHARS
+    ]
+    retained_indices = {
+        index
+        for index, message in enumerate(original[:first_tool_index])
+        if isinstance(message, HumanMessage)
+    }
+    retained_indices.update({assistant_index, *matching_tool_indices})
+    retained_indices.update(
+        index
+        for index, message in enumerate(original[exchange_end + 1 :], start=exchange_end + 1)
+        if message in short_corrections
+    )
+    # The selected prefix/suffix contain only HumanMessages, while the retained
+    # exchange contains one fully answered AI tool-call message and its matching
+    # ToolMessages. This construction cannot emit an orphaned tool response or
+    # an unanswered tool call.
+    return [message for index, message in enumerate(original) if index in retained_indices]
+
+
+def _model_request_tool_name(tool: Any) -> str:
+    if isinstance(tool, Mapping):
+        direct_name = tool.get("name")
+        if isinstance(direct_name, str):
+            return direct_name
+        function = tool.get("function")
+        if isinstance(function, Mapping) and isinstance(function.get("name"), str):
+            return function["name"]
+        return ""
+    name = getattr(tool, "name", None)
+    if isinstance(name, str):
+        return name
+    name = getattr(tool, "__name__", None)
+    return name if isinstance(name, str) else ""
+
+
+class ToolAllowlistMiddleware(AgentMiddleware):
+    """Align a stage's system prompt and tools at the model-call boundary.
+
+    ``create_deep_agent`` intentionally treats its ``tools`` argument as
+    additive and appends built-in tool instructions to the system prompt. This
+    middleware uses the public LangChain request hook to replace that assembled
+    prompt with the stage-owned prompt and expose only the matching tools.
+    Structured result tools are derived from the request's ``ToolStrategy`` so
+    correction calls that hide working tools also receive a result-only prompt.
+    """
+
+    def __init__(
+        self,
+        allowed_tools: frozenset[str],
+        *,
+        system_prompt: str,
+        compact_tool_history: bool = False,
+    ) -> None:
+        super().__init__()
+        self.allowed_tools = allowed_tools
+        self.system_prompt = system_prompt
+        self.compact_tool_history = compact_tool_history
+
+    @staticmethod
+    def _result_tool_names(request: ModelRequest) -> set[str]:
+        if not isinstance(request.response_format, ToolStrategy):
+            return set()
+        return {spec.name for spec in request.response_format.schema_specs}
+
+    def _filter_request(self, request: ModelRequest) -> ModelRequest:
+        filtered_tools = [
+            tool for tool in request.tools if _model_request_tool_name(tool) in self.allowed_tools
+        ]
+        working_tool_names = {
+            name for tool in filtered_tools if (name := _model_request_tool_name(tool))
+        }
+        result_tool_names = self._result_tool_names(request)
+        offered_tool_names = sorted(working_tool_names | result_tool_names)
+        offered_tools = ", ".join(offered_tool_names) if offered_tool_names else "none"
+        if working_tool_names:
+            prompt = self.system_prompt
+        elif result_tool_names:
+            results = ", ".join(sorted(result_tool_names))
+            prompt = (
+                "The working phase is complete. Return exactly one valid structured "
+                f"result tool call using {results} and the completed work already present "
+                "in the conversation."
+            )
+        else:
+            prompt = self.system_prompt
+        prompt = (
+            f"{prompt}\n\nThe complete tool list for this model request is: "
+            f"{offered_tools}. Use only a listed tool."
+        )
+        filtered_request = request.override(
+            tools=filtered_tools,
+            system_message=SystemMessage(content=prompt),
+        )
+        if self.compact_tool_history:
+            filtered_request = filtered_request.override(
+                messages=_compact_supervisor_messages(filtered_request.messages),
+            )
+        return filtered_request
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        return handler(self._filter_request(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        return await handler(self._filter_request(request))
+
+    def _check_tool_call(self, request: ToolCallRequest) -> None:
+        tool_name = request.tool_call.get("name")
+        if tool_name not in self.allowed_tools:
+            raise AgentProtocolError(
+                f"Agent attempted unavailable tool {tool_name!r}; "
+                f"allowed tools are {sorted(self.allowed_tools)}"
+            )
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        self._check_tool_call(request)
+        return handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        self._check_tool_call(request)
+        return await handler(request)
+
+
 class StructuredResultMiddleware(AgentMiddleware):
     async def awrap_model_call(
         self,
@@ -2719,7 +3293,10 @@ class StructuredResultMiddleware(AgentMiddleware):
             raise AgentProtocolError("Subagent returned invalid structured output")
 
         if validation_errors:
-            messages = list(request.messages)
+            messages = _compact_structured_validation_messages(
+                list(request.messages),
+                result_tool_names,
+            )
             correction = _structured_result_validation_correction(
                 response_format,
                 messages,
@@ -2886,6 +3463,8 @@ class StageGuardMiddleware(AgentMiddleware):
         series_bible: SeriesBibleSummary | None = None,
         register_series_review: SeriesReviewRegistration | None = None,
         get_series_bible: SeriesBibleRetriever | None = None,
+        model_call_state: ModelCallState | None = None,
+        suffix_rewrite_feedback: Mapping[str, Any] | None = None,
     ) -> None:
         self.before_stage = before_stage
         self.approve_stage = approve_stage
@@ -2904,6 +3483,20 @@ class StageGuardMiddleware(AgentMiddleware):
         self.series_bible = series_bible
         self.register_series_review = register_series_review
         self.get_series_bible = get_series_bible
+        self.model_call_state = model_call_state
+        self.suffix_rewrite_feedback = suffix_rewrite_feedback
+
+    @contextmanager
+    def _repair_round_context(self, repair_round: int | None):
+        if self.model_call_state is None:
+            yield
+            return
+        previous = self.model_call_state.context.repair_round
+        self.model_call_state.context.repair_round = repair_round
+        try:
+            yield
+        finally:
+            self.model_call_state.context.repair_round = previous
 
     async def awrap_tool_call(
         self,
@@ -2974,6 +3567,17 @@ class StageGuardMiddleware(AgentMiddleware):
             InternalStage.ACCEPTING_L4,
         ):
             request = _request_with_canonical_workspace(request, self.approved_payloads)
+
+        if stage in (InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4):
+            state_files = request.state.get("files") if isinstance(request.state, Mapping) else None
+            description = _description_with_workspace_paths(
+                description,
+                state_files if isinstance(state_files, Mapping) else {},
+            )
+            args = {**args, "description": description}
+            request = request.override(
+                tool_call={**request.tool_call, "args": args},
+            )
 
         if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
             return await self._write_episodes(request, handler, args)
@@ -3264,6 +3868,7 @@ class StageGuardMiddleware(AgentMiddleware):
                 files=review_files,
                 schema=StoryArchitectResult,
                 stage=stage,
+                repair_round=repair_round,
             )
             return StoryArchitectResult.model_validate(payload)
 
@@ -3313,6 +3918,17 @@ class StageGuardMiddleware(AgentMiddleware):
                     len(patch.line_replacements),
                     len(meaningful_ranges),
                     meaningful_ranges,
+                )
+                record_langfuse_event(
+                    "pengine.repair.result",
+                    input={
+                        "stage": stage.value,
+                        "repair_kind": "story_patch",
+                        "repair_round": repair_round,
+                        "succeeded": True,
+                        "candidate_chars": len(content),
+                    },
+                    metadata={"trace_version": "pengine-1"},
                 )
                 return repaired
             except AgentProtocolError as exc:
@@ -3642,17 +4258,29 @@ class StageGuardMiddleware(AgentMiddleware):
                         else "The episode-outline repair patch was invalid."
                     ),
                 ) from exc
+            record_langfuse_event(
+                "pengine.repair.result",
+                input={
+                    "stage": stage.value,
+                    "repair_kind": "outline_patch",
+                    "repair_round": repair_round,
+                    "succeeded": True,
+                },
+                metadata={"trace_version": "pengine-1"},
+            )
             return repaired.model_dump(mode="json")
 
         try:
-            return await generate_and_apply(None)
+            with self._repair_round_context(repair_round):
+                return await generate_and_apply(None)
         except AgentProtocolError as first_error:
             correction = (
                 "The previous patch could not be applied or did not validate. Return exactly "
                 "one corrected OutlineRepairPatch tool call now. Do not return analysis or the "
                 f"full candidate. {first_error.repair_instruction or ''}"
             )
-            return await generate_and_apply(correction)
+            with self._repair_round_context(repair_round):
+                return await generate_and_apply(correction)
 
     async def _call_structured_stage(
         self,
@@ -3681,6 +4309,25 @@ class StageGuardMiddleware(AgentMiddleware):
             if str(exc) != "Subagent returned invalid structured output":
                 raise
             language_only_retry = exc.language_retry_fingerprint is not None
+            ratio = _language_repair_ratio(stage)
+            original_raw: Mapping[str, Any] | None = None
+            if language_only_retry:
+                # First try the deterministic repair: strip appended English
+                # glosses in code. If that alone satisfies the gate, no model
+                # round-trip happens at all.
+                original_raw = _strip_language_glosses(
+                    _parse_stage_result(stage, json.loads(message.content)).model_dump(mode="json"),
+                    ratio=ratio,
+                )
+                try:
+                    return result, _validated_stage_payload(
+                        stage,
+                        json.dumps(original_raw, ensure_ascii=False),
+                        expected_episode_number=expected_episode_number,
+                        output_language=self.output_language,
+                    )
+                except AgentProtocolError:
+                    pass  # genuinely English content remains; ask the model
             retry_description = (
                 f"{description}\n"
                 "The previous attempt did not produce an acceptable result. Reuse its "
@@ -3708,7 +4355,11 @@ class StageGuardMiddleware(AgentMiddleware):
             if language_only_retry:
                 retry_request = _request_with_files(
                     retry_request,
-                    {"/workspace/result_to_translate.json": message.content},
+                    {
+                        "/workspace/result_to_translate.json": json.dumps(
+                            original_raw, ensure_ascii=False
+                        )
+                    },
                 )
             result = await handler(retry_request)
             message = _tool_message(result)
@@ -3717,27 +4368,59 @@ class StageGuardMiddleware(AgentMiddleware):
                     "Subagent result was not JSON text",
                     stage=stage,
                 ) from exc
-            payload = _validated_stage_payload(
-                stage,
-                message.content,
-                expected_episode_number=expected_episode_number,
-                output_language=self.output_language,
-                enforce_quality_gate=False,
-            )
+            if language_only_retry:
+                assert original_raw is not None
+                try:
+                    repaired_parsed = _parse_stage_result(stage, json.loads(message.content))
+                except AgentProtocolError:
+                    raise
+                except Exception as parse_exc:
+                    raise AgentProtocolError(
+                        "Language repair returned invalid structured output",
+                        stage=stage,
+                        safe_message=(
+                            "语言修复返回的结构化结果无效。"
+                            if self.output_language == "zh-CN"
+                            else "Language repair returned invalid structured output."
+                        ),
+                    ) from parse_exc
+                # Splice only the translated strings back into the original
+                # structure; the model's rewrite can never touch locked fields.
+                merged = _merge_language_repair(
+                    original_raw,
+                    repaired_parsed.model_dump(mode="json"),
+                    ratio=ratio,
+                )
+                try:
+                    payload = _validated_stage_payload(
+                        stage,
+                        json.dumps(merged, ensure_ascii=False),
+                        expected_episode_number=expected_episode_number,
+                        output_language=self.output_language,
+                        enforce_quality_gate=False,
+                    )
+                except AgentProtocolError as merge_exc:
+                    # Deterministic dead end — a second identical round-trip
+                    # would fail the same way, so stop here with evidence
+                    # instead of burning further attempts.
+                    raise AgentProtocolError(
+                        "Language repair could not converge while preserving locked structure",
+                        stage=stage,
+                        safe_message=(
+                            "语言修复未能在保持锁定结构的前提下完成简体中文转换。"
+                            if self.output_language == "zh-CN"
+                            else "Language repair could not preserve locked structured fields."
+                        ),
+                    ) from merge_exc
+            else:
+                payload = _validated_stage_payload(
+                    stage,
+                    message.content,
+                    expected_episode_number=expected_episode_number,
+                    output_language=self.output_language,
+                    enforce_quality_gate=False,
+                )
             repaired_result = _parse_stage_result(stage, payload)
-            if exc.language_retry_fingerprint is not None and not _language_retry_matches(
-                exc.language_retry_fingerprint,
-                _language_retry_fingerprint(repaired_result),
-            ):
-                raise AgentProtocolError(
-                    "Language repair changed non-language fields",
-                    stage=stage,
-                    safe_message=(
-                        "语言修复改变了已锁定的结构化事实或审核结论。"
-                        if self.output_language == "zh-CN"
-                        else "Language repair changed locked structured fields."
-                    ),
-                ) from exc
             if isinstance(repaired_result, QualityReviewerResult) and not repaired_result.passed:
                 raise QualityGateRejectedError(
                     stage=stage,
@@ -3767,7 +4450,7 @@ class StageGuardMiddleware(AgentMiddleware):
             nonlocal call_count
             call_count += 1
             if call_count > _REVIEW_SUBAGENT_MAX_CALLS:
-                raise AgentProtocolError(
+                raise AgentExecutionLimitError(
                     "Review subagent exceeded its internal call budget without "
                     "returning a structured result",
                     stage=stage,
@@ -3809,6 +4492,8 @@ class StageGuardMiddleware(AgentMiddleware):
             return parsed, result
 
         review, review_result = await invoke(review_request)
+        review_issues = getattr(review, "issues", [])
+        review_issue_codes = [issue.code for issue in review_issues]
         try:
             _validate_result_language(
                 review,
@@ -3854,7 +4539,39 @@ class StageGuardMiddleware(AgentMiddleware):
                     stage=stage,
                     safe_message="语言修复改变了原审核结论。",
                 ) from exc
+            record_langfuse_event(
+                "pengine.review.semantic",
+                input={
+                    "stage": stage.value,
+                    "passed": repaired.passed,
+                    "issue_count": len(getattr(repaired, "issues", [])),
+                    "schema": schema.__name__,
+                    "language_repair": True,
+                },
+                metadata={
+                    "issue_codes": [issue.code for issue in getattr(repaired, "issues", [])],
+                    "category": getattr(repaired, "category", None),
+                    "evidence_sha256": content_fingerprint(repaired.evidence),
+                    "trace_version": "pengine-1",
+                },
+            )
             return repaired
+        record_langfuse_event(
+            "pengine.review.semantic",
+            input={
+                "stage": stage.value,
+                "passed": review.passed,
+                "issue_count": len(review_issues),
+                "schema": schema.__name__,
+                "language_repair": False,
+            },
+            metadata={
+                "issue_codes": review_issue_codes,
+                "category": getattr(review, "category", None),
+                "evidence_sha256": content_fingerprint(review.evidence),
+                "trace_version": "pengine-1",
+            },
+        )
         return review
 
     async def _invoke_repair_subagent(
@@ -3870,6 +4587,7 @@ class StageGuardMiddleware(AgentMiddleware):
         ),
         stage: InternalStage,
         expected_episode_number: int | None = None,
+        repair_round: int | None = None,
     ) -> tuple[ToolMessage | Command[Any], Mapping[str, Any]]:
         repair_request = _subagent_request(
             request,
@@ -3935,7 +4653,8 @@ class StageGuardMiddleware(AgentMiddleware):
             )
             return parsed_result
 
-        result = await handler(repair_request)
+        with self._repair_round_context(repair_round):
+            result = await handler(repair_request)
         try:
             parsed = parse_result(result)
         except AgentProtocolError as exc:
@@ -3975,7 +4694,8 @@ class StageGuardMiddleware(AgentMiddleware):
                     retry_request,
                     {"/workspace/result_to_translate.json": original_message.content},
                 )
-            result = await handler(retry_request)
+            with self._repair_round_context(repair_round):
+                result = await handler(retry_request)
             parsed = parse_result(result)
             if exc.language_retry_fingerprint is not None and not _language_retry_matches(
                 exc.language_retry_fingerprint,
@@ -3986,6 +4706,17 @@ class StageGuardMiddleware(AgentMiddleware):
                     stage=stage,
                     safe_message="语言修复改变了已锁定的合同或连续性状态。",
                 ) from exc
+        record_langfuse_event(
+            "pengine.repair.result",
+            input={
+                "stage": stage.value,
+                "repair_kind": subagent_type,
+                "succeeded": True,
+                "episode_number": expected_episode_number,
+                "repair_round": repair_round,
+            },
+            metadata={"trace_version": "pengine-1"},
+        )
         return result, parsed.model_dump(mode="json")
 
     async def _milestone_review(
@@ -4150,6 +4881,36 @@ class StageGuardMiddleware(AgentMiddleware):
             if self.reset_episode_deadline is not None:
                 await self.reset_episode_deadline()
             await self.before_episode(plan)
+            evidence_contract = _evidence_contract(
+                contract,
+                plan.episode_number,
+                phase="initial_episode_write",
+            )
+            evidence_contract_json = json.dumps(
+                evidence_contract,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            required_evidence_target_ids = json.dumps(
+                evidence_contract["required_evidence_target_ids"],
+                ensure_ascii=False,
+            )
+            required_verbatim_facts = json.dumps(
+                evidence_contract["required_verbatim_facts"],
+                ensure_ascii=False,
+            )
+            suffix_feedback = _suffix_rewrite_feedback_for_episode(
+                self.suffix_rewrite_feedback,
+                plan.episode_number,
+            )
+            suffix_rewrite_instruction = ""
+            if suffix_feedback is not None:
+                suffix_rewrite_instruction = (
+                    " This is a suffix rewrite caused by the unresolved bound structural "
+                    "reviews in the read-only /workspace/suffix_rewrite_review.json. Read "
+                    "every review evidence entry and fix every named conflict; the locked "
+                    "story contract has priority, and do not reproduce the named defect."
+                )
             episode_args = {
                 **args,
                 "description": (
@@ -4157,6 +4918,16 @@ class StageGuardMiddleware(AgentMiddleware):
                     f"Write only episode {plan.episode_number}.\n"
                     f"Approved episode plan:\n{plan.plan}"
                     f"\nLocked contract SHA-256: {contract_hash}"
+                    "\nScreenplay labels and dialogue notation are format choices, not a cast "
+                    "whitelist. Preserve hard-Canon character identities without normalizing "
+                    "aliases, roles, generic labels, or colon-form lines. Read "
+                    "/workspace/evidence_contract.json and perform an exact-set self-check "
+                    f"against required_evidence_target_ids={required_evidence_target_ids}: "
+                    "no extra or duplicate target IDs and every excerpt verbatim in content. "
+                    "Only required_verbatim_facts require fact.value to appear contiguously "
+                    f"verbatim in content: required_verbatim_facts={required_verbatim_facts}. "
+                    "All other facts are semantic-only."
+                    f"{suffix_rewrite_instruction}"
                 ),
             }
             episode_files = {
@@ -4181,11 +4952,18 @@ class StageGuardMiddleware(AgentMiddleware):
                 {
                     "/workspace/story_contract.json": contract_json,
                     "/workspace/story_contract.md": outline["story_contract_markdown"],
+                    "/workspace/evidence_contract.json": evidence_contract_json,
                     "/workspace/series_state.json": prior_state.model_dump_json(),
                     "/workspace/previous_episode_handoff.md": prior_state.handoff or "None",
                     "/workspace/writer_notes.md": writer_notes or "None",
                 }
             )
+            if suffix_feedback is not None:
+                episode_files["/workspace/suffix_rewrite_review.json"] = json.dumps(
+                    suffix_feedback,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
             episode_request = _request_with_files(
                 request.override(
                     tool_call={**request.tool_call, "args": episode_args},
@@ -4249,16 +5027,12 @@ class StageGuardMiddleware(AgentMiddleware):
                         description=(
                             f"Review episode {plan.episode_number} and the complete committed "
                             "series prefix against the locked contract and every approved upstream "
-                            "artifact. Reject only a direct explicit hard-Canon contradiction, "
-                            "an impossible required locked binding, or a proven private-runtime "
-                            "leak. Compare only explicitly locked or formally committed "
+                            "artifact. Compare only explicitly locked or formally committed "
                             "identities, relationships, aliases, pronouns, ages, "
                             "durations, call participants, clue meanings, causal facts, viewpoint "
                             "knowledge, cast, and episode obligation across all prior scripts and "
                             "the current candidate. The candidate's final dramatic beat must "
                             "realize the locked end_hook without a later beat undoing it. On the "
-                            "other hand, screenplay format, labels, calculation or reasoning, "
-                            "and ordinary creative choices are not defects by themselves. On the "
                             "final episode this is the whole-series consistency review before "
                             "script-stage approval. Read /workspace/series_prefix.json as a "
                             "trusted runtime envelope: episode_number and JSON framing are trusted "
@@ -4342,24 +5116,90 @@ class StageGuardMiddleware(AgentMiddleware):
                         repair_rounds=repair_rounds,
                     )
                 repair_rounds += 1
+                unknown_speaker_issues = [
+                    issue for issue in review.issues if issue.code == "unknown_speaker"
+                ]
+                evidence_coverage_issues = [
+                    issue for issue in review.issues if issue.code == "evidence_coverage_mismatch"
+                ]
+                verbatim_fact_issues = [
+                    issue for issue in review.issues if issue.code == "verbatim_fact_missing"
+                ]
+                evidence_repair_issues = [
+                    *evidence_coverage_issues,
+                    *verbatim_fact_issues,
+                ]
+                evidence_contract_references = sorted(
+                    {
+                        reference
+                        for issue in evidence_coverage_issues
+                        for reference in issue.contract_refs
+                    }
+                )
+                repair_description = (
+                    f"Repair episode {plan.episode_number}; round {repair_rounds} of 2. "
+                    "Change only the unlocked candidate and state delta. Keep the locked "
+                    "contract and earlier episodes unchanged, and address every review issue. "
+                    "The final dramatic beat must realize the locked end_hook, with no later "
+                    "beat that cancels or replaces it. Before returning the complete screenplay "
+                    "and state_delta, preserve the candidate's established screenplay notation. "
+                    "Read /workspace/evidence_contract.json and self-check the exact evidence "
+                    "target set before returning."
+                )
+                if suffix_feedback is not None:
+                    repair_description += (
+                        " This is a suffix rewrite caused by the unresolved bound structural "
+                        "reviews in the read-only /workspace/suffix_rewrite_review.json. Read "
+                        "every review evidence entry and fix every named conflict; the locked "
+                        "story contract has priority, and do not reproduce the named defect."
+                    )
+                if unknown_speaker_issues:
+                    repair_description += (
+                        " Resolve every unknown_speaker issue only as the contextual review "
+                        "describes it. Repair a genuinely new continuity-bearing character that "
+                        "conflicts with explicit hard Canon, while preserving surface notation. "
+                        "Do not rewrite a label merely because it is an alias, occupational "
+                        "title, generic or descriptive label, or appears before a colon."
+                    )
+                if evidence_coverage_issues:
+                    repair_description += (
+                        " Evidence coverage repair is mandatory. Use the exact required target "
+                        "IDs from issue.contract_refs: "
+                        f"{json.dumps(evidence_contract_references, ensure_ascii=False)}. "
+                        "Return exactly one state_delta.evidence entry per required target ID "
+                        "and remove every unexpected target. Rebuild the exact set: no extras, "
+                        "no duplicates, every required target exactly once, and every excerpt "
+                        "must occur verbatim in content."
+                    )
+                if verbatim_fact_issues:
+                    verbatim_fact_references = sorted(
+                        {
+                            reference
+                            for issue in verbatim_fact_issues
+                            for reference in issue.contract_refs
+                        }
+                    )
+                    repair_description += (
+                        " Verbatim fact repair is mandatory. Use the exact fact IDs from "
+                        "issue.contract_refs: "
+                        f"{json.dumps(verbatim_fact_references, ensure_ascii=False)}. "
+                        "For each matching required_verbatim_facts item, restore its exact "
+                        "fact.value as one contiguous substring in content; facts not listed "
+                        "there remain semantic-only."
+                    )
                 result, payload = await self._invoke_repair_subagent(
                     request=episode_request,
                     handler=handler,
                     subagent_type="episode_repair",
-                    description=(
-                        f"Repair episode {plan.episode_number}; round {repair_rounds} of 2. "
-                        "Change only the unlocked candidate and state delta. Keep the locked "
-                        "contract and earlier episodes unchanged, and address every review issue. "
-                        "For evidence issues, return exactly one state_delta.evidence entry per "
-                        "required target ID, remove every unexpected target, and use a verbatim "
-                        "excerpt that appears in the repaired content. "
-                        "The final dramatic beat must realize the locked end_hook, with no later "
-                        "beat that cancels or replaces it. Preserve the candidate's established "
-                        "screenplay notation; do not normalize a surface label unless the review "
-                        "proves a new continuity-bearing character violates explicit hard Canon."
-                    ),
+                    description=repair_description,
                     files={
                         "/workspace/story_contract.json": contract_json,
+                        "/workspace/evidence_contract.json": _evidence_contract_json(
+                            contract,
+                            plan.episode_number,
+                            rejected_issues=evidence_repair_issues,
+                            phase="episode_repair",
+                        ),
                         "/workspace/series_state.json": prior_state.model_dump_json(),
                         "/workspace/current_episode_plan.md": plan.plan,
                         "/workspace/current_episode_obligation.json": (
@@ -4370,10 +5210,22 @@ class StageGuardMiddleware(AgentMiddleware):
                             parsed.state_delta.model_dump_json()
                         ),
                         "/workspace/episode_review.json": review.model_dump_json(),
+                        **(
+                            {
+                                "/workspace/suffix_rewrite_review.json": json.dumps(
+                                    suffix_feedback,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                )
+                            }
+                            if suffix_feedback is not None
+                            else {}
+                        ),
                     },
                     schema=ScriptWriterResult,
                     stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
                     expected_episode_number=plan.episode_number,
+                    repair_round=repair_rounds,
                 )
                 parsed = ScriptWriterResult.model_validate(payload)
 
@@ -4413,6 +5265,7 @@ class DeepAgentWorkflow:
     recursion_limit: int = 80
     generation_provider_profile_key: str = "anthropic"
     review_provider_profile_key: str = "deepseek"
+    model_call_state: ModelCallState | None = None
 
     def __post_init__(self) -> None:
         register_pengine_harness_profile(self.generation_provider_profile_key)
@@ -4444,6 +5297,7 @@ class DeepAgentWorkflow:
         series_bible: SeriesBibleSummary | None = None,
         register_series_review: SeriesReviewRegistration | None = None,
         get_series_bible: SeriesBibleRetriever | None = None,
+        suffix_rewrite_feedback: Mapping[str, Any] | None = None,
     ) -> WorkflowResult:
         approved_payloads: dict[InternalStage, Any] = {
             stage: payload for stage, payload in (approved_checkpoints or {}).items()
@@ -4504,7 +5358,20 @@ class DeepAgentWorkflow:
             )
 
         structured_output_retry = _structured_output_retry_message
-        structured_result_middleware = [StructuredResultMiddleware()]
+        generation_tools = list(tools)
+        repair_tools = [
+            tool for tool in tools if _model_request_tool_name(tool) == "calculate_arithmetic"
+        ]
+
+        def stage_middleware(
+            allowed_tools: frozenset[str],
+            *,
+            system_prompt: str,
+        ) -> list[AgentMiddleware]:
+            return [
+                StructuredResultMiddleware(),
+                ToolAllowlistMiddleware(allowed_tools, system_prompt=system_prompt),
+            ]
 
         def bind_language(prompt: str) -> str:
             if not output_language_contract:
@@ -4631,6 +5498,42 @@ class DeepAgentWorkflow:
             )
             return _outline_repair_result(response)
 
+        story_architect_prompt = bind_language(_STORY_ARCHITECT_PROMPT)
+        episode_planner_prompt = bind_language(_EPISODE_PLANNER_PROMPT)
+        script_writer_prompt = bind_language(_SCRIPT_WRITER_PROMPT)
+        quality_reviewer_prompt = bind_language(_QUALITY_REVIEWER_PROMPT)
+        canon_reviewer_prompt = bind_language(
+            "First read /skills/canon-review/SKILL.md. Follow that skill while treating "
+            "explicitly locked facts in approved upstream artifacts as immutable and "
+            "unspecified prose details as free. Review only the explicitly named unlocked "
+            "prose artifact or JSON contract, and return structured evidence with precise "
+            "issues. For a JSON contract mutation, set contract_mutation_required=true and "
+            "provide only exact repair_targets; keep contract_refs for Canon entity IDs. "
+            "Express an exact full-item replace, remove, or missing append, including the "
+            "current index and expected value where applicable. The runtime applies every "
+            "target atomically and validates the combined StoryContract. Give every target "
+            "a unique target_id and never grant a whole collection implicitly. Never repair "
+            "or rewrite the candidate."
+        )
+        episode_reviewer_prompt = bind_language(_EPISODE_REVIEWER_PROMPT)
+        series_reviewer_prompt = bind_language(_SERIES_REVIEWER_PROMPT)
+        episode_repair_prompt = bind_language(_EPISODE_REPAIR_PROMPT)
+        story_repair_prompt = bind_language(
+            "First read /skills/story-repair/SKILL.md. Follow that skill while keeping every "
+            "approved upstream hard fact unchanged and preserving unspecified creative "
+            "choices. Read the current candidate and every confirmed review issue, then "
+            "return the complete corrected character_biographies and relationship_logic in "
+            "one structured result. Resolve issues jointly across both sections rather than "
+            "line by line."
+        )
+        supervisor_prompt = _supervisor_prompt(
+            story=story,
+            requirements=requirements,
+            feedback=feedback,
+            approved_json=approved_json,
+            language_contract=output_language_contract,
+        )
+
         subagents = [
             {
                 "name": "story_architect",
@@ -4638,11 +5541,14 @@ class DeepAgentWorkflow:
                     "Selects L0 and creates story outline, character biographies, "
                     "and relationship logic as separate structured tasks."
                 ),
-                "system_prompt": bind_language(_STORY_ARCHITECT_PROMPT),
+                "system_prompt": story_architect_prompt,
                 "model": self.generation_model,
-                "tools": tools,
+                "tools": generation_tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
-                "middleware": structured_result_middleware,
+                "middleware": stage_middleware(
+                    _GENERATION_TOOL_ALLOWLIST,
+                    system_prompt=story_architect_prompt,
+                ),
                 "response_format": ToolStrategy(
                     schema=StoryArchitectResult,
                     handle_errors=structured_output_retry,
@@ -4651,11 +5557,14 @@ class DeepAgentWorkflow:
             {
                 "name": "episode_planner",
                 "description": "Creates the complete episode outline.",
-                "system_prompt": bind_language(_EPISODE_PLANNER_PROMPT),
+                "system_prompt": episode_planner_prompt,
                 "model": self.generation_model,
-                "tools": tools,
+                "tools": generation_tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
-                "middleware": structured_result_middleware,
+                "middleware": stage_middleware(
+                    _GENERATION_TOOL_ALLOWLIST,
+                    system_prompt=episode_planner_prompt,
+                ),
                 "response_format": ToolStrategy(
                     schema=EpisodePlannerResult,
                     handle_errors=structured_output_retry,
@@ -4664,11 +5573,14 @@ class DeepAgentWorkflow:
             {
                 "name": "script_writer",
                 "description": "Creates the complete episode scripts.",
-                "system_prompt": bind_language(_SCRIPT_WRITER_PROMPT),
+                "system_prompt": script_writer_prompt,
                 "model": self.generation_model,
-                "tools": tools,
+                "tools": generation_tools,
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
-                "middleware": structured_result_middleware,
+                "middleware": stage_middleware(
+                    _GENERATION_TOOL_ALLOWLIST,
+                    system_prompt=script_writer_prompt,
+                ),
                 "response_format": ToolStrategy(
                     schema=ScriptWriterResult,
                     handle_errors=structured_output_retry,
@@ -4679,11 +5591,14 @@ class DeepAgentWorkflow:
                 "description": (
                     "Reviews the L0 and L4 gates and itemizes revision-feedback coverage."
                 ),
-                "system_prompt": bind_language(_QUALITY_REVIEWER_PROMPT),
+                "system_prompt": quality_reviewer_prompt,
                 "model": self.review_model,
-                "tools": tools,
-                "permissions": VIRTUAL_FILE_PERMISSIONS,
-                "middleware": structured_result_middleware,
+                "tools": [],
+                "permissions": REVIEW_FILE_PERMISSIONS,
+                "middleware": stage_middleware(
+                    _REVIEW_TOOL_ALLOWLIST,
+                    system_prompt=quality_reviewer_prompt,
+                ),
                 "response_format": ToolStrategy(
                     schema=QualityReviewerResult,
                     handle_errors=structured_output_retry,
@@ -4694,27 +5609,16 @@ class DeepAgentWorkflow:
                 "description": (
                     "Independently reviews an unlocked story artifact or structured contract."
                 ),
-                "system_prompt": bind_language(
-                    "Use the canon-review skill. Treat explicitly locked facts in approved "
-                    "upstream artifacts as immutable; treat unspecified prose details as free. "
-                    "Review only the explicitly named unlocked prose artifact or JSON "
-                    "contract, and return structured evidence with precise issues. For a JSON "
-                    "contract mutation, set contract_mutation_required=true and provide only "
-                    "exact repair_targets; keep contract_refs for Canon entity IDs. Express an "
-                    "exact full-item replace, remove, or missing append, including the current "
-                    "index and expected value where applicable. The runtime applies every target "
-                    "atomically and validates the combined StoryContract. Give every target a "
-                    "unique target_id and never grant a whole collection implicitly. "
-                    "Never repair or rewrite the candidate."
-                ),
+                "system_prompt": canon_reviewer_prompt,
                 "model": self.review_model,
-                # No working tools: the candidate and upstream artifacts are already
-                # injected as workspace files. Arithmetic and reference retrieval are
-                # generation-stage tools; giving them to the reviewer causes work-tool
-                # loops that exhaust the subagent recursion budget on large candidates.
+                # Reviewers may read the explicitly injected workspace files, but they
+                # cannot list/search/write or invoke generation-stage tools.
                 "tools": [],
                 "permissions": REVIEW_FILE_PERMISSIONS,
-                "middleware": structured_result_middleware,
+                "middleware": stage_middleware(
+                    _REVIEW_TOOL_ALLOWLIST,
+                    system_prompt=canon_reviewer_prompt,
+                ),
                 "skills": _SPECIALIST_SKILL_SOURCES["canon_reviewer"],
                 "response_format": ToolStrategy(
                     schema=CanonReviewerResult,
@@ -4724,11 +5628,14 @@ class DeepAgentWorkflow:
             {
                 "name": "episode_reviewer",
                 "description": "Independently reviews one episode against locked continuity.",
-                "system_prompt": bind_language(_EPISODE_REVIEWER_PROMPT),
+                "system_prompt": episode_reviewer_prompt,
                 "model": self.review_model,
-                "tools": tools,
+                "tools": [],
                 "permissions": REVIEW_FILE_PERMISSIONS,
-                "middleware": structured_result_middleware,
+                "middleware": stage_middleware(
+                    _REVIEW_TOOL_ALLOWLIST,
+                    system_prompt=episode_reviewer_prompt,
+                ),
                 "skills": _SPECIALIST_SKILL_SOURCES["episode_reviewer"],
                 "response_format": ToolStrategy(
                     schema=EpisodeReviewerResult,
@@ -4742,11 +5649,14 @@ class DeepAgentWorkflow:
                     "structural milestone or the final completion and returns a deterministic "
                     "classification."
                 ),
-                "system_prompt": bind_language(_SERIES_REVIEWER_PROMPT),
+                "system_prompt": series_reviewer_prompt,
                 "model": self.review_model,
-                "tools": tools,
+                "tools": [],
                 "permissions": REVIEW_FILE_PERMISSIONS,
-                "middleware": structured_result_middleware,
+                "middleware": stage_middleware(
+                    _REVIEW_TOOL_ALLOWLIST,
+                    system_prompt=series_reviewer_prompt,
+                ),
                 "response_format": ToolStrategy(
                     schema=StructuralReviewResult,
                     handle_errors=structured_output_retry,
@@ -4755,18 +5665,14 @@ class DeepAgentWorkflow:
             {
                 "name": "episode_repair",
                 "description": "Repairs only the current unlocked episode candidate.",
-                "system_prompt": bind_language(
-                    "Use the continuity-repair skill. Keep the locked contract and earlier "
-                    "episodes unchanged. Treat character identities as continuity constraints, "
-                    "not a surface-label whitelist: do not normalize aliases, roles, generic or "
-                    "descriptive labels, or colon-form lines unless contextual evidence proves "
-                    "a genuinely new character contradicting explicit hard Canon. Return the "
-                    "complete structured script result only."
-                ),
+                "system_prompt": episode_repair_prompt,
                 "model": self.generation_model,
-                "tools": tools,
-                "permissions": SKILLED_WRITE_PERMISSIONS,
-                "middleware": structured_result_middleware,
+                "tools": repair_tools,
+                "permissions": REVIEW_FILE_PERMISSIONS,
+                "middleware": stage_middleware(
+                    _REPAIR_TOOL_ALLOWLIST,
+                    system_prompt=episode_repair_prompt,
+                ),
                 "skills": _SPECIALIST_SKILL_SOURCES["episode_repair"],
                 "response_format": ToolStrategy(
                     schema=ScriptWriterResult,
@@ -4779,18 +5685,14 @@ class DeepAgentWorkflow:
                     "Rewrites the unlocked character+relationships candidate to "
                     "resolve every confirmed canon-review issue."
                 ),
-                "system_prompt": bind_language(
-                    "Use the story-repair skill. Keep every approved upstream hard fact "
-                    "unchanged and preserve unspecified creative choices. Read the current "
-                    "candidate and every confirmed review issue, then return the complete "
-                    "corrected character_biographies and "
-                    "relationship_logic in one structured result. Resolve issues jointly "
-                    "across both sections rather than line by line."
-                ),
+                "system_prompt": story_repair_prompt,
                 "model": self.generation_model,
-                "tools": tools,
-                "permissions": SKILLED_WRITE_PERMISSIONS,
-                "middleware": structured_result_middleware,
+                "tools": repair_tools,
+                "permissions": REVIEW_FILE_PERMISSIONS,
+                "middleware": stage_middleware(
+                    _REPAIR_TOOL_ALLOWLIST,
+                    system_prompt=story_repair_prompt,
+                ),
                 "skills": _SPECIALIST_SKILL_SOURCES["story_repair"],
                 "response_format": ToolStrategy(
                     schema=StoryArchitectResult,
@@ -4802,14 +5704,8 @@ class DeepAgentWorkflow:
         supervisor = create_deep_agent(
             model=self.generation_model,
             name="workflow_supervisor",
-            system_prompt=_supervisor_prompt(
-                story=story,
-                requirements=requirements,
-                feedback=feedback,
-                approved_json=approved_json,
-                language_contract=output_language_contract,
-            ),
-            tools=tools,
+            system_prompt=supervisor_prompt,
+            tools=[],
             middleware=[
                 StageGuardMiddleware(
                     before_stage,
@@ -4828,7 +5724,14 @@ class DeepAgentWorkflow:
                     series_bible=series_bible,
                     register_series_review=register_series_review,
                     get_series_bible=get_series_bible,
-                )
+                    model_call_state=self.model_call_state,
+                    suffix_rewrite_feedback=suffix_rewrite_feedback,
+                ),
+                ToolAllowlistMiddleware(
+                    _SUPERVISOR_TOOL_ALLOWLIST,
+                    system_prompt=supervisor_prompt,
+                    compact_tool_history=True,
+                ),
             ],
             subagents=subagents,
             permissions=VIRTUAL_FILE_PERMISSIONS,

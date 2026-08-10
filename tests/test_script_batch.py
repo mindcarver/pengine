@@ -484,6 +484,62 @@ async def test_suffix_rewrite_preserves_prefix_and_supersedes_suffix(
     assert rewritten.series_state.locked_through_episode == 2
 
 
+async def test_suffix_rewrite_starts_new_episode_attempt_cycle_without_losing_history(
+    repository: Repository,
+) -> None:
+    _, lease = await create_leased_run(repository)
+    _, _, committed = await seed_batch_with_episodes(repository, lease.run_id, up_to=3)
+    first, _, _ = committed
+
+    async with repository._transaction() as connection:
+        await connection.executemany(
+            """
+            INSERT INTO episode_attempts(
+                run_id, episode_number, attempt_cycle, attempt_number, recorded_at
+            ) VALUES (?, ?, 0, ?, ?)
+            """,
+            [
+                (str(lease.run_id), episode, attempt, NOW.isoformat())
+                for episode in (2, 3)
+                for attempt in range(1, 4)
+            ],
+        )
+
+    await repository.rewrite_episode_suffix(lease.run_id, 2, now=NOW)
+
+    assert await repository.get_episode_attempt_cycles(lease.run_id) == {1: 0, 2: 1, 3: 1}
+    assert await repository.get_episode_attempt_counts(lease.run_id) == {}
+    async with repository._connection() as connection:
+        rows = await (
+            await connection.execute(
+                """
+                SELECT episode_number, attempt_cycle, COUNT(*) AS count
+                FROM episode_attempts
+                WHERE run_id = ?
+                GROUP BY episode_number, attempt_cycle
+                ORDER BY episode_number, attempt_cycle
+                """,
+                (str(lease.run_id),),
+            )
+        ).fetchall()
+    assert [(row["episode_number"], row["attempt_cycle"], row["count"]) for row in rows] == [
+        (2, 0, 3),
+        (3, 0, 3),
+    ]
+
+    assert await repository.record_episode_attempt(lease.run_id, 2, now=NOW) == 1
+    assert await repository.record_episode_attempt(lease.run_id, 2, now=NOW) == 2
+    assert await repository.record_episode_attempt(lease.run_id, 2, now=NOW) == 3
+    with pytest.raises(DomainError) as exhausted:
+        await repository.record_episode_attempt(lease.run_id, 2, now=NOW)
+    assert exhausted.value.code == "attempts_exhausted"
+    assert await repository.get_episode_attempt_counts(lease.run_id) == {2: 3}
+
+    lineage = await repository.get_script_batch_lineage(lease.run_id)
+    assert lineage is not None
+    assert lineage.active_pointers == {1: first.candidate_id}
+
+
 async def test_suffix_rewrite_state_never_borrows_superseded_suffix_deltas(
     repository: Repository,
 ) -> None:

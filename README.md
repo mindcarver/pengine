@@ -22,8 +22,9 @@ Pengine V1 是一个带同源 Web 原型的本地短剧创作 Agent。它通过
 [Deep Agents](https://github.com/langchain-ai/deepagents) 与 LangGraph，
 让阶段化专业 Agent 按固定流程协作；业务状态、检查点和交付物全部落在本地
 SQLite。模型请求共用一组 relay URL 与密钥，但按角色固定为两条路由：生成与创作修复
-使用 Anthropic Messages 的 `claude-opus-5`，审核使用 DeepSeek OpenAI-compatible 的
-`deepseek-v4-flash`。
+使用 Anthropic Messages 的 `claude-opus-5`；审核模型可配置为 `deepseek-v4-flash`、
+`gpt-5.5`、`gpt-5.6-terra` 或 `claude-opus-5`，运行时按模型选择 DeepSeek、OpenAI
+或 Anthropic 客户端协议。
 
 Web 原型只服务本机单操作员，并以约 1.8 秒轮询展示后端确认的六个用户阶段进度、
 已运行时长和超时恢复操作；V1 没有身份认证、公共部署、多用户隔离、SSE /
@@ -69,7 +70,7 @@ WebSocket 或跨项目可写记忆。
 | 状态仓库 | 管理创作、运行、任务、反馈、检查点与交付物 |
 | 内嵌任务器 | 租约、重启恢复、阶段尝试预算、工作流调度 |
 | Agent 编排层 | 由监督 Agent 编排同步创作 Agent 与技能化审查/修复子代理 |
-| 模型中继客户端 | 共用 URL/密钥，按角色固定调用 Opus 生成路由与 DeepSeek 审核路由 |
+| 模型中继客户端 | 共用 URL/密钥，生成固定走 Opus；审核按配置选择 DeepSeek、OpenAI 或 Anthropic 协议 |
 
 系统采用模块化单体：一个进程、一个 Worker、一次处理一个创作任务，不依赖外部
 消息队列或远程 Agent。
@@ -125,22 +126,29 @@ persona/
 - `script_writer`：分集剧本；
 - `quality_reviewer`：L0/L4 验收证据与修订反馈覆盖。
 
-`workflow_supervisor`、三个创作 Agent、故事／分集大纲补丁生成和 `episode_repair`
-固定使用生成路由；`quality_reviewer`、`canon_reviewer` 与 `episode_reviewer` 固定使用
-审核路由。两个角色不互换，也不会在一路失败时回退到另一路。
+`workflow_supervisor`、三个创作 Agent、故事／分集大纲补丁生成、`episode_repair` 和
+`story_repair` 固定使用生成路由；`quality_reviewer`、`canon_reviewer`、
+`episode_reviewer` 与 `series_reviewer` 固定使用审核路由。两个角色不互换，也不会在
+一路失败时回退到另一路。
 
-分集大纲批准前，`episode_planner` 同步产出结构化、带版本的剧情合同。
+分集大纲批准前，`episode_planner` 在一次结构化结果中同步产出全部 `episode_plans`、
+`StoryContract` 和结构审查里程碑。
 确定性校验与加载 `canon-review` skill 的独立审查子代理均通过后，合同及其
 SHA-256 才会写入业务检查点并锁定。后续每集只读取该合同、上一集折叠后的
 `series_state` 和已锁剧本；`episode-continuity-review` 独立审查通过后，剧本、
 `episode_state_delta`、新状态及其哈希才会原子提交。Skill 只加载到对应审查或
 修复子代理，不作为监督 Agent 的全局提示。
 
+剧本正文是结构化结果中的文本字段，不会被拆成逐句 JSON；结构化部分只承载分集编号、
+状态增量、证据目标和审核结果。说话人标签、冒号格式、片尾标记、算式以及故事世界里的
+JSON／代码／AI 题材本身都不是拒绝理由；只有与明确 hard Canon 冲突，或能够指向私有运行
+来源的真实泄漏，才构成阻断。
+
 当已批准的分集大纲带有剧情合同时，Pengine 会把故事大纲、人物小传、关系逻辑、
 分集大纲与合同组装成一个**不可变的设计包候选（SeriesBible）**：所有投影与哈希
 同属一个候选，任何接口、界面、检查点或重启状态都观察不到跨版本混合。候选需
 通过确定性通用校验（schema、引用、唯一性、顺序、显式算术、投影一致）与按类型
-激活的规则（悬疑才要求线索与揭晓，普通题材不会被误拒），并由 DeepSeek 对**该
+激活的规则（悬疑才要求线索与揭晓，普通题材不会被误拒），并由审核路由对**该
 精确候选**做全局设计审核后才允许原子提升为 active。同一运行族系对确认的设计
 缺陷最多自动整体重建一次；过期候选与审核作为不可变证据保留，永远不能移动激活
 指针。设计哈希／纪元一旦变化，旧的脚本批次整体失效。工作台从唯一激活候选展示
@@ -156,6 +164,11 @@ SHA-256 才会写入业务检查点并锁定。后续每集只读取该合同、
 次数与内容修复次数分别记录，互不消耗。只有全部分集锁定、聚合哈希复验通过，
 且 L0/L4 闸门通过的完整内容包才会公开。
 
+> **60–100 集当前边界：**数据合同没有设置集数上限，但当前 `episode_planner` 仍在一次
+> 模型调用中返回全量分集大纲与剧情合同，尚未实现分批规划。代码因此不能把“接受 80 集
+> 输入”解释为“已可靠支持 80 集生产”。逐集写作会持久化每一集并可恢复，但默认整阶段
+> 调用预算为生成 `192`、审核 `128`；80 集只有在大多数集首轮通过时才可能落在审核预算内。
+
 <h2 align="center">04 · 一次创作，一次修订</h2>
 
 1. 创建请求使用调用方生成的 `Idempotency-Key`，返回异步资源地址；
@@ -169,7 +182,7 @@ SHA-256 才会写入业务检查点并锁定。后续每集只读取该合同、
 <h2 align="center">05 · 快速启动</h2>
 
 要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及一个能以同一组 URL／密钥
-同时提供 Anthropic Messages 与 DeepSeek OpenAI-compatible chat completions 的 relay。
+同时提供 Anthropic Messages 生成路由和所选审核协议的 relay。
 仓库已内置四套临时原型人格包。
 这四套人格当前统一采用 6 集原型基线，不代表创作者人格定稿。
 
@@ -195,19 +208,24 @@ PENGINE_GENERATION_MAX_OUTPUT_TOKENS=128000
 # 未设置时 fail closed，任何真实模型请求都不会发出。
 PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS=200000
 PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS=64000
+PENGINE_STAGE_MODEL_CALL_LIMIT=48
+PENGINE_STAGE_REVIEW_CALL_LIMIT=32
+PENGINE_SCRIPT_STAGE_MODEL_CALL_TOTAL_LIMIT=192
+PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 ```
 
 API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localhost`、
 `127.0.0.1` 和 `::1` 可使用 HTTP。`PENGINE_RELAY_BASE_URL` 与
 `PENGINE_RELAY_API_KEY` 同时交给两个客户端；该地址必须同时接受 Anthropic Messages
-和 OpenAI-compatible 请求。`PENGINE_GENERATION_MODEL_ID` 必须是 `claude-opus-5`，
-`PENGINE_REVIEW_MODEL_ID` 必须是 `deepseek-v4-flash`。URL、密钥或任一模型 ID 缺失时，
+和所选审核模型对应的协议。`PENGINE_GENERATION_MODEL_ID` 必须是 `claude-opus-5`；
+`PENGINE_REVIEW_MODEL_ID` 只能是 `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`
+或 `claude-opus-5`。URL、密钥或任一模型 ID 缺失时，
 工作流会 fail closed，不会降级成单模型，也不会跨角色回退。
 
 生成路由通过 `ChatAnthropic` 调用 Anthropic Messages；
 `PENGINE_GENERATION_MAX_OUTPUT_TOKENS` 默认使用 Opus 5 支持的最大值 128000，且不能
-配置为更大的值。审核路由通过原生
-`ChatDeepSeek` 调用 OpenAI-compatible API，关闭 thinking 并串行调用工具；未设置
+配置为更大的值。审核路由分别使用 `ChatDeepSeek`、`ChatOpenAI` 或 `ChatAnthropic`；
+DeepSeek 路径关闭 thinking，所有审核客户端都串行调用工具。未设置
 `PENGINE_REVIEW_MAX_OUTPUT_TOKENS` 时 Pengine 不额外添加输出上限。旧的
 `PENGINE_RELAY_ADAPTER`、`PENGINE_RELAY_MODEL_ID` 和
 `PENGINE_RELAY_MAX_OUTPUT_TOKENS` 已不再生效，设置它们不能配置或覆盖任一路由。
@@ -223,11 +241,17 @@ tools/schema 与完整规范上下文，加上该路由的**保留输出**，估
 估计值与 provider 实际用量是两个独立字段：provider 报告 input/output/cache 用量时按原值
 持久化；缺失时显示为 `unavailable`，绝不从估计值回填。
 
-每次尝试的调用（生成、审核、修复、被预检拦截的尝试）都会以唯一的 `call_id` 记录角色、
+每次尝试的物理调用（生成、审核、修复、被预检拦截的尝试）都会以唯一的 `call_id`
+记录角色，并以 `operation_id` 把一次业务产物操作与其真实 provider 调用关联；
 adapter/provider/model、阶段、分集、候选与批次血缘，以及估计值、实际或不可用用量、
 耗时、结束原因与结果，并同时写入结构化日志、SQLite 的 `model_calls` 表、创作资源
 （`RunProgress.model_calls`）与工作台用量面板；失败、超时、被取代、过期与被拦截的调用
 都保留各自的分类并计入本轮与整轮合计。
+
+默认调用预算同时约束单阶段/单集和整个剧本阶段。预算是在 provider dispatch 前保留的；
+超过预算会以 `agent_execution_limit` 阻断，而不会再发出一个注定无法记账的模型请求。
+分集候选、全剧审核和锁定后的剧情合同必须引用状态为 `succeeded` 的真实物理调用，不能
+用合成 `call_id` 补齐来源。
 
 确认 `PENGINE_PERSONA_ROOT=./personas` 后启动：
 
@@ -290,6 +314,10 @@ curl --fail-with-body -X POST \
 curl --fail-with-body -X POST \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/retry-final-review \
   -H 'Idempotency-Key: final-review-001'
+
+curl --fail-with-body -X POST \
+  http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/authorize-repair \
+  -H 'Idempotency-Key: repair-authorization-001'
 
 curl --fail-with-body -X POST \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/end \

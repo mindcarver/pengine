@@ -51,15 +51,15 @@ LangGraph checkpoint = 可恢复、但仍可能未批准的执行上下文
 
 ## 3. 逻辑表分组
 
-当前 `src/pengine/repository.py` 的迁移头版本为 `17`。下表按领域归纳表，而不是要求调用方直接依赖内部 SQL；SQL schema 变化必须通过迁移维护。
+当前 `src/pengine/repository.py` 的迁移头版本为 `18`。下表按领域归纳表，而不是要求调用方直接依赖内部 SQL；SQL schema 变化必须通过迁移维护。
 
 | 领域 | 逻辑表 | 作用 |
 | --- | --- | --- |
 | 元数据 | `pengine_schema` | 迁移版本 |
 | 作品与运行 | `creations`、`runs` | 原始输入、人格快照引用、初稿/修订 run、顺序和状态 |
 | 调度 | `jobs`、`stage_attempts` | 队列、租约、下次运行时间、阶段尝试保护 |
-| 业务 checkpoint | `business_checkpoints` | 通过验证的方向、设计产物、合同和阶段结果 |
-| 进度 | `run_progress`、`episode_plans`、`episode_drafts`、`episode_attempts`、`episode_timeouts` | 可恢复进度、逐集候选和超时证据 |
+| 业务 checkpoint | `business_checkpoints` | 通过验证的方向、设计产物、合同和阶段结果；锁定合同可绑定 `review_call_id` |
+| 进度 | `run_progress`、`episode_plans`、`episode_drafts`、`episode_attempts`、`episode_attempt_cycles`、`episode_attempt_current`、`episode_timeouts` | 可恢复进度、按重写周期隔离的逐集尝试和超时证据 |
 | 交付与修订 | `deliveries`、`frozen_revisions` | 成功交付、冻结 feedback、修订资格 |
 | 命令幂等 | `idempotency_records` | key、scope、payload hash 和已接受响应 |
 | 质量/内容 | `quality_gate_rejections`、`content_rejections` | L0/L4 拒绝、合同/连续性拒绝、证据和修复计数 |
@@ -148,10 +148,15 @@ parse structured result
 ```
 
 `business_checkpoints` 已批准记录不可被普通重试覆盖。修订或后续阶段只能基于已批准内容继续。
+带 `StoryContract` 的分集大纲还必须绑定一个同 run、审核角色、分集大纲阶段、状态为
+`succeeded` 且具有 `operation_id` 的真实 `review_call_id`；不能用合成 ID 补来源。
 
 ### 单集提交
 
-单集的剧本、`EpisodeStateDelta`、折叠 `SeriesState`、semantic review、repair rounds 和 hash 必须原子提交。提交前重新验证 design epoch、batch、active predecessor 和候选版本，防止迟到响应把旧后缀写回当前序列。
+单集的剧本、`EpisodeStateDelta`、折叠 `SeriesState`、semantic review、repair rounds、
+hash 和生成 `call_id` 必须原子提交。生成 `call_id` 必须来自同一 `operation_id` 下的真实
+成功物理调用。提交前重新验证 design epoch、batch、active predecessor 和候选版本，
+防止迟到响应把旧后缀写回当前序列。
 
 ### 正式交付
 
@@ -172,7 +177,7 @@ parse structured result
 
 | 字段组 | 说明 |
 | --- | --- |
-| 身份 | `call_id`、run/creation/thread、run kind |
+| 身份 | 物理 `call_id`、业务 `operation_id`、run/creation/thread、run kind |
 | 路由 | role、adapter、provider、requested model |
 | 血缘 | stage、episode、candidate、batch、supersedes_call_id |
 | 预算 | estimated input/output/total、verified limit、preflight |
@@ -182,6 +187,14 @@ parse structured result
 | 时间 | requested/finished/duration |
 
 实际用量缺失时不从估算值回填。估算是“是否允许发出请求”的安全预检证据，provider usage 才是实际使用证据。
+
+`operation_id` 不是 provider request id。Worker 在进入一个受保护阶段或一集写作时创建
+operation；callback 为每次真正出站调用记录唯一 `call_id`。锁定产物时，Repository 会
+反查同 run/role/stage/episode/operation 的成功记录，并在终态发布前等待审计 writer 落盘。
+
+Schema 18 同时引入两组迁移：旧 `episode_attempts` 进入 `attempt_cycle=0`，并增加
+`episode_attempt_cycles`/`episode_attempt_current`；`model_calls` 增加 `operation_id`，
+`business_checkpoints` 增加 `review_call_id` 以及相应索引。迁移在一个前向事务中完成。
 
 ## 8. SQLite、WAL 与备份
 

@@ -36,6 +36,20 @@ class Settings(BaseSettings):
     worker_poll_seconds: float = Field(default=0.25, gt=0)
     agent_recursion_limit: int = Field(default=200, ge=4)
     retrieval_limit: int = Field(default=5, ge=1, le=20)
+    # Per-stage outbound-call guardrails. These are deliberately separate from the
+    # graph recursion limit: one model call can consume several graph/tool steps.
+    stage_model_call_limit: int = Field(default=48, ge=1)
+    stage_review_call_limit: int = Field(default=32, ge=1)
+    # Script generation spans multiple episodes: keep per-episode limits above while
+    # retaining a bounded total for the whole script stage.
+    script_stage_model_call_total_limit: int = Field(default=192, ge=1)
+    script_stage_review_call_total_limit: int = Field(default=128, ge=1)
+    # Optional agent observability via a self-hosted Langfuse instance.
+    # Disabled by default so pengine runs unchanged when tracing is off.
+    langfuse_enabled: bool = Field(default=False)
+    langfuse_host: str | None = None
+    langfuse_public_key: SecretStr | None = None
+    langfuse_secret_key: SecretStr | None = None
 
     @property
     def database_path(self) -> Path:
@@ -52,6 +66,15 @@ class Settings(BaseSettings):
             and self.relay_api_key
             and self.generation_model_id
             and self.review_model_id
+        )
+
+    @property
+    def langfuse_configured(self) -> bool:
+        return bool(
+            self.langfuse_enabled
+            and self.langfuse_host
+            and self.langfuse_public_key
+            and self.langfuse_secret_key
         )
 
     @field_validator("generation_model_id")

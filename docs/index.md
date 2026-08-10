@@ -55,8 +55,8 @@ Pengine 把一个自由表达的故事想法、短剧要求和一份版本化人
           ┌──────────────────────────┼──────────────────────────┐
           ▼                          ▼                          ▼
     生成路由                     审核路由                    内容闸门
-  ChatAnthropic                ChatDeepSeek              L0 / L4 / final
-  claude-opus-5                deepseek-v4-flash
+  ChatAnthropic        DeepSeek / OpenAI / Anthropic    L0 / L4 / final
+  claude-opus-5          由 review_model_id 选择
           │                          │
           └────────────── 同一 relay URL / key ──────────────┘
 </code></pre>
@@ -71,13 +71,23 @@ Pengine 把一个自由表达的故事想法、短剧要求和一份版本化人
 <strong>这不是公共 SaaS。</strong> V1 只绑定回环地址，面向单个本地操作员；没有认证、多用户隔离、公共部署、流式传输、远程队列、跨创作可写记忆、任务列表/导出/删除 API，也不会把主机文件系统暴露给 Agent。
 </div>
 
-模型 relay 共享一组 URL 和 API key，但角色路由固定分离：生成和创作修复使用 Anthropic Messages 的 `claude-opus-5`；审核使用 DeepSeek OpenAI-compatible chat completions 的 `deepseek-v4-flash`。两类角色不互换，也不在一路失败时自动回退到另一路。
+模型 relay 共享一组 URL 和 API key，但角色路由固定分离：生成和创作修复只使用
+Anthropic Messages 的 `claude-opus-5`；审核模型允许 `deepseek-v4-flash`、`gpt-5.5`、
+`gpt-5.6-terra` 或 `claude-opus-5`，并分别选择 DeepSeek、OpenAI 或 Anthropic 客户端。
+两类角色不互换，也不在一路失败时自动回退到另一路。
 
 当前仓库内置的四套人格包是可运行的原型数据，不等于生产人格定稿。人格源文件只读；创建任务会建立不可变快照，后续修改源目录不会改变已经创建的任务。
 
+<div class="callout warning">
+<strong>长篇幅边界：</strong>当前 schema 接受任意正整数集数，但全量分集大纲、剧情合同和
+义务仍由一次结构化模型结果生成。逐集剧本具备持久化、恢复和有界审核，不代表当前版本
+已经可靠解决 60–100 集的分批规划与预算问题。
+</div>
+
 ## 最短启动路径
 
-环境要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及同时支持 Anthropic Messages 和 OpenAI-compatible chat completions 的 relay。
+环境要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及同时支持 Anthropic
+Messages 生成路由和所选审核模型协议的 relay。
 
 ```bash
 uv sync --locked --all-groups
@@ -107,6 +117,7 @@ uv run pengine
 - `quality_reviewer` 给出 L0 和 L4 的通过证据；
 - 最终交付包、交付报告和运行成功状态在一个业务提交边界内落盘；
 - 模型调用的角色、模型身份、上下文预检、实际用量或 `unavailable` 状态都留下可查询记录。
+- 锁定合同、分集候选和结构审核都绑定到真实成功的物理 `call_id`，而不是合成来源。
 
 这意味着：HTTP `202`、进度增长、单个草稿产生或某次模型请求返回 `200`，都只能证明阶段性进展，不能单独证明成品交付。
 
