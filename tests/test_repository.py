@@ -2817,9 +2817,7 @@ async def test_schema_v18_collision_repairs_missing_episode_attempt_cycles(
             (str(lease.run_id), NOW.isoformat()),
         )
         await connection.execute("DROP TABLE episode_attempts")
-        await connection.execute(
-            "ALTER TABLE episode_attempts_v17 RENAME TO episode_attempts"
-        )
+        await connection.execute("ALTER TABLE episode_attempts_v17 RENAME TO episode_attempts")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
         await connection.commit()
 

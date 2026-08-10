@@ -1771,9 +1771,7 @@ class Repository:
                     episode_attempt_columns = await (
                         await connection.execute("PRAGMA table_info(episode_attempts)")
                     ).fetchall()
-                    if "attempt_cycle" not in {
-                        column[1] for column in episode_attempt_columns
-                    }:
+                    if "attempt_cycle" not in {column[1] for column in episode_attempt_columns}:
                         await connection.execute("DROP TABLE IF EXISTS episode_attempt_current")
                         await connection.execute("DROP TABLE IF EXISTS episode_attempt_cycles")
                         await connection.execute("DROP TABLE IF EXISTS episode_attempts_v19")
