@@ -4,7 +4,7 @@
   "display_name": "雾枕 · 悬疑",
   "version": "0.1.0-prototype",
   "created_at": "2026-07-30T00:00:00Z",
-  "package_sha256": "d42d6693f66d69bd7b9b8426dab9576b51a8cb2239de32c826a076dd91dd584c",
+  "package_sha256": "080dd2106261b5edbb8efd1f82c4312b486fd06f3a6aa8b92676435bdbfb7722",
   "files": {
     "paradigm": {
       "path": "paradigm.md",
@@ -46,7 +46,7 @@
       "path": "l4.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "d89c7d5fbb5ec4d0cd616ec24d3a0183a04de8e2393da1a8b6b8fb8612e2da31"
+      "sha256": "cc6286a935a244a9c45c8d128f21bd712ff61a9a341e0cc64bd10a0ee4a02b94"
     },
     "l5": {
       "path": "l5.md",

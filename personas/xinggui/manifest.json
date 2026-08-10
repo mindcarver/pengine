@@ -4,7 +4,7 @@
   "display_name": "星轨 · 科幻",
   "version": "0.1.0-prototype",
   "created_at": "2026-07-30T00:00:00Z",
-  "package_sha256": "19ae2de21f8eaa3a013516b9db46c9a075312bbc86e18bdf805b71742616d4ce",
+  "package_sha256": "4647ba7ae0be584dbc347d6545fd0b31622e2431afb38f2365d6b2635c1fae3e",
   "files": {
     "paradigm": {
       "path": "paradigm.md",
@@ -46,7 +46,7 @@
       "path": "l4.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "ce896f9666a75ae9c95070fb100e71548d51cea9a9fcb56cd015dd1faeb2c11f"
+      "sha256": "284063769880a3410e62211651e65f1335100c461301f9e5c7480752a0761b62"
     },
     "l5": {
       "path": "l5.md",
