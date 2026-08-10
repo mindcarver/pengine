@@ -27,13 +27,22 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import StructuredTool, ToolException
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
-from pydantic import Field, JsonValue, ValidationError, field_validator, model_validator
+from pydantic import (
+    Field,
+    JsonValue,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from pengine.continuity import (
     ContinuityViolation,
     EpisodeStateDelta,
+    ReviewIssue,
     SemanticReview,
     SeriesState,
+    StableId,
     StoryContract,
     bind_episode_delta_to_contract,
     build_episode_lock,
@@ -181,26 +190,30 @@ _GENERATION_TOOL_ALLOWLIST = frozenset(
 _REVIEW_TOOL_ALLOWLIST = frozenset({"read_file"})
 _REPAIR_TOOL_ALLOWLIST = frozenset({"read_file", "calculate_arithmetic"})
 
-_WORKFLOW_SCAFFOLDING_POLICY = (
-    "Workflow scaffolding is internal-only. Raw story-contract records or serialization, the "
-    "workflow episode index, workspace paths, fact/clue/obligation IDs, tool calls, validation "
-    "steps, and arithmetic operands or intermediate expressions must never appear in screenplay "
-    "content as scene descriptions, action, narration, or dialogue. The story-world facts "
-    "encoded by the contract are not scaffolding and should still appear when the story "
-    "naturally needs them. Use tools only for private verification. From arithmetic checks, "
-    "finished content may retain only the result or time expression naturally needed in the "
-    "story world, without operands, equations, or the verification process. Never turn workflow "
-    "labels such as 第N集, 上一集, "
-    "or episode N into a character's past experience. This episode-language rule is not a "
-    "blanket ban: such terms may appear naturally only when the user request or an approved "
-    "upstream artifact explicitly establishes a diegetic film, television, or serialized-program "
-    "production or an in-world discussion of program episodes. That exception applies only to "
-    "episode terminology, not to other workflow scaffolding."
+_INTERNAL_RUNTIME_LEAK_POLICY = (
+    "Screenplay form or story-world subject matter is not internal-runtime-leak evidence by "
+    "itself. Episode, chapter, act, and scene headings; title cards; recap labels; end markers "
+    "such as 本集终; screenplay directions; arithmetic, equations, mental calculation, checking, "
+    "and other reasoning; and depictions of JSON, code, paths, tools, models, AI, or validation "
+    "may all be legitimate content. Never reject or rewrite content merely because it uses one "
+    "of those forms or subjects, unless it directly violates an explicit hard-Canon requirement. "
+    "Keep this generation workflow's private runtime provenance out of the screenplay. "
+    "A reviewer may reject an internal-runtime leak only when the screenplay copies a concrete "
+    "runtime-only token or record from a supplied private workflow artifact, such as an exact "
+    "canonical /workspace path, a fact/clue/obligation stable ID, a tool-call or model-message "
+    "envelope, validation or retry status text, or raw contract serialization, and the same "
+    "material is not established as story-world content by the user request, an approved "
+    "upstream artifact, or the candidate screenplay's own clear dramatic context. Story-world "
+    "facts encoded by a contract are content, not runtime leakage. A match between a "
+    "screenplay's own episode label and the trusted envelope's "
+    "episode_number is not provenance evidence. Review evidence must quote the exact screenplay "
+    "excerpt, name the matching private source, and explain why the runtime provenance is "
+    "unambiguous. If provenance is ambiguous, pass this dimension."
 )
 
 
-def _with_workflow_scaffolding_policy(prompt: str) -> str:
-    return "\n\n".join((prompt, _WORKFLOW_SCAFFOLDING_POLICY))
+def _with_internal_runtime_leak_policy(prompt: str) -> str:
+    return "\n\n".join((prompt, _INTERNAL_RUNTIME_LEAK_POLICY))
 
 
 _STORY_ARCHITECT_PROMPT = (
@@ -263,19 +276,19 @@ _EPISODE_PLANNER_PROMPT = (
     "verbatim=true; leave verbatim=false otherwise."
 )
 
-_SCRIPT_WRITER_PROMPT = _with_workflow_scaffolding_policy(
-    "Read /workspace/story_contract.json, /workspace/speaker_contract.json, and "
-    "/workspace/series_state.json, then return a "
+_SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
+    "Read /workspace/story_contract.json and /workspace/series_state.json, then return a "
     "complete non-null state_delta bound to the supplied contract hash. Put only changes from "
     "the requested episode in every state_delta list; never copy cumulative prior state into a "
     "delta. Follow the single episode plan and persona rules without changing any "
     "locked episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
     "returning, reread every approved upstream artifact and audit this episode "
-    "against them. The speaker contract is authoritative: every dialogue speaker label before "
-    "a colon must exactly match an item in allowed_speaker_labels. Do not use an occupational "
-    "title, generic label, or alias as a speaker label; if no locked character needs to speak, "
-    "write non-speaker narration without a speaker label. Before submitting, inspect the "
-    "screenplay line by line and self-check every speaker label against speaker_contract.json. "
+    "against them. Treat contract characters as continuity-bearing identities, not as a "
+    "screenplay-label whitelist. Surface speaker labels may use names, aliases, roles, generic "
+    "or descriptive labels, or another notation established by the screenplay. Never normalize "
+    "a label merely because it precedes a colon. A cast defect requires contextual evidence "
+    "that the script introduced a genuinely new continuity-bearing character in direct conflict "
+    "with explicit hard Canon. "
     "Read /workspace/evidence_contract.json as the evidence authority. Before returning, "
     "perform an exact-set self-check: state_delta.evidence.target_id values must equal "
     "required_evidence_target_ids exactly, each target must occur once, no earlier or later "
@@ -284,16 +297,17 @@ _SCRIPT_WRITER_PROMPT = _with_workflow_scaffolding_policy(
     "contiguous verbatim substring in content; all other facts require semantic consistency "
     "only. Do not infer a verbatim requirement from kind=text, quotation marks, the value "
     "field, or wording such as 原文 in subject or predicate. "
-    "Use canonical contract names in every speaker label, including when a "
-    "parenthetical delivery direction follows the name. Treat explicitly locked or formally "
+    "Treat explicitly locked or formally "
     "committed aliases, pronouns, ages, elapsed durations, call participants, identity and "
     "relationship facts, and clue meanings as binding. "
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
     "exact dialogue-count claims, and episode-specific promised actions. Every "
     "explicitly locked upstream commitment must appear in the scripts. Unspecified "
-    "creative details remain the writer's choice. Use calculate_arithmetic privately "
-    "for every derived numeric claim and copy only the exact result naturally needed in the "
-    "story world. The tool accepts "
+    "creative details remain the writer's choice. Use calculate_arithmetic to verify every "
+    "derived numeric claim. The tool interaction stays private, but it does not constrain "
+    "dramatic presentation: the screenplay may show operands, equations, mental calculation, "
+    "checking, and reasoning when the story needs them. Never copy a tool-call envelope or "
+    "private validation log into the screenplay. The tool accepts "
     "decimal operands only: convert clock times to elapsed minutes before subtracting "
     "them (for example, 22:50 becomes 1370 and 22:20 becomes 1340). Never round a "
     "non-integral division unless the script states the rounding rule. Every required "
@@ -308,18 +322,17 @@ _SCRIPT_WRITER_PROMPT = _with_workflow_scaffolding_policy(
 
 _EPISODE_REPAIR_PROMPT = (
     "First read /skills/continuity-repair/SKILL.md. Follow that skill while keeping the locked "
-    "contract and earlier episodes unchanged. Read /workspace/speaker_contract.json together "
-    "with /workspace/evidence_contract.json, the explicitly named candidate, upstream files, "
+    "contract and earlier episodes unchanged. Read /workspace/evidence_contract.json together "
+    "with the explicitly named candidate, upstream files, "
     "and review. For evidence_coverage_mismatch, use the issue.contract_refs collection as the "
     "exact required evidence target set: rebuild evidence with no extras, no duplicates, every "
     "required target exactly once, and every excerpt copied verbatim from the screenplay. When "
     "the review contains "
-    "unknown_speaker issues, eliminate every one item by item. Change each offending speaker "
-    "line to the most suitable locked character, or, when no dialogue is needed, rewrite it as "
-    "non-speaker narration. Do not merely change the line to an alias, and never leave an "
-    "occupational title or generic label before the colon. Before returning the complete "
-    "screenplay and state_delta, self-check every speaker label against the exact "
-    "allowed_speaker_labels in speaker_contract.json. When "
+    "unknown_speaker issues, repair only a contextually proven new continuity-bearing character "
+    "that directly conflicts with explicit hard Canon. Resolve the narrative identity conflict "
+    "without normalizing screenplay notation. An alias, occupational title, generic or "
+    "descriptive label, or colon-form line is not an unknown character by itself. Keep the "
+    "screenplay and state_delta mutually consistent. When "
     "the review contains verbatim_fact_missing issues, use each issue.contract_refs entry to "
     "find the matching required_verbatim_facts item and restore its exact fact.value as a "
     "contiguous substring in content. Do not impose exact wording on facts not listed there. "
@@ -330,7 +343,7 @@ _EPISODE_REPAIR_PROMPT = (
     "structured script result only."
 )
 
-_QUALITY_REVIEWER_PROMPT = _with_workflow_scaffolding_policy(
+_QUALITY_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "Read /workspace/story_contract.json and the relevant /persona context, then review only "
     "the named gate "
     "against the approved artifacts supplied in the delegated request. Always return "
@@ -342,77 +355,45 @@ _QUALITY_REVIEWER_PROMPT = _with_workflow_scaffolding_policy(
     "only when that fact has verbatim=true. kind=text, the value field, quotation marks, "
     "or words such as 原文 in subject or predicate do not create a machine-executable "
     "verbatim requirement. Facts without verbatim=true must be reviewed for semantic "
-    "consistency only. At accepting_l4, explicit workflow scaffolding leakage outside the "
-    "diegetic exception is a blocking defect: set passed=false and cite the leakage in concrete "
-    "evidence."
+    "consistency only. A rejection must identify a direct conflict with a user requirement, an "
+    "applicable explicit persona gate rule, locked Contract or SeriesBible data, a frozen "
+    "revision-feedback item, or the output/schema protocol. Ordinary screenplay format, style, "
+    "or matters of taste are not sufficient reasons to set passed=false. At accepting_l4, only "
+    "an internal-runtime leak that meets the policy's provenance and evidence standard is a "
+    "blocking leakage defect."
 )
 
-_EPISODE_REVIEWER_PROMPT = _with_workflow_scaffolding_policy(
+_EPISODE_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "First read /skills/episode-continuity-review/SKILL.md. Follow that skill while treating "
     "explicit contract facts and prior state as immutable and unspecified creative details as "
     "free. Only a story_contract fact with verbatim=true requires its value to appear "
     "contiguously word-for-word; all other facts, including kind=text facts, are reviewed for "
-    "semantic consistency only. Explicit workflow scaffolding leakage outside the diegetic "
-    "exception is blocking and the episode candidate must be rejected. Return only structured "
-    "review evidence and never repair content."
+    "semantic consistency only. Only an internal-runtime leak that meets the policy's provenance "
+    "and evidence standard is blocking. Screenplay formatting and story-world subject matter "
+    "named in the policy are never defects on their own. "
+    "/workspace/series_prefix.json is a trusted runtime envelope: episode_number and JSON "
+    "framing are trusted runtime metadata, not screenplay content. Judge leakage only inside "
+    "episodes[].content. Return only structured review evidence and never repair content."
 )
 
-_SERIES_REVIEWER_PROMPT = _with_workflow_scaffolding_policy(
+_SERIES_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "Review the complete active series prefix against the active SeriesBible and locked story "
-    "contract. The design and every committed script are immutable. Classify the decision "
-    "exactly: pass requires concrete whole-series consistency evidence; a design defect returns "
-    "no affected episode; a script defect returns the earliest affected episode N. Explicit "
-    "workflow scaffolding leakage outside the diegetic exception is a script_defect: reject it "
-    "and return the earliest episode containing leakage, even when later episodes also leak. "
-    "Never repair content and never reinterpret the design to make the prefix pass."
+    "contract. The design and every committed script are immutable. Hard Canon is limited to "
+    "user requirements, explicitly locked Contract or SeriesBible values, formally committed "
+    "facts and state in the prefix, mandatory episode obligations, and the output/schema "
+    "protocol. Ordinary SeriesBible prose, screenplay format or style, and omitted creative "
+    "details are not locks. Fail only for a direct contradiction to that hard Canon, an "
+    "impossible required locked binding, or an internal-runtime leak that meets the policy's "
+    "provenance and evidence standard. Classify the decision exactly: pass requires concrete "
+    "evidence that no such blocker exists; a design_defect means the active SeriesBible itself "
+    "contains the blocking contradiction or impossible binding and returns no affected episode; "
+    "a script_defect means the current prefix contains the blocker and returns the earliest "
+    "affected episode N. Collect every current blocking defect in the evidence. "
+    "/workspace/series_prefix.json is a trusted runtime envelope: episode_number and JSON framing "
+    "are trusted runtime metadata, not screenplay content. Judge leakage only inside "
+    "episodes[].content. Never repair content and never reinterpret the design to make the "
+    "prefix pass."
 )
-
-
-def _speaker_contract(
-    contract: StoryContract,
-    *,
-    rejected_issues: list[Any] | None = None,
-    phase: str,
-) -> dict[str, Any]:
-    return {
-        "version": 1,
-        "phase": phase,
-        "allowed_speaker_labels": [character.name for character in contract.characters],
-        "rules": {
-            "speaker_label_before_colon": "must_exactly_match_allowed_speaker_labels",
-            "occupational_titles": "not_allowed_as_speaker_labels",
-            "generic_labels": "not_allowed_as_speaker_labels",
-            "aliases": "not_allowed_as_speaker_labels",
-            "no_dialogue": "use_non_speaker_narration_without_speaker_label",
-        },
-        "rule_text": [
-            "Any dialogue speaker label before a colon must exactly equal one item in "
-            "allowed_speaker_labels.",
-            "Occupational titles, generic labels, and aliases must not be used as speaker labels.",
-            "If no locked character needs to speak, rewrite the line as non-speaker narration "
-            "without a speaker label.",
-        ],
-        "rejected_issues": [
-            issue.model_dump(mode="json") for issue in (rejected_issues or [])
-        ],
-    }
-
-
-def _speaker_contract_json(
-    contract: StoryContract,
-    *,
-    rejected_issues: list[Any] | None = None,
-    phase: str,
-) -> str:
-    return json.dumps(
-        _speaker_contract(
-            contract,
-            rejected_issues=rejected_issues,
-            phase=phase,
-        ),
-        ensure_ascii=False,
-        sort_keys=True,
-    )
 
 
 def _suffix_rewrite_feedback_for_episode(
@@ -434,9 +415,7 @@ def _suffix_rewrite_feedback_for_episode(
     ]
     if not current_reviews:
         return None
-    effective = min(
-        review["earliest_affected_episode"] for review in current_reviews
-    )
+    effective = min(review["earliest_affected_episode"] for review in current_reviews)
     return {
         **feedback,
         "effective_earliest_affected_episode": effective,
@@ -502,9 +481,7 @@ def _evidence_contract(
             "Only required_verbatim_facts[].value must appear contiguously and verbatim in the "
             "episode content; all other facts are checked for semantic consistency only.",
         ],
-        "rejected_issues": [
-            issue.model_dump(mode="json") for issue in (rejected_issues or [])
-        ],
+        "rejected_issues": [issue.model_dump(mode="json") for issue in (rejected_issues or [])],
     }
 
 
@@ -525,6 +502,7 @@ def _evidence_contract_json(
         ensure_ascii=False,
         sort_keys=True,
     )
+
 
 VIRTUAL_FILE_PERMISSIONS = [
     FilesystemPermission(operations=["read"], paths=["/persona", "/persona/**"]),
@@ -741,30 +719,23 @@ class StoryArtifactRepairPatch(StrictModel):
 
 
 class OutlineJsonEdit(StrictModel):
-    op: Literal["add", "replace", "remove"]
+    op: Literal["replace"]
     path: NonEmptyText = Field(
         max_length=500,
         description=(
-            "RFC 6901 JSON pointer targeting /episode_count, /episodes, or "
-            "/story_contract. Use /- only to append to an existing list."
+            "RFC 6901 JSON pointer targeting an item under /episodes. Story-contract "
+            "mutations are applied atomically by the runtime."
         ),
     )
     expected: JsonValue = Field(
-        description=(
-            "Exact current JSON value for replace/remove; current list length for append; "
-            "null for a new object key."
-        )
+        description="Exact current JSON value at the exposed episode-plan path."
     )
-    value: JsonValue = Field(description="Replacement/addition value, or null for remove.")
+    value: JsonValue = Field(description="Exact replacement value.")
 
     @model_validator(mode="after")
     def validate_edit(self) -> "OutlineJsonEdit":
-        if self.path != "/episode_count" and not self.path.startswith(
-            ("/episodes/", "/story_contract/")
-        ):
-            raise ValueError("Outline repair paths must target episodes or story_contract")
-        if self.op == "remove" and self.value is not None:
-            raise ValueError("Remove edits require a null value")
+        if not self.path.startswith("/episodes/"):
+            raise ValueError("Outline repair paths must target episode plans")
         return self
 
 
@@ -781,14 +752,13 @@ class OutlineRepairPatch(StrictModel):
         default_factory=list,
         max_length=64,
         description=(
-            "Minimal guarded edits to episodes/story_contract. Never return the full candidate."
+            "Minimal guarded edits to episode plans. Story-contract mutations are applied "
+            "atomically by the runtime and must not be repeated here."
         ),
     )
 
     @model_validator(mode="after")
-    def validate_non_empty_patch(self) -> "OutlineRepairPatch":
-        if not self.content_replacements and not self.json_edits:
-            raise ValueError("Outline repair patch cannot be empty")
+    def validate_patch_size(self) -> "OutlineRepairPatch":
         if len(self.model_dump_json()) > 16_000:
             raise ValueError("Outline repair patch cannot exceed 16000 characters")
         return self
@@ -850,7 +820,79 @@ class CanonIssueClosure(StrictModel):
     )
 
 
+class CanonRepairTarget(StrictModel):
+    target_id: StableId = Field(
+        description="Reviewer-local unique permission ID for exactly one contract mutation."
+    )
+    collection: Literal[
+        "characters",
+        "relationships",
+        "facts",
+        "timeline",
+        "knowledge_states",
+        "clues",
+        "prohibitions",
+        "episode_obligations",
+    ]
+    intent: Literal["replace_existing", "remove_existing", "append_missing"]
+    index: int | None = Field(
+        default=None,
+        ge=0,
+        description=("Zero-based collection index for replace/remove; null for append_missing."),
+    )
+    expected_value: JsonValue = Field(
+        default=None,
+        description=("Exact current collection item for replace/remove; null for append_missing."),
+    )
+    value: JsonValue = Field(
+        default=None,
+        description=("Exact complete replacement or append item; null only for remove_existing."),
+    )
+
+    @model_validator(mode="after")
+    def validate_target(self) -> "CanonRepairTarget":
+        if self.intent == "replace_existing":
+            if self.index is None or self.expected_value is None or self.value is None:
+                raise ValueError("replace_existing requires index, expected_value, and value")
+        elif self.intent == "remove_existing":
+            if self.index is None or self.expected_value is None or self.value is not None:
+                raise ValueError("remove_existing requires only index and expected_value")
+        elif self.index is not None or self.expected_value is not None or self.value is None:
+            raise ValueError("append_missing requires only value")
+        return self
+
+
+class CanonReviewIssue(ReviewIssue):
+    contract_mutation_required: bool = Field(
+        description=(
+            "Whether resolving this issue requires changing the structured story contract. "
+            "False for prose-only repairs even when contract_refs contains an ID whose text "
+            "matches a collection name."
+        ),
+    )
+    repair_targets: list[CanonRepairTarget] = Field(
+        default_factory=list,
+        max_length=64,
+        description=(
+            "Exact story-contract mutation permissions for this issue. Required when "
+            "contract_mutation_required is true; omit for prose-only repairs."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_repair_targets(self) -> "CanonReviewIssue":
+        if self.contract_mutation_required and not self.repair_targets:
+            raise ValueError("Contract mutations require repair_targets")
+        if not self.contract_mutation_required and self.repair_targets:
+            raise ValueError("Prose-only canon issues cannot grant contract repair targets")
+        target_ids = [target.target_id for target in self.repair_targets]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("Canon repair target IDs must be unique")
+        return self
+
+
 class CanonReviewerResult(SemanticReview):
+    issues: list[CanonReviewIssue] = Field(default_factory=list)
     prior_issue_closures: list[CanonIssueClosure] = Field(
         default_factory=list,
         description=(
@@ -878,6 +920,9 @@ class CanonReviewerResult(SemanticReview):
         closure_ids = [closure.issue_id for closure in self.prior_issue_closures]
         if len(closure_ids) != len(set(closure_ids)):
             raise ValueError("Canon review prior issue closure IDs must be unique")
+        target_ids = [target.target_id for issue in self.issues for target in issue.repair_targets]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("Canon repair target IDs must be globally unique")
         return self
 
 
@@ -1009,9 +1054,16 @@ def _merge_episode_reviews(
     if deterministic_issues:
         evidence.append(
             "确定性审核："
-            + "; ".join(f"{issue.code}: {issue.message}" for issue in deterministic_issues)
+            + "; ".join(
+                f"{issue.code}: {issue.message}"
+                + (f"（目标：{', '.join(issue.contract_refs)}）" if issue.contract_refs else "")
+                for issue in deterministic_issues
+            )
         )
     evidence.append(f"语义审核：{semantic_review.evidence}")
+    referenced_targets = sorted({target for issue in issues for target in issue.contract_refs})
+    if referenced_targets:
+        evidence.append(f"审查目标：{', '.join(referenced_targets)}")
     return EpisodeReviewerResult(
         passed=not issues,
         evidence="；".join(evidence),
@@ -1074,9 +1126,17 @@ _SAFE_VALIDATION_MESSAGES = frozenset(
         "A passing review cannot contain issues",
         "A failed review requires at least one issue",
         "Canon review issues must contain only blocking contradictions",
+        "Contract mutations require repair_targets",
+        "Prose-only canon issues cannot grant contract repair targets",
+        "replace_existing requires index, expected_value, and value",
+        "remove_existing requires only index and expected_value",
+        "append_missing requires only value",
+        "Canon repair target IDs must be unique",
+        "Canon repair target IDs must be globally unique",
         "L0 selection requires only variant and rationale",
         "Story artifact stages require only content",
         "Episode plans must be ordered and contiguous from 1",
+        "Outline repair paths must target episode plans",
         "Story contract episode count must match the episode plan",
         "Episode state delta must match the script episode",
     }
@@ -1122,6 +1182,14 @@ _SAFE_VALIDATION_LOCATIONS = frozenset(
         "value",
         "verbatim",
         "unit",
+        "contract_refs",
+        "contract_mutation_required",
+        "repair_targets",
+        "target_id",
+        "collection",
+        "intent",
+        "index",
+        "expected_value",
     }
 )
 
@@ -1172,6 +1240,51 @@ def _structured_output_retry_message(error: Exception) -> str:
     if not details:
         return instruction
     return f"{instruction} Correct these validation errors: {'; '.join(details)}."
+
+
+_OUTLINE_PATCH_ERROR_GUIDANCE = {
+    "outline_repair_patch_target_not_exposed": (
+        "Use only an exact episode_plans path. Story-contract mutations are already applied "
+        "atomically by the runtime and must not be repeated in the patch."
+    ),
+    "outline_repair_patch_did_not_change": (
+        "Change the readable outline or an exposed episode plan to resolve the confirmed issue."
+    ),
+    "patch_target_mismatch": ("Copy the exact current episode-plan target value into expected."),
+    "ambiguous_content_replacement": (
+        "Use an old excerpt that occurs exactly once in readable_outline.value."
+    ),
+    "outline_repair_patch_not_minimal": (
+        "Reduce the patch to the confirmed issue and keep it below half the serialized "
+        "candidate size."
+    ),
+    "missing_patch_target": "Choose an existing path supplied in the repair context.",
+    "invalid_json_pointer": "Use a valid RFC 6901 path supplied in the repair context.",
+    "invalid_list_index": "Use an existing decimal episode-plan list index.",
+    "disallowed_patch_root": "Use only an exposed /episodes path.",
+}
+_OUTLINE_REVIEW_TARGET_ERRORS = frozenset(
+    {
+        "outline_repair_review_collection_missing",
+        "outline_repair_review_append_already_exists",
+        "outline_repair_review_native_identity_changed",
+        "outline_repair_review_proposed_contract_did_not_change",
+        "outline_repair_review_proposed_contract_invalid",
+        "outline_repair_review_target_conflict",
+        "outline_repair_review_target_did_not_change",
+        "outline_repair_review_target_not_found",
+        "outline_repair_review_target_mismatch",
+        "outline_repair_review_target_value_invalid",
+    }
+)
+
+
+def _outline_patch_retry_message(error: Exception) -> str:
+    code = str(error)
+    guidance = _OUTLINE_PATCH_ERROR_GUIDANCE.get(code)
+    if guidance is None:
+        return _structured_output_retry_message(error)
+    return f"The patch application failed with {code}. {guidance}"
 
 
 def _structured_result_validation_correction(
@@ -1273,8 +1386,7 @@ def _compact_structured_validation_messages(
         if not isinstance(message, AIMessage):
             continue
         if any(
-            call.get("id") == latest_error.tool_call_id
-            and call.get("name") == latest_error.name
+            call.get("id") == latest_error.tool_call_id and call.get("name") == latest_error.name
             for call in message.tool_calls
         ):
             latest_result_index = index
@@ -1292,9 +1404,7 @@ def _compact_structured_validation_messages(
         latest_result_index,
     )
     base_user_context = [
-        message
-        for message in messages[:first_tool_turn]
-        if isinstance(message, HumanMessage)
+        message for message in messages[:first_tool_turn] if isinstance(message, HumanMessage)
     ]
     prior_corrections = [
         message
@@ -1303,9 +1413,7 @@ def _compact_structured_validation_messages(
     ]
     latest_result = messages[latest_result_index]
     latest_call_ids = {
-        call.get("id")
-        for call in latest_result.tool_calls
-        if call.get("id") is not None
+        call.get("id") for call in latest_result.tool_calls if call.get("id") is not None
     }
     latest_feedback = [
         message
@@ -1609,6 +1717,28 @@ def _language_retry_fingerprint(result: Any) -> tuple[Any, ...]:
                     _language_text_fingerprint(issue.message),
                     tuple(issue.contract_refs),
                     issue.script_excerpt,
+                    getattr(issue, "contract_mutation_required", False),
+                    tuple(
+                        (
+                            target.target_id,
+                            target.collection,
+                            target.intent,
+                            target.index,
+                            json.dumps(
+                                target.expected_value,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            json.dumps(
+                                target.value,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                        )
+                        for target in getattr(issue, "repair_targets", [])
+                    ),
                 )
                 for issue in result.issues
             ),
@@ -1964,6 +2094,29 @@ def _tool_message(result: ToolMessage | Command[Any]) -> ToolMessage:
     if not isinstance(message, ToolMessage):
         raise AgentProtocolError("Subagent command result was not a tool message")
     return message
+
+
+def _result_with_payload(
+    result: ToolMessage | Command[Any],
+    payload: Mapping[str, Any],
+) -> ToolMessage | Command[Any]:
+    content = json.dumps(
+        dict(payload),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    message = _tool_message(result).model_copy(update={"content": content})
+    if isinstance(result, ToolMessage):
+        return message
+    if not isinstance(result.update, Mapping):
+        raise AgentProtocolError("Subagent command did not contain an update")
+    return Command(
+        graph=result.graph,
+        update={**result.update, "messages": [message]},
+        resume=result.resume,
+        goto=result.goto,
+    )
 
 
 def _request_state_after_result(
@@ -2347,9 +2500,7 @@ def _json_pointer_parts(path: str) -> list[str]:
     parts = [part.replace("~1", "/").replace("~0", "~") for part in path[1:].split("/")]
     if any(not part for part in parts):
         raise ValueError("invalid_json_pointer")
-    if parts == ["episode_count"]:
-        return parts
-    if len(parts) < 2 or parts[0] not in {"episodes", "story_contract"}:
+    if len(parts) < 2 or parts[0] != "episodes":
         raise ValueError("disallowed_patch_root")
     return parts
 
@@ -2378,34 +2529,17 @@ def _apply_outline_json_edit(document: dict[str, Any], edit: OutlineJsonEdit) ->
 
     token = parts[-1]
     if isinstance(parent, dict):
-        exists = token in parent
-        if edit.op == "add":
-            if exists or edit.expected is not None:
-                raise ValueError("patch_target_mismatch")
-            parent[token] = copy.deepcopy(edit.value)
-            return
-        if not exists or not _json_values_match(parent[token], edit.expected):
+        if token not in parent or not _json_values_match(parent[token], edit.expected):
             raise ValueError("patch_target_mismatch")
-        if edit.op == "replace":
-            parent[token] = copy.deepcopy(edit.value)
-        else:
-            del parent[token]
+        parent[token] = copy.deepcopy(edit.value)
         return
 
     if not isinstance(parent, list):
         raise ValueError("missing_patch_target")
-    if edit.op == "add":
-        if token != "-" or not _json_values_match(edit.expected, len(parent)):
-            raise ValueError("patch_target_mismatch")
-        parent.append(copy.deepcopy(edit.value))
-        return
     index = _json_list_index(token, len(parent))
     if not _json_values_match(parent[index], edit.expected):
         raise ValueError("patch_target_mismatch")
-    if edit.op == "replace":
-        parent[index] = copy.deepcopy(edit.value)
-    else:
-        del parent[index]
+    parent[index] = copy.deepcopy(edit.value)
 
 
 _OUTLINE_REPAIR_CONTRACT_COLLECTIONS = (
@@ -2427,28 +2561,110 @@ _OUTLINE_REPAIR_ID_FIELDS = {
 }
 
 
-def _contains_outline_repair_ref(value: Any, refs: set[str]) -> bool:
-    if isinstance(value, str):
-        return value in refs
-    if isinstance(value, Mapping):
-        return any(_contains_outline_repair_ref(item, refs) for item in value.values())
-    if isinstance(value, list):
-        return any(_contains_outline_repair_ref(item, refs) for item in value)
-    return False
+def _bind_outline_contract_repairs(
+    contract: Mapping[str, Any],
+    review: CanonReviewerResult,
+) -> tuple[StoryContract, list[dict[str, Any]]]:
+    try:
+        current_contract = StoryContract.model_validate(contract)
+    except ValidationError as exc:
+        raise ValueError("invalid_outline_repair_candidate") from exc
+    current_contract_json = current_contract.model_dump(mode="json")
+    proposed = copy.deepcopy(current_contract_json)
+    mutations: list[dict[str, Any]] = []
+    existing_targets: set[tuple[str, int]] = set()
 
+    def validate_item(collection: str, value: JsonValue) -> JsonValue:
+        try:
+            validated = TypeAdapter(
+                StoryContract.model_fields[collection].annotation
+            ).validate_python([value])[0]
+        except ValidationError as exc:
+            raise ValueError("outline_repair_review_target_value_invalid") from exc
+        if hasattr(validated, "model_dump"):
+            return cast(Any, validated).model_dump(mode="json")
+        return cast(JsonValue, validated)
 
-def _outline_repair_issue_refs(
-    issue: Any,
-    known_contract_ids: set[str],
-) -> set[str]:
-    issue_text = "\n".join(
-        value
-        for value in (issue.code, issue.message, issue.script_excerpt)
-        if isinstance(value, str)
-    )
-    refs = set(issue.contract_refs) & known_contract_ids
-    refs.update(ref for ref in known_contract_ids if ref in issue_text)
-    return refs
+    for issue in review.issues:
+        for target in issue.repair_targets:
+            items = current_contract_json.get(target.collection)
+            if not isinstance(items, list):
+                raise ValueError("outline_repair_review_collection_missing")
+            if target.intent == "append_missing":
+                value = validate_item(target.collection, target.value)
+                mutations.append(
+                    {
+                        "target_id": target.target_id,
+                        "op": "add",
+                        "path": f"/story_contract/{target.collection}/-",
+                        "expected_value": None,
+                        "value": value,
+                    }
+                )
+                continue
+
+            if target.index is None or target.index >= len(items):
+                raise ValueError("outline_repair_review_target_not_found")
+            key = (target.collection, target.index)
+            if key in existing_targets:
+                raise ValueError("outline_repair_review_target_conflict")
+            existing_targets.add(key)
+            current = items[target.index]
+            if not _json_values_match(current, target.expected_value):
+                raise ValueError("outline_repair_review_target_mismatch")
+            operation = {
+                "target_id": target.target_id,
+                "op": "replace" if target.intent == "replace_existing" else "remove",
+                "path": f"/story_contract/{target.collection}/{target.index}",
+                "expected_value": current,
+                "value": target.value,
+            }
+            if target.intent == "replace_existing":
+                value = validate_item(target.collection, target.value)
+                operation["value"] = value
+                if _json_values_match(current, value):
+                    raise ValueError("outline_repair_review_target_did_not_change")
+                id_fields = _OUTLINE_REPAIR_ID_FIELDS.get(target.collection, ())
+                if id_fields and (
+                    not isinstance(current, Mapping)
+                    or not isinstance(value, Mapping)
+                    or any(current.get(field) != value.get(field) for field in id_fields)
+                ):
+                    raise ValueError("outline_repair_review_native_identity_changed")
+            mutations.append(operation)
+
+    for mutation in mutations:
+        if mutation["op"] != "replace":
+            continue
+        _, _, collection, index_text = mutation["path"].split("/")
+        proposed[collection][int(index_text)] = copy.deepcopy(mutation["value"])
+    for collection in _OUTLINE_REPAIR_CONTRACT_COLLECTIONS:
+        removals = sorted(
+            (
+                int(mutation["path"].rsplit("/", 1)[1])
+                for mutation in mutations
+                if mutation["op"] == "remove"
+                and mutation["path"].startswith(f"/story_contract/{collection}/")
+            ),
+            reverse=True,
+        )
+        for index in removals:
+            del proposed[collection][index]
+    for mutation in mutations:
+        if mutation["op"] != "add":
+            continue
+        collection = mutation["path"].split("/")[2]
+        if any(_json_values_match(item, mutation["value"]) for item in proposed[collection]):
+            raise ValueError("outline_repair_review_append_already_exists")
+        proposed[collection].append(copy.deepcopy(mutation["value"]))
+
+    try:
+        normalized = StoryContract.model_validate(proposed)
+    except ValidationError as exc:
+        raise ValueError("outline_repair_review_proposed_contract_invalid") from exc
+    if mutations and _json_values_match(normalized.model_dump(mode="json"), current_contract_json):
+        raise ValueError("outline_repair_review_proposed_contract_did_not_change")
+    return normalized, mutations
 
 
 def _outline_repair_context(
@@ -2465,139 +2681,42 @@ def _outline_repair_context(
     ):
         raise ValueError("invalid_outline_repair_candidate")
 
+    normalized_contract, contract_mutations = _bind_outline_contract_repairs(contract, review)
     contract_ids_by_collection: dict[str, set[str]] = {}
+    declared_targets: dict[str, list[tuple[str, Any]]] = {}
     for collection, id_fields in _OUTLINE_REPAIR_ID_FIELDS.items():
         collection_ids: set[str] = set()
         items = contract.get(collection)
         if not isinstance(items, list):
             continue
-        for item in items:
+        for index, item in enumerate(items):
             if not isinstance(item, Mapping):
                 continue
             for field in id_fields:
                 value = item.get(field)
                 if isinstance(value, str):
                     collection_ids.add(value)
+                    declared_targets.setdefault(value, []).append(
+                        (
+                            f"/story_contract/{collection}/{index}",
+                            item,
+                        )
+                    )
         contract_ids_by_collection[collection] = collection_ids
 
     known_contract_ids = set().union(*contract_ids_by_collection.values())
-    collection_names = set(_OUTLINE_REPAIR_CONTRACT_COLLECTIONS)
-    character_ids = contract_ids_by_collection.get("characters", set())
-    fact_ids = contract_ids_by_collection.get("facts", set())
     requested_refs = {ref for issue in review.issues for ref in issue.contract_refs}
     matched_refs = requested_refs & known_contract_ids
-    matched_scopes = requested_refs & collection_names
-    mentioned_contract_ids: set[str] = set()
-    target_flags: dict[str, bool] = {}
-
-    def add_target(path: str, *, editable: bool) -> None:
-        target_flags[path] = target_flags.get(path, False) or editable
-
-    declared_paths: dict[str, str] = {}
-    for collection, id_fields in _OUTLINE_REPAIR_ID_FIELDS.items():
-        items = contract.get(collection)
-        if not isinstance(items, list):
-            continue
-        for index, item in enumerate(items):
-            if not isinstance(item, Mapping):
-                continue
-            for field in id_fields:
-                value = item.get(field)
-                if isinstance(value, str):
-                    declared_paths[value] = f"/story_contract/{collection}/{index}"
-
-    for issue in review.issues:
-        explicit_refs = set(issue.contract_refs) & known_contract_ids
-        scopes = set(issue.contract_refs) & collection_names
-        refs = _outline_repair_issue_refs(issue, known_contract_ids)
-        mentioned_contract_ids.update(refs - explicit_refs)
-        mentioned_characters = refs & character_ids
-        editable_fact_refs = explicit_refs & fact_ids if not scopes or "facts" in scopes else set()
-
-        for ref in explicit_refs:
-            add_target(declared_paths[ref], editable=not scopes)
-
-        if editable_fact_refs:
-            for collection in ("characters", "timeline", "knowledge_states"):
-                items = contract.get(collection)
-                if not isinstance(items, list):
-                    continue
-                for index, item in enumerate(items):
-                    if _contains_outline_repair_ref(item, editable_fact_refs):
-                        add_target(f"/story_contract/{collection}/{index}", editable=True)
-            obligations = contract.get("episode_obligations")
-            if isinstance(obligations, list):
-                for index in range(len(obligations)):
-                    add_target(
-                        f"/story_contract/episode_obligations/{index}",
-                        editable=True,
-                    )
-
-        if "knowledge_states" in scopes and mentioned_characters:
-            characters = contract.get("characters")
-            if isinstance(characters, list):
-                for index, character in enumerate(characters):
-                    if (
-                        isinstance(character, Mapping)
-                        and character.get("character_id") in mentioned_characters
-                        and _contains_outline_repair_ref(character, explicit_refs & fact_ids)
-                    ):
-                        add_target(
-                            f"/story_contract/characters/{index}",
-                            editable=True,
-                        )
-
-        for scope in scopes:
-            items = contract.get(scope)
-            if not isinstance(items, list):
-                continue
-            for index, item in enumerate(items):
-                if scope == "knowledge_states":
-                    referenced_facts = explicit_refs & fact_ids
-                    if not referenced_facts and not mentioned_characters:
-                        continue
-                    if referenced_facts and not _contains_outline_repair_ref(
-                        item, referenced_facts
-                    ):
-                        continue
-                    if mentioned_characters and (
-                        not isinstance(item, Mapping)
-                        or item.get("character_id") not in mentioned_characters
-                    ):
-                        continue
-                else:
-                    if explicit_refs and not _contains_outline_repair_ref(item, explicit_refs):
-                        continue
-                    if mentioned_characters and not _contains_outline_repair_ref(
-                        item, mentioned_characters
-                    ):
-                        continue
-                    if not explicit_refs and not mentioned_characters:
-                        continue
-                add_target(f"/story_contract/{scope}/{index}", editable=True)
-
-    contract_targets: list[dict[str, Any]] = []
-    contract_collections: dict[str, dict[str, Any]] = {}
-    for collection in _OUTLINE_REPAIR_CONTRACT_COLLECTIONS:
-        items = contract.get(collection)
-        if not isinstance(items, list):
-            continue
-        if collection in matched_scopes:
-            contract_collections[collection] = {
-                "path": f"/story_contract/{collection}",
-                "length": len(items),
-                "editable": True,
-            }
-        for index, item in enumerate(items):
-            path = f"/story_contract/{collection}/{index}"
-            if path in target_flags:
-                contract_targets.append(
-                    {
-                        "path": path,
-                        "editable": target_flags[path],
-                        "value": item,
-                    }
-                )
+    matched_scopes = {
+        target.collection for issue in review.issues for target in issue.repair_targets
+    }
+    context_values: dict[str, Any] = {}
+    for ref in matched_refs:
+        for path, value in declared_targets.get(ref, []):
+            context_values[path] = value
+    contract_context = [
+        {"path": path, "value": value} for path, value in sorted(context_values.items())
+    ]
 
     serialized_candidate = json.dumps(
         dict(candidate),
@@ -2621,12 +2740,12 @@ def _outline_repair_context(
             "version": contract.get("version"),
             "episode_count": contract.get("episode_count"),
         },
-        "contract_collections": contract_collections,
+        "contract_mutations_applied_by_runtime": contract_mutations,
+        "resulting_story_contract_sha256": story_contract_sha256(normalized_contract),
         "matched_contract_refs": sorted(matched_refs),
         "matched_collection_scopes": sorted(matched_scopes),
-        "mentioned_contract_ids": sorted(mentioned_contract_ids),
-        "unmatched_contract_refs": sorted(requested_refs - matched_refs - matched_scopes),
-        "contract_targets": contract_targets,
+        "unmatched_contract_refs": sorted(requested_refs - matched_refs),
+        "contract_context": contract_context,
     }
 
 
@@ -2670,25 +2789,9 @@ def _validate_outline_repair_patch_targets(
         for item in context.get("episode_plans", [])
         if isinstance(item, Mapping) and isinstance(item.get("path"), str)
     }
-    editable_contract_paths = {
-        item["path"]
-        for item in context.get("contract_targets", [])
-        if isinstance(item, Mapping)
-        and item.get("editable") is True
-        and isinstance(item.get("path"), str)
-    }
-    editable_append_paths = {
-        f"{item['path']}/-"
-        for item in context.get("contract_collections", {}).values()
-        if isinstance(item, Mapping)
-        and item.get("editable") is True
-        and isinstance(item.get("path"), str)
-    }
-
     for edit in patch.json_edits:
-        allowed = edit.path in editable_append_paths or any(
-            edit.path == base or edit.path.startswith(f"{base}/")
-            for base in episode_paths | editable_contract_paths
+        allowed = any(
+            edit.path == base or edit.path.startswith(f"{base}/") for base in episode_paths
         )
         if not allowed:
             raise ValueError("outline_repair_patch_target_not_exposed")
@@ -2857,7 +2960,7 @@ def _review_workspace_files(
                     "encoding": "utf-8",
                 }
     manifest = json.dumps(
-        {stage.value: payload for stage, payload in approved.items()},
+        _approved_checkpoint_manifest(approved),
         ensure_ascii=False,
         sort_keys=True,
     )
@@ -2866,6 +2969,22 @@ def _review_workspace_files(
         "encoding": "utf-8",
     }
     return files
+
+
+def _approved_checkpoint_manifest(
+    approved: Mapping[InternalStage, Any],
+) -> dict[str, Any]:
+    manifest: dict[str, Any] = {}
+    for stage, payload in approved.items():
+        if isinstance(payload, Mapping):
+            manifest[stage.value] = {
+                key: value
+                for key, value in payload.items()
+                if not (key.endswith("_review") or key.endswith("_repair_rounds"))
+            }
+        else:
+            manifest[stage.value] = payload
+    return manifest
 
 
 def _drop_dangling_tool_call_messages(messages: list[Any]) -> list[Any]:
@@ -2984,12 +3103,9 @@ def _compact_supervisor_messages(messages: Sequence[Any]) -> list[Any]:
         matching_tool_indices = {
             index
             for index in range(assistant_index + 1, len(original))
-            if isinstance(original[index], ToolMessage)
-            and original[index].tool_call_id in call_ids
+            if isinstance(original[index], ToolMessage) and original[index].tool_call_id in call_ids
         }
-        answered_ids = {
-            original[index].tool_call_id for index in matching_tool_indices
-        }
+        answered_ids = {original[index].tool_call_id for index in matching_tool_indices}
         if call_ids <= answered_ids:
             latest_exchange = (assistant_index, call_ids, matching_tool_indices)
             break
@@ -3002,8 +3118,7 @@ def _compact_supervisor_messages(messages: Sequence[Any]) -> list[Any]:
         (
             index
             for index, message in enumerate(original)
-            if (call_ids_at_index := _assistant_tool_call_ids(message))
-            and call_ids_at_index
+            if (call_ids_at_index := _assistant_tool_call_ids(message)) and call_ids_at_index
         ),
         assistant_index,
     )
@@ -3079,9 +3194,7 @@ class ToolAllowlistMiddleware(AgentMiddleware):
 
     def _filter_request(self, request: ModelRequest) -> ModelRequest:
         filtered_tools = [
-            tool
-            for tool in request.tools
-            if _model_request_tool_name(tool) in self.allowed_tools
+            tool for tool in request.tools if _model_request_tool_name(tool) in self.allowed_tools
         ]
         working_tool_names = {
             name for tool in filtered_tools if (name := _model_request_tool_name(tool))
@@ -3433,12 +3546,19 @@ class StageGuardMiddleware(AgentMiddleware):
                 status="error",
             )
 
-        if self.language_contract and self.language_contract not in description:
+        description = (
+            f"[stage={stage.value}] Complete only this specialist stage. Read "
+            "/workspace/creation-request.md, /workspace/approved-checkpoints.json, the "
+            "applicable canonical /workspace artifacts, and the active /persona rules. "
+            "Treat those files as the sole authority for approved creative facts. Do not "
+            "reuse or restate derived story facts from the supervisor conversation."
+        )
+        if self.language_contract:
             description = f"{description}\n{self.language_contract}"
-            args = {**args, "description": description}
-            request = request.override(
-                tool_call={**request.tool_call, "args": args},
-            )
+        args = {**args, "description": description}
+        request = request.override(
+            tool_call={**request.tool_call, "args": args},
+        )
 
         if stage in (
             *_STORY_ARTIFACT_STAGES,
@@ -3661,8 +3781,9 @@ class StageGuardMiddleware(AgentMiddleware):
                 )
                 review = _merge_canon_reviews([review, backstop])
             if review.passed:
-                return result, {
-                    **parsed.model_dump(mode="json"),
+                approved_payload = parsed.model_dump(mode="json")
+                return _result_with_payload(result, approved_payload), {
+                    **approved_payload,
                     "consistency_review": review.model_dump(
                         mode="json", exclude={"prior_issue_closures"}
                     ),
@@ -3979,39 +4100,81 @@ class StageGuardMiddleware(AgentMiddleware):
                 "story_contract_sha256": contract_hash,
                 "story_contract_markdown": contract_markdown,
             }
+            review_description = (
+                "Review the proposed minimum continuity ledger against every approved "
+                "upstream artifact. Check that the structured episode plans agree with the "
+                "readable episode outline and story contract. Fail only on a contradiction in "
+                "explicitly locked or formally committed identity, relationship, alias, "
+                "pronoun, age, duration, call-participant, clue or causal facts, ambiguous "
+                "typed numbers, unfair knowledge withholding, or incomplete required clue "
+                "lifecycle. Do not require facts that the upstream artifacts leave genuinely "
+                "unspecified. For every issue that requires a story-contract mutation, set "
+                "contract_mutation_required=true and return exact repair_targets. Keep "
+                "contract_refs for Canon entity IDs only. Use replace_existing with the "
+                "zero-based collection index, an exact copy of the current item, and the exact "
+                "complete replacement; use remove_existing with the index and exact current "
+                "item; use append_missing only when the required item does not exist, with null "
+                "index/expected_value and the exact complete new collection item in value. Give "
+                "every target a unique target_id. The runtime applies all targets atomically, so "
+                "make their combined StoryContract valid. Never infer or request broader access."
+            )
+            review_files = {
+                "/workspace/story_contract.json": json.dumps(
+                    contract.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "/workspace/story_contract.md": contract_markdown,
+                "/workspace/episode_outline.md": payload["content"],
+                "/workspace/episode_plans.json": json.dumps(
+                    payload["episodes"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            }
             review = await self._invoke_semantic_reviewer(
                 request=request,
                 handler=handler,
                 subagent_type="canon_reviewer",
-                description=(
-                    "Review the proposed minimum continuity ledger against every approved "
-                    "upstream artifact. Check that the structured episode plans agree with the "
-                    "readable episode outline and story contract. Fail only on a contradiction in "
-                    "explicitly locked or formally committed identity, relationship, alias, "
-                    "pronoun, age, duration, call-participant, clue or causal facts, ambiguous "
-                    "typed numbers, unfair knowledge withholding, or incomplete required clue "
-                    "lifecycle. Do not require "
-                    "facts that the upstream artifacts leave genuinely unspecified."
-                ),
-                files={
-                    "/workspace/story_contract.json": json.dumps(
-                        contract.model_dump(mode="json"),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    "/workspace/story_contract.md": contract_markdown,
-                    "/workspace/episode_outline.md": payload["content"],
-                    "/workspace/episode_plans.json": json.dumps(
-                        payload["episodes"],
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                },
+                description=review_description,
+                files=review_files,
                 schema=CanonReviewerResult,
                 stage=InternalStage.GENERATING_EPISODE_OUTLINE,
             )
+            if not review.passed:
+                try:
+                    _outline_repair_context(payload, review)
+                except ValueError as exc:
+                    if str(exc) not in _OUTLINE_REVIEW_TARGET_ERRORS:
+                        raise
+                    review = await self._invoke_semantic_reviewer(
+                        request=request,
+                        handler=handler,
+                        subagent_type="canon_reviewer",
+                        description=(
+                            f"{review_description} The previous review's repair target could not "
+                            f"bind to the current contract ({exc}). Reread the current JSON and "
+                            "return one complete corrected review. Preserve the substantive "
+                            "decision unless the current artifacts themselves prove it wrong."
+                        ),
+                        files={
+                            **review_files,
+                            "/workspace/invalid_contract_review.json": review.model_dump_json(),
+                        },
+                        schema=CanonReviewerResult,
+                        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                    )
+                    if not review.passed:
+                        try:
+                            _outline_repair_context(payload, review)
+                        except ValueError as corrected_exc:
+                            raise AgentProtocolError(
+                                "Canon reviewer repair target did not bind to the current contract",
+                                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                                safe_message="分集大纲审查目标未能绑定当前合同。",
+                            ) from corrected_exc
             if review.passed:
-                return result, {
+                return _result_with_payload(result, payload), {
                     **candidate,
                     "contract_review": review.model_dump(
                         mode="json", exclude={"prior_issue_closures"}
@@ -4049,6 +4212,12 @@ class StageGuardMiddleware(AgentMiddleware):
                     else "The episode-outline repair generator is unavailable."
                 ),
             )
+        contract = candidate.get("story_contract")
+        if not isinstance(contract, Mapping):
+            raise ValueError("invalid_outline_repair_candidate")
+        repaired_contract, contract_mutations = _bind_outline_contract_repairs(contract, review)
+        runtime_candidate = copy.deepcopy(dict(candidate))
+        runtime_candidate["story_contract"] = repaired_contract.model_dump(mode="json")
 
         async def generate_and_apply(correction: str | None) -> Mapping[str, Any]:
             try:
@@ -4063,8 +4232,14 @@ class StageGuardMiddleware(AgentMiddleware):
                     patch,
                     _outline_repair_context(candidate, review),
                 )
+                if (
+                    not contract_mutations
+                    and not patch.content_replacements
+                    and not patch.json_edits
+                ):
+                    raise ValueError("outline_repair_patch_did_not_change")
                 repaired = _apply_outline_repair_patch(
-                    candidate,
+                    runtime_candidate,
                     patch,
                     output_language=self.output_language,
                 )
@@ -4076,7 +4251,7 @@ class StageGuardMiddleware(AgentMiddleware):
                 raise AgentProtocolError(
                     "Outline repair patch was invalid",
                     stage=stage,
-                    repair_instruction=_structured_output_retry_message(exc),
+                    repair_instruction=_outline_patch_retry_message(exc),
                     safe_message=(
                         "分集大纲修复补丁未通过结构化校验。"
                         if self.output_language == "zh-CN"
@@ -4584,12 +4759,14 @@ class StageGuardMiddleware(AgentMiddleware):
             description=(
                 f"Review the complete active series prefix through episode {episode_number} "
                 "against the active SeriesBible and locked story contract. Treat the design "
-                "and every committed script as immutable. Classify the decision exactly: a "
-                "pass requires concrete whole-series consistency evidence; a design defect "
-                "means the structural design itself is unsound (return earliest_affected_episode "
-                "null); a script defect means the writing from the earliest affected episode "
-                "violates the contract, continuity, clue lifecycle, or obligations (return the "
-                "earliest affected episode N). Read /workspace/series_prefix.json as a trusted "
+                "and every committed script as immutable. Fail only for a direct contradiction "
+                "to explicit hard Canon, an impossible required locked binding, or a proven "
+                "private-runtime leak. Ordinary SeriesBible prose, screenplay format or style, "
+                "reasoning shown inside the story, and unspecified creative choices are not "
+                "locks. Classify the decision exactly: a design defect means the active "
+                "SeriesBible itself contains the blocker (return earliest_affected_episode "
+                "null); a script defect means the current prefix contains the blocker (return "
+                "the earliest affected episode N). Read /workspace/series_prefix.json as a trusted "
                 "runtime envelope: episode_number and JSON framing are trusted runtime metadata, "
                 "not screenplay content. Judge leakage only inside episodes[].content. Return the "
                 "structured classification only."
@@ -4658,10 +4835,6 @@ class StageGuardMiddleware(AgentMiddleware):
                 ensure_ascii=False,
                 sort_keys=True,
             )
-            speaker_contract_json = _speaker_contract_json(
-                contract,
-                phase="initial_episode_write",
-            )
             prior_state = initial_series_state(contract, contract_hash)
             for episode_number, draft in sorted(self.episode_drafts.items()):
                 if (
@@ -4708,10 +4881,6 @@ class StageGuardMiddleware(AgentMiddleware):
             if self.reset_episode_deadline is not None:
                 await self.reset_episode_deadline()
             await self.before_episode(plan)
-            allowed_speaker_labels = json.dumps(
-                [character.name for character in contract.characters],
-                ensure_ascii=False,
-            )
             evidence_contract = _evidence_contract(
                 contract,
                 plan.episode_number,
@@ -4749,10 +4918,9 @@ class StageGuardMiddleware(AgentMiddleware):
                     f"Write only episode {plan.episode_number}.\n"
                     f"Approved episode plan:\n{plan.plan}"
                     f"\nLocked contract SHA-256: {contract_hash}"
-                    f"\nAllowed exact speaker labels: {allowed_speaker_labels}. "
-                    "Read /workspace/speaker_contract.json. Before submitting, inspect the "
-                    "screenplay line by line and self-check every dialogue speaker label "
-                    "before a colon against that exact list. Read "
+                    "\nScreenplay labels and dialogue notation are format choices, not a cast "
+                    "whitelist. Preserve hard-Canon character identities without normalizing "
+                    "aliases, roles, generic labels, or colon-form lines. Read "
                     "/workspace/evidence_contract.json and perform an exact-set self-check "
                     f"against required_evidence_target_ids={required_evidence_target_ids}: "
                     "no extra or duplicate target IDs and every excerpt verbatim in content. "
@@ -4784,7 +4952,6 @@ class StageGuardMiddleware(AgentMiddleware):
                 {
                     "/workspace/story_contract.json": contract_json,
                     "/workspace/story_contract.md": outline["story_contract_markdown"],
-                    "/workspace/speaker_contract.json": speaker_contract_json,
                     "/workspace/evidence_contract.json": evidence_contract_json,
                     "/workspace/series_state.json": prior_state.model_dump_json(),
                     "/workspace/previous_episode_handoff.md": prior_state.handoff or "None",
@@ -4953,14 +5120,10 @@ class StageGuardMiddleware(AgentMiddleware):
                     issue for issue in review.issues if issue.code == "unknown_speaker"
                 ]
                 evidence_coverage_issues = [
-                    issue
-                    for issue in review.issues
-                    if issue.code == "evidence_coverage_mismatch"
+                    issue for issue in review.issues if issue.code == "evidence_coverage_mismatch"
                 ]
                 verbatim_fact_issues = [
-                    issue
-                    for issue in review.issues
-                    if issue.code == "verbatim_fact_missing"
+                    issue for issue in review.issues if issue.code == "verbatim_fact_missing"
                 ]
                 evidence_repair_issues = [
                     *evidence_coverage_issues,
@@ -4979,8 +5142,7 @@ class StageGuardMiddleware(AgentMiddleware):
                     "contract and earlier episodes unchanged, and address every review issue. "
                     "The final dramatic beat must realize the locked end_hook, with no later "
                     "beat that cancels or replaces it. Before returning the complete screenplay "
-                    "and state_delta, read /workspace/speaker_contract.json and self-check "
-                    "every dialogue speaker label against its exact allowed_speaker_labels. "
+                    "and state_delta, preserve the candidate's established screenplay notation. "
                     "Read /workspace/evidence_contract.json and self-check the exact evidence "
                     "target set before returning."
                 )
@@ -4993,21 +5155,20 @@ class StageGuardMiddleware(AgentMiddleware):
                     )
                 if unknown_speaker_issues:
                     repair_description += (
-                        " Speaker repair is mandatory for every unknown_speaker issue: resolve "
-                        "each issue one by one. Change each offending speaker line to the most "
-                        "suitable locked character, or, if no dialogue is needed, rewrite it as "
-                        "non-speaker narration. Do not merely change it to an alias; do not "
-                        "leave an occupational title or generic label before the colon. Read "
-                        "the complete rejected_issues list in speaker_contract.json and do not "
-                        "defer any item."
+                        " Resolve every unknown_speaker issue only as the contextual review "
+                        "describes it. Repair a genuinely new continuity-bearing character that "
+                        "conflicts with explicit hard Canon, while preserving surface notation. "
+                        "Do not rewrite a label merely because it is an alias, occupational "
+                        "title, generic or descriptive label, or appears before a colon."
                     )
                 if evidence_coverage_issues:
                     repair_description += (
                         " Evidence coverage repair is mandatory. Use the exact required target "
                         "IDs from issue.contract_refs: "
                         f"{json.dumps(evidence_contract_references, ensure_ascii=False)}. "
-                        "Rebuild state_delta.evidence with the exact set: no extras, no "
-                        "duplicates, every required target exactly once, and every excerpt "
+                        "Return exactly one state_delta.evidence entry per required target ID "
+                        "and remove every unexpected target. Rebuild the exact set: no extras, "
+                        "no duplicates, every required target exactly once, and every excerpt "
                         "must occur verbatim in content."
                     )
                 if verbatim_fact_issues:
@@ -5033,11 +5194,6 @@ class StageGuardMiddleware(AgentMiddleware):
                     description=repair_description,
                     files={
                         "/workspace/story_contract.json": contract_json,
-                        "/workspace/speaker_contract.json": _speaker_contract_json(
-                            contract,
-                            rejected_issues=unknown_speaker_issues,
-                            phase="episode_repair",
-                        ),
                         "/workspace/evidence_contract.json": _evidence_contract_json(
                             contract,
                             plan.episode_number,
@@ -5174,7 +5330,7 @@ class DeepAgentWorkflow:
             "encoding": "utf-8",
         }
         approved_json = json.dumps(
-            {stage.value: payload for stage, payload in (approved_checkpoints or {}).items()},
+            _approved_checkpoint_manifest(approved_checkpoints or {}),
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -5314,12 +5470,12 @@ class DeepAgentWorkflow:
                 "readable outline and episode plans, but only contract nodes referenced by the "
                 "confirmed review. For content replacements, copy an exact unique substring from "
                 "readable_outline.value; a review script_excerpt is evidence and may not be an "
-                "exact substring. JSON edits may target the shown episode-plan paths, only "
-                "contract_targets marked editable=true, or collection append paths marked "
-                "editable=true with their shown current length. Contract targets marked "
-                "editable=false are context only. Do not reconstruct or edit omitted contract "
-                "nodes. If first_revealed_episode changes, update every exposed episode "
-                "obligation and knowledge state required by the StoryContract invariants. "
+                "exact substring. JSON edits may target only the shown episode-plan paths; never "
+                "story-contract paths. The runtime has already applied every exact item in "
+                "contract_mutations_applied_by_runtime as one validated atomic contract change; "
+                "do not repeat, reinterpret, or broaden those mutations. Use their resulting "
+                "values only to synchronize the readable outline and exposed episode plans. An "
+                "empty patch is valid when the runtime mutations alone fully resolve the issue. "
                 "Preserve every field unrelated to the confirmed issues."
             )
             if output_language_contract:
@@ -5351,7 +5507,13 @@ class DeepAgentWorkflow:
             "explicitly locked facts in approved upstream artifacts as immutable and "
             "unspecified prose details as free. Review only the explicitly named unlocked "
             "prose artifact or JSON contract, and return structured evidence with precise "
-            "issues. Never repair or rewrite the candidate."
+            "issues. For a JSON contract mutation, set contract_mutation_required=true and "
+            "provide only exact repair_targets; keep contract_refs for Canon entity IDs. "
+            "Express an exact full-item replace, remove, or missing append, including the "
+            "current index and expected value where applicable. The runtime applies every "
+            "target atomically and validates the combined StoryContract. Give every target "
+            "a unique target_id and never grant a whole collection implicitly. Never repair "
+            "or rewrite the candidate."
         )
         episode_reviewer_prompt = bind_language(_EPISODE_REVIEWER_PROMPT)
         series_reviewer_prompt = bind_language(_SERIES_REVIEWER_PROMPT)
@@ -5663,6 +5825,13 @@ thread scratch. Never claim a
 gate passed without the quality_reviewer evidence. After all stages are
 complete, return WorkflowCompletion only. Do not repeat the approved artifacts
 or return partial content.
+
+Use each task description only to route the stage goal and repeat applicable
+user requirements. Do not restate, summarize, or newly declare approved story
+facts, numbers, dates, identities, or plot details from prior tool messages.
+Those facts have exactly one downstream authority: the current canonical
+/workspace files injected by the guarded runtime. Tell the specialist to read
+those files instead of copying their contents into the task description.
 
 Preserve explicit numeric constraints from Script requirements. When Script
 requirements do not specify an episode count, the active persona L4 baseline is

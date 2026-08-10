@@ -173,6 +173,7 @@ class ModelCallUsage(StrictModel):
 
 class ModelCallSummary(StrictModel):
     call_id: str
+    operation_id: str | None = None
     role: Literal["generation", "review"]
     adapter: str
     provider: str
@@ -328,9 +329,10 @@ class RunPause(StrictModel):
 class RepairAuthorization(StrictModel):
     """The exact one-cycle repair authorization shown at a repair-authorization pause.
 
-    It binds the active lineage and carries the review evidence, the affected
-    range, and the estimated token requirement so the operator can decide between
-    ``authorize once`` and ``end and preserve workspace`` (RPR-A8/A9).
+    It binds the active lineage and carries the review evidence, affected range,
+    and a reference token count for the active design projections and retained
+    prefix at the pause. This is neither a lower bound nor a total cycle forecast;
+    actual repair input and output can differ (RPR-A8/A9).
     """
 
     authorization_epoch: int = Field(ge=1)
@@ -342,7 +344,14 @@ class RepairAuthorization(StrictModel):
     batch_epoch: int = Field(ge=1)
     earliest_affected_episode: int | None = Field(default=None, ge=1)
     range_episodes: int | None = Field(default=None, ge=1)
-    estimated_tokens: int | None = Field(default=None, ge=0)
+    estimated_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Reference token count for active design projections and the retained prefix at the "
+            "pause; neither a lower bound nor a total repair-cycle forecast."
+        ),
+    )
     evidence: NonEmptyText
     review_id: str
     granted_at: datetime | None = None

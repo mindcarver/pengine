@@ -51,6 +51,7 @@ OUTCOME = Literal["success", "failure", "timeout", "stale", "superseded", "block
 _MODEL_CALLS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS model_calls (
     call_id TEXT PRIMARY KEY,
+    operation_id TEXT,
     run_id TEXT,
     creation_id TEXT,
     thread_id TEXT,
@@ -92,6 +93,11 @@ CREATE TABLE IF NOT EXISTS model_calls (
 _MODEL_CALLS_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS model_calls_run_id
 ON model_calls(run_id);
+"""
+
+_MODEL_CALLS_OPERATION_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS model_calls_operation_id
+ON model_calls(run_id, operation_id);
 """
 
 
@@ -170,7 +176,7 @@ class ModelCallContext:
     repair_round: int | None = None
     candidate: str | None = None
     batch: str | None = None
-    call_id: str | None = None
+    operation_id: str | None = None
 
     def reset(self) -> None:
         self.run_id = None
@@ -182,7 +188,7 @@ class ModelCallContext:
         self.repair_round = None
         self.candidate = None
         self.batch = None
-        self.call_id = None
+        self.operation_id = None
 
 
 class StageCallBudgetExceeded(RuntimeError):
@@ -231,6 +237,7 @@ class ModelCallRecord:
     status: MODEL_CALLS_STATUS
     usage_status: USAGE_STATUS = "unavailable"
     outcome: OUTCOME = "incomplete"
+    operation_id: str | None = None
     run_id: str | None = None
     creation_id: str | None = None
     thread_id: str | None = None
@@ -259,12 +266,17 @@ def new_call_id() -> str:
     return str(uuid4())
 
 
+def new_operation_id() -> str:
+    return str(uuid4())
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
 def build_started_record(
     *,
+    call_id: str | None = None,
     role: str,
     adapter: str,
     provider: str,
@@ -276,7 +288,7 @@ def build_started_record(
 ) -> ModelCallRecord:
     now = _utc_now()
     return ModelCallRecord(
-        call_id=context.call_id or new_call_id(),
+        call_id=call_id or new_call_id(),
         role=role,
         adapter=adapter,
         provider=provider,
@@ -288,6 +300,7 @@ def build_started_record(
         verified_limit_tokens=verified_limit_tokens,
         preflight="ok",
         status="started",
+        operation_id=context.operation_id,
         run_id=context.run_id,
         creation_id=context.creation_id,
         thread_id=context.thread_id,
@@ -423,6 +436,7 @@ def _row_values(record: ModelCallRecord) -> tuple[Any, ...]:
 
 _COLUMNS = (
     "call_id",
+    "operation_id",
     "run_id",
     "creation_id",
     "thread_id",
@@ -491,7 +505,8 @@ WHERE run_id = ?
 """
 
 
-_PROVIDER_EVIDENCE_ALTERS = (
+_MODEL_CALL_ALTERS = (
+    "ALTER TABLE model_calls ADD COLUMN operation_id TEXT",
     "ALTER TABLE model_calls ADD COLUMN http_status INTEGER",
     "ALTER TABLE model_calls ADD COLUMN provider_error_code TEXT",
     "ALTER TABLE model_calls ADD COLUMN redacted_response TEXT",
@@ -521,30 +536,36 @@ class ModelCallStore:
         self._connection.execute("PRAGMA busy_timeout = 30000")
         self._connection.execute(_MODEL_CALLS_TABLE_SQL)
         self._connection.execute(_MODEL_CALLS_INDEX_SQL)
-        self._ensure_provider_evidence_columns()
+        self._ensure_model_call_columns()
+        self._connection.execute(_MODEL_CALLS_OPERATION_INDEX_SQL)
         self._connection.commit()
         # Serialize writes when the store is used from the audit writer thread and
         # the worker loop (e.g. the timeout finalizer) at the same time.
         self._write_lock = threading.Lock()
 
-    def _ensure_provider_evidence_columns(self) -> None:
+    def _ensure_model_call_columns(self) -> None:
         """Upgrade a pre-existing ``model_calls`` table in place.
 
-        Databases created before the provider-evidence columns were added keep working
-        after a restart: each missing column is added with a nullable default so the
-        upsert writes all columns (Issue #52 graph revision 4).
+        Missing logical-operation and provider-evidence columns use nullable defaults,
+        preserving existing physical call rows while enabling current writes.
         """
         existing = {
             row["name"]
             for row in self._connection.execute("PRAGMA table_info(model_calls)").fetchall()
         }
-        for statement in _PROVIDER_EVIDENCE_ALTERS:
+        for statement in _MODEL_CALL_ALTERS:
             column = statement.split()[-2]
             if column not in existing:
                 self._connection.execute(statement)
 
     def upsert(self, record: ModelCallRecord) -> None:
         with self._write_lock:
+            existing = self._connection.execute(
+                "SELECT requested_at FROM model_calls WHERE call_id = ?",
+                (record.call_id,),
+            ).fetchone()
+            if existing is not None and existing["requested_at"] != record.requested_at:
+                raise ValueError(f"Physical model call id collision: {record.call_id}")
             self._connection.execute(_UPSERT_SQL, _row_values(record))
             self._connection.commit()
 
@@ -577,6 +598,10 @@ class ModelCallState:
     stage_role_call_counts: dict[tuple[str, str], int] = field(default_factory=dict)
     episode_role_call_counts: dict[tuple[str, int, str], int] = field(default_factory=dict)
     _count_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _succeeded_call_ids: dict[tuple[str | None, str, str | None, int | None, str | None], str] = (
+        field(default_factory=dict, repr=False)
+    )
+    _seen_physical_call_ids: set[str] = field(default_factory=set, repr=False)
 
     def reset(self) -> None:
         self.context.reset()
@@ -584,6 +609,8 @@ class ModelCallState:
             self.stage_call_counts.clear()
             self.stage_role_call_counts.clear()
             self.episode_role_call_counts.clear()
+        self._succeeded_call_ids.clear()
+        self._seen_physical_call_ids.clear()
 
     def reserve_stage_call(
         self,
@@ -625,3 +652,31 @@ class ModelCallState:
             self.stage_role_call_counts[stage_key] = stage_attempted
             self.stage_call_counts[stage] = self.stage_call_counts.get(stage, 0) + 1
             return episode_attempted or stage_attempted
+
+    def claim_physical_call_id(self, call_id: str) -> None:
+        if call_id in self._seen_physical_call_ids:
+            raise RuntimeError(f"Duplicate physical model call id: {call_id}")
+        self._seen_physical_call_ids.add(call_id)
+
+    def remember_succeeded(self, record: ModelCallRecord) -> None:
+        if record.status != "succeeded":
+            raise ValueError("Only a succeeded physical model call can be remembered")
+        key = (
+            record.run_id,
+            record.role,
+            record.stage,
+            record.episode_number,
+            record.operation_id,
+        )
+        self._succeeded_call_ids[key] = record.call_id
+
+    def latest_succeeded_call_id(
+        self,
+        *,
+        role: str,
+        run_id: str | None,
+        stage: str | None,
+        episode_number: int | None,
+        operation_id: str | None,
+    ) -> str | None:
+        return self._succeeded_call_ids.get((run_id, role, stage, episode_number, operation_id))

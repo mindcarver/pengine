@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.types import Command
 from persona_factory import create_persona_package
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -27,13 +29,13 @@ from pengine.agents import (
     _EPISODE_PLANNER_PROMPT,
     _EPISODE_REPAIR_PROMPT,
     _EPISODE_REVIEWER_PROMPT,
+    _INTERNAL_RUNTIME_LEAK_POLICY,
     _QUALITY_REVIEWER_PROMPT,
     _REPAIR_TOOL_ALLOWLIST,
     _SCRIPT_WRITER_PROMPT,
     _SERIES_REVIEWER_PROMPT,
     _SPECIALIST_SKILL_SOURCES,
     _STORY_ARCHITECT_PROMPT,
-    _WORKFLOW_SCAFFOLDING_POLICY,
     REVIEW_FILE_PERMISSIONS,
     SKILLED_WRITE_PERMISSIONS,
     VIRTUAL_FILE_PERMISSIONS,
@@ -56,6 +58,7 @@ from pengine.agents import (
     _apply_outline_repair_patch,
     _apply_story_artifact_repair_patch,
     _arithmetic_tool,
+    _bind_outline_contract_repairs,
     _calculate_arithmetic,
     _canon_issue_ledger,
     _compact_supervisor_messages,
@@ -67,6 +70,7 @@ from pengine.agents import (
     _outline_repair_context,
     _outline_repair_result,
     _request_with_canonical_workspace,
+    _result_with_payload,
     _story_patch_correction,
     _story_repair_context,
     _structured_output_retry_message,
@@ -85,6 +89,12 @@ from pengine.continuity import (
     story_contract_sha256,
 )
 from pengine.language import SIMPLIFIED_CHINESE, language_instruction
+from pengine.model_calls import (
+    ModelCallState,
+    ModelCallStore,
+    build_started_record,
+    new_call_id,
+)
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import CreateCreationRequest, EpisodeDraft, EpisodePlan, InternalStage
@@ -125,14 +135,74 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         )
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ProvenanceFakeWorkflow(DeepAgentWorkflow):
+    """Make artifact-producing fake calls obey the physical ledger contract."""
+
+    model_call_state: ModelCallState
+
+    def _record_succeeded_call(self, role: str) -> None:
+        state = self.model_call_state
+        assert state.store is not None
+        call_id = new_call_id()
+        state.claim_physical_call_id(call_id)
+        record = build_started_record(
+            call_id=call_id,
+            role=role,
+            adapter="fake",
+            provider="fake",
+            model="toolcallingfakemodel",
+            context=state.context,
+            estimated_input_tokens=10,
+            estimated_output_tokens=20,
+            verified_limit_tokens=200_000,
+        )
+        record.status = "succeeded"
+        record.outcome = "success"
+        state.store.upsert(record)
+        state.remember_succeeded(record)
+
+    async def execute(self, **kwargs: Any):
+        approve_stage = kwargs["approve_stage"]
+        commit_episode = kwargs.get("commit_episode")
+        register_series_review = kwargs.get("register_series_review")
+
+        async def approve_with_provenance(stage, payload):
+            if stage is InternalStage.GENERATING_EPISODE_OUTLINE and "story_contract" in payload:
+                self._record_succeeded_call("review")
+            await approve_stage(stage, payload)
+
+        async def commit_with_provenance(*args, **commit_kwargs):
+            assert commit_episode is not None
+            self._record_succeeded_call("generation")
+            return await commit_episode(*args, **commit_kwargs)
+
+        async def review_with_provenance(**review_kwargs):
+            assert register_series_review is not None
+            self._record_succeeded_call("review")
+            return await register_series_review(**review_kwargs)
+
+        return await DeepAgentWorkflow.execute(
+            self,
+            **{
+                **kwargs,
+                "approve_stage": approve_with_provenance,
+                "commit_episode": commit_with_provenance,
+                "register_series_review": review_with_provenance,
+            },
+        )
+
+
 def _fake_workflow(
     *,
     model: ToolCallingFakeModel,
     checkpointer: Any,
     recursion_limit: int = 80,
     provider_profile_key: str = "toolcallingfakemodel",
+    model_call_state: ModelCallState | None = None,
 ) -> DeepAgentWorkflow:
-    return DeepAgentWorkflow(
+    workflow_type = _ProvenanceFakeWorkflow if model_call_state is not None else DeepAgentWorkflow
+    kwargs = dict(
         generation_model=model,
         review_model=model,
         checkpointer=checkpointer,
@@ -140,6 +210,9 @@ def _fake_workflow(
         generation_provider_profile_key=provider_profile_key,
         review_provider_profile_key=provider_profile_key,
     )
+    if model_call_state is not None:
+        return workflow_type(**kwargs, model_call_state=model_call_state)
+    return workflow_type(**kwargs)
 
 
 def _tool_name(tool: Any) -> str:
@@ -153,10 +226,13 @@ def _tool_name(tool: Any) -> str:
 
 
 def _prompt_mentions_tool(prompt: str, tool_name: str) -> bool:
-    return re.search(
-        rf"(?<![A-Za-z0-9_]){re.escape(tool_name)}(?![A-Za-z0-9_])",
-        prompt,
-    ) is not None
+    return (
+        re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(tool_name)}(?![A-Za-z0-9_])",
+            prompt,
+        )
+        is not None
+    )
 
 
 def _assert_task_lists_exact_workspace_paths(request: ToolCallRequest) -> None:
@@ -647,6 +723,7 @@ def test_story_artifact_patch_repairs_only_numbered_minimal_lines() -> None:
                 "code": "relative_age_conflict",
                 "message": "候选年龄应与小传的二十二岁、相差两岁一致",
                 "script_excerpt": "程远在海难时二十四岁，比程屿大约六岁。",
+                "contract_mutation_required": False,
             }
         ],
     )
@@ -859,6 +936,7 @@ def test_canon_review_rejects_non_blocking_suggestions_as_issues() -> None:
                     {
                         "code": "optional_naming",
                         "message": "这不是逻辑矛盾，仅建议换一个名字，不构成失败。",
+                        "contract_mutation_required": False,
                     }
                 ],
             }
@@ -874,6 +952,7 @@ def _prior_story_review() -> CanonReviewerResult:
                 "code": "relative_age_conflict",
                 "message": "上游小传为二十二岁。",
                 "script_excerpt": "人物年龄二十四岁。",
+                "contract_mutation_required": False,
             }
         ],
     )
@@ -1033,6 +1112,7 @@ async def test_story_repair_allows_two_bounded_targeted_patch_corrections() -> N
                 "code": "only_repairer_conflict",
                 "message": "删除唯一限定词。",
                 "script_excerpt": "林守诚（父亲）：兼岛上唯一修表师。",
+                "contract_mutation_required": False,
             }
         ],
     )
@@ -1092,7 +1172,13 @@ async def test_story_repair_preserves_transport_failures_without_retry(failure: 
     review = CanonReviewerResult(
         passed=False,
         evidence="需要修复。",
-        issues=[{"code": "stale_text", "message": "替换旧文字。"}],
+        issues=[
+            {
+                "code": "stale_text",
+                "message": "替换旧文字。",
+                "contract_mutation_required": False,
+            }
+        ],
     )
 
     with pytest.raises(type(failure)) as caught:
@@ -1193,6 +1279,43 @@ async def test_loop_relay_retry_propagates_non_relay_errors_immediately() -> Non
     assert calls == 1
 
 
+def test_result_with_payload_preserves_command_state_and_tool_metadata() -> None:
+    tool_message = ToolMessage(
+        content='{"value":"stale"}',
+        tool_call_id="task-call",
+        name="task",
+        artifact={"audit": "preserved"},
+        additional_kwargs={"source": "subagent"},
+        response_metadata={"trace": "preserved"},
+    )
+    original = Command(
+        graph=Command.PARENT,
+        update={
+            "messages": [tool_message],
+            "files": {"/workspace/scratch.md": {"content": "保留"}},
+            "counter": 2,
+        },
+        resume={"approved": True},
+        goto="supervisor",
+    )
+
+    result = _result_with_payload(original, {"value": "approved"})
+
+    assert isinstance(result, Command)
+    assert result.graph == original.graph
+    assert result.resume == original.resume
+    assert result.goto == original.goto
+    assert result.update["files"] == original.update["files"]
+    assert result.update["counter"] == 2
+    message = result.update["messages"][0]
+    assert json.loads(message.content) == {"value": "approved"}
+    assert message.tool_call_id == tool_message.tool_call_id
+    assert message.name == tool_message.name
+    assert message.artifact == tool_message.artifact
+    assert message.additional_kwargs == tool_message.additional_kwargs
+    assert message.response_metadata == tool_message.response_metadata
+
+
 def test_canonical_workspace_replaces_stale_story_files_and_preserves_scratch() -> None:
     request = ToolCallRequest(
         tool_call={"name": "task", "args": {}, "id": "canonical", "type": "tool_call"},
@@ -1223,6 +1346,12 @@ def test_canonical_workspace_replaces_stale_story_files_and_preserves_scratch() 
             "relationship_logic": None,
             "selected_l0_variant": None,
             "selection_rationale": None,
+            "consistency_review": {
+                "passed": True,
+                "evidence": "已淘汰的旧事实只用于审计",
+                "issues": [],
+            },
+            "consistency_repair_rounds": 1,
         },
         InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
             "stage": "generating_character_relationships",
@@ -1241,7 +1370,11 @@ def test_canonical_workspace_replaces_stale_story_files_and_preserves_scratch() 
     assert files["/workspace/character_biographies.md"]["content"] == "已批准小传"
     assert files["/workspace/relationship_logic.md"]["content"] == "已批准关系"
     assert files["/workspace/scratch.md"]["content"] == "保留"
-    assert "已批准大纲" in files["/workspace/approved-checkpoints.json"]["content"]
+    manifest = json.loads(files["/workspace/approved-checkpoints.json"]["content"])
+    assert manifest["generating_story_outline"]["content"] == "已批准大纲"
+    assert "consistency_review" not in manifest["generating_story_outline"]
+    assert "consistency_repair_rounds" not in manifest["generating_story_outline"]
+    assert "已淘汰的旧事实" not in files["/workspace/approved-checkpoints.json"]["content"]
 
 
 def test_outline_repair_context_excludes_unrelated_contract_and_frozen_upstream() -> None:
@@ -1264,7 +1397,26 @@ def test_outline_repair_context_excludes_unrelated_contract_and_frozen_upstream(
             {
                 "code": "knowledge_overcommit",
                 "message": "修正所有引用事实一的知识状态。",
-                "contract_refs": ["fact_ep1", "knowledge_states"],
+                "contract_refs": ["fact_ep1"],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": f"replace_knowledge_{index}",
+                        "collection": "knowledge_states",
+                        "intent": "replace_existing",
+                        "index": index,
+                        "expected_value": state,
+                        "value": {
+                            **state,
+                            "known_fact_ids": [
+                                fact_id
+                                for fact_id in state["known_fact_ids"]
+                                if fact_id != "fact_ep1"
+                            ],
+                        },
+                    }
+                    for index, state in enumerate(contract["knowledge_states"])
+                ],
             }
         ],
     )
@@ -1272,7 +1424,10 @@ def test_outline_repair_context_excludes_unrelated_contract_and_frozen_upstream(
     context = _outline_repair_context(candidate, review)
     serialized_context = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
     serialized_candidate = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
-    target_by_path = {item["path"]: item for item in context["contract_targets"]}
+    mutation_by_path = {
+        item["path"]: item for item in context["contract_mutations_applied_by_runtime"]
+    }
+    context_by_path = {item["path"]: item for item in context["contract_context"]}
 
     assert "frozen_upstream" not in context
     assert "candidate" not in context
@@ -1283,16 +1438,15 @@ def test_outline_repair_context_excludes_unrelated_contract_and_frozen_upstream(
     assert context["unmatched_contract_refs"] == []
     assert context["readable_outline"]["value"] == candidate["content"]
     assert [item["value"] for item in context["episode_plans"]] == candidate["episodes"]
-    assert set(target_by_path) == {
-        "/story_contract/facts/0",
+    assert set(mutation_by_path) == {
         "/story_contract/knowledge_states/0",
         "/story_contract/knowledge_states/1",
     }
-    assert target_by_path["/story_contract/facts/0"]["editable"] is False
-    assert target_by_path["/story_contract/knowledge_states/0"]["editable"] is True
+    assert set(context_by_path) == {"/story_contract/facts/0"}
+    assert mutation_by_path["/story_contract/knowledge_states/0"]["op"] == "replace"
 
 
-def test_outline_repair_context_exposes_fact_dependency_closure() -> None:
+def test_outline_repair_context_uses_explicit_contract_targets() -> None:
     contract = _story_contract(episode_count=2).model_dump(mode="json")
     candidate = {
         "stage": "generating_episode_outline",
@@ -1306,33 +1460,754 @@ def test_outline_repair_context_exposes_fact_dependency_closure() -> None:
     }
     review = CanonReviewerResult(
         passed=False,
-        evidence="事实一被提前到第一集揭示。",
+        evidence="事实一的谓词和时间线标签与上游冲突。",
         issues=[
             {
-                "code": "premature_reveal",
-                "message": "fact_ep1 应改到第二集揭示并同步义务与知识状态。",
+                "code": "fact_timeline_conflict",
+                "message": "精确修正 fact_ep1 及其时间线标签。",
                 "contract_refs": ["fact_ep1"],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "replace_fact_ep1",
+                        "collection": "facts",
+                        "intent": "replace_existing",
+                        "index": 0,
+                        "expected_value": contract["facts"][0],
+                        "value": {
+                            **contract["facts"][0],
+                            "predicate": "确认修复事实",
+                        },
+                    },
+                    {
+                        "target_id": "replace_timeline_ep1",
+                        "collection": "timeline",
+                        "intent": "replace_existing",
+                        "index": 0,
+                        "expected_value": contract["timeline"][0],
+                        "value": {
+                            **contract["timeline"][0],
+                            "when": "第一幕",
+                        },
+                    },
+                ],
             }
         ],
     )
 
     context = _outline_repair_context(candidate, review)
-    target_by_path = {item["path"]: item for item in context["contract_targets"]}
+    mutation_by_path = {
+        item["path"]: item for item in context["contract_mutations_applied_by_runtime"]
+    }
 
-    assert set(target_by_path) == {
+    assert set(mutation_by_path) == {
         "/story_contract/facts/0",
         "/story_contract/timeline/0",
-        "/story_contract/knowledge_states/0",
-        "/story_contract/knowledge_states/1",
-        "/story_contract/episode_obligations/0",
-        "/story_contract/episode_obligations/1",
     }
-    assert all(item["editable"] is True for item in target_by_path.values())
+    assert all(item["op"] == "replace" for item in mutation_by_path.values())
+
+
+def test_outline_repair_context_exposes_explicit_collection_scope() -> None:
+    contract = _story_contract().model_dump(mode="json")
+    contract["prohibitions"] = ["保留正确约束", "删除冲突约束"]
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "第一集发现事实一，并遵守所有明确约束。",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract,
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="合同的禁止项与正式事实冲突。",
+        issues=[
+            {
+                "code": "conflicting_prohibition",
+                "message": "删除与 fact_ep1 冲突的禁止项。",
+                "contract_refs": ["fact_ep1"],
+                "script_excerpt": "删除冲突约束",
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "remove_conflicting_prohibition",
+                        "collection": "prohibitions",
+                        "intent": "remove_existing",
+                        "index": 1,
+                        "expected_value": "删除冲突约束",
+                    }
+                ],
+            }
+        ],
+    )
+
+    context = _outline_repair_context(candidate, review)
+    mutation_by_path = {
+        item["path"]: item for item in context["contract_mutations_applied_by_runtime"]
+    }
+    context_by_path = {item["path"]: item for item in context["contract_context"]}
+    with pytest.raises(ValidationError, match="episode plans"):
+        OutlineRepairPatch.model_validate(
+            {
+                "stage": "generating_episode_outline",
+                "json_edits": [
+                    {
+                        "op": "replace",
+                        "path": "/story_contract/prohibitions/1",
+                        "expected": "删除冲突约束",
+                        "value": "替换冲突约束",
+                    }
+                ],
+            }
+        )
+
+    assert set(context_by_path) == {"/story_contract/facts/0"}
+    assert mutation_by_path["/story_contract/prohibitions/1"]["op"] == "remove"
+    repaired_contract, _ = _bind_outline_contract_repairs(contract, review)
+    assert repaired_contract.prohibitions == ["保留正确约束"]
+
+    mismatched_review_payload = review.model_dump(mode="json")
+    mismatched_review_payload["issues"][0]["repair_targets"][0]["expected_value"] = "错误旧值"
+    mismatched_review = CanonReviewerResult.model_validate(mismatched_review_payload)
+    with pytest.raises(ValueError, match="outline_repair_review_target_mismatch"):
+        _outline_repair_context(candidate, mismatched_review)
+
+
+def test_outline_repair_context_keeps_explicit_id_scope_narrow() -> None:
+    contract = _story_contract(episode_count=2).model_dump(mode="json")
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "第一集和第二集各自建立一个事实。",
+        "episode_count": 2,
+        "episodes": [
+            {"episode_number": 1, "plan": "第一集计划"},
+            {"episode_number": 2, "plan": "第二集计划"},
+        ],
+        "story_contract": contract,
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="只需修复事实一。",
+        issues=[
+            {
+                "code": "fact_one_conflict",
+                "message": "fact_ep1 的正式值冲突。",
+                "contract_refs": ["fact_ep1"],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "replace_fact_ep1",
+                        "collection": "facts",
+                        "intent": "replace_existing",
+                        "index": 0,
+                        "expected_value": contract["facts"][0],
+                        "value": {
+                            **contract["facts"][0],
+                            "value": "修复事实1",
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+
+    context = _outline_repair_context(candidate, review)
+    mutation_by_path = {
+        item["path"]: item for item in context["contract_mutations_applied_by_runtime"]
+    }
+
+    assert mutation_by_path["/story_contract/facts/0"]["op"] == "replace"
+    assert "/story_contract/facts/1" not in mutation_by_path
+    with pytest.raises(ValidationError, match="episode plans"):
+        OutlineRepairPatch.model_validate(
+            {
+                "stage": "generating_episode_outline",
+                "json_edits": [
+                    {
+                        "op": "replace",
+                        "path": "/story_contract/facts/-",
+                        "expected": None,
+                        "value": contract["facts"][1],
+                    }
+                ],
+            }
+        )
+
+
+def test_outline_repair_context_allows_explicit_scalar_append_once() -> None:
+    contract = _story_contract().model_dump(mode="json")
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "第一集尚未建立缺失事实。",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract,
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="必须新增禁止项。",
+        issues=[
+            {
+                "code": "missing_prohibition",
+                "message": "补充不得省略关键事实的禁止项。",
+                "contract_refs": [],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "append_required_prohibition",
+                        "collection": "prohibitions",
+                        "intent": "append_missing",
+                        "value": "  不得省略关键事实。  ",
+                    }
+                ],
+            }
+        ],
+    )
+    context = _outline_repair_context(candidate, review)
+    with pytest.raises(ValidationError, match="episode plans"):
+        OutlineRepairPatch.model_validate(
+            {
+                "stage": "generating_episode_outline",
+                "json_edits": [
+                    {
+                        "op": "replace",
+                        "path": "/story_contract/prohibitions/-",
+                        "expected": len(contract["prohibitions"]),
+                        "value": "不得省略关键事实。",
+                    }
+                ],
+            }
+        )
+
+    assert context["contract_mutations_applied_by_runtime"] == [
+        {
+            "target_id": "append_required_prohibition",
+            "op": "add",
+            "path": "/story_contract/prohibitions/-",
+            "expected_value": None,
+            "value": "不得省略关键事实。",
+        }
+    ]
+    repaired_contract, _ = _bind_outline_contract_repairs(contract, review)
+    assert repaired_contract.prohibitions[-1] == "不得省略关键事实。"
+
+    empty_patch = OutlineRepairPatch.model_validate(
+        {
+            "stage": "generating_episode_outline",
+            "content_replacements": [],
+            "json_edits": [],
+        }
+    )
+    _validate_outline_repair_patch_targets(empty_patch, context)
+
+
+def test_outline_repair_context_rejects_invalid_or_existing_append_targets() -> None:
+    contract = _story_contract().model_dump(mode="json")
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "分集大纲",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract,
+    }
+
+    invalid_shape = CanonReviewerResult(
+        passed=False,
+        evidence="禁止项目标类型错误。",
+        issues=[
+            {
+                "code": "missing_prohibition",
+                "message": "补充禁止项。",
+                "contract_refs": [],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "append_invalid_prohibition",
+                        "collection": "prohibitions",
+                        "intent": "append_missing",
+                        "value": {"text": "不得增加人物"},
+                    }
+                ],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="outline_repair_review_target_value_invalid"):
+        _outline_repair_context(candidate, invalid_shape)
+
+    existing_value = CanonReviewerResult(
+        passed=False,
+        evidence="禁止项已存在。",
+        issues=[
+            {
+                "code": "duplicate_prohibition",
+                "message": "重复补充禁止项。",
+                "contract_refs": [],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "append_existing_prohibition",
+                        "collection": "prohibitions",
+                        "intent": "append_missing",
+                        "value": "不得增加人物",
+                    }
+                ],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="outline_repair_review_append_already_exists"):
+        _outline_repair_context(candidate, existing_value)
+
+    existing_identity = CanonReviewerResult(
+        passed=False,
+        evidence="角色 ID 已存在。",
+        issues=[
+            {
+                "code": "duplicate_character",
+                "message": "不得以追加方式覆盖现有角色。",
+                "contract_refs": [],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "append_existing_character",
+                        "collection": "characters",
+                        "intent": "append_missing",
+                        "value": {
+                            **contract["characters"][0],
+                            "role": "错误的新身份",
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="outline_repair_review_proposed_contract_invalid"):
+        _outline_repair_context(candidate, existing_identity)
+
+    conflicting_pending_targets = CanonReviewerResult(
+        passed=False,
+        evidence="两个追加目标复用了同一角色 ID。",
+        issues=[
+            {
+                "code": "conflicting_character_appends",
+                "message": "追加目标彼此冲突。",
+                "contract_refs": [],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "append_new_character_as_witness",
+                        "collection": "characters",
+                        "intent": "append_missing",
+                        "value": {
+                            "character_id": "new_character",
+                            "name": "新角色",
+                            "role": "证人",
+                            "initial_known_fact_ids": [],
+                        },
+                    },
+                    {
+                        "target_id": "append_new_character_as_editor",
+                        "collection": "characters",
+                        "intent": "append_missing",
+                        "value": {
+                            "character_id": "new_character",
+                            "name": "新角色",
+                            "role": "剪辑师",
+                            "initial_known_fact_ids": [],
+                        },
+                    },
+                ],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="outline_repair_review_proposed_contract_invalid"):
+        _outline_repair_context(candidate, conflicting_pending_targets)
+
+
+def test_outline_repair_append_targets_bind_all_refs_and_sequential_lengths() -> None:
+    contract = _story_contract().model_dump(mode="json")
+    contract["characters"].extend(
+        [
+            {
+                "character_id": "bob",
+                "name": "鲍勃",
+                "role": "同事",
+                "initial_known_fact_ids": [],
+            },
+            {
+                "character_id": "carol",
+                "name": "卡萝尔",
+                "role": "主管",
+                "initial_known_fact_ids": [],
+            },
+        ]
+    )
+    contract["relationships"] = [
+        {
+            "source_character_id": "test_character",
+            "target_character_id": "bob",
+            "relation": "同事",
+        }
+    ]
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "三个人的关系需要补齐。",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract,
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="缺少两条明确要求的关系。",
+        issues=[
+            {
+                "code": "missing_relationships",
+                "message": "新增 bob→carol 与 carol→test_character。",
+                "contract_refs": [
+                    "test_character",
+                    "bob",
+                    "carol",
+                ],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "append_bob_carol",
+                        "collection": "relationships",
+                        "intent": "append_missing",
+                        "value": {
+                            "source_character_id": "bob",
+                            "target_character_id": "carol",
+                            "relation": "下属与主管",
+                        },
+                    },
+                    {
+                        "target_id": "append_carol_editor",
+                        "collection": "relationships",
+                        "intent": "append_missing",
+                        "value": {
+                            "source_character_id": "carol",
+                            "target_character_id": "test_character",
+                            "relation": "主管与剪辑师",
+                        },
+                    },
+                ],
+            }
+        ],
+    )
+    context = _outline_repair_context(candidate, review)
+    assert [item["op"] for item in context["contract_mutations_applied_by_runtime"]] == [
+        "add",
+        "add",
+    ]
+    repaired_contract, _ = _bind_outline_contract_repairs(contract, review)
+    assert len(repaired_contract.relationships) == 3
+    assert repaired_contract.relationships[-2].source_character_id == "bob"
+    assert repaired_contract.relationships[-1].source_character_id == "carol"
+
+    normalized_duplicate = CanonReviewerResult(
+        passed=False,
+        evidence="重复追加既有关系。",
+        issues=[
+            {
+                "code": "duplicate_relationship",
+                "message": "带空格的值仍是同一关系。",
+                "contract_refs": ["test_character", "bob"],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "append_normalized_duplicate",
+                        "collection": "relationships",
+                        "intent": "append_missing",
+                        "value": {
+                            "source_character_id": "test_character",
+                            "target_character_id": "bob",
+                            "relation": " 同事 ",
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="outline_repair_review_append_already_exists"):
+        _outline_repair_context(candidate, normalized_duplicate)
+
+    replace_then_duplicate = CanonReviewerResult(
+        passed=False,
+        evidence="替换和追加会生成重复关系。",
+        issues=[
+            {
+                "code": "conflicting_relationship_targets",
+                "message": "原子操作的最终集合不得重复。",
+                "contract_refs": ["test_character", "bob"],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "replace_existing_relationship",
+                        "collection": "relationships",
+                        "intent": "replace_existing",
+                        "index": 0,
+                        "expected_value": contract["relationships"][0],
+                        "value": {
+                            **contract["relationships"][0],
+                            "relation": "盟友",
+                        },
+                    },
+                    {
+                        "target_id": "append_replacement_duplicate",
+                        "collection": "relationships",
+                        "intent": "append_missing",
+                        "value": {
+                            **contract["relationships"][0],
+                            "relation": " 盟友 ",
+                        },
+                    },
+                ],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="outline_repair_review_append_already_exists"):
+        _outline_repair_context(candidate, replace_then_duplicate)
+
+
+def test_outline_repair_append_target_requires_exact_value() -> None:
+    contract = _story_contract().model_dump(mode="json")
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "需要补充一个已锁定角色。",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract,
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="角色合同缺少已锁定角色。",
+        issues=[
+            {
+                "code": "missing_character",
+                "message": "补充 new_character。",
+                "contract_refs": ["new_character"],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "append_new_character",
+                        "collection": "characters",
+                        "intent": "append_missing",
+                        "value": {
+                            "character_id": "new_character",
+                            "name": "新角色",
+                            "role": "证人",
+                            "initial_known_fact_ids": [],
+                        },
+                    },
+                    {
+                        "target_id": "append_new_character_relationship",
+                        "collection": "relationships",
+                        "intent": "append_missing",
+                        "value": {
+                            "source_character_id": "test_character",
+                            "target_character_id": "new_character",
+                            "relation": "保护证人",
+                        },
+                    },
+                ],
+            }
+        ],
+    )
+    _outline_repair_context(candidate, review)
+    with pytest.raises(ValidationError, match="episode plans"):
+        OutlineRepairPatch.model_validate(
+            {
+                "stage": "generating_episode_outline",
+                "json_edits": [
+                    {
+                        "op": "replace",
+                        "path": "/story_contract/characters/-",
+                        "expected": len(contract["characters"]),
+                        "value": {
+                            "character_id": "new_character",
+                            "name": "新角色",
+                            "role": "证人",
+                            "initial_known_fact_ids": [],
+                        },
+                    }
+                ],
+            }
+        )
+    repaired_contract, _ = _bind_outline_contract_repairs(contract, review)
+    assert repaired_contract.characters[-1].character_id == "new_character"
+    assert repaired_contract.relationships[-1].target_character_id == "new_character"
+
+    duplicate_name_payload = review.model_dump(mode="json")
+    duplicate_name_payload["issues"][0]["repair_targets"][0]["value"]["name"] = "测试人物"
+    duplicate_name = CanonReviewerResult.model_validate(duplicate_name_payload)
+    with pytest.raises(ValueError, match="outline_repair_review_proposed_contract_invalid"):
+        _outline_repair_context(candidate, duplicate_name)
+
+    missing_endpoint_payload = review.model_dump(mode="json")
+    missing_endpoint_payload["issues"][0]["repair_targets"][1]["value"]["target_character_id"] = (
+        "missing_character"
+    )
+    missing_endpoint = CanonReviewerResult.model_validate(missing_endpoint_payload)
+    with pytest.raises(ValueError, match="outline_repair_review_proposed_contract_invalid"):
+        _outline_repair_context(candidate, missing_endpoint)
+
+
+def test_canon_review_requires_explicit_contract_mutation_authority() -> None:
+    with pytest.raises(ValidationError, match="contract_mutation_required"):
+        CanonReviewerResult(
+            passed=False,
+            evidence="禁止项冲突。",
+            issues=[
+                {
+                    "code": "conflicting_prohibition",
+                    "message": "必须定位具体禁止项。",
+                    "contract_refs": ["prohibitions"],
+                }
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="Contract mutations require"):
+        CanonReviewerResult(
+            passed=False,
+            evidence="合同需要修改。",
+            issues=[
+                {
+                    "code": "missing_repair_target",
+                    "message": "必须声明精确目标。",
+                    "contract_refs": ["fact_ep1"],
+                    "contract_mutation_required": True,
+                }
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="Prose-only canon issues cannot grant"):
+        CanonReviewerResult(
+            passed=False,
+            evidence="纯文本修复不得授予合同权限。",
+            issues=[
+                {
+                    "code": "prose_only_issue",
+                    "message": "只修改可读大纲。",
+                    "contract_refs": ["fact_ep1"],
+                    "contract_mutation_required": False,
+                    "repair_targets": [
+                        {
+                            "target_id": "replace_fact_without_authority",
+                            "collection": "prohibitions",
+                            "intent": "remove_existing",
+                            "index": 0,
+                            "expected_value": "不得增加人物",
+                        }
+                    ],
+                }
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="target IDs must be unique"):
+        CanonReviewerResult(
+            passed=False,
+            evidence="同一缺失关系不得重复授权。",
+            issues=[
+                {
+                    "code": "missing_relationship",
+                    "message": "补充一条关系。",
+                    "contract_refs": ["test_character", "bob"],
+                    "contract_mutation_required": True,
+                    "repair_targets": [
+                        {
+                            "target_id": "duplicate_relationship",
+                            "collection": "relationships",
+                            "intent": "append_missing",
+                            "value": {
+                                "source_character_id": "test_character",
+                                "target_character_id": "bob",
+                                "relation": "同事",
+                            },
+                        },
+                        {
+                            "target_id": "duplicate_relationship",
+                            "collection": "relationships",
+                            "intent": "append_missing",
+                            "value": {
+                                "source_character_id": "bob",
+                                "target_character_id": "test_character",
+                                "relation": "同事",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+
+
+def test_contract_ref_matching_collection_name_remains_an_entity_id() -> None:
+    contract = _story_contract().model_dump(mode="json")
+    contract["facts"][0]["fact_id"] = "facts"
+    contract["timeline"][0]["fact_ids"] = ["facts"]
+    contract["knowledge_states"][0]["known_fact_ids"] = ["facts"]
+    contract["episode_obligations"][0]["new_information_fact_ids"] = ["facts"]
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "分集大纲中的事实措辞需要同步。",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract,
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="只需同步可读大纲。",
+        issues=[
+            {
+                "code": "prose_fact_wording",
+                "message": "同步 facts 的可读措辞。",
+                "contract_refs": ["facts"],
+                "contract_mutation_required": False,
+            }
+        ],
+    )
+
+    context = _outline_repair_context(candidate, review)
+
+    assert context["matched_contract_refs"] == ["facts"]
+    assert context["matched_collection_scopes"] == []
+    assert context["contract_mutations_applied_by_runtime"] == []
+    assert context["contract_context"] == [
+        {"path": "/story_contract/facts/0", "value": contract["facts"][0]}
+    ]
+
+
+def test_contract_ref_exposes_every_node_with_the_same_cross_domain_id() -> None:
+    contract = _story_contract().model_dump(mode="json")
+    contract["timeline"][0]["event_id"] = "test_character"
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "分集大纲中的同名 Canon 节点都需要作为只读上下文。",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract,
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="同一稳定 ID 在不同 Canon 域均有相关上下文。",
+        issues=[
+            {
+                "code": "cross_domain_context",
+                "message": "同步引用 test_character 的可读措辞。",
+                "contract_refs": ["test_character"],
+                "contract_mutation_required": False,
+            }
+        ],
+    )
+
+    context = _outline_repair_context(candidate, review)
+
+    assert context["matched_contract_refs"] == ["test_character"]
+    assert context["contract_context"] == [
+        {"path": "/story_contract/characters/0", "value": contract["characters"][0]},
+        {"path": "/story_contract/timeline/0", "value": contract["timeline"][0]},
+    ]
 
 
 def test_outline_repair_patch_targets_only_exposed_editable_nodes() -> None:
     contract = _story_contract().model_dump(mode="json")
-    contract["characters"][0]["initial_known_fact_ids"] = ["fact_ep1"]
     candidate = {
         "stage": "generating_episode_outline",
         "content": "第一集发现事实一。",
@@ -1347,43 +2222,56 @@ def test_outline_repair_patch_targets_only_exposed_editable_nodes() -> None:
             {
                 "code": "knowledge_overcommit",
                 "message": "test_character 不应知道 fact_ep1。",
-                "contract_refs": ["fact_ep1", "knowledge_states"],
+                "contract_refs": ["fact_ep1"],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "replace_knowledge_state",
+                        "collection": "knowledge_states",
+                        "intent": "replace_existing",
+                        "index": 0,
+                        "expected_value": contract["knowledge_states"][0],
+                        "value": {
+                            **contract["knowledge_states"][0],
+                            "known_fact_ids": [],
+                        },
+                    }
+                ],
             }
         ],
     )
     context = _outline_repair_context(candidate, review)
-    target_by_path = {item["path"]: item for item in context["contract_targets"]}
     allowed = OutlineRepairPatch.model_validate(
         {
             "stage": "generating_episode_outline",
             "json_edits": [
                 {
                     "op": "replace",
-                    "path": "/story_contract/knowledge_states/0/known_fact_ids",
-                    "expected": ["fact_ep1"],
-                    "value": [],
+                    "path": "/episodes/0/plan",
+                    "expected": "第一集计划",
+                    "value": "修复后的第一集计划",
                 }
             ],
         }
     )
-    forbidden = OutlineRepairPatch.model_validate(
-        {
-            "stage": "generating_episode_outline",
-            "json_edits": [
-                {
-                    "op": "remove",
-                    "path": "/story_contract/facts/0",
-                    "expected": contract["facts"][0],
-                    "value": None,
-                }
-            ],
-        }
-    )
+    with pytest.raises(ValidationError, match="episode plans"):
+        OutlineRepairPatch.model_validate(
+            {
+                "stage": "generating_episode_outline",
+                "json_edits": [
+                    {
+                        "op": "replace",
+                        "path": "/story_contract/facts/0",
+                        "expected": contract["facts"][0],
+                        "value": {**contract["facts"][0], "value": "不允许的改写"},
+                    }
+                ],
+            }
+        )
 
-    assert target_by_path["/story_contract/characters/0"]["editable"] is True
     _validate_outline_repair_patch_targets(allowed, context)
-    with pytest.raises(ValueError, match="target_not_exposed"):
-        _validate_outline_repair_patch_targets(forbidden, context)
+    repaired_contract, _ = _bind_outline_contract_repairs(contract, review)
+    assert repaired_contract.knowledge_states[0].known_fact_ids == []
 
 
 def test_outline_repair_result_reports_output_truncation() -> None:
@@ -1524,8 +2412,7 @@ async def test_repair_tool_allowlist_is_read_only_and_keeps_result_tool() -> Non
         ["read_file", "calculate_arithmetic", "Result"],
     ]
     assert all(
-        not _prompt_mentions_tool(prompt, "edit_file")
-        for prompt in model.model_system_prompts
+        not _prompt_mentions_tool(prompt, "edit_file") for prompt in model.model_system_prompts
     )
     assert all(not _prompt_mentions_tool(prompt, "ls") for prompt in model.model_system_prompts)
 
@@ -2599,9 +3486,9 @@ def test_outline_repair_patch_applies_only_guarded_minimal_edits() -> None:
             "json_edits": [
                 {
                     "op": "replace",
-                    "path": "/story_contract/characters/0/role",
-                    "expected": "主角",
-                    "value": "调查真相的主角",
+                    "path": "/episodes/0/plan",
+                    "expected": "第一集计划",
+                    "value": "调查真相的第一集计划",
                 }
             ],
         }
@@ -2614,9 +3501,9 @@ def test_outline_repair_patch_applies_only_guarded_minimal_edits() -> None:
     )
 
     assert repaired.content == "修复后的分集大纲。其余内容保持。"
-    assert repaired.story_contract.characters[0].role == "调查真相的主角"
+    assert repaired.episodes[0].plan == "调查真相的第一集计划"
     assert candidate["content"] == "旧分集大纲。其余内容保持。"
-    assert candidate["story_contract"]["characters"][0]["role"] == "主角"
+    assert candidate["episodes"][0]["plan"] == "第一集计划"
 
 
 def test_outline_repair_patch_rejects_a_stale_expected_value() -> None:
@@ -2634,9 +3521,9 @@ def test_outline_repair_patch_rejects_a_stale_expected_value() -> None:
             "json_edits": [
                 {
                     "op": "replace",
-                    "path": "/story_contract/characters/0/role",
+                    "path": "/episodes/0/plan",
                     "expected": "错误旧值",
-                    "value": "调查真相的主角",
+                    "value": "调查真相的第一集计划",
                 }
             ],
         }
@@ -2672,8 +3559,11 @@ def test_outline_repair_patch_supports_guarded_episode_structure_edits() -> None
     candidate = {
         "stage": "generating_episode_outline",
         "content": "两集分集大纲",
-        "episode_count": 1,
-        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "episode_count": 2,
+        "episodes": [
+            {"episode_number": 1, "plan": "第一集计划"},
+            {"episode_number": 2, "plan": "第二集计划"},
+        ],
         "story_contract": contract.model_dump(mode="json"),
     }
     patch = OutlineRepairPatch.model_validate(
@@ -2682,15 +3572,15 @@ def test_outline_repair_patch_supports_guarded_episode_structure_edits() -> None
             "json_edits": [
                 {
                     "op": "replace",
-                    "path": "/episode_count",
-                    "expected": 1,
-                    "value": 2,
+                    "path": "/episodes/0/plan",
+                    "expected": "第一集计划",
+                    "value": "修复后的第一集计划",
                 },
                 {
-                    "op": "add",
-                    "path": "/episodes/-",
-                    "expected": 1,
-                    "value": {"episode_number": 2, "plan": "第二集计划"},
+                    "op": "replace",
+                    "path": "/episodes/1/plan",
+                    "expected": "第二集计划",
+                    "value": "修复后的第二集计划",
                 },
             ],
         }
@@ -2698,35 +3588,27 @@ def test_outline_repair_patch_supports_guarded_episode_structure_edits() -> None
 
     repaired = _apply_outline_repair_patch(candidate, patch)
 
-    assert repaired.episode_count == 2
-    assert [episode.episode_number for episode in repaired.episodes] == [1, 2]
+    assert [episode.plan for episode in repaired.episodes] == [
+        "修复后的第一集计划",
+        "修复后的第二集计划",
+    ]
 
 
-def test_outline_repair_patch_rejects_boolean_list_length_guard() -> None:
-    contract = _story_contract()
-    candidate = {
-        "stage": "generating_episode_outline",
-        "content": "分集大纲",
-        "episode_count": 1,
-        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
-        "story_contract": contract.model_dump(mode="json"),
-    }
-    patch = OutlineRepairPatch.model_validate(
-        {
-            "stage": "generating_episode_outline",
-            "json_edits": [
-                {
-                    "op": "add",
-                    "path": "/episodes/-",
-                    "expected": True,
-                    "value": {"episode_number": 2, "plan": "第二集计划"},
-                }
-            ],
-        }
-    )
-
-    with pytest.raises(ValueError, match="patch_target_mismatch"):
-        _apply_outline_repair_patch(candidate, patch)
+def test_outline_repair_patch_rejects_non_replace_operations() -> None:
+    with pytest.raises(ValidationError, match="replace"):
+        OutlineRepairPatch.model_validate(
+            {
+                "stage": "generating_episode_outline",
+                "json_edits": [
+                    {
+                        "op": "add",
+                        "path": "/episodes/-",
+                        "expected": True,
+                        "value": {"episode_number": 2, "plan": "第二集计划"},
+                    }
+                ],
+            }
+        )
 
 
 def test_outline_repair_patch_rejects_oversized_payload() -> None:
@@ -2764,12 +3646,15 @@ def test_outline_repair_patch_must_be_less_than_half_the_candidate() -> None:
 
 
 def test_outline_repair_patch_is_atomic_when_a_later_edit_fails() -> None:
-    contract = _story_contract()
+    contract = _story_contract(episode_count=2)
     candidate = {
         "stage": "generating_episode_outline",
         "content": "分集大纲",
-        "episode_count": 1,
-        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "episode_count": 2,
+        "episodes": [
+            {"episode_number": 1, "plan": "第一集计划"},
+            {"episode_number": 2, "plan": "第二集计划"},
+        ],
         "story_contract": contract.model_dump(mode="json"),
     }
     original = copy.deepcopy(candidate)
@@ -2785,9 +3670,9 @@ def test_outline_repair_patch_is_atomic_when_a_later_edit_fails() -> None:
                 },
                 {
                     "op": "replace",
-                    "path": "/story_contract/characters/0/role",
+                    "path": "/episodes/1/plan",
                     "expected": "错误旧值",
-                    "value": "调查真相的主角",
+                    "value": "修复后的第二集计划",
                 },
             ],
         }
@@ -2905,6 +3790,78 @@ def test_supervisor_carries_the_inferred_language_contract() -> None:
     assert "Output language contract" in prompt
 
 
+def test_supervisor_uses_canonical_workspace_as_the_only_approved_fact_source() -> None:
+    prompt = _supervisor_prompt(
+        story="故事",
+        requirements="三集",
+        feedback=None,
+        approved_json="{}",
+    )
+
+    normalized = " ".join(prompt.split())
+    assert "Do not restate, summarize, or newly declare approved story facts" in normalized
+    assert "exactly one downstream authority" in normalized
+    assert "current canonical /workspace files" in normalized
+
+
+@pytest.mark.asyncio
+async def test_stage_guard_discards_supervisor_derived_story_facts() -> None:
+    descriptions: list[str] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        return None
+
+    async def handler(candidate: ToolCallRequest) -> ToolMessage:
+        descriptions.append(candidate.tool_call["args"]["description"])
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "stage": "selecting_l0_variant",
+                    "content": None,
+                    "character_biographies": None,
+                    "relationship_logic": None,
+                    "selected_l0_variant": "主动选择",
+                    "selection_rationale": "契合故事",
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id=candidate.tool_call["id"],
+            name="task",
+        )
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": (
+                    "[stage=selecting_l0_variant] Treat STALE_PRIVATE_FACT as locked truth."
+                ),
+                "subagent_type": "story_architect",
+            },
+            "id": "guarded-description",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+
+    await middleware.awrap_tool_call(request, handler)
+
+    assert len(descriptions) == 1
+    assert descriptions[0].startswith("[stage=selecting_l0_variant]")
+    assert "STALE_PRIVATE_FACT" not in descriptions[0]
+    assert "sole authority for approved creative facts" in descriptions[0]
+
+
 def test_structured_output_retry_reports_safe_validation_details() -> None:
     try:
         StoryArchitectResult.model_validate(
@@ -3009,10 +3966,12 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "Unspecified creative details remain the writer's choice" in _SCRIPT_WRITER_PROMPT
     assert "explicitly locked or formally committed aliases" in _SCRIPT_WRITER_PROMPT
     assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
-    assert "canonical contract names in every speaker label" in _SCRIPT_WRITER_PROMPT
-    assert "/workspace/speaker_contract.json" in _SCRIPT_WRITER_PROMPT
-    assert "allowed_speaker_labels" in _SCRIPT_WRITER_PROMPT
-    assert "line by line" in _SCRIPT_WRITER_PROMPT
+    assert "continuity-bearing identities, not as a screenplay-label whitelist" in (
+        _SCRIPT_WRITER_PROMPT
+    )
+    assert "Surface speaker labels may use names, aliases, roles" in _SCRIPT_WRITER_PROMPT
+    assert "/workspace/speaker_contract.json" not in _SCRIPT_WRITER_PROMPT
+    assert "allowed_speaker_labels" not in _SCRIPT_WRITER_PROMPT
     assert "/workspace/evidence_contract.json" in _SCRIPT_WRITER_PROMPT
     assert "exact-set self-check" in _SCRIPT_WRITER_PROMPT
     assert "required_evidence_target_ids" in _SCRIPT_WRITER_PROMPT
@@ -3024,15 +3983,15 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "read-only bound" in _SCRIPT_WRITER_PROMPT
     assert "do not reproduce the named defect" in _SCRIPT_WRITER_PROMPT
     assert "grandfathered pre-contract run" not in _SCRIPT_WRITER_PROMPT
-    assert "/workspace/speaker_contract.json" in _EPISODE_REPAIR_PROMPT
+    assert "/workspace/speaker_contract.json" not in _EPISODE_REPAIR_PROMPT
     assert "/workspace/evidence_contract.json" in _EPISODE_REPAIR_PROMPT
     assert "evidence_coverage_mismatch" in _EPISODE_REPAIR_PROMPT
     assert "issue.contract_refs" in _EPISODE_REPAIR_PROMPT
     assert "no extras" in _EPISODE_REPAIR_PROMPT
     assert "no duplicates" in _EPISODE_REPAIR_PROMPT
     assert "unknown_speaker" in _EPISODE_REPAIR_PROMPT
-    assert "most suitable locked character" in _EPISODE_REPAIR_PROMPT
-    assert "non-speaker narration" in _EPISODE_REPAIR_PROMPT
+    assert "contextually proven new continuity-bearing character" in _EPISODE_REPAIR_PROMPT
+    assert "without normalizing screenplay notation" in _EPISODE_REPAIR_PROMPT
     assert "alias" in _EPISODE_REPAIR_PROMPT
     assert "occupational title" in _EPISODE_REPAIR_PROMPT
     assert "state_delta" in _EPISODE_REPAIR_PROMPT
@@ -3051,48 +4010,63 @@ def test_l4_reviewer_prompt_only_locks_explicit_verbatim_facts() -> None:
     assert "semantic consistency only" in _QUALITY_REVIEWER_PROMPT
 
 
-def test_workflow_scaffolding_policy_keeps_internal_data_out_of_content() -> None:
-    policy = " ".join(_WORKFLOW_SCAFFOLDING_POLICY.split())
+def test_internal_runtime_leak_policy_requires_unambiguous_source_evidence() -> None:
+    policy = " ".join(_INTERNAL_RUNTIME_LEAK_POLICY.split())
 
     for internal_marker in (
-        "Raw story-contract records or serialization",
-        "workflow episode index",
-        "workspace paths",
-        "fact/clue/obligation IDs",
-        "tool calls",
-        "validation steps",
-        "arithmetic operands or intermediate expressions",
+        "exact canonical /workspace path",
+        "fact/clue/obligation stable ID",
+        "tool-call or model-message envelope",
+        "validation or retry status text",
+        "raw contract serialization",
     ):
         assert internal_marker in policy
-    assert "internal-only" in policy
-    assert "must never appear in screenplay content" in policy
-    assert "scene descriptions, action, narration, or dialogue" in policy
-    assert "story-world facts encoded by the contract are not scaffolding" in policy
-    assert "Use tools only for private verification" in policy
-    assert "From arithmetic checks" in policy
-    assert "only the result or time expression naturally needed in the story world" in policy
-    assert "without operands, equations, or the verification process" in policy
-    assert "calculate_arithmetic" not in policy
+    assert "concrete runtime-only token or record" in policy
+    assert "not established as story-world content" in policy
+    assert "quote the exact screenplay excerpt" in policy
+    assert "name the matching private source" in policy
+    assert "runtime provenance is unambiguous" in policy
+    assert "If provenance is ambiguous, pass this dimension" in policy
+    assert "Story-world facts encoded by a contract are content" in policy
 
 
-def test_workflow_scaffolding_policy_preserves_diegetic_episode_language() -> None:
-    policy = " ".join(_WORKFLOW_SCAFFOLDING_POLICY.split())
+def test_internal_runtime_leak_policy_accepts_diverse_screenplay_forms() -> None:
+    policy = " ".join(_INTERNAL_RUNTIME_LEAK_POLICY.split())
 
-    assert "Never turn workflow labels such as 第N集, 上一集, or episode N" in policy
-    assert "not a blanket ban" in policy
-    assert "user request or an approved upstream artifact explicitly establishes" in policy
-    assert "diegetic film, television, or serialized-program production" in policy
-    assert "in-world discussion of program episodes" in policy
-    assert "exception applies only to episode terminology" in policy
+    for legitimate_content in (
+        "Episode, chapter, act, and scene headings",
+        "title cards",
+        "recap labels",
+        "end markers such as 本集终",
+        "screenplay directions",
+        "arithmetic, equations, mental calculation, checking, and other reasoning",
+        "JSON, code, paths, tools, models, AI, or validation",
+    ):
+        assert legitimate_content in policy
+    assert "Never reject or rewrite content merely because" in policy
+    assert "episode_number is not provenance evidence" in policy
+    assert "the screenplay may show operands, equations, mental calculation" in (
+        _SCRIPT_WRITER_PROMPT
+    )
+    assert "Never copy a tool-call envelope or private validation log" in _SCRIPT_WRITER_PROMPT
 
 
-def test_workflow_scaffolding_review_prompts_make_leakage_blocking() -> None:
+def test_internal_runtime_leak_review_prompts_apply_proof_standard() -> None:
     assert "At accepting_l4" in _QUALITY_REVIEWER_PROMPT
-    assert "blocking defect: set passed=false" in _QUALITY_REVIEWER_PROMPT
+    assert "applicable explicit persona gate rule" in _QUALITY_REVIEWER_PROMPT
+    assert "matters of taste are not sufficient reasons" in _QUALITY_REVIEWER_PROMPT
+    assert "provenance and evidence standard is a blocking leakage defect" in (
+        _QUALITY_REVIEWER_PROMPT
+    )
     assert "script_defect" in _SERIES_REVIEWER_PROMPT
-    assert "earliest episode containing leakage" in _SERIES_REVIEWER_PROMPT
-    assert "even when later episodes also leak" in _SERIES_REVIEWER_PROMPT
-    assert "episode candidate must be rejected" in _EPISODE_REVIEWER_PROMPT
+    assert "current prefix contains the blocker" in _SERIES_REVIEWER_PROMPT
+    assert "earliest affected episode N" in _SERIES_REVIEWER_PROMPT
+    assert "Ordinary SeriesBible prose, screenplay format or style" in _SERIES_REVIEWER_PROMPT
+    assert "never defects on their own" in _EPISODE_REVIEWER_PROMPT
+    for prompt in (_EPISODE_REVIEWER_PROMPT, _SERIES_REVIEWER_PROMPT):
+        assert "/workspace/series_prefix.json" in prompt
+        assert "trusted runtime metadata" in prompt
+        assert "episodes[].content" in prompt
 
 
 def test_evidence_contract_exposes_episode_verbatim_facts_and_rejected_issue() -> None:
@@ -3262,8 +4236,8 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
         "series_reviewer",
     ):
         system_prompt = subagents_by_name[name]["system_prompt"]
-        assert system_prompt.count(_WORKFLOW_SCAFFOLDING_POLICY) == 1
-        assert f"\n\n{_WORKFLOW_SCAFFOLDING_POLICY}" in system_prompt
+        assert system_prompt.count(_INTERNAL_RUNTIME_LEAK_POLICY) == 1
+        assert f"\n\n{_INTERNAL_RUNTIME_LEAK_POLICY}" in system_prompt
     assert subagents_by_name["episode_repair"]["permissions"] == REVIEW_FILE_PERMISSIONS
     assert subagents_by_name["story_repair"]["permissions"] == REVIEW_FILE_PERMISSIONS
     supervisor_allowlists = [
@@ -3280,11 +4254,11 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
 
 
 @pytest.mark.asyncio
-async def test_episode_writer_receives_exact_speaker_contract_and_self_check_instruction(
+async def test_episode_writer_treats_speaker_labels_as_format_not_a_whitelist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database = tmp_path / "speaker-contract-checkpoints.sqlite3"
+    database = tmp_path / "format-agnostic-speaker-checkpoints.sqlite3"
     contract = _story_contract(verbatim_episodes={1})
     captured_requests: list[ToolCallRequest] = []
     original_call = StageGuardMiddleware._call_structured_stage
@@ -3325,7 +4299,7 @@ async def test_episode_writer_receives_exact_speaker_contract_and_self_check_ins
             provider_profile_key="toolcallingfakemodel",
         )
         await workflow.execute(
-            thread_id="speaker-contract-writer-thread",
+            thread_id="format-agnostic-speaker-writer-thread",
             story="故事",
             requirements="要求",
             persona_files={"/persona/project.md": "规则"},
@@ -3337,12 +4311,7 @@ async def test_episode_writer_receives_exact_speaker_contract_and_self_check_ins
     assert len(captured_requests) == 1
     request = captured_requests[0]
     files = request.state["files"]
-    speaker_contract = json.loads(files["/workspace/speaker_contract.json"]["content"])
-    assert speaker_contract["allowed_speaker_labels"] == ["测试人物"]
-    assert speaker_contract["rejected_issues"] == []
-    assert speaker_contract["rules"]["speaker_label_before_colon"] == (
-        "must_exactly_match_allowed_speaker_labels"
-    )
+    assert "/workspace/speaker_contract.json" not in files
     evidence_contract = json.loads(files["/workspace/evidence_contract.json"]["content"])
     assert evidence_contract["episode_number"] == 1
     assert evidence_contract["required_evidence_target_ids"] == [
@@ -3355,9 +4324,9 @@ async def test_episode_writer_receives_exact_speaker_contract_and_self_check_ins
     assert evidence_contract["rejected_issues"] == []
     assert "/workspace/suffix_rewrite_review.json" not in files
     description = request.tool_call["args"]["description"]
-    assert 'Allowed exact speaker labels: ["测试人物"]' in description
-    assert "Read /workspace/speaker_contract.json" in description
-    assert "self-check every dialogue speaker label" in description
+    assert "Screenplay labels and dialogue notation are format choices" in description
+    assert "without normalizing aliases, roles, generic labels" in description
+    assert "Allowed exact speaker labels" not in description
     assert 'required_evidence_target_ids=["fact_ep1", "obligation_ep1"]' in description
     assert 'required_verbatim_facts=[{"fact_id": "fact_ep1", "value": "事实1"}]' in description
     assert "exact-set self-check" in description
@@ -3741,6 +4710,7 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
                                 "code": "relative_age_conflict",
                                 "message": "权威小传为二十二岁、相差两岁",
                                 "script_excerpt": "程远二十四岁，比程屿大六岁。",
+                                "contract_mutation_required": False,
                             }
                         ],
                     }
@@ -3753,6 +4723,7 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
                                 "code": "call_participant_conflict",
                                 "message": "权威通话对象为程屿",
                                 "script_excerpt": "电话对象写成周砚。",
+                                "contract_mutation_required": False,
                             }
                         ],
                     }
@@ -3767,10 +4738,18 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
             name="task",
         )
 
-    await middleware.awrap_tool_call(request, handler)
+    returned = await middleware.awrap_tool_call(request, handler)
 
     assert review_calls == 4
     assert repair_calls == 1
+    assert isinstance(returned, ToolMessage)
+    returned_payload = json.loads(returned.content)
+    assert "二十二岁，比程屿大两岁" in returned_payload["relationship_logic"]
+    assert "电话对象写成程屿" in returned_payload["relationship_logic"]
+    assert "二十四岁" not in returned_payload["relationship_logic"]
+    assert "电话对象写成周砚" not in returned_payload["relationship_logic"]
+    assert "consistency_review" not in returned_payload
+    assert "consistency_repair_rounds" not in returned_payload
     assert (
         approved_payloads | {key: value for key, value in frozen_upstream.items()}
         == approved_payloads
@@ -3928,6 +4907,7 @@ async def test_story_consistency_converges_at_fourth_repair_round() -> None:
                             "code": "call_participant_conflict",
                             "message": "权威通话对象为程屿。",
                             "script_excerpt": "电话打给周砚后，陈伯决定在终局作证。",
+                            "contract_mutation_required": False,
                         }
                     ],
                 }
@@ -3942,6 +4922,7 @@ async def test_story_consistency_converges_at_fourth_repair_round() -> None:
                             "code": "knowledge_source_gap",
                             "message": "必须补出陈伯如何得知真相的既有来源。",
                             "script_excerpt": "陈伯一直知情并准备在终局作证。",
+                            "contract_mutation_required": False,
                         },
                     ],
                 }
@@ -3958,6 +4939,7 @@ async def test_story_consistency_converges_at_fourth_repair_round() -> None:
                             "code": "repeated_knowledge_source_gap",
                             "message": "第二行也必须同步写明陈伯知情的既有记录来源。",
                             "script_excerpt": "人物摘要仍称陈伯一直知情",
+                            "contract_mutation_required": False,
                         }
                     ],
                 }
@@ -3973,6 +4955,7 @@ async def test_story_consistency_converges_at_fourth_repair_round() -> None:
                             "code": "relationship_summary_knowledge_gap",
                             "message": "第三行也必须同步写明陈伯知情的既有记录来源。",
                             "script_excerpt": "关系摘要仍称陈伯一直知情",
+                            "contract_mutation_required": False,
                         }
                     ],
                 }
@@ -4019,6 +5002,7 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
                     "message": "必须补齐承诺",
                     "contract_refs": [],
                     "script_excerpt": None,
+                    "contract_mutation_required": False,
                 }
             ],
         },
@@ -4086,7 +5070,13 @@ async def test_contract_repair_stops_after_one_invalid_patch_correction(tmp_path
         {
             "passed": False,
             "evidence": "合同遗漏一项上游承诺",
-            "issues": [{"code": "missing_commitment", "message": "必须补齐承诺"}],
+            "issues": [
+                {
+                    "code": "missing_commitment",
+                    "message": "必须补齐承诺",
+                    "contract_mutation_required": False,
+                }
+            ],
         },
         outline_review_index,
     )
@@ -4212,7 +5202,13 @@ async def test_outline_canon_review_receives_structured_episode_plans() -> None:
                 {
                     "passed": False,
                     "evidence": "第一集计划需要修复",
-                    "issues": [{"code": "episode_plan", "message": "修复第一集计划"}],
+                    "issues": [
+                        {
+                            "code": "episode_plan",
+                            "message": "修复第一集计划",
+                            "contract_mutation_required": False,
+                        }
+                    ],
                 }
                 if len(reviewed_plans) == 1
                 else {"passed": True, "evidence": "合同一致", "issues": []}
@@ -4222,12 +5218,17 @@ async def test_outline_canon_review_receives_structured_episode_plans() -> None:
             tool_call_id="call-outline-review-files",
         )
 
-    _, locked = await middleware._generate_locked_outline(
+    returned, locked = await middleware._generate_locked_outline(
         request,
         handler,
         request.tool_call["args"],
     )
 
+    assert isinstance(returned, ToolMessage)
+    returned_payload = json.loads(returned.content)
+    assert returned_payload["episodes"] == [{"episode_number": 1, "plan": "修复后的第一集计划"}]
+    assert "contract_review" not in returned_payload
+    assert "contract_repair_rounds" not in returned_payload
     assert reviewed_plans == [
         [{"episode_number": 1, "plan": "第一集计划"}],
         [{"episode_number": 1, "plan": "修复后的第一集计划"}],
@@ -4237,12 +5238,234 @@ async def test_outline_canon_review_receives_structured_episode_plans() -> None:
 
 
 @pytest.mark.asyncio
+async def test_outline_review_target_mismatch_gets_one_fresh_review_before_repair() -> None:
+    contract = _story_contract()
+    planner_payload = {
+        "stage": "generating_episode_outline",
+        "content": "分集大纲",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract.model_dump(mode="json"),
+    }
+    review_calls = 0
+    patch_calls = 0
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        return None
+
+    async def generate_patch(
+        _: Mapping[str, Any],
+        review: CanonReviewerResult,
+        __: int,
+        correction: str | None,
+    ) -> Any:
+        nonlocal patch_calls
+        patch_calls += 1
+        assert correction is None
+        assert review.issues[0].repair_targets[0].expected_value == "不得增加人物"
+        return {
+            "stage": "generating_episode_outline",
+            "content_replacements": [],
+            "json_edits": [],
+        }
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_patch=generate_patch,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] generate outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-outline-review-target-correction",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+
+    async def handler(candidate_request: ToolCallRequest) -> ToolMessage:
+        nonlocal review_calls
+        subagent_type = candidate_request.tool_call["args"]["subagent_type"]
+        if subagent_type == "episode_planner":
+            payload = planner_payload
+        else:
+            assert subagent_type == "canon_reviewer"
+            review_calls += 1
+            if review_calls == 1:
+                expected_value = "错误旧值"
+            elif review_calls == 2:
+                expected_value = "不得增加人物"
+                assert "/workspace/invalid_contract_review.json" in candidate_request.state["files"]
+                assert "could not bind" in candidate_request.tool_call["args"]["description"]
+            else:
+                payload = {"passed": True, "evidence": "修复后合同一致", "issues": []}
+                return ToolMessage(
+                    content=json.dumps(payload, ensure_ascii=False),
+                    tool_call_id="call-outline-review-target-correction",
+                )
+            payload = {
+                "passed": False,
+                "evidence": "禁止项与正式事实冲突。",
+                "issues": [
+                    {
+                        "code": "conflicting_prohibition",
+                        "message": "删除冲突禁止项。",
+                        "contract_refs": [],
+                        "contract_mutation_required": True,
+                        "repair_targets": [
+                            {
+                                "target_id": "remove_conflicting_prohibition",
+                                "collection": "prohibitions",
+                                "intent": "remove_existing",
+                                "index": 0,
+                                "expected_value": expected_value,
+                            }
+                        ],
+                    }
+                ],
+            }
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-outline-review-target-correction",
+        )
+
+    returned, locked = await middleware._generate_locked_outline(
+        request,
+        handler,
+        request.tool_call["args"],
+    )
+
+    assert review_calls == 3
+    assert patch_calls == 1
+    assert isinstance(returned, ToolMessage)
+    assert json.loads(returned.content)["story_contract"]["prohibitions"] == []
+    assert locked["contract_review"]["passed"] is True
+    assert locked["contract_repair_rounds"] == 1
+
+
+@pytest.mark.asyncio
+async def test_outline_review_target_mismatch_fails_closed_after_fresh_review() -> None:
+    contract = _story_contract()
+    planner_payload = {
+        "stage": "generating_episode_outline",
+        "content": "分集大纲",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract.model_dump(mode="json"),
+    }
+    review_calls = 0
+    patch_calls = 0
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        return None
+
+    async def generate_patch(
+        _: Mapping[str, Any],
+        __: CanonReviewerResult,
+        ___: int,
+        ____: str | None,
+    ) -> Any:
+        nonlocal patch_calls
+        patch_calls += 1
+        raise AssertionError("repair must not run for an unbound review target")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_patch=generate_patch,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] generate outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-outline-review-target-fail-closed",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+
+    async def handler(candidate_request: ToolCallRequest) -> ToolMessage:
+        nonlocal review_calls
+        subagent_type = candidate_request.tool_call["args"]["subagent_type"]
+        if subagent_type == "episode_planner":
+            payload = planner_payload
+        else:
+            assert subagent_type == "canon_reviewer"
+            review_calls += 1
+            if review_calls == 2:
+                assert "/workspace/invalid_contract_review.json" in candidate_request.state["files"]
+            payload = {
+                "passed": False,
+                "evidence": "禁止项与正式事实冲突。",
+                "issues": [
+                    {
+                        "code": "conflicting_prohibition",
+                        "message": "删除冲突禁止项。",
+                        "contract_refs": [],
+                        "contract_mutation_required": True,
+                        "repair_targets": [
+                            {
+                                "target_id": "remove_conflicting_prohibition",
+                                "collection": "prohibitions",
+                                "intent": "remove_existing",
+                                "index": 0,
+                                "expected_value": f"错误旧值{review_calls}",
+                            }
+                        ],
+                    }
+                ],
+            }
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-outline-review-target-fail-closed",
+        )
+
+    with pytest.raises(AgentProtocolError) as error:
+        await middleware._generate_locked_outline(
+            request,
+            handler,
+            request.tool_call["args"],
+        )
+
+    assert error.value.safe_message == "分集大纲审查目标未能绑定当前合同。"
+    assert review_calls == 2
+    assert patch_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
     writer_index = _index_of_tool_call(responses, "ScriptWriterResult", occurrence=1)
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
-    writer_payload = responses[writer_index].tool_calls[0]["args"]
+    writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
+    writer_payload["state_delta"]["evidence"] = [
+        item
+        for item in writer_payload["state_delta"]["evidence"]
+        if item["target_id"] != "fact_ep1"
+    ]
+    responses[writer_index] = _tool_call("ScriptWriterResult", writer_payload, writer_index)
     failed_review = {
         "passed": False,
         "evidence": "人物身份与上游小传不一致",
@@ -4250,7 +5473,7 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
             {
                 "code": "identity_drift",
                 "message": "剧本把母亲姓名改成了合同外角色",
-                "contract_refs": ["fact_ep1"],
+                "contract_refs": ["semantic_target"],
                 "script_excerpt": "事实1",
             }
         ],
@@ -4290,6 +5513,9 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
 
     assert error.value.episode_number == 1
     assert error.value.repair_rounds == 2
+    assert "missing_evidence_targets" in error.value.evidence
+    assert "目标：fact_ep1" in error.value.evidence
+    assert "审查目标：fact_ep1, semantic_target" in error.value.evidence
     assert episode_attempts == [1]
     assert InternalStage.GENERATING_EPISODE_SCRIPTS not in approved
     repair_requests = [
@@ -4321,6 +5547,11 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     repaired_writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
     invalid_writer_payload = copy.deepcopy(repaired_writer_payload)
     invalid_writer_payload["content"] = "钩子1"
+    invalid_writer_payload["state_delta"]["evidence"] = [
+        item
+        for item in invalid_writer_payload["state_delta"]["evidence"]
+        if item["target_id"] != "fact_ep1"
+    ]
     responses[writer_index] = _tool_call("ScriptWriterResult", invalid_writer_payload, writer_index)
     responses[review_index] = _tool_call(
         "EpisodeReviewerResult",
@@ -4412,23 +5643,20 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
 
     review = json.loads(captured_files[0]["/workspace/episode_review.json"])
     assert {issue["code"] for issue in review["issues"]} >= {
-        "evidence_not_in_script",
+        "missing_evidence_targets",
         "identity_drift",
     }
+    missing = next(
+        issue for issue in review["issues"] if issue["code"] == "missing_evidence_targets"
+    )
+    assert missing["contract_refs"] == ["fact_ep1"]
+    assert "exactly one state_delta.evidence entry" in captured_descriptions[0]
+    assert "remove every unexpected target" in captured_descriptions[0]
+    assert "verbatim" in captured_descriptions[0]
     assert captured_files[0]["/workspace/current_episode_plan.md"] == "第一集计划"
     obligation = json.loads(captured_files[0]["/workspace/current_episode_obligation.json"])
     assert obligation["end_hook"] == "钩子1"
-    speaker_contract = json.loads(captured_files[0]["/workspace/speaker_contract.json"])
-    assert speaker_contract["allowed_speaker_labels"] == ["测试人物"]
-    assert speaker_contract["phase"] == "episode_repair"
-    assert speaker_contract["rejected_issues"] == [
-        {
-            "code": "unknown_speaker",
-            "contract_refs": [],
-            "message": "剧本引入了锁定角色表之外的说话人 年轻协办",
-            "script_excerpt": "年轻协办：我来开车。",
-        }
-    ]
+    assert "/workspace/speaker_contract.json" not in captured_files[0]
     evidence_contract = json.loads(captured_files[0]["/workspace/evidence_contract.json"])
     assert evidence_contract["episode_number"] == 1
     assert evidence_contract["phase"] == "episode_repair"
@@ -4461,15 +5689,12 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     assert "suffix_rewrite_review.json" in repair_description
     assert "fix every named conflict" in repair_description
     assert "unknown_speaker" in repair_description
-    assert "resolve each issue one by one" in repair_description
-    assert "most suitable locked character" in repair_description
-    assert "non-speaker narration" in repair_description
-    assert "Do not merely change it to an alias" in repair_description
-    assert "occupational title or generic label" in repair_description
-    assert "speaker_contract.json" in repair_description
-    assert (
-        'issue.contract_refs: ["fact_ep1", "obligation_ep1"]' in repair_description
-    )
+    assert "genuinely new continuity-bearing character" in repair_description
+    assert "preserving surface notation" in repair_description
+    assert "Do not rewrite a label merely because it is an alias" in repair_description
+    assert "generic or descriptive label" in repair_description
+    assert "speaker_contract.json" not in repair_description
+    assert 'issue.contract_refs: ["fact_ep1", "obligation_ep1"]' in repair_description
     assert "exact set" in repair_description
     assert "no extras" in repair_description
     assert "no duplicates" in repair_description
@@ -4712,10 +5937,10 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
             }
         elif subagent_type == "series_reviewer":
             # The final milestone (episode 2) fires the bound final structural review.
+            _assert_task_lists_exact_workspace_paths(subagent_request)
             assert "trusted runtime metadata" in description
             assert "episodes[].content" in description
             series_review_inputs.append(dict(subagent_request.state["files"]))
-            _assert_task_lists_exact_workspace_paths(subagent_request)
             payload = {"passed": True, "category": "pass", "evidence": "全系列一致"}
         else:
             assert subagent_type == "episode_reviewer"
@@ -5142,6 +6367,45 @@ def test_language_retry_translates_relative_timeline_but_locks_contract_version(
     )
 
 
+def test_review_language_retry_cannot_change_contract_repair_authority() -> None:
+    original = CanonReviewerResult(
+        passed=False,
+        evidence="The prohibition conflicts with locked canon.",
+        issues=[
+            {
+                "code": "conflicting_prohibition",
+                "message": "Remove the stale prohibition.",
+                "contract_refs": [],
+                "script_excerpt": "旧禁止项",
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "remove_stale_prohibition",
+                        "collection": "prohibitions",
+                        "intent": "remove_existing",
+                        "index": 1,
+                        "expected_value": "旧禁止项",
+                    }
+                ],
+            }
+        ],
+    )
+    translated_payload = original.model_dump(mode="json")
+    translated_payload["evidence"] = "该禁止项与锁定事实冲突。"
+    translated_payload["issues"][0]["message"] = "删除陈旧禁止项。"
+    translated = CanonReviewerResult.model_validate(translated_payload)
+    changed_payload = translated.model_dump(mode="json")
+    changed_payload["issues"][0]["repair_targets"][0]["index"] = 0
+    changed = CanonReviewerResult.model_validate(changed_payload)
+
+    original_fingerprint = _language_retry_fingerprint(original)
+    assert _language_retry_matches(original_fingerprint, _language_retry_fingerprint(translated))
+    assert not _language_retry_matches(
+        original_fingerprint,
+        _language_retry_fingerprint(changed),
+    )
+
+
 def test_language_retry_allows_variant_label_translation_but_locks_machine_id() -> None:
     english_label = StoryArchitectResult(
         stage="selecting_l0_variant",
@@ -5534,6 +6798,7 @@ async def test_semantic_review_language_repair_preserves_failed_decision() -> No
                             "message": "必须补齐事实。" if chinese else "The fact must be added.",
                             "contract_refs": [],
                             "script_excerpt": None,
+                            "contract_mutation_required": False,
                         }
                     ],
                 },
@@ -5677,6 +6942,7 @@ async def test_semantic_language_repair_cannot_change_review_decision() -> None:
                         "message": "The fact must be added.",
                         "contract_refs": [],
                         "script_excerpt": None,
+                        "contract_mutation_required": False,
                     }
                 ],
             }
@@ -5721,7 +6987,13 @@ async def test_outline_repair_gets_one_bounded_structured_correction() -> None:
     review = CanonReviewerResult(
         passed=False,
         evidence="大纲文字需要修复。",
-        issues=[{"code": "stale_text", "message": "替换旧文字。"}],
+        issues=[
+            {
+                "code": "stale_text",
+                "message": "替换旧文字。",
+                "contract_mutation_required": False,
+            }
+        ],
     )
 
     async def generate_patch(
@@ -5757,6 +7029,78 @@ async def test_outline_repair_gets_one_bounded_structured_correction() -> None:
     assert corrections[0] is None
     assert corrections[1] is not None
     assert "exactly one corrected OutlineRepairPatch" in corrections[1]
+    assert repaired["content"] == "修复后的分集大纲"
+
+
+@pytest.mark.asyncio
+async def test_outline_repair_correction_reports_a_safe_target_error() -> None:
+    corrections: list[str | None] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        return None
+
+    contract = _story_contract()
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "旧分集大纲",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+        "story_contract": contract.model_dump(mode="json"),
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="只需修复可读大纲。",
+        issues=[
+            {
+                "code": "stale_text",
+                "message": "替换旧文字。",
+                "contract_mutation_required": False,
+            }
+        ],
+    )
+
+    async def generate_patch(
+        _: Mapping[str, Any],
+        __: CanonReviewerResult,
+        ___: int,
+        correction: str | None,
+    ) -> Any:
+        corrections.append(correction)
+        if correction is None:
+            return {
+                "stage": "generating_episode_outline",
+                "json_edits": [
+                    {
+                        "op": "replace",
+                        "path": "/story_contract/prohibitions/0",
+                        "expected": "不得增加人物",
+                        "value": "替换禁止项",
+                    }
+                ],
+            }
+        return {
+            "stage": "generating_episode_outline",
+            "content_replacements": [{"old": "旧分集大纲", "new": "修复后的分集大纲"}],
+        }
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+        generate_outline_patch=generate_patch,
+    )
+
+    repaired = await middleware._invoke_outline_repair(
+        candidate=candidate,
+        review=review,
+        repair_round=1,
+    )
+
+    assert len(corrections) == 2
+    assert "Outline repair paths must target episode plans" in (corrections[1] or "")
     assert repaired["content"] == "修复后的分集大纲"
 
 
@@ -5797,7 +7141,13 @@ async def test_outline_repair_fails_after_one_correction_with_safe_chinese_messa
     review = CanonReviewerResult(
         passed=False,
         evidence="大纲文字需要修复。",
-        issues=[{"code": "stale_text", "message": "替换旧文字。"}],
+        issues=[
+            {
+                "code": "stale_text",
+                "message": "替换旧文字。",
+                "contract_mutation_required": False,
+            }
+        ],
     )
 
     with pytest.raises(AgentProtocolError) as error:
@@ -5846,7 +7196,13 @@ async def test_outline_repair_preserves_relay_errors_for_worker_recovery() -> No
     review = CanonReviewerResult(
         passed=False,
         evidence="需要修复。",
-        issues=[{"code": "stale_text", "message": "替换旧文字。"}],
+        issues=[
+            {
+                "code": "stale_text",
+                "message": "替换旧文字。",
+                "contract_mutation_required": False,
+            }
+        ],
     )
 
     with pytest.raises(httpx.ReadTimeout):
@@ -6637,12 +7993,15 @@ async def test_restarted_worker_resumes_same_run_and_thread(
     assert set(await repository.get_business_checkpoints(lease.run_id)) == {first_stage}
     assert await repository.requeue_expired_jobs(now=stopped_at + timedelta(seconds=6)) == 1
 
+    model_call_store = ModelCallStore(settings.database_path)
+    model_call_state = ModelCallState(store=model_call_store)
     async with AsyncSqliteSaver.from_conn_string(str(settings.database_path)) as saver:
         await saver.setup()
         resumed_workflow = _fake_workflow(
             model=ToolCallingFakeModel(responses=responses[2:]),
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
+            model_call_state=model_call_state,
         )
         restarted_worker = Worker(
             settings=settings,
@@ -6651,6 +8010,7 @@ async def test_restarted_worker_resumes_same_run_and_thread(
             workflow=resumed_workflow,
             worker_id="restarted-worker",
         )
+        restarted_worker._model_call_state = model_call_state
 
         assert await restarted_worker.run_once() is True
         checkpoint_after_restart = await saver.aget_tuple(
@@ -6671,6 +8031,7 @@ async def test_restarted_worker_resumes_same_run_and_thread(
     assert resource.initial.state == "succeeded"
     assert attempts[first_stage] == 1
     assert all(count == 1 for count in attempts.values())
+    model_call_store.close()
 
 
 @pytest.mark.asyncio

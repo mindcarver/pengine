@@ -5,7 +5,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 import aiosqlite
@@ -30,7 +30,7 @@ from pengine.model_calls import (
     ModelCallState,
     ModelCallStore,
     StageCallBudgetExceeded,
-    new_call_id,
+    new_operation_id,
 )
 from pengine.observability import content_fingerprint, record_langfuse_event
 from pengine.personas import PersonaCatalog, PersonaPackageError
@@ -227,24 +227,11 @@ EpisodeDeadlineReset = Callable[[], Awaitable[None]]
 SeriesReviewRegistration = Callable[..., Awaitable[str]]
 
 
-class StageValidationError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        stage: InternalStage,
-        safe_message: str,
-    ) -> None:
-        super().__init__(message)
-        self.stage = stage
-        self.safe_message = safe_message
-
-
 def _suffix_rewrite_feedback_payload(
     reviews: list[BoundStructuralReview],
     effective_earliest_episode: int,
 ) -> dict[str, Any]:
-    """Serialize all unresolved bound defects for the next suffix writer."""
+    """Serialize unresolved defects bound to the latest reviewed prefix."""
     return {
         "version": 1,
         "effective_earliest_affected_episode": effective_earliest_episode,
@@ -271,6 +258,19 @@ def _suffix_rewrite_feedback_payload(
             for review in reviews
         ],
     }
+
+
+class StageValidationError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: InternalStage,
+        safe_message: str,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.safe_message = safe_message
 
 
 class WorkflowExecutor(Protocol):
@@ -514,6 +514,7 @@ class Worker:
             model_call_state.context.thread_id = work.thread_id
             model_call_state.context.run_kind = work.run_kind
             model_call_state.context.stage = current_stage.value
+            model_call_state.context.operation_id = new_operation_id()
         logger.info(
             "workflow run started run_id=%s creation_id=%s kind=%s",
             work.run_id,
@@ -634,6 +635,7 @@ class Worker:
                     if model_call_state is not None:
                         model_call_state.context.stage = stage.value
                         model_call_state.context.episode_number = None
+                        model_call_state.context.operation_id = new_operation_id()
                     attempt = await self.repository.record_stage_attempt(work.run_id, stage)
                     open_stage_observation(stage, attempt)
                     return attempt
@@ -642,8 +644,31 @@ class Worker:
                     stage: InternalStage,
                     payload: Mapping[str, Any],
                 ) -> None:
-                    await self.repository.approve_checkpoint(work.run_id, stage, payload)
-                    approved[stage] = dict(payload)
+                    approved_payload = dict(payload)
+                    review_call_id = None
+                    if (
+                        stage is InternalStage.GENERATING_EPISODE_OUTLINE
+                        and "story_contract" in approved_payload
+                    ):
+                        operation_id = (
+                            model_call_state.context.operation_id
+                            if model_call_state is not None
+                            else None
+                        )
+                        review_call_id = await self._require_physical_call_id(
+                            run_id=work.run_id,
+                            role="review",
+                            stage=stage,
+                            episode_number=None,
+                            operation_id=operation_id,
+                        )
+                    await self.repository.approve_checkpoint(
+                        work.run_id,
+                        stage,
+                        approved_payload,
+                        review_call_id=review_call_id,
+                    )
+                    approved[stage] = approved_payload
                     close_stage_observation(status="approved")
                     if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
                         await self._sync_series_bible(work, approved)
@@ -661,7 +686,7 @@ class Worker:
                             InternalStage.GENERATING_EPISODE_SCRIPTS.value
                         )
                         model_call_state.context.episode_number = plan.episode_number
-                        model_call_state.context.call_id = new_call_id()
+                        model_call_state.context.operation_id = new_operation_id()
                     return await self.repository.record_episode_attempt(
                         work.run_id,
                         plan.episode_number,
@@ -696,15 +721,24 @@ class Worker:
                         design_content_hash=active.content_hash,
                         design_epoch=active.design_epoch,
                     )
-                    resolved_call_id = (
-                        call_id
-                        or (
-                            model_call_state.context.call_id
-                            if model_call_state is not None
-                            else None
-                        )
-                        or f"{work.run_id}-episode-{episode_number}"
+                    operation_id = (
+                        model_call_state.context.operation_id
+                        if model_call_state is not None
+                        else None
                     )
+                    resolved_call_id = await self._require_physical_call_id(
+                        run_id=work.run_id,
+                        role="generation",
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        episode_number=episode_number,
+                        operation_id=operation_id,
+                    )
+                    if call_id is not None and call_id != resolved_call_id:
+                        raise AgentProtocolError(
+                            "Episode candidate call_id does not match its successful physical "
+                            "generation call",
+                            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        )
                     candidate = await self.repository.commit_episode_candidate(
                         work.run_id,
                         episode_number=episode_number,
@@ -765,9 +799,17 @@ class Worker:
                             for candidate in prefix
                         ]
                     )
-                    call_id = await self.repository.latest_review_call_id(
-                        work.run_id,
+                    operation_id = (
+                        model_call_state.context.operation_id
+                        if model_call_state is not None
+                        else None
+                    )
+                    call_id = await self._require_physical_call_id(
+                        run_id=work.run_id,
+                        role="review",
                         stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        episode_number=episode_number,
+                        operation_id=operation_id,
                     )
                     bound = await self.repository.register_series_review(
                         work.run_id,
@@ -779,7 +821,7 @@ class Worker:
                         batch_id=batch.batch_id,
                         batch_epoch=batch.batch_epoch,
                         prefix_hash=prefix_hash,
-                        call_id=call_id or f"{work.run_id}-review-{episode_number}",
+                        call_id=call_id,
                         passed=passed,
                         category=category,
                         evidence=evidence,
@@ -862,6 +904,9 @@ class Worker:
                         assembly_payload,
                     )
                     approved[current_stage] = assembly_payload
+                # Publish succeeded state only after every physical model-call row is
+                # durable, so the first terminal API projection cannot omit ledger rows.
+                await asyncio.to_thread(drain_audit_writes)
                 final_review_id = await self._resolve_final_review_id(work.run_id)
                 await self.repository.succeed_run(
                     work.run_id,
@@ -1027,6 +1072,50 @@ class Worker:
                 # records (usage, stale, failed, blocked) are present for the API, UI,
                 # and evidence (Delivery #58 INT-A2/A6/A9).
                 await asyncio.to_thread(drain_audit_writes)
+
+    async def _require_physical_call_id(
+        self,
+        *,
+        run_id: UUID,
+        role: Literal["generation", "review"],
+        stage: InternalStage,
+        episode_number: int | None,
+        operation_id: str | None,
+    ) -> str:
+        """Resolve one exact successful provider call, never synthetic provenance."""
+        if operation_id is None:
+            raise AgentProtocolError(
+                f"Missing successful physical {role} call for artifact provenance",
+                stage=stage,
+            )
+        expected_call_id = None
+        if self._model_call_state is not None:
+            expected_call_id = self._model_call_state.latest_succeeded_call_id(
+                role=role,
+                run_id=str(run_id),
+                stage=stage.value,
+                episode_number=episode_number,
+                operation_id=operation_id,
+            )
+        # The callback updates in-memory completion synchronously, while SQLite writes
+        # land on the audit thread. Drain before binding an immutable artifact so the
+        # referenced physical call is already durable if the process stops afterward.
+        await asyncio.to_thread(drain_audit_writes)
+        durable_call_id = await self.repository.latest_successful_model_call_id(
+            run_id,
+            role=role,
+            stage=stage,
+            episode_number=episode_number,
+            operation_id=operation_id,
+        )
+        if durable_call_id is None or (
+            expected_call_id is not None and expected_call_id != durable_call_id
+        ):
+            raise AgentProtocolError(
+                f"Missing successful physical {role} call for artifact provenance",
+                stage=stage,
+            )
+        return durable_call_id
 
     async def _pause_recoverable_episode_error(
         self,
@@ -1243,12 +1332,26 @@ class Worker:
                 "A unified outline requires bound global design review evidence",
                 stage=InternalStage.GENERATING_EPISODE_OUTLINE,
             )
-        call_id = await self.repository.latest_review_call_id(
+        call_id = await self.repository.get_checkpoint_review_call_id(
             work.run_id,
-            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
         )
         if call_id is None:
-            call_id = f"{work.run_id}-outline-review"
+            raise AgentProtocolError(
+                "Global design review lacks a successful physical review call",
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            )
+        if not await self.repository.is_successful_model_call(
+            work.run_id,
+            call_id=call_id,
+            role="review",
+            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            episode_number=None,
+        ):
+            raise AgentProtocolError(
+                "Global design review lacks a successful physical review call",
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            )
 
         return bind_global_design_review(
             candidate,
@@ -1352,9 +1455,7 @@ class Worker:
                 if review.earliest_affected_episode is not None
             ]
             effective_earliest = (
-                min(affected_episodes)
-                if affected_episodes
-                else exc.earliest_affected_episode
+                min(affected_episodes) if affected_episodes else exc.earliest_affected_episode
             )
             aggregated_evidence = (
                 aggregate_script_defect_evidence(unresolved_reviews)
@@ -1362,9 +1463,7 @@ class Worker:
                 else exc.evidence
             )
             latest_review_id = (
-                unresolved_reviews[-1].review_id
-                if unresolved_reviews
-                else exc.review_id
+                unresolved_reviews[-1].review_id if unresolved_reviews else exc.review_id
             )
             if (
                 batch is not None
@@ -1399,12 +1498,8 @@ class Worker:
                 batch_id=(batch.batch_id if batch is not None else ""),
                 batch_epoch=(batch.batch_epoch if batch is not None else 1),
                 earliest_affected_episode=effective_earliest,
-                range_episodes=(
-                    len(work.episode_plans)
-                    - (effective_earliest or 1)
-                    + 1
-                ),
-                estimated_tokens=await self._repair_token_estimate(
+                range_episodes=(len(work.episode_plans) - (effective_earliest or 1) + 1),
+                estimated_tokens=await self._repair_reference_context_tokens(
                     work.run_id,
                     from_episode=effective_earliest or 1,
                 ),
@@ -1441,7 +1536,7 @@ class Worker:
                 batch_epoch=(batch.batch_epoch if batch else 1),
                 earliest_affected_episode=None,
                 range_episodes=None,
-                estimated_tokens=await self._repair_token_estimate(
+                estimated_tokens=await self._repair_reference_context_tokens(
                     work.run_id,
                     from_episode=1,
                 ),
@@ -1460,11 +1555,12 @@ class Worker:
             exc.category,
         )
 
-    async def _repair_token_estimate(self, run_id: UUID, *, from_episode: int) -> int:
-        """A deterministic token estimate for the one authorized generation+review cycle.
+    async def _repair_reference_context_tokens(self, run_id: UUID, *, from_episode: int) -> int:
+        """Return the reference context amount shown at authorization.
 
-        The estimate covers the retained active prefix scripts plus the active design
-        projections that the writer must carry into the regenerated range (RPR-A8).
+        It counts the retained active prefix plus the active design projections at the pause.
+        Those texts are not guaranteed to be the exact input of a design rebuild or every
+        suffix call, so this is neither a lower bound nor a total cycle forecast (RPR-A8).
         """
         from pengine.model_calls import estimate_text_tokens
 

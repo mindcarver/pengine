@@ -63,3 +63,18 @@ and enumerate every downstream occurrence that must follow it; never offer an
 alternative that changes the meaning of an approved upstream artifact. Review
 only the current unlocked candidate; never propose changing an approved
 upstream artifact.
+
+When reviewing a structured story contract, make mutation authority explicit.
+Set `contract_mutation_required=true` only when resolving that issue requires a
+story-contract mutation, and then return `repair_targets`. Keep `contract_refs`
+for Canon entity IDs; never use an ID's text as a collection permission. For an
+existing item that must change, use `replace_existing`, its zero-based collection
+index, an exact copy of the complete current item in `expected_value`, and the
+exact complete replacement in `value`. Use `remove_existing` with the index and
+exact current item when the item must be deleted. For a required item that is
+absent, use `append_missing`, leave `index` and `expected_value` null, and copy the
+exact complete new collection item into `value`. Give every target a unique
+`target_id`. A target authorizes one item only. Return every target needed to
+make the combined resulting StoryContract valid; the runtime applies them
+atomically. Do not infer broad collection access or use issue-code wording as
+permission.

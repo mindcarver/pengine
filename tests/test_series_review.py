@@ -7,6 +7,7 @@ import pytest
 from test_continuity import make_contract
 from test_script_batch import (
     NOW,
+    _approve_episode_outline,
     build_episode_lock_for,
     create_leased_run,
     initial_series_state,
@@ -282,6 +283,52 @@ async def test_unresolved_script_defects_aggregate_until_a_same_lineage_pass(
         earliest_affected_episode=None,
     )
     assert await repository.get_unresolved_script_defect_reviews(lease.run_id) == []
+
+
+async def test_unresolved_script_defects_follow_the_latest_reviewed_prefix(
+    repository: Repository,
+) -> None:
+    accepted, lease = await create_leased_run(repository)
+    contract, active = await seed_active_design_and_batch(repository, lease.run_id)
+    batch = await repository.get_script_batch_lineage(lease.run_id)
+    common = {
+        "run_id": lease.run_id,
+        "review_type": "milestone",
+        "episode_number": 3,
+        "design_candidate_id": active.candidate_id,
+        "design_content_hash": active.content_hash,
+        "design_epoch": active.design_epoch,
+        "batch_id": batch.batch_id,
+        "batch_epoch": batch.batch_epoch,
+    }
+    old_prefix = await repository.register_series_review(
+        **common,
+        prefix_hash="a" * 64,
+        call_id="old-prefix-reject",
+        passed=False,
+        category="script_defect",
+        evidence="旧前缀第1集缺陷",
+        earliest_affected_episode=1,
+    )
+
+    assert [
+        review.review_id
+        for review in await repository.get_unresolved_script_defect_reviews(lease.run_id)
+    ] == [old_prefix.review_id]
+
+    new_prefix = await repository.register_series_review(
+        **common,
+        prefix_hash="b" * 64,
+        call_id="new-prefix-reject",
+        passed=False,
+        category="script_defect",
+        evidence="新前缀第2集缺陷",
+        earliest_affected_episode=2,
+    )
+
+    unresolved = await repository.get_unresolved_script_defect_reviews(lease.run_id)
+    assert [review.review_id for review in unresolved] == [new_prefix.review_id]
+    assert [review.earliest_affected_episode for review in unresolved] == [2]
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +863,10 @@ async def test_worker_authorized_design_rebuild_promotes_a_fresh_design(
         idempotency_key="authorize-worker-1",
     )
 
+    rebuild_lease = await repository.lease_next_job("rebuild-worker", 30)
+    assert rebuild_lease is not None and rebuild_lease.run_id == lease.run_id
+    await repository.mark_run_running(lease.run_id)
+
     settings = Settings(
         persona_root=tmp_path / "personas",
         data_dir=tmp_path / "data",
@@ -828,11 +879,11 @@ async def test_worker_authorized_design_rebuild_promotes_a_fresh_design(
             settings.snapshot_root,
         ),
     )
-    work = await repository.get_run_work_item(lease.run_id)
     rebuilt_contract = three_episode_contract().model_copy(deep=True)
     for fact in rebuilt_contract.facts:
         fact.value = f"{fact.value}（重建版）"
-    approved = {
+    upstream = {
+        InternalStage.SELECTING_L0_VARIANT: {"selected_l0_variant": "归返"},
         InternalStage.GENERATING_STORY_OUTLINE: {
             "content": "新的完整故事梗概。\n其余人物设定与已批准大纲保持一致。",
         },
@@ -840,18 +891,12 @@ async def test_worker_authorized_design_rebuild_promotes_a_fresh_design(
             "character_biographies": "阿丽：回乡调查旧案的主角。\n阿博：见证旧事的证人。",
             "relationship_logic": "阿丽与阿博为搭档。",
         },
-        InternalStage.SELECTING_L0_VARIANT: {"selected_l0_variant": "归返"},
-        InternalStage.GENERATING_EPISODE_OUTLINE: {
-            "content": "三集连续写作。",
-            "story_contract": rebuilt_contract.model_dump(mode="json"),
-            "contract_review": {
-                "passed": True,
-                "evidence": "独立设计审查通过。",
-                "issues": [],
-            },
-        },
     }
-    await worker._sync_series_bible(work, approved)
+    for stage, payload in upstream.items():
+        await repository.approve_business_checkpoint(lease.run_id, stage, payload)
+    await _approve_episode_outline(repository, lease.run_id, rebuilt_contract)
+    work = await repository.get_run_work_item(lease.run_id)
+    await worker._sync_series_bible(work, work.business_checkpoints)
 
     fresh = await repository.get_run_series_bible(lease.run_id)
     assert fresh is not None

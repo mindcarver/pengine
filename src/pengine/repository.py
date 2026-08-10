@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS business_checkpoints (
     stage TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     payload_sha256 TEXT NOT NULL,
+    review_call_id TEXT,
     approved_at TEXT NOT NULL,
     PRIMARY KEY (run_id, stage)
 );
@@ -885,6 +886,7 @@ CREATE TABLE run_progress_v11 (
 _SCHEMA_V11_MODEL_CALLS_SQL = """
 CREATE TABLE IF NOT EXISTS model_calls (
     call_id TEXT PRIMARY KEY,
+    operation_id TEXT,
     run_id TEXT,
     creation_id TEXT,
     thread_id TEXT,
@@ -923,6 +925,11 @@ CREATE TABLE IF NOT EXISTS model_calls (
 _SCHEMA_V11_MODEL_CALLS_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS model_calls_run_id
 ON model_calls(run_id);
+"""
+
+_SCHEMA_V18_MODEL_CALLS_OPERATION_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS model_calls_operation_id
+ON model_calls(run_id, operation_id);
 """
 
 _SCHEMA_V12_SERIES_BIBLE_SQL = """
@@ -1734,6 +1741,21 @@ class Repository:
                         )
                         """
                     )
+                    model_call_columns = await (
+                        await connection.execute("PRAGMA table_info(model_calls)")
+                    ).fetchall()
+                    if "operation_id" not in {column[1] for column in model_call_columns}:
+                        await connection.execute(
+                            "ALTER TABLE model_calls ADD COLUMN operation_id TEXT"
+                        )
+                    checkpoint_columns = await (
+                        await connection.execute("PRAGMA table_info(business_checkpoints)")
+                    ).fetchall()
+                    if "review_call_id" not in {column[1] for column in checkpoint_columns}:
+                        await connection.execute(
+                            "ALTER TABLE business_checkpoints ADD COLUMN review_call_id TEXT"
+                        )
+                    await connection.execute(_SCHEMA_V18_MODEL_CALLS_OPERATION_INDEX_SQL)
                     await connection.execute(
                         "INSERT OR IGNORE INTO pengine_schema(version) VALUES (18)"
                     )
@@ -3341,6 +3363,7 @@ class Repository:
         stage: InternalStage,
         payload: BaseModel | Mapping[str, Any],
         *,
+        review_call_id: str | None = None,
         now: datetime | None = None,
     ) -> Any:
         payload_json = _json(payload)
@@ -3360,7 +3383,7 @@ class Repository:
             existing = await self._fetchone(
                 connection,
                 """
-                SELECT payload_json, payload_sha256
+                SELECT payload_json, payload_sha256, review_call_id
                 FROM business_checkpoints
                 WHERE run_id = ? AND stage = ?
                 """,
@@ -3371,6 +3394,12 @@ class Repository:
                     raise DomainError(
                         "checkpoint_conflict",
                         "An approved checkpoint cannot be replaced.",
+                        409,
+                    )
+                if review_call_id is not None and existing["review_call_id"] != review_call_id:
+                    raise DomainError(
+                        "checkpoint_conflict",
+                        "An approved checkpoint cannot replace its model-call provenance.",
                         409,
                     )
                 return json.loads(existing["payload_json"])
@@ -3405,6 +3434,34 @@ class Repository:
                             "The episode outline story contract is not lockable.",
                             409,
                         ) from exc
+                    if not isinstance(review_call_id, str) or not review_call_id:
+                        raise DomainError(
+                            "invalid_story_contract",
+                            "A lockable episode outline requires physical review provenance.",
+                            409,
+                        )
+                    producing_review = await self._fetchone(
+                        connection,
+                        """
+                        SELECT 1
+                        FROM model_calls
+                        WHERE call_id = ? AND run_id = ? AND role = 'review'
+                              AND stage = ? AND episode_number IS NULL
+                              AND operation_id IS NOT NULL AND status = 'succeeded'
+                        """,
+                        (
+                            review_call_id,
+                            str(run_id),
+                            InternalStage.GENERATING_EPISODE_OUTLINE.value,
+                        ),
+                    )
+                    if producing_review is None:
+                        raise DomainError(
+                            "invalid_story_contract",
+                            "The episode outline review provenance is not a successful "
+                            "physical review call.",
+                            409,
+                        )
             if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
                 try:
                     supplied_scripts = json.loads(payload_json)
@@ -3449,10 +3506,17 @@ class Repository:
             await connection.execute(
                 """
                 INSERT INTO business_checkpoints(
-                    run_id, stage, payload_json, payload_sha256, approved_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    run_id, stage, payload_json, payload_sha256, review_call_id, approved_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (str(run_id), stage.value, payload_json, payload_hash, timestamp),
+                (
+                    str(run_id),
+                    stage.value,
+                    payload_json,
+                    payload_hash,
+                    review_call_id,
+                    timestamp,
+                ),
             )
             if plans is not None:
                 await connection.executemany(
@@ -3488,9 +3552,34 @@ class Repository:
         stage: InternalStage,
         payload: BaseModel | Mapping[str, Any],
         *,
+        review_call_id: str | None = None,
         now: datetime | None = None,
     ) -> Any:
-        return await self.approve_business_checkpoint(run_id, stage, payload, now=now)
+        return await self.approve_business_checkpoint(
+            run_id,
+            stage,
+            payload,
+            review_call_id=review_call_id,
+            now=now,
+        )
+
+    async def get_checkpoint_review_call_id(
+        self,
+        run_id: UUID,
+        stage: InternalStage,
+    ) -> str | None:
+        """Return hidden physical review provenance without exposing it in payloads."""
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT review_call_id
+                FROM business_checkpoints
+                WHERE run_id = ? AND stage = ?
+                """,
+                (str(run_id), stage.value),
+            )
+            return row["review_call_id"] if row is not None else None
 
     async def get_business_checkpoints(
         self,
@@ -3968,27 +4057,54 @@ class Repository:
         async with self._connection() as connection:
             return await self._fetch_series_bible_lineage(connection, run_id)
 
-    async def latest_review_call_id(
+    async def latest_successful_model_call_id(
         self,
         run_id: UUID,
         *,
+        role: Literal["generation", "review"],
         stage: InternalStage,
+        episode_number: int | None,
+        operation_id: str,
     ) -> str | None:
-        """The most recent succeeded review-route call for a design stage."""
+        """Return the exact operation-scoped successful physical model call."""
         async with self._connection() as connection:
             row = await self._fetchone(
                 connection,
                 """
                 SELECT call_id
                 FROM model_calls
-                WHERE run_id = ? AND role = 'review' AND stage = ?
+                WHERE run_id = ? AND role = ? AND stage = ?
+                      AND episode_number IS ? AND operation_id = ?
                       AND status = 'succeeded'
                 ORDER BY requested_at DESC, call_id DESC
                 LIMIT 1
                 """,
-                (str(run_id), stage.value),
+                (str(run_id), role, stage.value, episode_number, operation_id),
             )
             return row["call_id"] if row is not None else None
+
+    async def is_successful_model_call(
+        self,
+        run_id: UUID,
+        *,
+        call_id: str,
+        role: Literal["generation", "review"],
+        stage: InternalStage,
+        episode_number: int | None,
+    ) -> bool:
+        """Validate persisted physical provenance without selecting a nearby call."""
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT 1
+                FROM model_calls
+                WHERE call_id = ? AND run_id = ? AND role = ? AND stage = ?
+                      AND episode_number IS ? AND status = 'succeeded'
+                """,
+                (call_id, str(run_id), role, stage.value, episode_number),
+            )
+            return row is not None
 
     async def assert_episode_batch_current(self, run_id: UUID) -> str | None:
         """Return the active design content hash, or ``None`` when no design is active.
@@ -4908,11 +5024,13 @@ class Repository:
         self,
         run_id: UUID,
     ) -> list[BoundStructuralReview]:
-        """Return all active script defects after the latest active-lineage pass.
+        """Return current-prefix script defects after its latest passing review.
 
-        A passing review closes every earlier script defect on the exact active
-        design/batch lineage. Reviews bound to a stale design or batch are never
-        eligible feedback, even when their rows remain queryable as evidence.
+        The newest review selects the exact active prefix under consideration. Reviews
+        for earlier prefixes remain immutable audit evidence and may guide the rewrite
+        until a replacement prefix is reviewed, but they cannot affect that replacement's
+        repair range or evidence. Reviews bound to a stale design or batch are never
+        eligible feedback.
         """
         async with self._connection() as connection:
             lineage = await self._fetch_series_bible_lineage(connection, run_id)
@@ -4962,7 +5080,7 @@ class Repository:
         batch_id: str,
         batch_epoch: int,
     ) -> list[BoundStructuralReview]:
-        """Read unresolved reviews while an existing transaction owns the lineage."""
+        """Read unresolved current-prefix reviews while a transaction owns the lineage."""
         binding = (
             str(run_id),
             design_candidate_id,
@@ -4974,7 +5092,7 @@ class Repository:
         latest = await self._fetchone(
             connection,
             """
-            SELECT passed
+            SELECT passed, prefix_hash
             FROM series_reviews
             WHERE run_id = ?
               AND design_candidate_id = ?
@@ -4990,6 +5108,7 @@ class Repository:
         )
         if latest is None or bool(latest["passed"]):
             return []
+        latest_prefix_hash = str(latest["prefix_hash"])
         passing = await self._fetchone(
             connection,
             """
@@ -5001,10 +5120,11 @@ class Repository:
               AND design_epoch = ?
               AND batch_id = ?
               AND batch_epoch = ?
+              AND prefix_hash = ?
               AND status = 'active'
               AND passed = 1
             """,
-            binding,
+            (*binding, latest_prefix_hash),
         )
         passing_epoch = (
             int(passing["review_epoch"])
@@ -5021,13 +5141,14 @@ class Repository:
               AND design_epoch = ?
               AND batch_id = ?
               AND batch_epoch = ?
+              AND prefix_hash = ?
               AND status = 'active'
               AND passed = 0
               AND category = 'script_defect'
               AND review_epoch > ?
             ORDER BY review_epoch ASC
             """,
-            (*binding, passing_epoch),
+            (*binding, latest_prefix_hash, passing_epoch),
         )
         rows = await cursor.fetchall()
         return [self._series_review_from_row(row) for row in rows]
@@ -5206,8 +5327,10 @@ class Repository:
         """Pause the run for an exact one-cycle repair authorization.
 
         The authorization is bound to the active lineage and shows the evidence,
-        the affected range, and the estimated token requirement (RPR-A8). It grants
-        at most one generation-plus-review cycle (RPR-A9).
+        affected range, and reference context amount at the pause (neither a lower
+        bound nor a total cycle forecast) (RPR-A8). It grants at most one
+        generation-plus-review cycle
+        (RPR-A9).
         """
         current = now or _utc_now()
         timestamp = _timestamp(current)
@@ -5348,8 +5471,8 @@ class Repository:
 
         The authorization is bound to the active lineage; if the active design or
         batch changed since the pause, it cannot be granted (RPR-A9). Granting
-        requeues the run for exactly one cycle; a subsequent failure returns to the
-        same evidence pause.
+        requeues the run for exactly one cycle; if a hard-constraint conflict remains,
+        the next pause carries the latest prefix-bound review evidence.
         """
         timestamp = _timestamp(now or _utc_now())
         scope = f"run-control:{creation_id}:{run_kind}:authorize-repair"
@@ -7096,6 +7219,7 @@ class Repository:
     def _model_call_summary(row: aiosqlite.Row) -> ModelCallSummary:
         return ModelCallSummary(
             call_id=row["call_id"],
+            operation_id=row["operation_id"],
             role=row["role"],
             adapter=row["adapter"],
             provider=row["provider"],

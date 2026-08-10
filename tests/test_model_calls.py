@@ -31,6 +31,7 @@ from pengine.model_calls import (
 )
 from pengine.relay import (
     PreflightBlockedError,
+    _ModelCallAuditHandler,
     build_relay_adapter,
     build_relay_routes,
 )
@@ -178,6 +179,107 @@ def _usage_response(*, usage_metadata: dict[str, Any] | None, llm_output: dict[s
         generations=[[ChatGeneration(message=message)]],
         llm_output=llm_output,
     )
+
+
+def _audited_response(model_id: str, *, input_tokens: int, output_tokens: int) -> LLMResult:
+    return LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="ok",
+                        response_metadata={"model": model_id, "finish_reason": "stop"},
+                        usage_metadata={
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                        },
+                    )
+                )
+            ]
+        ]
+    )
+
+
+def test_each_provider_request_uses_callback_id_as_physical_ledger_key(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One logical operation may span roles/stages without collapsing physical calls."""
+    caplog.set_level("INFO", logger="uvicorn.error.pengine.model_calls")
+    caplog.set_level("INFO", logger="uvicorn.error.pengine.model_call_records")
+    store = ModelCallStore(tmp_path / "model_calls.sqlite3")
+    operation_id = "episode-3-operation"
+    state = ModelCallState(store=store)
+    state.context.run_id = "run-physical"
+    state.context.stage = "generating_episode_scripts"
+    state.context.episode_number = 3
+    state.context.operation_id = operation_id
+    generation = _ModelCallAuditHandler(
+        role="generation",
+        model_id="claude-opus-5",
+        adapter="anthropic",
+        provider="anthropic",
+        model_call_state=state,
+        context_limit_tokens=200_000,
+        reserved_output_tokens=100,
+    )
+    review = _ModelCallAuditHandler(
+        role="review",
+        model_id="gpt-5.5",
+        adapter="openai",
+        provider="openai",
+        model_call_state=state,
+        context_limit_tokens=200_000,
+        reserved_output_tokens=100,
+    )
+    physical_calls = [uuid4(), uuid4(), uuid4()]
+
+    generation.on_chat_model_start({}, [[AIMessage(content="write")]], run_id=physical_calls[0])
+    generation.on_llm_end(
+        _audited_response("claude-opus-5", input_tokens=101, output_tokens=11),
+        run_id=physical_calls[0],
+    )
+    review.on_chat_model_start({}, [[AIMessage(content="review")]], run_id=physical_calls[1])
+    review.on_llm_end(
+        _audited_response("gpt-5.5", input_tokens=102, output_tokens=12),
+        run_id=physical_calls[1],
+    )
+    state.context.stage = "accepting_l4"
+    state.context.episode_number = None
+    generation.on_chat_model_start({}, [[AIMessage(content="gate")]], run_id=physical_calls[2])
+    generation.on_llm_end(
+        _audited_response("claude-opus-5", input_tokens=103, output_tokens=13),
+        run_id=physical_calls[2],
+    )
+
+    rows = store._connection.execute(
+        "SELECT call_id, operation_id, role, stage, status, actual_input_tokens, "
+        "actual_output_tokens FROM model_calls ORDER BY requested_at, call_id"
+    ).fetchall()
+    assert {row["call_id"] for row in rows} == {str(call_id) for call_id in physical_calls}
+    assert len(rows) == len(physical_calls)
+    assert {row["operation_id"] for row in rows} == {operation_id}
+    assert all(row["status"] == "succeeded" for row in rows)
+    assert sum(row["actual_input_tokens"] for row in rows) == 306
+    assert sum(row["actual_output_tokens"] for row in rows) == 36
+    assert state.latest_succeeded_call_id(
+        role="review",
+        run_id="run-physical",
+        stage="generating_episode_scripts",
+        episode_number=3,
+        operation_id=operation_id,
+    ) == str(physical_calls[1])
+    for physical_call_id in map(str, physical_calls):
+        assert "event=start role=" in caplog.text
+        assert f"call_id={physical_call_id}" in caplog.text
+    with pytest.raises(RuntimeError, match="Duplicate physical model call id"):
+        generation.on_chat_model_start(
+            {},
+            [[AIMessage(content="duplicate")]],
+            run_id=physical_calls[0],
+        )
+    store.close()
 
 
 def test_provider_usage_is_extracted_exactly_when_present() -> None:
@@ -442,6 +544,7 @@ def test_model_call_id_is_unique_and_lineaged(tmp_path: Path) -> None:
         run_kind="initial",
         stage="generating_episode_scripts",
         episode_number=3,
+        operation_id="episode-3-operation",
     )
     first = build_started_record(
         role="generation",
@@ -468,10 +571,11 @@ def test_model_call_id_is_unique_and_lineaged(tmp_path: Path) -> None:
     store.upsert(first)
     store.upsert(second)
     row = store._connection.execute(
-        "SELECT run_id, creation_id, thread_id, run_kind, stage, episode_number "
+        "SELECT operation_id, run_id, creation_id, thread_id, run_kind, stage, episode_number "
         "FROM model_calls WHERE call_id = ?",
         (first.call_id,),
     ).fetchone()
+    assert row["operation_id"] == "episode-3-operation"
     assert row["run_id"] == "run-1"
     assert row["creation_id"] == "creation-1"
     assert row["thread_id"] == "thread-1"
@@ -551,15 +655,17 @@ def test_store_migrates_legacy_table_without_provider_evidence_columns(
     store.upsert(record)
 
     rows = store._connection.execute(
-        "SELECT call_id, http_status, provider_error_code, redacted_response "
+        "SELECT call_id, operation_id, http_status, provider_error_code, redacted_response "
         "FROM model_calls ORDER BY requested_at"
     ).fetchall()
     assert len(rows) == 2
     assert rows[0]["call_id"] == "legacy-1"
+    assert rows[0]["operation_id"] is None
     assert rows[0]["http_status"] is None
     assert rows[0]["provider_error_code"] is None
     assert rows[0]["redacted_response"] is None
     assert rows[1]["call_id"] != "legacy-1"
+    assert rows[1]["operation_id"] is None
     assert rows[1]["http_status"] is None
     assert rows[1]["provider_error_code"] is None
     assert rows[1]["redacted_response"] is None

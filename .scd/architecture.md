@@ -23,8 +23,8 @@ same-origin single-page workbench plus a JSON HTTP API, persists durable state
 in SQLite, and runs one embedded background worker. The worker drives a Deep
 Agents/LangGraph creative runtime through two fixed role routes that share one
 relay URL and API key: Anthropic Messages with `claude-opus-5` for generation
-and creative repair, and DeepSeek OpenAI-compatible chat completions with
-`deepseek-v4-flash` for review.
+and creative repair, plus a configured review model using its matching
+Anthropic, OpenAI, or DeepSeek client protocol.
 
 V1 does not include authentication, multi-user isolation, public deployment,
 operator-selectable model roles or providers, production persona authoring,
@@ -220,8 +220,18 @@ scripts, which are never formal delivery until the final gate.
 ### Bounded structural review and repair authorization
 
 The SeriesBible declares structural review milestones (`review_milestones`); the
-final episode is always a structural milestone. DeepSeek reviews only these
-milestones and the final completion.
+final episode is always a structural milestone. The configured review role
+reviews only these milestones and the final completion.
+
+Screenplay validation is format-agnostic. Do not add per-artifact, per-language,
+or legacy-format allowlists to make a rejected script pass. Deterministic checks
+may enforce only explicit structured bindings, such as a fact's own bound
+evidence excerpt. Headings, labels, dialogue notation, story-world arithmetic,
+dates, code, and other subject matter require contextual review and may block
+only when they directly contradict hard Canon or contain a proven private-runtime
+leak. After changing this policy, validate it with a fresh isolated run; retain
+old drafts and reviews as audit evidence, but do not mutate, reclassify, or
+resume them as compatibility work.
 
 - A **bound structural review** observes the complete active prefix at one
   milestone and binds the exact design candidate, script batch/epoch,
@@ -240,9 +250,11 @@ milestones and the final completion.
   run requeues to rewrite the suffix. When the budget is exhausted, the run
   pauses for authorization.
 - A **repair authorization** is bound to the active lineage, shows the evidence,
-  the affected range, and the estimated token requirement, and grants exactly
-  one generation-plus-review cycle. A failure returns to the same evidence
-  pause. Generic Continue is for transient runtime/Relay/timeout states only
+  the affected range, and a reference token count for the active design
+  projections and retained prefix at the pause (neither a lower bound nor a total
+  cycle forecast), and grants exactly one generation-plus-review cycle. If a
+  hard-constraint conflict remains, the run pauses with the latest review
+  evidence. Generic Continue is for transient runtime/Relay/timeout states only
   and can never bypass a semantic rejection or spend a content-repair budget.
 - Only a passing **bound final whole-series review** atomically freezes the
   active design and complete active script batch as formal delivery; without
@@ -513,13 +525,12 @@ duplicate the full field contract.
   caps are optional.
 - The worker atomically constructs both process-level clients from the shared
   URL/key: `ChatAnthropic` with exactly `claude-opus-5` for generation and
-  creative repair, and `ChatDeepSeek` with exactly `deepseek-v4-flash` for
-  review. Missing either route fails closed before workflow execution; neither
-  client is used as fallback for the other.
-- The relay must support Anthropic Messages tool use and DeepSeek
-  OpenAI-compatible tool use at the configured root. Supervisor and subagent
-  schemas use LangChain `ToolStrategy` rather than provider-native
-  structured-output extensions.
+  creative repair, and the Anthropic, OpenAI, or DeepSeek client selected by
+  `review_model_id` for review. Missing either route fails closed before workflow
+  execution; neither client is used as fallback for the other.
+- The relay must support the selected clients' tool-use protocols at the
+  configured root. Supervisor and subagent schemas use LangChain `ToolStrategy`
+  rather than provider-native structured-output extensions.
 - `PENGINE_RELAY_ADAPTER`, `PENGINE_RELAY_MODEL_ID`, and
   `PENGINE_RELAY_MAX_OUTPUT_TOKENS` are obsolete, ignored settings; they cannot
   configure or override either role.
@@ -673,9 +684,10 @@ quality.
 - One persona-bound `workflow_supervisor`, four primary subagents, and three
   skill-scoped canon/continuity review and repair subagents.
 - Two preconfigured LangChain clients share the operator-supplied relay URL/key:
-  `ChatAnthropic` with `claude-opus-5` for generation and creative repair, and
-  `ChatDeepSeek` with `deepseek-v4-flash` for review. Both disable automatic
-  retries; both routes are required and neither falls back to the other.
+  `ChatAnthropic` with `claude-opus-5` for generation and creative repair, and a
+  review client whose Anthropic, OpenAI, or DeepSeek protocol is selected from
+  `review_model_id`. Both disable automatic retries; both routes are required
+  and neither falls back to the other.
 - `AsyncSqliteSaver` provides durable per-run thread checkpoints in the same
   local SQLite database. `StateBackend` provides checkpointed thread scratch.
 - V1 memory is thread-scoped only. Cross-creation writable `StoreBackend` memory

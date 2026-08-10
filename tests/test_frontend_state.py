@@ -707,6 +707,35 @@ if (!elements["run-control-description"].textContent.includes("人物知识状�
   throw new Error("content rejection did not expose review evidence");
 }
 
+state.creation.revision.progress.recovery_reason = "repair_authorization";
+state.creation.revision.authorization = {
+  kind: "suffix_rewrite",
+  earliest_affected_episode: 2,
+  range_episodes: 2,
+  estimated_tokens: 1200,
+};
+state.creation.revision.pause = {
+  code: "repair_authorization_required",
+  message: "最新前缀仍与硬约束冲突。",
+  stage: "generating_episode_scripts",
+};
+renderProgress();
+if (elements["run-control-title"].textContent !== "分集硬约束需修复 · 等待授权") {
+  throw new Error("repair authorization title did not identify a hard constraint");
+}
+if (!elements["run-control-description"].textContent.includes("最新审查证据")) {
+  throw new Error("repair authorization did not describe latest review evidence");
+}
+if (!elements["run-control-description"].textContent.includes("参考上下文量")) {
+  throw new Error("repair authorization omitted its reference context amount");
+}
+if (!elements["run-control-description"].textContent.includes("不是下限、整轮用量或费用预测")) {
+  throw new Error("repair authorization presented reference context as a usage forecast");
+}
+if (elements["run-control-description"].textContent.includes("同一证据")) {
+  throw new Error("repair authorization promised stale evidence reuse");
+}
+
 state.creation.revision.progress.recovery_reason = "episode_error";
 state.creation.revision.progress.current_stage = "generating_episode_scripts";
 state.creation.revision.progress.episodes = { total: 10, completed: 7, current: 8 };

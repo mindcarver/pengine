@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 from test_continuity import make_sparse_knowledge_contract
-from test_repository import create_and_lease_initial
+from test_repository import create_and_lease_initial, persist_succeeded_outline_review
 
 from pengine.continuity import (
     EpisodeStateDelta,
@@ -229,10 +229,12 @@ async def _approve_episode_outline(repository: Repository, run_id, contract: Sto
         InternalStage.GENERATING_EPISODE_OUTLINE,
         now=NOW,
     )
+    review_call_id = persist_succeeded_outline_review(repository, run_id)
     await repository.approve_business_checkpoint(
         run_id,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         payload,
+        review_call_id=review_call_id,
         now=NOW,
     )
 

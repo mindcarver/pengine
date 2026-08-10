@@ -13,6 +13,13 @@ from pengine.continuity import (
     story_contract_sha256,
 )
 from pengine.errors import DomainError
+from pengine.model_calls import (
+    ModelCallContext,
+    ModelCallRecord,
+    ModelCallStore,
+    build_started_record,
+    new_call_id,
+)
 from pengine.repository import SCHEMA_VERSION, Repository
 from pengine.schemas import (
     ContentPackage,
@@ -143,6 +150,50 @@ def locked_outline_payload():
     }
 
 
+def persist_succeeded_model_call(
+    repository: Repository,
+    *,
+    context: ModelCallContext,
+    role: str,
+    call_id: str | None = None,
+) -> ModelCallRecord:
+    store = ModelCallStore(repository.database_path)
+    record = build_started_record(
+        call_id=call_id or new_call_id(),
+        role=role,
+        adapter="fake",
+        provider="fake",
+        model="gpt-5.5" if role == "review" else "claude-opus-5",
+        context=context,
+        estimated_input_tokens=10,
+        estimated_output_tokens=20,
+        verified_limit_tokens=200_000,
+    )
+    record.status = "succeeded"
+    record.outcome = "success"
+    store.upsert(record)
+    store.close()
+    return record
+
+
+def persist_succeeded_outline_review(
+    repository: Repository,
+    run_id,
+    *,
+    call_id: str | None = None,
+) -> str:
+    return persist_succeeded_model_call(
+        repository,
+        call_id=call_id,
+        role="review",
+        context=ModelCallContext(
+            run_id=str(run_id),
+            stage=InternalStage.GENERATING_EPISODE_OUTLINE.value,
+            operation_id="outline-operation",
+        ),
+    ).call_id
+
+
 async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository) -> None:
     assert SCHEMA_VERSION == 18
     async with repository._connection() as connection:
@@ -197,10 +248,12 @@ async def test_schema_v18_migrates_episode_attempts_to_cycle_zero(
 ) -> None:
     _, lease = await create_and_lease_initial(repository, persona, creation_request)
     _, outline = locked_outline_payload()
+    review_call_id = persist_succeeded_outline_review(repository, lease.run_id)
     await repository.approve_business_checkpoint(
         lease.run_id,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         outline,
+        review_call_id=review_call_id,
         now=NOW,
     )
     await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
@@ -366,6 +419,50 @@ async def test_approved_checkpoint_is_immutable_and_blocks_regeneration(
     with pytest.raises(DomainError) as approved:
         await repository.record_stage_attempt(lease.run_id, stage)
     assert approved.value.code == "stage_already_approved"
+
+
+async def test_checkpoint_model_call_provenance_is_hidden_and_immutable(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    _, lease = await create_and_lease_initial(repository, persona, creation_request)
+    stage = InternalStage.GENERATING_EPISODE_OUTLINE
+    _, payload = locked_outline_payload()
+
+    with pytest.raises(DomainError, match="physical review provenance"):
+        await repository.approve_business_checkpoint(lease.run_id, stage, payload)
+    with pytest.raises(DomainError, match="not a successful physical review call"):
+        await repository.approve_business_checkpoint(
+            lease.run_id,
+            stage,
+            payload,
+            review_call_id="forged-review",
+        )
+
+    review_call_id = persist_succeeded_outline_review(
+        repository,
+        lease.run_id,
+        call_id="physical-review-1",
+    )
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        stage,
+        payload,
+        review_call_id=review_call_id,
+    )
+
+    assert (await repository.get_business_checkpoints(lease.run_id))[stage] == payload
+    assert await repository.get_checkpoint_review_call_id(lease.run_id, stage) == (
+        "physical-review-1"
+    )
+    with pytest.raises(DomainError, match="model-call provenance"):
+        await repository.approve_business_checkpoint(
+            lease.run_id,
+            stage,
+            payload,
+            review_call_id="physical-review-2",
+        )
 
 
 async def test_story_checkpoint_persists_sixth_semantic_repair_round(
@@ -1487,10 +1584,12 @@ async def test_contract_bound_episode_lock_persists_and_controls_aggregate(
         InternalStage.GENERATING_EPISODE_OUTLINE,
         now=NOW,
     )
+    review_call_id = persist_succeeded_outline_review(repository, lease.run_id)
     await repository.approve_business_checkpoint(
         lease.run_id,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         outline,
+        review_call_id=review_call_id,
         now=NOW,
     )
     await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
@@ -1599,10 +1698,12 @@ async def test_content_rejection_pauses_with_evidence_without_consuming_writer_a
         InternalStage.GENERATING_EPISODE_OUTLINE,
         now=NOW,
     )
+    review_call_id = persist_succeeded_outline_review(repository, lease.run_id)
     await repository.approve_business_checkpoint(
         lease.run_id,
         InternalStage.GENERATING_EPISODE_OUTLINE,
         outline,
+        review_call_id=review_call_id,
         now=NOW,
     )
     await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
@@ -2619,3 +2720,29 @@ async def test_schema_v10_to_v11_preserves_run_progress_and_model_calls(
     assert resource.initial.state == "running"
     assert len(resource.initial.progress.model_calls) == 1
     assert resource.initial.progress.model_calls[0].call_id == calls[0].call_id
+
+
+async def test_schema_v17_to_v18_adds_hidden_model_call_provenance(repository) -> None:
+    async with repository._connection() as connection:
+        await connection.execute("DROP INDEX model_calls_operation_id")
+        await connection.execute("ALTER TABLE model_calls DROP COLUMN operation_id")
+        await connection.execute("ALTER TABLE business_checkpoints DROP COLUMN review_call_id")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
+        await connection.commit()
+
+    restarted = Repository(repository.database_path)
+    await restarted.initialize()
+    async with restarted._connection() as connection:
+        columns = await (await connection.execute("PRAGMA table_info(model_calls)")).fetchall()
+        checkpoint_columns = await (
+            await connection.execute("PRAGMA table_info(business_checkpoints)")
+        ).fetchall()
+        indexes = await (await connection.execute("PRAGMA index_list(model_calls)")).fetchall()
+        version = await (
+            await connection.execute("SELECT MAX(version) FROM pengine_schema")
+        ).fetchone()
+
+    assert "operation_id" in {column[1] for column in columns}
+    assert "review_call_id" in {column[1] for column in checkpoint_columns}
+    assert "model_calls_operation_id" in {index[1] for index in indexes}
+    assert version[0] == 18

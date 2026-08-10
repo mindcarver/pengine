@@ -236,8 +236,9 @@ def create_app(
         summary="Authorize exactly one generation-plus-review cycle for a repair",
         description=(
             "Grants the pending repair authorization bound to the active lineage and "
-            "queues the run for exactly one cycle. A failure returns to the same "
-            "evidence pause without automatic repetition. Generic Continue cannot "
+            "queues the run for exactly one cycle. If a hard-constraint conflict remains, "
+            "the run pauses again with the latest review evidence and no automatic "
+            "repetition. Generic Continue cannot "
             "spend a content-repair budget."
         ),
         responses={
