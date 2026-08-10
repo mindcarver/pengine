@@ -178,6 +178,7 @@ class ModelCallSummary(StrictModel):
     adapter: str
     provider: str
     model: str
+    response_model_ids: list[str] | None = None
     stage: str | None = None
     episode_number: int | None = Field(default=None, ge=1)
     candidate: str | None = None
@@ -228,6 +229,7 @@ class RunProgress(StrictModel):
         "content_rejected",
         "episode_error",
         "context_budget",
+        "relay_identity_mismatch",
         "repair_authorization",
     ]
     final_review: FinalReviewProgress
@@ -292,6 +294,7 @@ class RunPause(StrictModel):
         "content_rejected",
         "episode_error",
         "context_budget",
+        "relay_identity_mismatch",
         "repair_authorization",
     ] = "run_timeout"
     message: NonEmptyText
@@ -316,7 +319,12 @@ class RunPause(StrictModel):
                 UserStage.GENERATING_CHARACTER_RELATIONSHIPS,
             }:
                 raise ValueError("Only story creation stages allow more than two content repairs")
-        elif self.code in {"episode_error", "context_budget", "repair_authorization"}:
+        elif self.code in {
+            "episode_error",
+            "context_budget",
+            "relay_identity_mismatch",
+            "repair_authorization",
+        }:
             if self.timeout_count is not None or self.content_repair_count is not None:
                 raise ValueError("This pause does not use timeout or repair counts")
         elif self.timeout_count is None or self.content_repair_count is not None:

@@ -346,8 +346,16 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         sequence, repair_round = self._pending_lineage.pop(run_id, (None, None))
         physical_call_id = record.call_id if record is not None else str(run_id)
         response_model_ids = _response_model_ids(response)
+        sorted_response_model_ids = sorted(response_model_ids)
         tokens, finish_reason = extract_provider_usage(response)
         if {model_id.casefold() for model_id in response_model_ids} != {self.model_id.casefold()}:
+            identity_error = RelayIdentityError(
+                role=self.role,
+                requested_model_id=self.model_id,
+                response_model_ids=sorted_response_model_ids,
+                stage=(record.stage if record is not None else None),
+                episode_number=(record.episode_number if record is not None else None),
+            )
             if record is not None:
                 self._finalize(
                     record,
@@ -356,8 +364,9 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                     tokens=tokens,
                     finish_reason=finish_reason,
                     error_code="relay_incompatible",
-                    error_type="RelayError",
-                    safe_message="The relay returned an unexpected model for the configured role.",
+                    error_type="RelayIdentityError",
+                    safe_message=identity_error.safe_message,
+                    response_model_ids=sorted_response_model_ids,
                     sequence=sequence,
                     repair_round=repair_round,
                 )
@@ -366,13 +375,10 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 "response_model_ids=%s call_id=%s",
                 self.role,
                 self.model_id,
-                sorted(response_model_ids),
+                sorted_response_model_ids,
                 physical_call_id,
             )
-            raise RelayError(
-                code="relay_incompatible",
-                safe_message="The relay returned an unexpected model for the configured role.",
-            )
+            raise identity_error
         if record is not None:
             self._finalize(
                 record,
@@ -380,6 +386,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 outcome="success",
                 tokens=tokens,
                 finish_reason=finish_reason,
+                response_model_ids=sorted_response_model_ids,
                 sequence=sequence,
                 repair_round=repair_round,
             )
@@ -390,7 +397,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             "call_id=%s usage_status=%s finish_reason=%s",
             self.role,
             self.model_id,
-            self.model_id,
+            sorted_response_model_ids[0],
             physical_call_id,
             usage_status_from(tokens) if record is not None else "unavailable",
             finish_reason,
@@ -456,6 +463,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         http_status: int | None = None,
         provider_error_code: str | None = None,
         redacted_body: str | None = None,
+        response_model_ids: list[str] | None = None,
         sequence: int | None = None,
         repair_round: int | None = None,
     ) -> None:
@@ -483,6 +491,11 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         record.http_status = http_status
         record.provider_error_code = provider_error_code
         record.redacted_response = redacted_body
+        record.response_model_ids_json = (
+            json.dumps(response_model_ids, ensure_ascii=False, separators=(",", ":"))
+            if response_model_ids is not None
+            else None
+        )
         self._persist(record)
         record_model_call_event(
             phase="end",
@@ -497,6 +510,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             error_code=record.error_code,
             finish_reason=record.finish_reason,
             duration_seconds=record.duration_seconds,
+            response_model_ids=response_model_ids,
         )
 
     def _log_record(self, record: ModelCallRecord) -> None:
@@ -506,7 +520,8 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             "estimated_output_tokens=%s estimated_total_tokens=%s verified_limit_tokens=%s "
             "usage_status=%s actual_input_tokens=%s actual_output_tokens=%s "
             "cache_read_tokens=%s cache_creation_tokens=%s duration_ms=%s "
-            "finish_reason=%s outcome=%s error_code=%s error_type=%s supersedes_call_id=%s",
+            "finish_reason=%s outcome=%s error_code=%s error_type=%s "
+            "response_model_ids=%s supersedes_call_id=%s",
             record.call_id,
             record.operation_id,
             record.role,
@@ -531,6 +546,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             record.outcome,
             record.error_code,
             record.error_type,
+            record.response_model_ids_json,
             record.supersedes_call_id,
         )
 
@@ -822,6 +838,34 @@ class RelayError(Exception):
 
     def __str__(self) -> str:
         return self.safe_message
+
+
+class RelayIdentityError(RelayError):
+    """Fail-closed result when the relay cannot prove the configured model identity."""
+
+    def __init__(
+        self,
+        *,
+        role: ModelRole,
+        requested_model_id: str,
+        response_model_ids: list[str],
+        stage: str | None,
+        episode_number: int | None,
+    ) -> None:
+        self.role = role
+        self.requested_model_id = requested_model_id
+        self.response_model_ids = tuple(response_model_ids)
+        self.stage = stage
+        self.episode_number = episode_number
+        reported = ", ".join(response_model_ids) if response_model_ids else "none"
+        super().__init__(
+            code="relay_incompatible",
+            safe_message=(
+                "The relay response model identity did not exactly match "
+                f"{requested_model_id} (reported: {reported}). The response was discarded; "
+                "verify relay routing before continuing."
+            ),
+        )
 
 
 class PreflightBlockedError(RelayError):

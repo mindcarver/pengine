@@ -124,7 +124,7 @@ review     = ChatDeepSeek  / deepseek-v4-flash
           | ChatAnthropic / claude-opus-5
 ```
 
-两个客户端共用 relay URL 和 key，但每个响应还必须回报与该角色配置一致的模型身份。身份不一致属于 `relay_incompatible`，不会被当成正常响应。
+两个客户端共用 relay URL 和 key，但每个响应还必须回报与该角色配置一致的模型身份。身份缺失、不一致或出现多个值时，本次响应会被丢弃，实际 `response_model_ids` 写入 SQLite 与 Langfuse，运行暂停为 `relay_identity_mismatch`；核验 Relay 后才能人工继续。
 
 模型调用预算与 LangGraph recursion limit 分开计算。默认每个普通阶段最多保留生成调用
 `48` 次、审核调用 `32` 次；剧本阶段另有全剧生成 `192`、审核 `128` 的总上限，同时

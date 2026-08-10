@@ -178,7 +178,7 @@ hash 和生成 `call_id` 必须原子提交。生成 `call_id` 必须来自同�
 | 字段组 | 说明 |
 | --- | --- |
 | 身份 | 物理 `call_id`、业务 `operation_id`、run/creation/thread、run kind |
-| 路由 | role、adapter、provider、requested model |
+| 路由 | role、adapter、provider、requested model、实际 `response_model_ids` |
 | 血缘 | stage、episode、candidate、batch、supersedes_call_id |
 | 预算 | estimated input/output/total、verified limit、preflight |
 | 结果 | started/succeeded/failed/timed_out/stale/superseded/preflight_blocked |

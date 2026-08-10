@@ -1524,6 +1524,7 @@ state.creation = {
           adapter: "deepseek",
           provider: "deepseek",
           model: "deepseek-v4-flash",
+          response_model_ids: ["deepseek-v4-flash"],
           stage: "accepting_l0",
           episode_number: null,
           requested_at: "2026-08-03T00:01:00Z",
@@ -1566,6 +1567,24 @@ if (listItems[0].dataset.callStatus !== "preflight_blocked") {
 }
 if (!listItems[1].textContent.includes("deepseek-v4-flash")) {
   throw new Error("review call did not render its model");
+}
+if (!listItems[1].textContent.includes("响应身份 deepseek-v4-flash")) {
+  throw new Error("review call did not render its response model identity");
+}
+state.creation.initial.progress.recovery_reason = "relay_identity_mismatch";
+state.creation.initial.progress.episodes = { total: 30, completed: 26, current: 27 };
+state.creation.initial.pause = {
+  code: "relay_identity_mismatch",
+  message: "reported: relay-fallback",
+  stage: "generating_episode_scripts",
+  episode_number: 27,
+};
+renderProgress();
+if (!elements["run-control-title"].textContent.includes("第 27 集模型身份待确认")) {
+  throw new Error("identity mismatch pause did not render its dedicated state");
+}
+if (elements["continue-run"].textContent !== "从第 27 集继续") {
+  throw new Error("identity mismatch pause did not preserve the episode resume point");
 }
 """
     harness = f"""

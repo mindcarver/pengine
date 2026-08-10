@@ -122,7 +122,7 @@ curl --fail-with-body \
 - 已运行秒数、`recovery_state`、`recovery_reason`；
 - L0/L4 最终审核子状态；
 - 总集数、已完成集数、当前集和已提交 `episode_drafts`；
-- `model_calls` 的物理 `call_id`、`operation_id`、估算/实际用量、角色、模型、结束原因和安全错误；
+- `model_calls` 的物理 `call_id`、`operation_id`、估算/实际用量、角色、请求模型、实际 `response_model_ids`、结束原因和安全错误；
 - `can_continue`、`can_end` 和暂停/拒绝证据；
 - 只有 `succeeded` 才有完整 `delivery`。
 

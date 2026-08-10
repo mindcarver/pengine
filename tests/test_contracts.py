@@ -100,6 +100,7 @@ def test_openapi_exposes_recovery_reasons_and_pause_evidence() -> None:
         "content_rejected",
         "episode_error",
         "context_budget",
+        "relay_identity_mismatch",
         "repair_authorization",
     ]
     assert "recovery_reason" in schemas["RunProgress"]["required"]
@@ -109,6 +110,7 @@ def test_openapi_exposes_recovery_reasons_and_pause_evidence() -> None:
         "content_rejected",
         "episode_error",
         "context_budget",
+        "relay_identity_mismatch",
         "repair_authorization",
     ]
     assert schemas["RunProgress"]["properties"]["model_calls"] == {
