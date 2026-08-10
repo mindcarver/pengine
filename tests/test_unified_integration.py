@@ -806,7 +806,7 @@ async def test_int_a5_repeated_script_defects_rewrite_from_oldest_unresolved_epi
             {"category": "pass", "evidence": "两个缺陷都已闭环。"},
         ]
     )
-    worker = Worker(
+    worker = _audited_worker(
         settings=settings,
         repository=repository,
         catalog=catalog,

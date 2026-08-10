@@ -32,9 +32,8 @@ from pengine.continuity import (
     Sha256,
     StableId,
     StoryContract,
-    canonical_model_hash,
-    character_label_base,
     canonical_story_contract_payload,
+    character_label_base,
     render_story_contract_markdown,
     story_contract_sha256,
 )

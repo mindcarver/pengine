@@ -30,8 +30,9 @@ V1 does not include authentication, multi-user isolation, public deployment,
 operator-selectable model roles or providers, production persona authoring,
 automatic persona learning, cross-creation writable memory, asynchronous or
 remote subagents, host filesystem or shell access, task
-listing/export/deletion, streaming transport, partial-result preview, or
-deployment automation.
+listing/export/deletion, streaming transport, uncommitted-candidate preview, or
+deployment automation. Committed per-episode drafts are available as read-only
+progress evidence but are never formal delivery.
 
 ## Domain model
 
@@ -64,6 +65,7 @@ A `WorkflowRun` is either `initial` or `revision`. Public run states are:
 - `auto_resuming`
 - `paused`
 - `ended`
+- `quality_rejected`
 - `succeeded`
 - `failed`
 
@@ -76,31 +78,29 @@ The revision resource separately exposes:
 
 - `unavailable` until the initial run succeeds;
 - `available` before feedback is frozen;
-- `queued`, `running`, `auto_resuming`, `paused`, `ended`, `failed`, or
-  `succeeded` after feedback is frozen.
+- `queued`, `running`, `auto_resuming`, `paused`, `ended`, `failed`,
+  `quality_rejected`, or `succeeded` after feedback is frozen.
 
 Internal stages are:
 
 1. `loading_persona`
 2. `selecting_l0_variant`
 3. `generating_story_outline`
-4. `generating_character_biographies`
-5. `generating_relationship_logic`
-6. `generating_episode_outline`
-7. `generating_episode_scripts`
-8. `accepting_l0`
-9. `accepting_l4`
-10. `assembling_delivery`
+4. `generating_character_relationships`
+5. `generating_episode_outline`
+6. `generating_episode_scripts`
+7. `accepting_l0`
+8. `accepting_l4`
+9. `assembling_delivery`
 
-The workbench groups those internal stages into seven stable user stages:
+The workbench groups those internal stages into six stable user stages:
 
 1. determine the creative direction;
 2. generate the story outline;
-3. generate character biographies;
-4. generate character relationships;
-5. generate the episode outline;
-6. generate episode scripts;
-7. review the finished work.
+3. generate character biographies and relationships;
+4. generate the episode outline;
+5. generate episode scripts;
+6. review the finished work.
 
 The final user stage exposes L0 creative-core alignment and L4 craft/value
 review as separate sub-statuses without collapsing their internal gates.
@@ -124,10 +124,13 @@ four primary synchronous subagents:
 The `workflow_supervisor`, `story_architect`, `episode_planner`,
 `script_writer`, direct story/outline patch generators, and `episode_repair`
 always use the generation route. `quality_reviewer`, `canon_reviewer`, and
-`episode_reviewer` always use the review route. Roles cannot be swapped and do
-not fall back to one another.
+`episode_reviewer`, plus `series_reviewer`, always use the review route;
+`story_repair` uses generation. Roles cannot be swapped and do not fall back to
+one another.
 
-The episode-outline result also contains a versioned `StoryContract`, which is
+One `EpisodePlannerResult` currently contains the complete episode outline and
+versioned `StoryContract`, including every episode plan, obligation, and review
+milestone. There is no chunked outline planner yet. The contract is
 the sole machine-readable source for cast membership, relationships, typed
 facts and units, temporal order, character knowledge, clue lifecycle, and
 per-episode obligations. The service runs deterministic validation and then a
@@ -135,6 +138,12 @@ fresh `canon_reviewer` model review. A failing candidate may be handled by the
 generation route's structured outline-patch call at most twice. Only a candidate
 that passes both checks is persisted with its canonical Markdown projection and
 SHA-256 in the approved episode-outline checkpoint.
+
+The schema accepts `episode_count >= 1`, but that is not production evidence for
+arbitrarily long series. In particular, 60-100 episodes still amplify one-call
+structured-output truncation, JSON retry, and global-consistency risk. Pengine
+must not claim reliable long-series support until outline planning, locking, and
+cross-batch validation are chunked and accepted with real runs.
 
 For each episode, `script_writer` returns both script text and a typed
 `EpisodeStateDelta`. Deterministic validation compares them with the locked
@@ -171,7 +180,7 @@ service assembles a candidate and runs deterministic universal validation
 (schema, references, uniqueness, ordering, explicit arithmetic, and projection
 consistency) plus the genre-activated rules the candidate declares. `mystery`
 activates reveal and clue obligations; a general-genre idea is never rejected
-for missing mystery-only mechanics. The bound DeepSeek global design review is
+for missing mystery-only mechanics. The bound configured-review-route global design review is
 the review-route `canon_reviewer` result for that exact candidate id and content
 hash; another candidate's review cannot approve it.
 
@@ -310,7 +319,7 @@ failed.
 | Synchronous subagents | Stage-scoped creative work, skill-scoped canon/continuity review, and repair candidates | Job scheduling, direct database writes, persona mutation, silent lock mutation |
 | Persona loader | Manifest/schema validation, immutable snapshots, read-only virtual context projection, bounded L5/L6 retrieval | Production persona content |
 | LangGraph checkpointer | Thread messages, plans, subagent results, and `StateBackend` scratch checkpoints | Business checkpoints, public run state, revision entitlement |
-| Relay clients | Role-bound `ChatAnthropic` generation and `ChatDeepSeek` review clients sharing one URL/key, explicit timeouts, model-identity audit, safe error mapping | Workflow retry policy, API keys at rest, cross-role fallback |
+| Relay clients | Role-bound `ChatAnthropic` generation plus `ChatDeepSeek`, `ChatOpenAI`, or `ChatAnthropic` review sharing one URL/key, explicit timeouts, model-identity audit, safe error mapping | Workflow retry policy, API keys at rest, cross-role fallback |
 | SQLite repository | Authoritative creation, run, attempt, job, feedback, approved-stage, delivery, catalog, and LangGraph checkpoint tables | Persona source-file ownership |
 
 The process uses one worker and processes one creation job at a time. Deep
@@ -361,7 +370,7 @@ immutable snapshots already referenced by creations.
 10. The complete content package and delivery report commit atomically with the
    run's `succeeded` state.
 11. Each guarded attempt records the current internal stage in SQLite. Resource
-   queries map it and approved checkpoints to the seven user stages, completed
+   queries map it and approved checkpoints to the six user stages, completed
    stages, elapsed active time, final-review sub-status, and available actions.
 
 ### Revision
@@ -542,8 +551,9 @@ duplicate the full field contract.
 - Persona paths are resolved below the configured persona root; absolute paths
   and traversal outside that root are rejected.
 - The default Deep Agents general-purpose subagent is disabled. Only the four
-  primary subagents and three skill-scoped review/repair subagents are
-  registered; direct story/outline patch generators are bounded structured
+  primary subagents, `canon_reviewer`, `episode_reviewer`, `series_reviewer`,
+  `episode_repair`, and `story_repair` are registered. Four of the review/repair
+  agents load dedicated skills; direct story/outline patch generators are bounded structured
   generation calls, not additional subagents.
 - `FilesystemBackend`, `LocalShellBackend`, sandbox `execute`, asynchronous or
   remote subagents, arbitrary MCP tools, agent-authored skills, and
@@ -557,7 +567,7 @@ duplicate the full field contract.
 
 ## Reliability and operations
 
-- Both `ChatAnthropic.max_retries` and `ChatDeepSeek.max_retries` are zero, and
+- Every configured LangChain client has `max_retries=0`, and
   no Deep Agents retry middleware is installed. The worker is the sole owner of
   the three-attempt budget.
 - A finite LangGraph recursion limit and a worker-enforced wall-clock deadline
@@ -565,8 +575,8 @@ duplicate the full field contract.
   error. A wall-clock timeout and an approved relay interruption share the
   one-auto-resume/then-pause policy and never start an unrecorded model call.
 - The generation cap defaults to the Opus 5 maximum of 128,000 output tokens.
-  An unset review cap is not supplemented by Pengine. DeepSeek thinking and
-  parallel tool calls are disabled; provider-specific prompt caching and
+  An unset review cap is not supplemented by Pengine. DeepSeek thinking is
+  disabled, and parallel tool calls are disabled on every client; provider-specific prompt caching and
   beta-only Anthropic features remain disabled until both configured relay
   routes pass smoke testing.
 - Every response must report the model ID configured for its role. A missing or
@@ -581,7 +591,8 @@ duplicate the full field contract.
   dispatched: the call is recorded as `preflight_blocked` and the run pauses
   (`context_budget`) with prior approved work unchanged.
 - Every attempted call (generation, review, repair, and blocked attempts) is
-  recorded with a unique `call_id`, role, adapter/provider/model, stage,
+  recorded with a unique physical `call_id`, business `operation_id`, role,
+  adapter/provider/model, stage,
   episode, candidate and batch lineage, estimated input/output totals, verified
   limit, provider-reported input/output/cache usage (or explicit
   `unavailable`), duration, finish reason, and outcome. Records are written
@@ -590,6 +601,15 @@ duplicate the full field contract.
   the workbench. Provider actual usage is never inferred or backfilled from
   estimates; failed, timed-out, superseded, stale, and preflight-blocked calls
   keep their own classifications in per-round and run totals.
+- Outbound call budgets are distinct from graph recursion and business-stage
+  attempts. Defaults are 48 generation and 32 review calls per ordinary stage,
+  plus whole-script-stage totals of 192 generation and 128 review calls. The
+  script stage also retains per-episode role limits. Reservation happens before
+  provider dispatch; exhaustion is recorded as `agent_execution_limit`.
+- An approved StoryContract checkpoint, active episode candidate, or bound
+  structural review must reference the successful physical call for its exact
+  operation. Synthetic run/episode-derived call ids are not valid provenance,
+  and audit writes are drained before a run is published as succeeded.
 - Each POST command requires an `Idempotency-Key`.
 - The same key and request hash replays the original command response; its
   `resource_url` resolves the resource's current state.
@@ -612,7 +632,7 @@ This is a greenfield V1. The HTTP contract, manifest schema, and SQLite schema
 each carry an explicit version.
 
 The implementation must lock exact tested versions of `deepagents`,
-`langchain-anthropic`, `langchain-deepseek`, `langgraph`, and
+`langchain-anthropic`, `langchain-deepseek`, `langchain-openai`, `langgraph`, and
 `langgraph-checkpoint-sqlite`. Upgrading any of them is a deliberate
 compatibility change requiring the supervisor, subagent structured-output,
 permissions, checkpoint-resume, and relay contract tests to pass again. V1 does
@@ -623,9 +643,10 @@ run-control commands are additive. Breaking HTTP or persona format changes
 require a new contract version. Persona source packages remain outside the
 database so application rollback does not rewrite operator content.
 
-SQLite schema version 6 adds contract-bound episode lock evidence and distinct
-content-review pause state while preserving existing creations, checkpoints,
-deliveries, and frozen revisions. Migrations
+SQLite schema version 18 preserves the prior contract-bound content and repair
+records, migrates episode attempts into explicit rewrite cycles, adds model-call
+`operation_id`, and binds approved outline checkpoints to physical
+`review_call_id` provenance. Migrations
 must remain forward and transactional where SQLite permits; production rollback
 automation is outside this architecture-delivery slice.
 
@@ -644,6 +665,8 @@ Technology feasibility is grounded in the current official contracts:
   <https://docs.langchain.com/oss/python/integrations/chat/anthropic>
 - `ChatDeepSeek` supplies the role-bound DeepSeek OpenAI-compatible client:
   <https://docs.langchain.com/oss/python/integrations/chat/deepseek>
+- `ChatOpenAI` supplies the configured OpenAI-compatible review client for
+  `gpt-5.5` and `gpt-5.6-terra`.
 
 ## Verification boundaries
 
@@ -657,14 +680,14 @@ Implementation evidence must include:
 - isolated SQLite tests for transactions, leases, checkpoints, and attempt
   exhaustion;
 - Deep Agents integration tests proving the persona-bound supervisor invokes
-  only the seven registered synchronous subagents, routes each subagent and
+  only the nine registered synchronous subagents, routes each subagent and
   direct repair call to the fixed model role, returns structured results, and
   cannot access host files, shell, MCP, or cross-thread memory;
 - checkpoint tests proving a stopped run resumes the same `thread_id`, approved
   business stages are not regenerated, and a new revision-attempt run uses a
   new thread;
-- fake-relay tests proving `ChatAnthropic` generation and `ChatDeepSeek` review
-  request mapping, exact role routing, no fallback, tool-use capability, SDK and
+- fake-relay tests proving `ChatAnthropic` generation and the configured
+  DeepSeek/OpenAI/Anthropic review request mapping, exact role routing, no fallback, tool-use capability, SDK and
   middleware retries disabled, structured output validation, bounded agent
   execution, identity auditing, and safe failures;
 - a configured dual-route relay smoke test that separately reports generation
@@ -681,8 +704,10 @@ quality.
 
 - Modular monolith, FastAPI/Pydantic HTTP layer, direct SQLite repository, one
   embedded worker, and an embedded Deep Agents/LangGraph creative runtime.
-- One persona-bound `workflow_supervisor`, four primary subagents, and three
-  skill-scoped canon/continuity review and repair subagents.
+- One persona-bound `workflow_supervisor`; four primary subagents; the
+  `canon_reviewer`, `episode_reviewer`, and `series_reviewer`; plus
+  `episode_repair` and `story_repair`. Four review/repair agents load dedicated
+  skills.
 - Two preconfigured LangChain clients share the operator-supplied relay URL/key:
   `ChatAnthropic` with `claude-opus-5` for generation and creative repair, and a
   review client whose Anthropic, OpenAI, or DeepSeek protocol is selected from

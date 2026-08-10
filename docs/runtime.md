@@ -80,6 +80,11 @@ loading_persona
 5. 合同及其 Markdown 投影、hash 一起写入 approved checkpoint。
 6. 设计同步阶段将投影组装为一个 `SeriesBible` candidate；不允许把不同候选的故事大纲、人物关系和分集大纲拼在一起。
 
+这里有一个必须显式保留的当前限制：第 3 步仍是一次结构化模型调用，返回全量
+`episode_plans`、合同事实/线索/义务和里程碑。schema 没有限制集数上限，但 60–100 集
+会显著放大输出截断、JSON 解析重试和单次全局编排失真的风险；当前实现没有按批次生成并
+逐批锁定分集大纲。
+
 ### 3.3 逐集写作
 
 对每一集 N，Writer 的输入包含：完整 active SeriesBible 投影、锁定合同、当前集计划与义务、active 前缀 1..N-1 的完整剧本、折叠后的 `SeriesState` 和有界 WriterNotes。摘要不能替代已锁定前缀。
@@ -94,6 +99,11 @@ script_writer
 ```
 
 只有提交成功的集才会进入 active pointer。当前集没提交时，API 不展示它的正文；已提交的前缀在刷新、结束或失败后仍可只读查看。
+
+每集至少需要一次生成和一次审核；修复会增加同集调用。默认剧本阶段整轮上限是生成
+`192`、审核 `128`，所以 80 集的最低调用量虽然落在上限内，但审核修复余量只有 `48`
+次，还要为结构里程碑审核留出空间。触顶时在出站前以 `agent_execution_limit` 阻断，
+不会让整轮无限调用。
 
 ### 3.4 最终闸门和交付
 
@@ -157,6 +167,9 @@ script_writer
 
 普通阶段和受保护子调用有最多三次尝试边界；第四次调用会在模型请求前被拒绝。Relay 恢复次数、阶段尝试次数和内容修复次数是不同预算，不能相互挪用。
 
+这组三次“业务尝试”也不等同于模型调用预算：调用预算按角色和阶段统计，剧本阶段还按
+单集与全剧总量双重统计；LangGraph recursion limit 又是第三种独立边界。
+
 ## 6. 暂停后的三种动作
 
 ### Continue
@@ -200,7 +213,9 @@ if limit is missing or estimated_total > limit:
 - provider 报告 input/output/cache 用量时原样保存；
 - provider 没有报告时，状态为 `unavailable` 或 `partial`；
 - 不能用本地估算值伪造实际 token 使用量；
-- 每个 call 有独立 `call_id`、角色、adapter/provider/model、阶段、集数、候选/batch 血缘、耗时、finish reason 和安全错误。
+- 每个物理 call 有独立 `call_id`、角色、adapter/provider/model、阶段、集数、候选/batch 血缘、耗时、finish reason 和安全错误；
+- `operation_id` 把一次业务产物操作与它可能发生的物理尝试关联；只有该 operation 下真实 `succeeded` 的调用才能成为锁定合同、分集候选或结构审核的来源；
+- 服务在公开 `succeeded` 前 drain 审计写入，避免交付已成功但对应调用账本尚未落盘。
 
 这套记录同时服务于 UI 用量面板、SQLite `model_calls` 表和结构化日志。迟到、被取代、超时和预检拦截的调用也保留，避免只看“最后一次成功请求”。
 

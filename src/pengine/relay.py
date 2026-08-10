@@ -1160,8 +1160,7 @@ def _is_upstream_stream_error(exc: BaseException) -> bool:
     ordinary API, auth, protocol, and structured-output errors remain terminal.
     """
     if not any(
-        base.__module__.startswith(("anthropic", "openai"))
-        and base.__name__ == "APIStatusError"
+        base.__module__.startswith(("anthropic", "openai")) and base.__name__ == "APIStatusError"
         for base in type(exc).__mro__
     ):
         return False
@@ -1181,9 +1180,9 @@ def _is_upstream_stream_error(exc: BaseException) -> bool:
     if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
         return False
     error = payload["error"]
-    return error.get("code") == "upstream_stream_error" or error.get(
-        "type"
-    ) == "upstream_stream_error"
+    return (
+        error.get("code") == "upstream_stream_error" or error.get("type") == "upstream_stream_error"
+    )
 
 
 def _cause_chain(exc: BaseException):

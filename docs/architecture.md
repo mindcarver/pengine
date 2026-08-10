@@ -115,14 +115,20 @@ V1 进程只运行一个 Worker，并一次处理一个创作任务。Deep Agent
 | `episode_repair` | 只修复当前未锁定集 | generation | `continuity-repair` |
 | `story_repair` | 只修复未锁定的人物/关系候选 | generation | `story-repair` |
 
-角色绑定由运行时建立，不能用环境变量把审核角色切换成生成角色。当前默认配置要求：
+角色绑定由运行时建立，不能用环境变量把审核角色切换成生成角色。当前配置合同是：
 
 ```text
 generation = ChatAnthropic / Anthropic Messages / claude-opus-5
-review     = ChatDeepSeek  / OpenAI-compatible / deepseek-v4-flash
+review     = ChatDeepSeek  / deepseek-v4-flash
+          | ChatOpenAI    / gpt-5.5 或 gpt-5.6-terra
+          | ChatAnthropic / claude-opus-5
 ```
 
 两个客户端共用 relay URL 和 key，但每个响应还必须回报与该角色配置一致的模型身份。身份不一致属于 `relay_incompatible`，不会被当成正常响应。
+
+模型调用预算与 LangGraph recursion limit 分开计算。默认每个普通阶段最多保留生成调用
+`48` 次、审核调用 `32` 次；剧本阶段另有全剧生成 `192`、审核 `128` 的总上限，同时
+仍受单集对应角色上限约束。预算在出站前原子保留，超限不会触发 provider 请求。
 
 ## 4. 人格包：从九个文件到不可变上下文
 
@@ -154,7 +160,9 @@ l3.md        l4.md      l5.md  l6.md
 
 ### `StoryContract` 是什么
 
-分集大纲不只有面向人的 Markdown，还会产生一份版本化剧情合同。合同是后续写作的机器边界，至少覆盖：
+分集大纲不只有面向人的 Markdown，还会产生一份版本化剧情合同。当前
+`episode_planner` 在一次 `EpisodePlannerResult` 结构化调用中返回全部集的计划、合同、
+分集义务和审查里程碑；还没有分批规划器。合同是后续写作的机器边界，至少覆盖：
 
 - 角色与关系；
 - 类型化事实和单位；
@@ -164,6 +172,10 @@ l3.md        l4.md      l5.md  l6.md
 - 每集剧情义务。
 
 合同在写入业务检查点前，必须经过确定性校验和绑定同一候选的 `canon_reviewer`。修复只能产生有界 patch；不能让修复悄悄改变已锁定的上游内容。
+
+数据 schema 只要求 `episode_count >= 1`，并不等于任意集数都已通过生产验收。尤其对
+60–100 集，一次返回全量 `episode_plans + StoryContract` 的输出长度、结构化截断和全局
+一致性仍是当前架构风险；在实现分批规划、分段锁定和跨批一致性验证前，文档不宣称可靠支持。
 
 ### SeriesBible 的原子候选
 
@@ -198,12 +210,17 @@ ScriptBatch(batch_id, batch_epoch)
 - 设计候选、设计 epoch、batch 和 batch epoch；
 - 集数与候选版本；
 - 前一个 active 候选的 hash；
-- 生成 `call_id`；
+- 生成 `call_id`；该 ID 必须是与同一 `operation_id` 对应的真实成功物理调用；
 - 完整剧本内容和内容 hash；
 - `EpisodeStateDelta` 与折叠后的 `SeriesState`；
 - 语义审查证据和修复轮次。
 
 改写第 N 集时，1..N-1 保持 active；N..末集全部 supersede；状态严格从保留前缀重新折叠，不能把旧后缀的事实、知识、线索或 delta 带回新上下文。设计 epoch 改变时，整个旧 batch 失效并从第 1 集重建。
+
+剧本正文仍是 `ScriptWriterResult.content` 中的自由文本；结构化字段负责集数、状态增量、
+证据和审查结论。确定性层只对显式锁定事实和证据目标做机器校验。审核不得把姓名/别名/
+职业/泛称等说话人标签、冒号排版、片尾标记、算式，或故事世界中的 JSON、代码、模型、AI
+题材本身当成违规；私有运行泄漏必须给出能对应到运行时来源的上下文证据。
 
 ## 7. 两套检查点为什么必须分开
 
