@@ -1900,6 +1900,7 @@
               "content_rejected",
               "episode_error",
               "context_budget",
+              "relay_identity_mismatch",
               "repair_authorization"
             ],
             "title": "Code",
@@ -1995,6 +1996,7 @@
               "content_rejected",
               "episode_error",
               "context_budget",
+              "relay_identity_mismatch",
               "repair_authorization"
             ],
             "title": "Recovery Reason"
@@ -2684,6 +2686,20 @@
           "model": {
             "type": "string",
             "title": "Model"
+          },
+          "response_model_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response Model Ids"
           },
           "stage": {
             "anyOf": [

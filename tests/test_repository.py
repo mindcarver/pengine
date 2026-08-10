@@ -195,7 +195,7 @@ def persist_succeeded_outline_review(
 
 
 async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository) -> None:
-    assert SCHEMA_VERSION == 19
+    assert SCHEMA_VERSION == 20
     async with repository._connection() as connection:
         journal = await (await connection.execute("PRAGMA journal_mode")).fetchone()
         foreign_keys = await (await connection.execute("PRAGMA foreign_keys")).fetchone()
@@ -287,6 +287,7 @@ async def test_schema_v18_migrates_episode_attempts_to_cycle_zero(
         await connection.execute("DROP TABLE episode_attempt_cycles")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
 
     await repository.initialize()
     assert await repository.get_episode_attempt_counts(lease.run_id) == {1: 1}
@@ -294,6 +295,71 @@ async def test_schema_v18_migrates_episode_attempts_to_cycle_zero(
     async with repository._connection() as connection:
         columns = await (await connection.execute("PRAGMA table_info(episode_attempts)")).fetchall()
     assert "attempt_cycle" in {row["name"] for row in columns}
+
+
+async def test_schema_v19_to_v20_adds_identity_evidence_and_pause_reason(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    async with repository._transaction() as connection:
+        await connection.execute(
+            """
+            CREATE TABLE run_progress_v19 (
+                run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+                current_stage TEXT NOT NULL,
+                execution_state TEXT NOT NULL,
+                elapsed_seconds REAL NOT NULL DEFAULT 0,
+                active_started_at TEXT,
+                timeout_stage TEXT,
+                timeout_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                current_episode INTEGER,
+                recovery_reason TEXT NOT NULL DEFAULT 'none' CHECK (
+                    recovery_reason IN (
+                        'none', 'run_timeout', 'relay_interruption', 'content_rejected',
+                        'episode_error', 'context_budget', 'repair_authorization'
+                    )
+                ),
+                content_repair_count INTEGER,
+                pause_message TEXT
+            )
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO run_progress_v19 SELECT * FROM run_progress
+            """
+        )
+        await connection.execute("DROP TABLE run_progress")
+        await connection.execute("ALTER TABLE run_progress_v19 RENAME TO run_progress")
+        await connection.execute("ALTER TABLE model_calls DROP COLUMN response_model_ids_json")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
+
+    await repository.initialize()
+    async with repository._connection() as connection:
+        version = await (
+            await connection.execute("SELECT MAX(version) FROM pengine_schema")
+        ).fetchone()
+        columns = await (await connection.execute("PRAGMA table_info(model_calls)")).fetchall()
+    assert version[0] == 20
+    assert "response_model_ids_json" in {column["name"] for column in columns}
+
+    await repository.mark_run_running(lease.run_id, now=NOW)
+    await repository.pause_relay_identity_mismatch(
+        lease.run_id,
+        stage=InternalStage.GENERATING_STORY_OUTLINE,
+        safe_message="Identity mismatch; response discarded.",
+        now=NOW + timedelta(seconds=1),
+    )
+    resource = await repository.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert resource is not None
+    assert resource.initial.state == "paused"
+    assert resource.initial.pause.code == "relay_identity_mismatch"
 
 
 async def test_creation_is_idempotent_and_payload_conflicts(
@@ -1207,6 +1273,7 @@ async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_draf
             DELETE FROM pengine_schema WHERE version = 17;
             DELETE FROM pengine_schema WHERE version = 18;
             DELETE FROM pengine_schema WHERE version = 19;
+            DELETE FROM pengine_schema WHERE version = 20;
             ALTER TABLE creations DROP COLUMN output_language;
             """
         )
@@ -2068,6 +2135,7 @@ async def test_schema_v6_recovers_legacy_failed_episode_without_replacing_drafts
         await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -2116,6 +2184,7 @@ async def test_schema_v7_creation_is_backfilled_to_chinese_output_language(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -2163,6 +2232,7 @@ async def test_schema_v8_migration_resumes_when_column_already_exists(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
         await connection.execute(
             "UPDATE creations SET output_language = NULL WHERE id = ?",
             (str(lease.creation_id),),
@@ -2240,6 +2310,7 @@ async def test_schema_v8_content_rejections_migrate_without_losing_rows(
             DELETE FROM pengine_schema WHERE version = 17;
             DELETE FROM pengine_schema WHERE version = 18;
             DELETE FROM pengine_schema WHERE version = 19;
+            DELETE FROM pengine_schema WHERE version = 20;
             """
         )
         await connection.commit()
@@ -2408,6 +2479,7 @@ async def test_schema_v9_repair_limits_migrate_without_losing_pause(
             DELETE FROM pengine_schema WHERE version = 17;
             DELETE FROM pengine_schema WHERE version = 18;
             DELETE FROM pengine_schema WHERE version = 19;
+            DELETE FROM pengine_schema WHERE version = 20;
             """
         )
         await connection.commit()
@@ -2522,6 +2594,7 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.execute("DROP TABLE episode_timeouts")
@@ -2577,6 +2650,7 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
         await connection.commit()
@@ -2660,6 +2734,7 @@ async def test_schema_v4_recovery_rows_gain_the_timeout_reason_without_losing_dr
         await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
 
@@ -2718,6 +2793,7 @@ async def test_schema_v10_to_v11_preserves_run_progress_and_model_calls(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 17")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -2740,6 +2816,7 @@ async def test_schema_v17_to_v18_adds_hidden_model_call_provenance(repository) -
         await connection.execute("ALTER TABLE business_checkpoints DROP COLUMN review_call_id")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 18")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -2757,7 +2834,7 @@ async def test_schema_v17_to_v18_adds_hidden_model_call_provenance(repository) -
     assert "operation_id" in {column[1] for column in columns}
     assert "review_call_id" in {column[1] for column in checkpoint_columns}
     assert "model_calls_operation_id" in {index[1] for index in indexes}
-    assert version[0] == 19
+    assert version[0] == 20
 
 
 async def test_schema_v18_collision_repairs_missing_model_call_provenance(repository) -> None:
@@ -2766,6 +2843,7 @@ async def test_schema_v18_collision_repairs_missing_model_call_provenance(reposi
         await connection.execute("ALTER TABLE model_calls DROP COLUMN operation_id")
         await connection.execute("ALTER TABLE business_checkpoints DROP COLUMN review_call_id")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -2783,7 +2861,7 @@ async def test_schema_v18_collision_repairs_missing_model_call_provenance(reposi
     assert "operation_id" in {column[1] for column in columns}
     assert "review_call_id" in {column[1] for column in checkpoint_columns}
     assert "model_calls_operation_id" in {index[1] for index in indexes}
-    assert version[0] == 19
+    assert version[0] == 20
 
 
 async def test_schema_v18_collision_repairs_missing_episode_attempt_cycles(
@@ -2819,6 +2897,7 @@ async def test_schema_v18_collision_repairs_missing_episode_attempt_cycles(
         await connection.execute("DROP TABLE episode_attempts")
         await connection.execute("ALTER TABLE episode_attempts_v17 RENAME TO episode_attempts")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 19")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 20")
         await connection.commit()
 
     restarted = Repository(repository.database_path)

@@ -148,7 +148,7 @@ script_writer
         final L0/L4 不通过 → quality_rejected（保留证据，可只重试最终审核）
 ```
 
-资源中还会暴露 `recovery_state`、`recovery_reason`、`can_continue` 和 `can_end`。恢复理由包括 `run_timeout`、`relay_interruption`、`content_rejected`、`episode_error`、`context_budget` 和 `repair_authorization`。
+资源中还会暴露 `recovery_state`、`recovery_reason`、`can_continue` 和 `can_end`。恢复理由包括 `run_timeout`、`relay_interruption`、`content_rejected`、`episode_error`、`context_budget`、`relay_identity_mismatch` 和 `repair_authorization`。
 
 ## 5. 哪些错误可以恢复
 
@@ -159,7 +159,8 @@ script_writer
 | 暂时 relay/网络 | 请求开始后的连接、DNS、TLS、读取超时或重置；relay `429/502/503/504` | 首次在同一 run/thread 上进入 `auto_resuming`，遵守至少 10 秒或更长 `Retry-After` | 若同一用户阶段再次共享中断，`Continue` 或 `End` |
 | 语法正确地址但连接失败 | 主机名解析/连接失败，无法证明一定短暂 | 按受限 transport 路径计入调用预算，耗尽后失败 | 修正 relay 配置后新建任务 |
 | 配置/安全错误 | 缺 URL/key、非 loopback HTTP、证书校验失败 | 不自动降级，不切换模型 | 修正 `.env` 后重新运行 |
-| 身份/协议错误 | provider 回报了错误模型、OpenAI/Anthropic 协议不匹配、结构化输出无效 | 终止为安全错误 | 检查 relay adapter、模型路由和响应合同 |
+| 模型身份错误 | 响应模型身份缺失、不等于配置模型或同时出现多个身份 | 丢弃响应，暂停为 `relay_identity_mismatch`，不自动重试 | 先核验 Relay；通过身份探测后 `Continue` |
+| 协议错误 | OpenAI/Anthropic tool 协议不匹配、结构化输出无效 | 终止为安全错误 | 检查 relay adapter 和响应合同 |
 | 上下文预算 | 未设置可信上限，或序列化请求 + 保留输出超出上限 | 请求前阻断，0 outbound call，运行暂停为 `context_budget` | 增加已验证上限、缩小上下文或结束任务 |
 | 内容审查不通过 | 合同、单集连续性、结构性里程碑失败 | 只做有界内容修复；预算耗尽后 `paused` | 需要 `authorize-repair` 才能消费一次授权周期，或保留并结束 |
 | L0/L4 最终拒绝 | 质量闸门返回 rejected | `quality_rejected`，不重跑前面内容 | `retry-final-review` 只重跑同一最终审核，或结束 |
@@ -213,11 +214,11 @@ if limit is missing or estimated_total > limit:
 - provider 报告 input/output/cache 用量时原样保存；
 - provider 没有报告时，状态为 `unavailable` 或 `partial`；
 - 不能用本地估算值伪造实际 token 使用量；
-- 每个物理 call 有独立 `call_id`、角色、adapter/provider/model、阶段、集数、候选/batch 血缘、耗时、finish reason 和安全错误；
+- 每个物理 call 有独立 `call_id`、角色、adapter/provider/requested model、实际 `response_model_ids`、阶段、集数、候选/batch 血缘、耗时、finish reason 和安全错误；
 - `operation_id` 把一次业务产物操作与它可能发生的物理尝试关联；只有该 operation 下真实 `succeeded` 的调用才能成为锁定合同、分集候选或结构审核的来源；
 - 服务在公开 `succeeded` 前 drain 审计写入，避免交付已成功但对应调用账本尚未落盘。
 
-这套记录同时服务于 UI 用量面板、SQLite `model_calls` 表和结构化日志。迟到、被取代、超时和预检拦截的调用也保留，避免只看“最后一次成功请求”。
+这套记录同时服务于 UI 用量面板、SQLite `model_calls` 表、Langfuse 事件和结构化日志。Langfuse 的身份事件名称与输入都会携带实际响应模型；迟到、被取代、超时和预检拦截的调用也保留，避免只看“最后一次成功请求”。
 
 ## 9. 修订流程
 

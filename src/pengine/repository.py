@@ -93,7 +93,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -133,6 +133,7 @@ RecoveryReason = Literal[
     "content_rejected",
     "episode_error",
     "context_budget",
+    "relay_identity_mismatch",
     "repair_authorization",
 ]
 RecoveryState = Literal["auto_resuming", "paused", "failed"]
@@ -920,6 +921,37 @@ CREATE TABLE IF NOT EXISTS model_calls (
     safe_message TEXT,
     supersedes_call_id TEXT
 );
+"""
+
+_SCHEMA_V20_RUN_PROGRESS_SQL = """
+CREATE TABLE run_progress_v20 (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    current_stage TEXT NOT NULL,
+    execution_state TEXT NOT NULL CHECK (
+        execution_state IN (
+            'queued', 'running', 'auto_resuming', 'paused',
+            'quality_rejected', 'ended', 'succeeded', 'failed'
+        )
+    ),
+    elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (elapsed_seconds >= 0),
+    active_started_at TEXT,
+    timeout_stage TEXT,
+    timeout_count INTEGER NOT NULL DEFAULT 0 CHECK (timeout_count >= 0),
+    updated_at TEXT NOT NULL,
+    current_episode INTEGER CHECK (current_episode IS NULL OR current_episode >= 1),
+    recovery_reason TEXT NOT NULL DEFAULT 'none' CHECK (
+        recovery_reason IN (
+            'none', 'run_timeout', 'relay_interruption', 'content_rejected',
+            'episode_error', 'context_budget', 'relay_identity_mismatch',
+            'repair_authorization'
+        )
+    ),
+    content_repair_count INTEGER CHECK (
+        content_repair_count IS NULL
+        OR content_repair_count BETWEEN 2 AND 6
+    ),
+    pause_message TEXT
+)
 """
 
 _SCHEMA_V11_MODEL_CALLS_INDEX_SQL = """
@@ -1926,6 +1958,45 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 19
+            if schema_version == 19:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.execute("DROP TABLE IF EXISTS run_progress_v20")
+                    await connection.execute(_SCHEMA_V20_RUN_PROGRESS_SQL)
+                    await connection.execute(
+                        """
+                        INSERT INTO run_progress_v20(
+                            run_id, current_stage, execution_state, elapsed_seconds,
+                            active_started_at, timeout_stage, timeout_count, updated_at,
+                            current_episode, recovery_reason, content_repair_count, pause_message
+                        )
+                        SELECT
+                            run_id, current_stage, execution_state, elapsed_seconds,
+                            active_started_at, timeout_stage, timeout_count, updated_at,
+                            current_episode, recovery_reason, content_repair_count, pause_message
+                        FROM run_progress
+                        """
+                    )
+                    await connection.execute("DROP TABLE run_progress")
+                    await connection.execute("ALTER TABLE run_progress_v20 RENAME TO run_progress")
+                    model_call_columns = await (
+                        await connection.execute("PRAGMA table_info(model_calls)")
+                    ).fetchall()
+                    if "response_model_ids_json" not in {
+                        column[1] for column in model_call_columns
+                    }:
+                        await connection.execute(
+                            "ALTER TABLE model_calls ADD COLUMN response_model_ids_json TEXT"
+                        )
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (20)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 20
 
     async def setup(self) -> None:
         await self.initialize()
@@ -3071,6 +3142,83 @@ class Repository:
                     timeout_stage = ?,
                     timeout_count = 0,
                     recovery_reason = 'context_budget',
+                    content_repair_count = NULL,
+                    pause_message = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    stage.value,
+                    episode_number,
+                    self._elapsed_seconds(progress, current),
+                    _USER_STAGE_BY_INTERNAL[stage].value,
+                    safe_message.strip(),
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'failed',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, str(run_id)),
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, progress["creation_id"]),
+            )
+
+    async def pause_relay_identity_mismatch(
+        self,
+        run_id: UUID,
+        *,
+        stage: InternalStage,
+        safe_message: str,
+        episode_number: int | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Discard an unverified response and pause until an operator checks the relay."""
+        if not safe_message.strip():
+            raise ValueError("Relay-identity pauses require a safe message")
+        if episode_number is not None and episode_number < 1:
+            raise ValueError("Relay-identity pauses require a valid episode number")
+        current = now or _utc_now()
+        timestamp = _timestamp(current)
+        async with self._transaction() as connection:
+            progress = await self._fetchone(
+                connection,
+                """
+                SELECT run_progress.*, runs.state AS run_state, runs.creation_id
+                FROM run_progress
+                JOIN runs ON runs.id = run_progress.run_id
+                WHERE run_progress.run_id = ?
+                """,
+                (str(run_id),),
+            )
+            if progress is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if progress["run_state"] != "running" or progress["execution_state"] != "running":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Workflow run is not actively running.",
+                    409,
+                )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    current_episode = ?,
+                    execution_state = 'paused',
+                    elapsed_seconds = ?,
+                    active_started_at = NULL,
+                    timeout_stage = ?,
+                    timeout_count = 0,
+                    recovery_reason = 'relay_identity_mismatch',
                     content_repair_count = NULL,
                     pause_message = ?,
                     updated_at = ?
@@ -7378,6 +7526,17 @@ class Repository:
 
     @staticmethod
     def _model_call_summary(row: aiosqlite.Row) -> ModelCallSummary:
+        response_model_ids: list[str] | None = None
+        raw_response_model_ids = row["response_model_ids_json"]
+        if raw_response_model_ids:
+            try:
+                parsed_response_model_ids = json.loads(raw_response_model_ids)
+            except (TypeError, ValueError):
+                parsed_response_model_ids = None
+            if isinstance(parsed_response_model_ids, list):
+                response_model_ids = [
+                    value for value in parsed_response_model_ids if isinstance(value, str) and value
+                ]
         return ModelCallSummary(
             call_id=row["call_id"],
             operation_id=row["operation_id"],
@@ -7385,6 +7544,7 @@ class Repository:
             adapter=row["adapter"],
             provider=row["provider"],
             model=row["model"],
+            response_model_ids=response_model_ids,
             stage=row["stage"],
             episode_number=row["episode_number"],
             candidate=row["candidate"],
@@ -7677,6 +7837,7 @@ class Repository:
             "content_rejected",
             "episode_error",
             "context_budget",
+            "relay_identity_mismatch",
             "repair_authorization",
         }:
             raise RuntimeError("Paused workflow run is missing its recovery reason")
@@ -7694,6 +7855,19 @@ class Repository:
             return RunPause(
                 message=progress["pause_message"],
                 code="context_budget",
+                stage=stage,
+                episode_number=(
+                    int(progress["current_episode"])
+                    if progress["current_episode"] is not None
+                    else None
+                ),
+            )
+        if recovery_reason == "relay_identity_mismatch":
+            if not progress["pause_message"]:
+                raise RuntimeError("Relay-identity pause is missing verification evidence")
+            return RunPause(
+                message=progress["pause_message"],
+                code="relay_identity_mismatch",
                 stage=stage,
                 episode_number=(
                     int(progress["current_episode"])

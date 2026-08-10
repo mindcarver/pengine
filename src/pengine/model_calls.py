@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS model_calls (
     http_status INTEGER,
     provider_error_code TEXT,
     redacted_response TEXT,
+    response_model_ids_json TEXT,
     safe_message TEXT,
     supersedes_call_id TEXT
 );
@@ -258,6 +259,7 @@ class ModelCallRecord:
     http_status: int | None = None
     provider_error_code: str | None = None
     redacted_response: str | None = None
+    response_model_ids_json: str | None = None
     safe_message: str | None = None
     supersedes_call_id: str | None = None
 
@@ -470,6 +472,7 @@ _COLUMNS = (
     "http_status",
     "provider_error_code",
     "redacted_response",
+    "response_model_ids_json",
     "safe_message",
     "supersedes_call_id",
 )
@@ -510,6 +513,7 @@ _MODEL_CALL_ALTERS = (
     "ALTER TABLE model_calls ADD COLUMN http_status INTEGER",
     "ALTER TABLE model_calls ADD COLUMN provider_error_code TEXT",
     "ALTER TABLE model_calls ADD COLUMN redacted_response TEXT",
+    "ALTER TABLE model_calls ADD COLUMN response_model_ids_json TEXT",
 )
 
 

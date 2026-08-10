@@ -37,6 +37,7 @@ from pengine.personas import PersonaCatalog, PersonaPackageError
 from pengine.relay import (
     PreflightBlockedError,
     RelayError,
+    RelayIdentityError,
     build_relay_routes,
     classify_relay_exception,
     drain_audit_writes,
@@ -982,6 +983,37 @@ class Worker:
                     exc.episode_number,
                     exc.required_tokens,
                     exc.verified_limit_tokens,
+                )
+                return
+            except RelayIdentityError as exc:
+                try:
+                    identity_stage = InternalStage(exc.stage) if exc.stage else current_stage
+                except ValueError:
+                    identity_stage = current_stage
+                episode_number = exc.episode_number
+                if (
+                    identity_stage is InternalStage.GENERATING_EPISODE_SCRIPTS
+                    and episode_number is None
+                ):
+                    refreshed = await self.repository.get_run_work_item(work.run_id)
+                    next_episode = len(refreshed.episode_drafts) + 1
+                    if next_episode <= len(refreshed.episode_plans):
+                        episode_number = next_episode
+                await self.repository.pause_relay_identity_mismatch(
+                    work.run_id,
+                    stage=identity_stage,
+                    safe_message=exc.safe_message,
+                    episode_number=episode_number,
+                )
+                logger.warning(
+                    "relay identity mismatch paused run_id=%s creation_id=%s stage=%s "
+                    "episode=%s requested_model_id=%s response_model_ids=%s",
+                    work.run_id,
+                    work.creation_id,
+                    identity_stage.value,
+                    episode_number,
+                    exc.requested_model_id,
+                    list(exc.response_model_ids),
                 )
                 return
             except TimeoutError as exc:

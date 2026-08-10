@@ -730,6 +730,8 @@ function renderCreation() {
     const contentRejected = initial.progress.recovery_reason === "content_rejected";
     const episodeError = initial.progress.recovery_reason === "episode_error";
     const contextBudget = initial.progress.recovery_reason === "context_budget";
+    const identityMismatch =
+      initial.progress.recovery_reason === "relay_identity_mismatch";
     const episodeNumber = initial.pause?.episode_number || initial.progress.episodes?.current;
     const retainedEpisodes = initial.progress.episodes?.completed || 0;
     const repairAuthorization = initial.progress.recovery_reason === "repair_authorization";
@@ -739,6 +741,8 @@ function renderCreation() {
         ? "任务已暂停 · 等待一次修复授权"
         : contextBudget
         ? "任务已暂停 · 上下文预算不足"
+        : identityMismatch
+        ? "任务已暂停 · 模型身份待确认"
         : "任务已暂停",
       repairAuthorization
         ? authorization && authorization.kind === "design_rebuild"
@@ -746,6 +750,10 @@ function renderCreation() {
           : "分集硬约束需修复 · 自动预算已用尽"
         : contextBudget
         ? "模型请求未发出，已完成的批准内容保持不变"
+        : identityMismatch
+        ? episodeNumber
+          ? `第 ${episodeNumber} 集响应的模型身份验证未通过`
+          : "当前响应的模型身份验证未通过"
         : episodeError
         ? `第 ${episodeNumber} 集生成遇到可恢复错误`
         : contentRejected
@@ -757,6 +765,8 @@ function renderCreation() {
         ? `${initial.pause?.message || "内容审查未通过。"} 自动修复预算已用尽，需在上方授权一次修复循环。`
         : contextBudget
         ? `${initial.pause?.message || "完整请求超出已验证上下文上限。"} 请配置更高的已验证上限后，在上方继续当前阶段；未发出的请求不消耗额度。`
+        : identityMismatch
+        ? `${initial.pause?.message || "Relay 未能证明本次响应来自配置模型。"} 本次响应已丢弃，已完成的 ${retainedEpisodes} 集保持不变；确认 Relay 后再继续。`
         : episodeError
         ? `${initial.pause?.message || "当前集生成遇到可恢复错误。"} 已完成的 ${retainedEpisodes} 集已保留，请在上方从第 ${episodeNumber} 集继续或结束任务。`
         : contentRejected
@@ -876,6 +886,7 @@ function renderProgress() {
   const contentRejected = progress.recovery_reason === "content_rejected";
   const episodeError = progress.recovery_reason === "episode_error";
   const contextBudget = progress.recovery_reason === "context_budget";
+  const identityMismatch = progress.recovery_reason === "relay_identity_mismatch";
   const repairAuthorization = progress.recovery_reason === "repair_authorization";
   const authorization = run.authorization || null;
   const episodeNumber = run.pause?.episode_number || progress.episodes?.current;
@@ -886,6 +897,10 @@ function renderProgress() {
       : "分集硬约束需修复 · 等待授权"
     : contextBudget
     ? "模型上下文预算不足 · 已安全暂停"
+    : identityMismatch
+    ? episodeNumber
+      ? `第 ${episodeNumber} 集模型身份待确认`
+      : "模型身份待确认"
     : episodeError
     ? `第 ${episodeNumber} 集可继续`
     : contentRejected
@@ -912,6 +927,8 @@ function renderProgress() {
         .concat(" 授权将执行一次生成加审查循环；若仍有硬约束冲突，将按最新审查证据再次暂停。")
     : contextBudget
     ? `${run.pause?.message || "请求未发出，未消耗任何额度。"} 请为对应路由配置更高的已验证上下文上限后继续当前阶段。`
+    : identityMismatch
+    ? `${run.pause?.message || "Relay 未能证明本次响应来自配置模型。"} 本次响应已丢弃，已完成的 ${retainedEpisodes} 集不会重新生成。确认 Relay 后再继续。`
     : episodeError
     ? `${run.pause?.message || "当前集生成遇到可恢复错误。"} 已完成的 ${retainedEpisodes} 集不会重新生成。`
     : contentRejected
@@ -923,6 +940,8 @@ function renderProgress() {
     ? "授权一次修复"
     : contextBudget
     ? "继续创作"
+    : identityMismatch && episodeNumber
+    ? `从第 ${episodeNumber} 集继续`
     : episodeError
     ? `从第 ${episodeNumber} 集继续`
     : "继续创作";
@@ -983,6 +1002,11 @@ function renderModelCalls(progress) {
     const usageText = formatCallUsage(call);
     const durationText =
       typeof call.duration_seconds === "number" ? ` · ${formatElapsed(Math.round(call.duration_seconds))}` : "";
+    const identityText = Array.isArray(call.response_model_ids)
+      ? call.response_model_ids.length > 0
+        ? ` · 响应身份 ${call.response_model_ids.join(", ")}`
+        : " · 响应身份未携带"
+      : "";
     item.textContent =
       `${MODEL_CALL_ROLE_LABELS[call.role] || call.role} ${call.model}` +
       (call.stage ? ` · ${USER_STAGE_LABELS.get(call.stage) || call.stage}` : "") +
@@ -992,6 +1016,7 @@ function renderModelCalls(progress) {
       (call.verified_limit_tokens ? ` / 上限 ${call.verified_limit_tokens}` : "") +
       (usageText ? ` · ${usageText}` : "") +
       (call.finish_reason ? ` · ${call.finish_reason}` : "") +
+      identityText +
       durationText;
     item.dataset.callStatus = call.status;
     list.appendChild(item);
@@ -1496,6 +1521,8 @@ function renderRevision() {
     description =
       revision.progress.recovery_reason === "content_rejected"
         ? "内容一致性审查连续修复后仍未通过。请使用上方进度卡重新生成当前未锁内容或结束；初稿仍可浏览。"
+        : revision.progress.recovery_reason === "relay_identity_mismatch"
+        ? "Relay 响应的模型身份验证未通过。响应已丢弃；请确认 Relay 后使用上方进度卡继续或结束。"
         : revision.progress.recovery_reason === "relay_interruption"
         ? "当前阶段再次发生网络 / Relay 中断。请使用上方进度卡继续或结束；初稿仍可浏览。"
         : "当前阶段再次超时。请使用上方进度卡继续或结束；初稿仍可浏览。";

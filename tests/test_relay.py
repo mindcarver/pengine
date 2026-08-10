@@ -17,6 +17,7 @@ from pengine.model_calls import ModelCallState, StageCallBudgetExceeded
 from pengine.relay import (
     MIN_RELAY_RETRY_DELAY_SECONDS,
     RelayError,
+    RelayIdentityError,
     _ModelCallAuditHandler,
     build_chat_model,
     build_relay_adapter,
@@ -220,8 +221,12 @@ def test_model_call_audit_rejects_missing_or_mismatched_response_identity(
     )
     handler = _ModelCallAuditHandler(role="generation", model_id="claude-opus-5")
 
-    with pytest.raises(RelayError, match="unexpected model"):
+    with pytest.raises(RelayIdentityError, match="identity did not exactly match") as excinfo:
         handler.on_llm_end(response, run_id=uuid4())
+    assert excinfo.value.requested_model_id == "claude-opus-5"
+    assert list(excinfo.value.response_model_ids) == (
+        [] if response_model is None else [response_model]
+    )
 
 
 @pytest.mark.parametrize(

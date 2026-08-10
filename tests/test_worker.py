@@ -18,7 +18,7 @@ from pengine.agents import AgentProtocolError, EpisodeTimeoutError, QualityGateR
 from pengine.config import Settings
 from pengine.errors import DomainError
 from pengine.personas import PersonaCatalog
-from pengine.relay import PreflightBlockedError, RelayError
+from pengine.relay import PreflightBlockedError, RelayError, RelayIdentityError
 from pengine.repository import Repository
 from pengine.schemas import (
     ContentPackage,
@@ -385,6 +385,31 @@ class EpisodeConnectionErrorWorkflow(DeterministicWorkflow):
                     if self.provider == "openai":
                         raise openai.APIConnectionError(request=request) from cause
                     raise anthropic.APIConnectionError(request=request) from cause
+            return attempt
+
+        return await super().execute(
+            **{
+                **kwargs,
+                "before_episode": fail_on_second_episode,
+            }
+        )
+
+
+class EpisodeIdentityMismatchWorkflow(DeterministicWorkflow):
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        before_episode = kwargs["before_episode"]
+        assert before_episode is not None
+
+        async def fail_on_second_episode(plan: EpisodePlan) -> int:
+            attempt = await before_episode(plan)
+            if plan.episode_number == 2:
+                raise RelayIdentityError(
+                    role="generation",
+                    requested_model_id="claude-opus-5",
+                    response_model_ids=["relay-fallback"],
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                    episode_number=2,
+                )
             return attempt
 
         return await super().execute(
@@ -1114,6 +1139,40 @@ async def test_worker_reports_graph_and_quality_failures_separately(
     else:
         assert resource.initial.quality_rejection.code == expected_code
         assert resource.initial.quality_rejection.evidence == "L0 与已批准稿件的核心冲突。"
+
+
+@pytest.mark.asyncio
+async def test_model_identity_mismatch_pauses_and_preserves_completed_episodes(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "identity-mismatch-pause",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成两集短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=EpisodeIdentityMismatchWorkflow(),
+        worker_id="identity-mismatch-worker",
+    )
+
+    assert await worker.run_once() is True
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "paused"
+    assert resource.initial.progress.recovery_reason == "relay_identity_mismatch"
+    assert resource.initial.pause.code == "relay_identity_mismatch"
+    assert resource.initial.pause.episode_number == 2
+    assert resource.initial.progress.can_continue is True
+    assert [draft.episode_number for draft in resource.initial.drafts.episodes] == [1]
+    assert "relay-fallback" in resource.initial.pause.message
 
 
 def test_episode_upstream_stream_decode_error_uses_relay_connection_prompt() -> None:

@@ -7,6 +7,7 @@ durability, superseded/stale classification, and credential safety.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from pathlib import Path
@@ -29,6 +30,7 @@ from pengine.model_calls import (
     extract_provider_usage,
     usage_status_from,
 )
+from pengine.observability import record_model_call_event
 from pengine.relay import (
     PreflightBlockedError,
     _ModelCallAuditHandler,
@@ -392,6 +394,76 @@ def test_current_started_call_is_never_self_superseded(tmp_path: Path) -> None:
     assert rows[1]["status"] == "started"
     assert rows[1]["outcome"] == "incomplete"
     store.close()
+
+
+def test_identity_mismatch_persists_exact_response_models(tmp_path: Path) -> None:
+    from pengine.relay import RelayIdentityError, _ModelCallAuditHandler
+
+    store = ModelCallStore(tmp_path / "model_calls.sqlite3")
+    state = ModelCallState(store=store)
+    state.context.run_id = "run-identity"
+    state.context.stage = "generating_episode_scripts"
+    state.context.episode_number = 27
+    handler = _ModelCallAuditHandler(
+        role="generation",
+        model_id="claude-opus-5",
+        adapter="anthropic",
+        provider="anthropic",
+        model_call_state=state,
+        context_limit_tokens=200_000,
+    )
+    call_id = uuid4()
+    handler.on_chat_model_start({}, [[{"role": "user", "content": "probe"}]], run_id=call_id)
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="untrusted",
+                        response_metadata={"model": "relay-fallback"},
+                    )
+                )
+            ]
+        ]
+    )
+
+    with pytest.raises(RelayIdentityError):
+        handler.on_llm_end(response, run_id=call_id)
+
+    row = store._connection.execute(
+        "SELECT status, error_code, error_type, response_model_ids_json "
+        "FROM model_calls WHERE run_id = 'run-identity'"
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["error_code"] == "relay_incompatible"
+    assert row["error_type"] == "RelayIdentityError"
+    assert json.loads(row["response_model_ids_json"]) == ["relay-fallback"]
+    store.close()
+
+
+def test_langfuse_model_call_event_contains_response_identity(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def capture(name: str, *, input: dict[str, Any], metadata: dict[str, Any]) -> None:
+        captured.update(name=name, input=input, metadata=metadata)
+
+    monkeypatch.setattr("pengine.observability.record_langfuse_event", capture)
+    record_model_call_event(
+        phase="end",
+        role="generation",
+        stage="generating_episode_scripts",
+        episode_number=27,
+        sequence=1,
+        outcome="failure",
+        call_id="identity-call",
+        model="claude-opus-5",
+        error_code="relay_incompatible",
+        response_model_ids=["relay-fallback"],
+    )
+
+    assert captured["input"]["response_model_ids"] == ["relay-fallback"]
+    assert captured["input"]["model_identity_verified"] is False
+    assert captured["name"].endswith("identity-relay-fallback")
 
 
 def test_store_persists_records_across_restart_and_supersedes_overlap(

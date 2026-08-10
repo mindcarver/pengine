@@ -44,6 +44,7 @@ def record_model_call_event(
     error_code: str | None = None,
     finish_reason: str | None = None,
     duration_seconds: float | None = None,
+    response_model_ids: list[str] | None = None,
 ) -> None:
     """Record queryable, content-safe lineage for one outbound model call.
 
@@ -56,28 +57,44 @@ def record_model_call_event(
     episode_label = f"episode-{episode_number}" if episode_number is not None else "no-episode"
     sequence_label = f"seq-{sequence}" if sequence is not None else "seq-none"
     repair_label = f"repair-{repair_round}" if repair_round is not None else "repair-none"
-    name = ".".join(
-        (
-            "pengine",
-            "model_call",
-            "v1",
-            _event_label(phase),
-            _event_label(role),
-            stage_label,
-            episode_label,
-            _event_label(outcome),
-            sequence_label,
-            repair_label,
+    name_parts = [
+        "pengine",
+        "model_call",
+        "v1",
+        _event_label(phase),
+        _event_label(role),
+        stage_label,
+        episode_label,
+        _event_label(outcome),
+        sequence_label,
+        repair_label,
+    ]
+    if response_model_ids is not None:
+        identity_label = (
+            "identity-missing"
+            if not response_model_ids
+            else "identity-" + "-and-".join(_event_label(value) for value in response_model_ids)
         )
-    )
+        name_parts.append(identity_label[:160])
+    name = ".".join(name_parts)
     record_langfuse_event(
         name,
         input={
             "call_id": call_id,
-            "model": model,
+            "requested_model_id": model,
+            "response_model_ids": response_model_ids,
+            "model_identity_verified": (
+                None
+                if response_model_ids is None
+                else {value.casefold() for value in response_model_ids} == {model.casefold()}
+            ),
+        },
+        metadata={
+            "trace_version": "pengine-1",
+            "lineage_version": "model-call-v1",
+            "role": role,
             "stage": stage,
             "episode_number": episode_number,
-            "role": role,
             "sequence": sequence,
             "outcome": outcome,
             "repair_round": repair_round,
@@ -85,7 +102,6 @@ def record_model_call_event(
             "finish_reason": finish_reason,
             "duration_seconds": duration_seconds,
         },
-        metadata={"trace_version": "pengine-1", "lineage_version": "model-call-v1"},
     )
 
 
