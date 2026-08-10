@@ -93,7 +93,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -1765,6 +1765,169 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 18
+            if schema_version == 18:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    episode_attempt_columns = await (
+                        await connection.execute("PRAGMA table_info(episode_attempts)")
+                    ).fetchall()
+                    if "attempt_cycle" not in {
+                        column[1] for column in episode_attempt_columns
+                    }:
+                        await connection.execute("DROP TABLE IF EXISTS episode_attempt_current")
+                        await connection.execute("DROP TABLE IF EXISTS episode_attempt_cycles")
+                        await connection.execute("DROP TABLE IF EXISTS episode_attempts_v19")
+                        await connection.execute(
+                            """
+                            CREATE TABLE episode_attempts_v19 (
+                                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                                episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+                                attempt_cycle INTEGER NOT NULL CHECK (attempt_cycle >= 0),
+                                attempt_number INTEGER NOT NULL CHECK (
+                                    attempt_number >= 1 AND attempt_number <= 3
+                                ),
+                                recorded_at TEXT NOT NULL,
+                                PRIMARY KEY (
+                                    run_id, episode_number, attempt_cycle, attempt_number
+                                )
+                            )
+                            """
+                        )
+                        await connection.execute(
+                            """
+                            INSERT INTO episode_attempts_v19(
+                                run_id, episode_number, attempt_cycle,
+                                attempt_number, recorded_at
+                            )
+                            SELECT run_id, episode_number, 0, attempt_number, recorded_at
+                            FROM episode_attempts
+                            """
+                        )
+                        await connection.execute("DROP TABLE episode_attempts")
+                        await connection.execute(
+                            "ALTER TABLE episode_attempts_v19 RENAME TO episode_attempts"
+                        )
+                    await connection.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS episode_attempts_current
+                        ON episode_attempts(run_id, episode_number, attempt_cycle)
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS episode_attempt_cycles (
+                            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                            attempt_cycle INTEGER NOT NULL CHECK (attempt_cycle >= 0),
+                            from_episode INTEGER NOT NULL CHECK (from_episode >= 1),
+                            to_episode INTEGER NOT NULL CHECK (to_episode >= from_episode),
+                            started_at TEXT NOT NULL,
+                            PRIMARY KEY (run_id, attempt_cycle)
+                        )
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS episode_attempt_current (
+                            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                            episode_number INTEGER NOT NULL CHECK (episode_number >= 1),
+                            attempt_cycle INTEGER NOT NULL CHECK (attempt_cycle >= 0),
+                            PRIMARY KEY (run_id, episode_number),
+                            FOREIGN KEY (run_id, attempt_cycle)
+                                REFERENCES episode_attempt_cycles(run_id, attempt_cycle)
+                        )
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        INSERT OR IGNORE INTO episode_attempt_cycles(
+                            run_id, attempt_cycle, from_episode, to_episode, started_at
+                        )
+                        SELECT
+                            plans.run_id,
+                            0,
+                            1,
+                            MAX(plans.episode_number),
+                            runs.created_at
+                        FROM episode_plans AS plans
+                        JOIN runs ON runs.id = plans.run_id
+                        GROUP BY plans.run_id
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        INSERT OR IGNORE INTO episode_attempt_cycles(
+                            run_id, attempt_cycle, from_episode, to_episode, started_at
+                        )
+                        SELECT
+                            attempts.run_id,
+                            0,
+                            MIN(attempts.episode_number),
+                            MAX(attempts.episode_number),
+                            MIN(attempts.recorded_at)
+                        FROM episode_attempts AS attempts
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM episode_attempt_cycles AS cycles
+                            WHERE cycles.run_id = attempts.run_id
+                              AND cycles.attempt_cycle = 0
+                        )
+                        GROUP BY attempts.run_id
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        INSERT OR IGNORE INTO episode_attempt_current(
+                            run_id, episode_number, attempt_cycle
+                        )
+                        SELECT run_id, episode_number, 0
+                        FROM episode_plans
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM episode_attempt_cycles
+                            WHERE episode_attempt_cycles.run_id = episode_plans.run_id
+                              AND episode_attempt_cycles.attempt_cycle = 0
+                        )
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        INSERT OR IGNORE INTO episode_attempt_current(
+                            run_id, episode_number, attempt_cycle
+                        )
+                        SELECT DISTINCT run_id, episode_number, 0
+                        FROM episode_attempts
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM episode_attempt_cycles
+                            WHERE episode_attempt_cycles.run_id = episode_attempts.run_id
+                              AND episode_attempt_cycles.attempt_cycle = 0
+                        )
+                        """
+                    )
+                    model_call_columns = await (
+                        await connection.execute("PRAGMA table_info(model_calls)")
+                    ).fetchall()
+                    if "operation_id" not in {column[1] for column in model_call_columns}:
+                        await connection.execute(
+                            "ALTER TABLE model_calls ADD COLUMN operation_id TEXT"
+                        )
+                    checkpoint_columns = await (
+                        await connection.execute("PRAGMA table_info(business_checkpoints)")
+                    ).fetchall()
+                    if "review_call_id" not in {column[1] for column in checkpoint_columns}:
+                        await connection.execute(
+                            "ALTER TABLE business_checkpoints ADD COLUMN review_call_id TEXT"
+                        )
+                    await connection.execute(_SCHEMA_V18_MODEL_CALLS_OPERATION_INDEX_SQL)
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (19)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 19
 
     async def setup(self) -> None:
         await self.initialize()
