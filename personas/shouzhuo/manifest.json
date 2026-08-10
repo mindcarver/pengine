@@ -4,7 +4,7 @@
   "display_name": "守拙 · 正剧",
   "version": "0.1.0-prototype",
   "created_at": "2026-07-30T00:00:00Z",
-  "package_sha256": "80cc48f3e4a3e66dbf6d97f249b27ab354f47d16b7248b0ad983a5fedbbdd09f",
+  "package_sha256": "0e7cb0ae113415da9d95f2b41e752f6007a3d23deb6f1f5aa05696aeef755735",
   "files": {
     "paradigm": {
       "path": "paradigm.md",
@@ -46,7 +46,7 @@
       "path": "l4.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "b4b224cf7f8e4002fc64554766708c11736fe8dee080c5df936eef62db99acb0"
+      "sha256": "bc773487b5d2a7a1fa45cb88eef0af5f03ade251b4443c9f1a1402c8514f2bb6"
     },
     "l5": {
       "path": "l5.md",
