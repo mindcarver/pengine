@@ -4010,11 +4010,10 @@ def test_specialist_prompts_apply_l0_by_stage_without_copying_source_content() -
     assert "complete /persona/l0.md" in _STORY_ARCHITECT_PROMPT
     assert "exact declared [ID:<value>]" in _STORY_ARCHITECT_PROMPT
     assert "protagonist, central conflict, choice, cost, and ending" in (_STORY_ARCHITECT_PROMPT)
-    assert "who carries the ideal" in _STORY_ARCHITECT_PROMPT
+    assert "Do not invent a universal interpretation" in _STORY_ARCHITECT_PROMPT
     assert "selected L0 facet" in _EPISODE_PLANNER_PROMPT
-    assert "warmth before harm" in _EPISODE_PLANNER_PROMPT
-    assert "red lines and emotional temperature" in _SCRIPT_WRITER_PROMPT
-    assert "visible action, choice, and relationship pressure" in _SCRIPT_WRITER_PROMPT
+    assert "this persona's L0" in _EPISODE_PLANNER_PROMPT
+    assert "current persona's exact red" in _SCRIPT_WRITER_PROMPT
     for label in ("母题兑现：", "选定侧面：", "雷区：", "温度："):
         assert label in _QUALITY_REVIEWER_PROMPT
     assert "do not reselect or reopen L0" in _QUALITY_REVIEWER_PROMPT
@@ -4028,6 +4027,8 @@ def test_specialist_prompts_apply_l0_by_stage_without_copying_source_content() -
         )
     )
     assert "初心 vs 现实的落差" not in combined
+    assert "warmth before harm" not in combined
+    assert "explanatory voiceover" not in combined
 
 
 def test_l4_reviewer_prompt_only_locks_explicit_verbatim_facts() -> None:
