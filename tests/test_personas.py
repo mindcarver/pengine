@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 
 import pytest
 from persona_factory import (
+    LOGICAL_FILES,
     NON_PRODUCTION_CONTENT,
     create_persona_package,
     package_bytes,
@@ -46,7 +48,7 @@ def test_discover_returns_only_complete_valid_package(tmp_path: Path) -> None:
     assert len(personas) == 1
     assert personas[0].persona_id == "test-persona"
     assert personas[0].display_name == "非生产测试人格"
-    assert personas[0].version == "1.0.0-test"
+    assert personas[0].version == "2.0.0-test"
     assert len(personas[0].snapshot_sha256) == 64
 
 
@@ -54,12 +56,12 @@ def test_discover_returns_only_complete_valid_package(tmp_path: Path) -> None:
     ("mutate", "expected_code"),
     [
         (
-            lambda package: (package / "l1.md").write_bytes(b"\xff"),
+            lambda package: (package / "soul.md").write_bytes(b"\xff"),
             "markdown_not_utf8",
         ),
         (
-            lambda package: (package / "l1.md").write_text(
-                "# L1\n\n## 摘要\n缺少来源画像。\n", encoding="utf-8"
+            lambda package: (package / "soul.md").write_text(
+                "# Soul\n\n## 身份\n已改变。\n", encoding="utf-8"
             ),
             "file_hash_mismatch",
         ),
@@ -268,17 +270,17 @@ def test_version_only_change_creates_new_identity_preserving_snapshot(
     first = catalog.create_snapshot("test-persona")
     first_package_hash = first.manifest["package_sha256"]
 
-    create_persona_package(package_dir, version="2.0.0-test")
+    create_persona_package(package_dir, version="2.0.1-test")
     restarted_catalog = PersonaCatalog(catalog.source_root, catalog.snapshot_root)
     second = restarted_catalog.create_snapshot("test-persona")
 
     assert second.manifest["package_sha256"] == first_package_hash
     assert second.summary.snapshot_sha256 != first.summary.snapshot_sha256
     assert restarted_catalog.resolve_snapshot(first.summary.snapshot_sha256).summary.version == (
-        "1.0.0-test"
+        "2.0.0-test"
     )
     assert restarted_catalog.resolve_snapshot(second.summary.snapshot_sha256).summary.version == (
-        "2.0.0-test"
+        "2.0.1-test"
     )
 
 
@@ -413,6 +415,32 @@ def test_complete_l0_is_available_to_every_specialist_stage(
     )
 
 
+@pytest.mark.parametrize(
+    "stage",
+    [
+        InternalStage.SELECTING_L0_VARIANT,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+        InternalStage.ACCEPTING_L0,
+        InternalStage.ACCEPTING_L4,
+    ],
+)
+def test_complete_soul_is_available_to_every_specialist_stage(
+    tmp_path: Path,
+    stage: InternalStage,
+) -> None:
+    catalog, _ = _catalog(tmp_path)
+    snapshot = catalog.create_snapshot("test-persona")
+
+    context = catalog.load_stage_context(snapshot.summary.snapshot_sha256, stage)
+
+    assert context.files["/persona/soul.md"] == NON_PRODUCTION_CONTENT["soul"]
+    assert "/persona/l1-summary.md" not in context.files
+    assert "/persona/l2-summary.md" not in context.files
+
+
 def test_l5_l6_retrieval_is_query_and_output_bounded(tmp_path: Path) -> None:
     catalog, _ = _catalog(tmp_path)
     snapshot = catalog.create_snapshot("test-persona")
@@ -439,23 +467,100 @@ def test_l5_l6_retrieval_is_query_and_output_bounded(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("mutate", "expected_code"),
+    [
+        (
+            lambda package: (package / "l1.md").write_text("legacy", encoding="utf-8"),
+            "mixed_persona_schema",
+        ),
+        (lambda package: (package / "soul.md").unlink(), "invalid_package_entries"),
+    ],
+)
+def test_v2_rejects_mixed_or_missing_soul_package(
+    tmp_path: Path,
+    mutate: object,
+    expected_code: str,
+) -> None:
+    package = create_persona_package(tmp_path / "persona")
+    mutate(package)  # type: ignore[operator]
+
+    with pytest.raises(PersonaPackageError) as exc_info:
+        validate_persona_package(package)
+
+    assert exc_info.value.code == expected_code
+
+
+def test_v2_rejects_manifest_that_declares_soul_and_legacy_layers(tmp_path: Path) -> None:
+    package = create_persona_package(
+        tmp_path / "persona",
+        manifest_mutator=lambda manifest: manifest["files"].update(
+            {"l1": dict(manifest["files"]["soul"])}
+        ),
+    )
+
+    with pytest.raises(PersonaPackageError) as exc_info:
+        validate_persona_package(package)
+
+    assert exc_info.value.code == "mixed_persona_schema"
+
+
+@pytest.mark.parametrize(
+    ("soul", "expected_code"),
+    [
+        (
+            NON_PRODUCTION_CONTENT["soul"].replace("状态：创作者已确认", "状态：AI草稿待真人确认"),
+            "soul_pending",
+        ),
+        (NON_PRODUCTION_CONTENT["soul"] + ("扩" * 8_000), "soul_too_large"),
+    ],
+)
+def test_v2_soul_status_and_size_fail_closed(
+    tmp_path: Path,
+    soul: str,
+    expected_code: str,
+) -> None:
+    package = create_persona_package(tmp_path / "persona", content_overrides={"soul": soul})
+
+    with pytest.raises(PersonaPackageError) as exc_info:
+        validate_persona_package(package)
+
+    assert exc_info.value.code == expected_code
+
+
+def test_v1_source_is_not_selectable_but_snapshot_keeps_legacy_projection(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "personas"
+    source = create_persona_package(
+        source_root / "legacy",
+        schema_version="1.0.0",
+        version="1.0.0-test",
+    )
+    package = validate_persona_package(source)
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    shutil.copytree(source, snapshot_root / package.summary.snapshot_sha256)
+    catalog = PersonaCatalog(source_root, snapshot_root)
+
+    assert catalog.discover() == []
+    assert catalog.get("test-persona") is None
+
+    snapshot = catalog.resolve_snapshot(package.summary.snapshot_sha256)
+    context = catalog.load_stage_context(
+        snapshot.summary.snapshot_sha256,
+        InternalStage.GENERATING_STORY_OUTLINE,
+    )
+
+    assert "/persona/soul.md" not in context.files
+    assert "表达具有向前推动的能量" in context.files["/persona/l1-summary.md"]
+    assert "冲突表现克制" in context.files["/persona/l2-summary.md"]
+
+
 def test_canonical_hash_is_order_sensitive_and_manifest_is_excluded(tmp_path: Path) -> None:
     package = create_persona_package(tmp_path / "persona")
     manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
-    ordered_hashes = [
-        manifest["files"][name]["sha256"]
-        for name, _ in (
-            ("paradigm", "paradigm.md"),
-            ("project", "project.md"),
-            ("l0", "l0.md"),
-            ("l1", "l1.md"),
-            ("l2", "l2.md"),
-            ("l3", "l3.md"),
-            ("l4", "l4.md"),
-            ("l5", "l5.md"),
-            ("l6", "l6.md"),
-        )
-    ]
+    ordered_hashes = [manifest["files"][name]["sha256"] for name, _ in LOGICAL_FILES]
 
     assert canonical_package_sha256(ordered_hashes) == manifest["package_sha256"]
     assert canonical_package_sha256(reversed(ordered_hashes)) != manifest["package_sha256"]

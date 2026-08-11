@@ -1,22 +1,22 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "persona_id": "wuzhen",
   "display_name": "雾枕 · 悬疑",
-  "version": "0.1.0-prototype",
+  "version": "0.2.0-soul-prototype",
   "created_at": "2026-07-30T00:00:00Z",
-  "package_sha256": "080dd2106261b5edbb8efd1f82c4312b486fd06f3a6aa8b92676435bdbfb7722",
+  "package_sha256": "decc10d328e54c1eb44ee829d6aa9a797800fe85fbca05f6bd50a886ba566de4",
   "files": {
     "paradigm": {
       "path": "paradigm.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "bf0654e322f02d532ba9858d83765a175c903b04b6b7440e19837c6175c2ab00"
+      "sha256": "f123930cd596aec1db37ef3344afc827e7945b5fee9e957a8874ed84e56caa13"
     },
     "project": {
       "path": "project.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "830c7f2621aca1b3334997d58b1c10441f617aa5fcbbef17fdcdd32a80476c60"
+      "sha256": "ea637f8ec6f595369be24883e68deada1be6b6a59a0f6af9a23668cc8702224e"
     },
     "l0": {
       "path": "l0.md",
@@ -24,17 +24,11 @@
       "encoding": "utf-8",
       "sha256": "43775ed37caa6fe39515d7230f03cf35f1ce2031593019d88add31310e62e30f"
     },
-    "l1": {
-      "path": "l1.md",
+    "soul": {
+      "path": "soul.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "5654983eeddae9ad68f3ba550f7da38ea8cf29eae516c40e61623de1284ae0ea"
-    },
-    "l2": {
-      "path": "l2.md",
-      "media_type": "text/markdown",
-      "encoding": "utf-8",
-      "sha256": "2a278af6c1439a072b3fe4a9eff28d071e4b33d0838e8f80fa26f8dd1ea3f6b9"
+      "sha256": "0ec51e7d84b94726b3983b3a678dd150120b030649559bd03a37b65fcc9f8103"
     },
     "l3": {
       "path": "l3.md",

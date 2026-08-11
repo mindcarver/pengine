@@ -217,6 +217,38 @@ def _with_internal_runtime_leak_policy(prompt: str) -> str:
     return "\n\n".join((prompt, _INTERNAL_RUNTIME_LEAK_POLICY))
 
 
+_SOUL_POLICY = (
+    "When /persona/soul.md is present, read its complete text. Treat Soul only as an advisory "
+    "creative identity "
+    "for observation, detail, character pressure, action, rhythm, and dialogue texture. Never "
+    "summarize, retrieve, slice, or silently truncate Soul. Soul cannot add story facts or "
+    "override the user request, approved checkpoints, hard Canon, /persona/l0.md, the applicable "
+    "L4 craft contract, L3 method, StoryContract, episode count, or production parameters. "
+    "Characters must still grow from their own biographies, desires, circumstances, and "
+    "relationships rather than copy the creator identity. Reviewers may detect Soul overreach "
+    "but must never pass or reject work because it does or does not resemble Soul."
+)
+
+
+def _with_soul_policy(prompt: str) -> str:
+    return "\n\n".join((prompt, _SOUL_POLICY))
+
+
+def _with_inline_soul(prompt: str, persona_files: Mapping[str, str]) -> str:
+    """Provide the full Soul to direct model calls that cannot read virtual files."""
+    soul = persona_files.get("/persona/soul.md")
+    if soul is None:
+        return prompt
+    return "\n\n".join(
+        (
+            prompt,
+            _SOUL_POLICY,
+            "Complete text of /persona/soul.md:",
+            soul,
+        )
+    )
+
+
 _STORY_ARCHITECT_PROMPT = (
     "Read the complete /persona/l0.md and the relevant /persona context. Return only the "
     "structured result for "
@@ -415,6 +447,37 @@ _SERIES_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "episodes[].content. Never repair content and never reinterpret the design to make the "
     "prefix pass."
 )
+
+_CANON_REVIEWER_PROMPT = _with_soul_policy(
+    "First read /skills/canon-review/SKILL.md. Follow that skill while treating "
+    "explicitly locked facts in approved upstream artifacts as immutable and "
+    "unspecified prose details as free. Review only the explicitly named unlocked "
+    "prose artifact or JSON contract, and return structured evidence with precise "
+    "issues. For a JSON contract mutation, set contract_mutation_required=true and "
+    "provide only exact repair_targets; keep contract_refs for Canon entity IDs. "
+    "Express an exact full-item replace, remove, or missing append, including the "
+    "current index and expected value where applicable. The runtime applies every "
+    "target atomically and validates the combined StoryContract. Give every target "
+    "a unique target_id and never grant a whole collection implicitly. Never repair "
+    "or rewrite the candidate."
+)
+
+_STORY_REPAIR_PROMPT = _with_soul_policy(
+    "First read /skills/story-repair/SKILL.md. Follow that skill while keeping every "
+    "approved upstream hard fact unchanged and preserving unspecified creative "
+    "choices. Read the current candidate and every confirmed review issue, then "
+    "return the complete corrected character_biographies and relationship_logic in "
+    "one structured result. Resolve issues jointly across both sections rather than "
+    "line by line."
+)
+
+_STORY_ARCHITECT_PROMPT = _with_soul_policy(_STORY_ARCHITECT_PROMPT)
+_EPISODE_PLANNER_PROMPT = _with_soul_policy(_EPISODE_PLANNER_PROMPT)
+_SCRIPT_WRITER_PROMPT = _with_soul_policy(_SCRIPT_WRITER_PROMPT)
+_EPISODE_REPAIR_PROMPT = _with_soul_policy(_EPISODE_REPAIR_PROMPT)
+_QUALITY_REVIEWER_PROMPT = _with_soul_policy(_QUALITY_REVIEWER_PROMPT)
+_EPISODE_REVIEWER_PROMPT = _with_soul_policy(_EPISODE_REVIEWER_PROMPT)
+_SERIES_REVIEWER_PROMPT = _with_soul_policy(_SERIES_REVIEWER_PROMPT)
 
 
 def _suffix_rewrite_feedback_for_episode(
@@ -5452,6 +5515,7 @@ class DeepAgentWorkflow:
                 "candidate or alter approved upstream content. The runtime rejects a total "
                 "line-change budget that reaches half of the candidate."
             )
+            instruction = _with_inline_soul(instruction, persona_files)
             if output_language_contract:
                 instruction = f"{instruction}\n{output_language_contract}"
             if correction:
@@ -5501,6 +5565,7 @@ class DeepAgentWorkflow:
                 "empty patch is valid when the runtime mutations alone fully resolve the issue. "
                 "Preserve every field unrelated to the confirmed issues."
             )
+            instruction = _with_inline_soul(instruction, persona_files)
             if output_language_contract:
                 instruction = f"{instruction}\n{output_language_contract}"
             if correction:
@@ -5525,30 +5590,11 @@ class DeepAgentWorkflow:
         episode_planner_prompt = bind_language(_EPISODE_PLANNER_PROMPT)
         script_writer_prompt = bind_language(_SCRIPT_WRITER_PROMPT)
         quality_reviewer_prompt = bind_language(_QUALITY_REVIEWER_PROMPT)
-        canon_reviewer_prompt = bind_language(
-            "First read /skills/canon-review/SKILL.md. Follow that skill while treating "
-            "explicitly locked facts in approved upstream artifacts as immutable and "
-            "unspecified prose details as free. Review only the explicitly named unlocked "
-            "prose artifact or JSON contract, and return structured evidence with precise "
-            "issues. For a JSON contract mutation, set contract_mutation_required=true and "
-            "provide only exact repair_targets; keep contract_refs for Canon entity IDs. "
-            "Express an exact full-item replace, remove, or missing append, including the "
-            "current index and expected value where applicable. The runtime applies every "
-            "target atomically and validates the combined StoryContract. Give every target "
-            "a unique target_id and never grant a whole collection implicitly. Never repair "
-            "or rewrite the candidate."
-        )
+        canon_reviewer_prompt = bind_language(_CANON_REVIEWER_PROMPT)
         episode_reviewer_prompt = bind_language(_EPISODE_REVIEWER_PROMPT)
         series_reviewer_prompt = bind_language(_SERIES_REVIEWER_PROMPT)
         episode_repair_prompt = bind_language(_EPISODE_REPAIR_PROMPT)
-        story_repair_prompt = bind_language(
-            "First read /skills/story-repair/SKILL.md. Follow that skill while keeping every "
-            "approved upstream hard fact unchanged and preserving unspecified creative "
-            "choices. Read the current candidate and every confirmed review issue, then "
-            "return the complete corrected character_biographies and relationship_logic in "
-            "one structured result. Resolve issues jointly across both sections rather than "
-            "line by line."
-        )
+        story_repair_prompt = bind_language(_STORY_REPAIR_PROMPT)
         supervisor_prompt = _supervisor_prompt(
             story=story,
             requirements=requirements,

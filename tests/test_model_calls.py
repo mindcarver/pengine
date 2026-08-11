@@ -459,11 +459,28 @@ def test_langfuse_model_call_event_contains_response_identity(monkeypatch) -> No
         model="claude-opus-5",
         error_code="relay_incompatible",
         response_model_ids=["relay-fallback"],
+        persona_schema_version="2.0.0",
+        persona_id="test-persona",
+        persona_version="2.0.0-test",
+        persona_snapshot_sha256="a" * 64,
+        soul_sha256="b" * 64,
+        soul_char_count=321,
+        soul_mount_path="/persona/soul.md",
+        soul_full_text_loaded=True,
     )
 
     assert captured["input"]["response_model_ids"] == ["relay-fallback"]
     assert captured["input"]["model_identity_verified"] is False
     assert captured["name"].endswith("identity-relay-fallback")
+    assert captured["metadata"]["persona_schema_version"] == "2.0.0"
+    assert captured["metadata"]["persona_id"] == "test-persona"
+    assert captured["metadata"]["persona_version"] == "2.0.0-test"
+    assert captured["metadata"]["persona_snapshot_sha256"] == "a" * 64
+    assert captured["metadata"]["soul_sha256"] == "b" * 64
+    assert captured["metadata"]["soul_char_count"] == 321
+    assert captured["metadata"]["soul_mount_path"] == "/persona/soul.md"
+    assert captured["metadata"]["soul_full_text_loaded"] is True
+    assert "soul_text" not in captured["metadata"]
 
 
 def test_store_persists_records_across_restart_and_supersedes_overlap(
@@ -617,6 +634,14 @@ def test_model_call_id_is_unique_and_lineaged(tmp_path: Path) -> None:
         stage="generating_episode_scripts",
         episode_number=3,
         operation_id="episode-3-operation",
+        persona_schema_version="2.0.0",
+        persona_id="test-persona",
+        persona_version="2.0.0-test",
+        persona_snapshot_sha256="a" * 64,
+        soul_sha256="b" * 64,
+        soul_char_count=321,
+        soul_mount_path="/persona/soul.md",
+        soul_full_text_loaded=True,
     )
     first = build_started_record(
         role="generation",
@@ -643,7 +668,9 @@ def test_model_call_id_is_unique_and_lineaged(tmp_path: Path) -> None:
     store.upsert(first)
     store.upsert(second)
     row = store._connection.execute(
-        "SELECT operation_id, run_id, creation_id, thread_id, run_kind, stage, episode_number "
+        "SELECT operation_id, run_id, creation_id, thread_id, run_kind, stage, episode_number, "
+        "persona_schema_version, persona_id, persona_version, persona_snapshot_sha256, "
+        "soul_sha256, soul_char_count, soul_mount_path, soul_full_text_loaded "
         "FROM model_calls WHERE call_id = ?",
         (first.call_id,),
     ).fetchone()
@@ -654,6 +681,14 @@ def test_model_call_id_is_unique_and_lineaged(tmp_path: Path) -> None:
     assert row["run_kind"] == "initial"
     assert row["stage"] == "generating_episode_scripts"
     assert row["episode_number"] == 3
+    assert row["persona_schema_version"] == "2.0.0"
+    assert row["persona_id"] == "test-persona"
+    assert row["persona_version"] == "2.0.0-test"
+    assert row["persona_snapshot_sha256"] == "a" * 64
+    assert row["soul_sha256"] == "b" * 64
+    assert row["soul_char_count"] == 321
+    assert row["soul_mount_path"] == "/persona/soul.md"
+    assert row["soul_full_text_loaded"] == 1
     store.close()
 
 
@@ -727,7 +762,8 @@ def test_store_migrates_legacy_table_without_provider_evidence_columns(
     store.upsert(record)
 
     rows = store._connection.execute(
-        "SELECT call_id, operation_id, http_status, provider_error_code, redacted_response "
+        "SELECT call_id, operation_id, http_status, provider_error_code, redacted_response, "
+        "persona_schema_version, soul_sha256, soul_full_text_loaded "
         "FROM model_calls ORDER BY requested_at"
     ).fetchall()
     assert len(rows) == 2
@@ -736,6 +772,9 @@ def test_store_migrates_legacy_table_without_provider_evidence_columns(
     assert rows[0]["http_status"] is None
     assert rows[0]["provider_error_code"] is None
     assert rows[0]["redacted_response"] is None
+    assert rows[0]["persona_schema_version"] is None
+    assert rows[0]["soul_sha256"] is None
+    assert rows[0]["soul_full_text_loaded"] == 0
     assert rows[1]["call_id"] != "legacy-1"
     assert rows[1]["operation_id"] is None
     assert rows[1]["http_status"] is None

@@ -1,22 +1,22 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "persona_id": "shouzhuo",
   "display_name": "守拙 · 正剧",
-  "version": "0.2.0-l0",
+  "version": "0.3.0-soul",
   "created_at": "2026-07-30T00:00:00Z",
-  "package_sha256": "4560d513daee147fc487fa56cc21d688b96cbeef39d799ecc42a6ad5154e5121",
+  "package_sha256": "3e40beee5d12d798f58d7593deaafb59a52c18bb8baa98a88e06efbc741692c5",
   "files": {
     "paradigm": {
       "path": "paradigm.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "bf0654e322f02d532ba9858d83765a175c903b04b6b7440e19837c6175c2ab00"
+      "sha256": "f123930cd596aec1db37ef3344afc827e7945b5fee9e957a8874ed84e56caa13"
     },
     "project": {
       "path": "project.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "c1be94b8b53f853acd57c6dee135165ecb49d12a17f6b26c1739802525837903"
+      "sha256": "4303ed81439e4ff800be5ed35637b0f5216802c38780ca79ec911bb6de905989"
     },
     "l0": {
       "path": "l0.md",
@@ -24,17 +24,11 @@
       "encoding": "utf-8",
       "sha256": "cf3b74abdc261d64664992683f100941775f7f50b13ea1a3684470220ea4cc67"
     },
-    "l1": {
-      "path": "l1.md",
+    "soul": {
+      "path": "soul.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "2a9bdb43ccc0f8e2d0c9c858db8ff210e06b1656d81a825e603dd2c3ac4fc4be"
-    },
-    "l2": {
-      "path": "l2.md",
-      "media_type": "text/markdown",
-      "encoding": "utf-8",
-      "sha256": "1040ce959a9bb1861d6e47a7e67378a3ebb00786f7893f33f3ba148d8d95df61"
+      "sha256": "4234686ce39fed7efd3c48ac9d4b4674be845ba16043b50a064b7361322d2ab3"
     },
     "l3": {
       "path": "l3.md",
