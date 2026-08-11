@@ -34,7 +34,12 @@ from pengine.model_calls import (
     new_operation_id,
 )
 from pengine.observability import content_fingerprint, record_langfuse_event
-from pengine.personas import PersonaCatalog, PersonaPackageError, extract_l0_variant_ids
+from pengine.personas import (
+    PERSONA_SCHEMA_V2,
+    PersonaCatalog,
+    PersonaPackageError,
+    extract_l0_variant_ids,
+)
 from pengine.relay import (
     PreflightBlockedError,
     RelayError,
@@ -552,6 +557,7 @@ class Worker:
         trace_cm = _langfuse_trace_context(self.settings, work)
         stage_cm: Any = None
         stage_observation: Any = None
+        persona_trace_metadata: dict[str, Any] = {}
 
         def close_stage_observation(*, status: str, error: str | None = None) -> None:
             nonlocal stage_cm, stage_observation
@@ -588,6 +594,7 @@ class Worker:
                             "stage": stage.value,
                             "attempt": attempt,
                             "trace_version": "pengine-1",
+                            **persona_trace_metadata,
                         },
                     )
                 )
@@ -605,6 +612,27 @@ class Worker:
                         InternalStage.LOADING_PERSONA,
                     )
                 snapshot = self.catalog.resolve_snapshot(work.persona.snapshot_sha256)
+                schema_version = str(snapshot.manifest["schema_version"])
+                soul_text = snapshot.text("soul") if schema_version == PERSONA_SCHEMA_V2 else None
+                persona_trace_metadata.update(
+                    {
+                        "persona_schema_version": schema_version,
+                        "persona_id": snapshot.summary.persona_id,
+                        "persona_version": snapshot.summary.version,
+                        "persona_snapshot_sha256": snapshot.summary.snapshot_sha256,
+                        "soul_sha256": (
+                            snapshot.manifest["files"]["soul"]["sha256"]
+                            if soul_text is not None
+                            else None
+                        ),
+                        "soul_char_count": len(soul_text) if soul_text is not None else None,
+                        "soul_mount_path": "/persona/soul.md" if soul_text is not None else None,
+                        "soul_full_text_loaded": soul_text is not None,
+                    }
+                )
+                if model_call_state is not None:
+                    for key, value in persona_trace_metadata.items():
+                        setattr(model_call_state.context, key, value)
                 if InternalStage.LOADING_PERSONA not in approved:
                     loading_payload = snapshot.summary.model_dump(mode="json")
                     await self.repository.approve_checkpoint(

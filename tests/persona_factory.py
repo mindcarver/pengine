@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LOGICAL_FILES: tuple[tuple[str, str], ...] = (
+V1_LOGICAL_FILES: tuple[tuple[str, str], ...] = (
     ("paradigm", "paradigm.md"),
     ("project", "project.md"),
     ("l0", "l0.md"),
@@ -17,6 +17,17 @@ LOGICAL_FILES: tuple[tuple[str, str], ...] = (
     ("l5", "l5.md"),
     ("l6", "l6.md"),
 )
+V2_LOGICAL_FILES: tuple[tuple[str, str], ...] = (
+    ("paradigm", "paradigm.md"),
+    ("project", "project.md"),
+    ("l0", "l0.md"),
+    ("soul", "soul.md"),
+    ("l3", "l3.md"),
+    ("l4", "l4.md"),
+    ("l5", "l5.md"),
+    ("l6", "l6.md"),
+)
+LOGICAL_FILES = V2_LOGICAL_FILES
 
 NON_PRODUCTION_CONTENT: dict[str, str] = {
     "paradigm": """\
@@ -192,23 +203,67 @@ NON_PRODUCTION_CONTENT: dict[str, str] = {
 """,
 }
 
+V1_NON_PRODUCTION_CONTENT = dict(NON_PRODUCTION_CONTENT)
+NON_PRODUCTION_CONTENT.update(
+    {
+        "paradigm": NON_PRODUCTION_CONTENT["paradigm"].replace(
+            "## L1 定义\n命运画像定义。\n## L2 定义\n能量画像定义。",
+            "## Soul 定义\n稳定创作身份与表达默认值。",
+        ),
+        "project": NON_PRODUCTION_CONTENT["project"].replace(
+            "## L1 摘要与状态\n- [真人已定][归属:创作者] 表达直接。\n"
+            "## L2 摘要与状态\n- [真人已定][归属:创作者] 张力内敛。",
+            "## Soul 状态\n- [创作者已确认][归属:创作者] 完整正文读取 "
+            "`/persona/soul.md`；Soul 只提供创作默认值。",
+        ),
+        "soul": """\
+# 非生产测试 Soul
+
+> NON-PRODUCTION TEST FIXTURE
+>
+> 状态：创作者已确认 · 归属：创作者
+
+## 身份
+让人物通过主动选择表达价值。
+## 观察与表达
+观察具体行动和关系后果。
+## 创作能量
+用清晰因果推动人物行动。
+## 生产性张力
+允许信念与现实形成张力，但母题由 L0 决定。
+## 避免
+不把所有人物写成同一种性格。
+## 权限与仲裁
+Soul 不得覆盖用户要求、Canon、L0、L4、L3 或 StoryContract。
+""",
+    }
+)
+
 
 def create_persona_package(
     package_dir: Path,
     *,
     persona_id: str = "test-persona",
     display_name: str = "非生产测试人格",
-    version: str = "1.0.0-test",
+    version: str = "2.0.0-test",
+    schema_version: str = "2.0.0",
     content_overrides: dict[str, str] | None = None,
     manifest_mutator: Callable[[dict[str, Any]], None] | None = None,
 ) -> Path:
     package_dir.mkdir(parents=True, exist_ok=True)
-    contents = dict(NON_PRODUCTION_CONTENT)
+    if schema_version == "1.0.0":
+        logical_files = V1_LOGICAL_FILES
+        contents = dict(V1_NON_PRODUCTION_CONTENT)
+    elif schema_version == "2.0.0":
+        logical_files = V2_LOGICAL_FILES
+        contents = dict(NON_PRODUCTION_CONTENT)
+    else:
+        raise ValueError(f"Unsupported test persona schema: {schema_version}")
     contents.update(content_overrides or {})
 
     files: dict[str, dict[str, str]] = {}
     hashes: list[str] = []
-    for logical_name, filename in LOGICAL_FILES:
+    for logical_name, filename in logical_files:
         raw = contents[logical_name].encode("utf-8")
         (package_dir / filename).write_bytes(raw)
         digest = hashlib.sha256(raw).hexdigest()
@@ -221,7 +276,7 @@ def create_persona_package(
         hashes.append(digest)
 
     manifest: dict[str, Any] = {
-        "schema_version": "1.0.0",
+        "schema_version": schema_version,
         "persona_id": persona_id,
         "display_name": display_name,
         "version": version,

@@ -130,12 +130,12 @@ review     = ChatDeepSeek  / deepseek-v4-flash
 `48` 次、审核调用 `32` 次；剧本阶段另有全剧生成 `192`、审核 `128` 的总上限，同时
 仍受单集对应角色上限约束。预算在出站前原子保留，超限不会触发 provider 请求。
 
-## 4. 人格包：从九个文件到不可变上下文
+## 4. 人格包：从 persona v2 到不可变上下文
 
 一个可选择人格必须包含 `manifest.json` 和以下固定文件：
 
 ```text
-paradigm.md  project.md  l0.md  l1.md  l2.md
+paradigm.md  project.md  l0.md  soul.md
 l3.md        l4.md      l5.md  l6.md
 ```
 
@@ -144,14 +144,16 @@ l3.md        l4.md      l5.md  l6.md
 1. `PersonaCatalog.discover()` 扫描人格根目录。
 2. 只接受固定文件集合、UTF-8 文本、合法 JSON、符合 `persona-package.schema.json` 的 manifest。
 3. 每个 Markdown 文件的声明 SHA-256 必须匹配实际内容，并且标题/状态/归属结构必须通过。
-4. 按固定九文件顺序拼接各文件 hash，形成 `package_sha256`。
+4. 按 schema 对应的固定文件顺序拼接各文件 hash，形成 `package_sha256`。
 5. 将规范化 manifest 与 `package_sha256` 放入域分离 hash，形成 `snapshot_sha256`。
 6. 创建任务时复制到 `data/persona-snapshots/<snapshot_sha256>/`；任务只引用快照 hash，不引用会变化的源路径。
 
-人格上下文不是九个文件无条件全文注入：
+人格上下文按职责投影：
 
 - `/persona/` 是只读虚拟上下文；
-- `project`、L0、L1-L3 摘要和按阶段选择的 L4 内容进入工作上下文；
+- `project`、完整 L0、完整 Soul、L3 摘要和按阶段选择的 L4 内容进入工作上下文；
+- v2 的 Soul 在所有模型阶段读取同一份全文，不摘要、不检索、不切片、不静默截断；
+- 历史 v1 snapshot 继续使用 L1/L2 摘要路径，但 v1 source package 不再用于新任务；
 - L5/L6 走有界检索，受结果数量和字符数限制；
 - `/workspace/` 是该 Agent thread 的临时 scratch；
 - 不配置 `StoreBackend`，不会形成跨任务可写记忆。

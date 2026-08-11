@@ -23,7 +23,10 @@ from pengine.schemas import InternalStage, PersonaSnapshot, PersonaSummary
 logger = logging.getLogger(__name__)
 
 MANIFEST_NAME = "manifest.json"
-LOGICAL_FILES: tuple[tuple[str, str], ...] = (
+PERSONA_SCHEMA_V1 = "1.0.0"
+PERSONA_SCHEMA_V2 = "2.0.0"
+CURRENT_PERSONA_SCHEMA = PERSONA_SCHEMA_V2
+V1_LOGICAL_FILES: tuple[tuple[str, str], ...] = (
     ("paradigm", "paradigm.md"),
     ("project", "project.md"),
     ("l0", "l0.md"),
@@ -34,7 +37,25 @@ LOGICAL_FILES: tuple[tuple[str, str], ...] = (
     ("l5", "l5.md"),
     ("l6", "l6.md"),
 )
-EXPECTED_ENTRY_NAMES = frozenset({MANIFEST_NAME, *(name for _, name in LOGICAL_FILES)})
+V2_LOGICAL_FILES: tuple[tuple[str, str], ...] = (
+    ("paradigm", "paradigm.md"),
+    ("project", "project.md"),
+    ("l0", "l0.md"),
+    ("soul", "soul.md"),
+    ("l3", "l3.md"),
+    ("l4", "l4.md"),
+    ("l5", "l5.md"),
+    ("l6", "l6.md"),
+)
+LOGICAL_FILES_BY_SCHEMA = MappingProxyType(
+    {
+        PERSONA_SCHEMA_V1: V1_LOGICAL_FILES,
+        PERSONA_SCHEMA_V2: V2_LOGICAL_FILES,
+    }
+)
+# The public default describes packages selectable for new work. Historical v1
+# callers must pass their schema version explicitly.
+LOGICAL_FILES = V2_LOGICAL_FILES
 DEFAULT_SCHEMA_PATH = (
     Path(__file__).resolve().parents[2] / "contracts" / "persona-package.schema.json"
 )
@@ -43,6 +64,7 @@ DEFAULT_RETRIEVAL_LIMIT = 5
 DEFAULT_RETRIEVAL_MAX_CHARS = 6_000
 DEFAULT_RETRIEVAL_RESULT_CHARS = 1_200
 MAX_RETRIEVAL_LIMIT = 20
+MAX_SOUL_CHARS = 8_000
 SNAPSHOT_HASH_DOMAIN = b"pengine-persona-snapshot-v1\0"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -75,9 +97,17 @@ class ValidatedPersonaPackage:
     package_sha256: str
     _raw_entries: Mapping[str, bytes]
 
+    @property
+    def schema_version(self) -> str:
+        return str(self.manifest["schema_version"])
+
+    @property
+    def logical_files(self) -> tuple[tuple[str, str], ...]:
+        return _logical_files(self.schema_version)
+
     def text(self, logical_name: str) -> str:
         try:
-            filename = dict(LOGICAL_FILES)[logical_name]
+            filename = dict(self.logical_files)[logical_name]
             raw = self._raw_entries[filename]
         except KeyError as exc:
             raise PersonaPackageError(
@@ -113,14 +143,28 @@ class ReferenceHit:
     score: int
 
 
-def canonical_package_sha256(file_hashes: Iterable[str]) -> str:
+def _logical_files(schema_version: str) -> tuple[tuple[str, str], ...]:
+    try:
+        return LOGICAL_FILES_BY_SCHEMA[schema_version]
+    except KeyError as exc:
+        raise PersonaPackageError(
+            "unsupported_persona_schema", "Persona schema version is not supported"
+        ) from exc
+
+
+def canonical_package_sha256(
+    file_hashes: Iterable[str],
+    *,
+    schema_version: str = CURRENT_PERSONA_SCHEMA,
+) -> str:
     hashes = tuple(file_hashes)
-    if len(hashes) != len(LOGICAL_FILES) or any(
+    logical_files = _logical_files(schema_version)
+    if len(hashes) != len(logical_files) or any(
         not _SHA256_RE.fullmatch(value) for value in hashes
     ):
         raise PersonaPackageError(
             "invalid_file_hashes",
-            f"Canonical package hash requires {len(LOGICAL_FILES)} lowercase SHA-256 values",
+            f"Canonical package hash requires {len(logical_files)} lowercase SHA-256 values",
         )
     return hashlib.sha256("".join(hashes).encode("ascii")).hexdigest()
 
@@ -164,8 +208,9 @@ def validate_persona_package(
     schema_path: Path = DEFAULT_SCHEMA_PATH,
 ) -> ValidatedPersonaPackage:
     package_path = Path(package_path)
-    _validate_package_directory(package_path)
+    _validate_package_root(package_path)
 
+    _validate_contained_regular_file(package_path, package_path / MANIFEST_NAME)
     manifest_raw = _read_entry(package_path / MANIFEST_NAME)
     try:
         manifest = json.loads(manifest_raw.decode("utf-8"), object_pairs_hook=_unique_object)
@@ -175,6 +220,16 @@ def validate_persona_package(
         raise PersonaPackageError(
             "invalid_manifest", "Manifest must be unique-key UTF-8 JSON"
         ) from exc
+
+    declared_schema = manifest.get("schema_version") if isinstance(manifest, Mapping) else None
+    declared_files = manifest.get("files") if isinstance(manifest, Mapping) else None
+    declared_file_names = set(declared_files) if isinstance(declared_files, Mapping) else set()
+    if (
+        declared_schema == PERSONA_SCHEMA_V2 and declared_file_names.intersection({"l1", "l2"})
+    ) or (declared_schema == PERSONA_SCHEMA_V1 and "soul" in declared_file_names):
+        raise PersonaPackageError(
+            "mixed_persona_schema", "Persona package cannot mix Soul with L1 or L2"
+        )
 
     schema = _load_schema(schema_path)
     errors = sorted(
@@ -187,9 +242,13 @@ def validate_persona_package(
             "manifest_schema_invalid", f"Manifest does not match schema at {location}"
         )
 
+    schema_version = manifest["schema_version"]
+    logical_files = _logical_files(schema_version)
+    _validate_package_directory(package_path, schema_version, logical_files)
+
     raw_entries: dict[str, bytes] = {MANIFEST_NAME: manifest_raw}
     actual_hashes: list[str] = []
-    for logical_name, filename in LOGICAL_FILES:
+    for logical_name, filename in logical_files:
         declared = manifest["files"][logical_name]
         if declared["path"] != filename:
             raise PersonaPackageError("unsafe_file_path", f"Invalid fixed path for {logical_name}")
@@ -207,11 +266,11 @@ def validate_persona_package(
         actual_hash = hashlib.sha256(raw).hexdigest()
         if actual_hash != declared["sha256"]:
             raise PersonaPackageError("file_hash_mismatch", f"Hash mismatch for {filename}")
-        _validate_required_structure(logical_name, text)
+        _validate_required_structure(logical_name, text, schema_version=schema_version)
         raw_entries[filename] = raw
         actual_hashes.append(actual_hash)
 
-    package_hash = canonical_package_sha256(actual_hashes)
+    package_hash = canonical_package_sha256(actual_hashes, schema_version=schema_version)
     if package_hash != manifest["package_sha256"]:
         raise PersonaPackageError("package_hash_mismatch", "Canonical package hash mismatch")
     snapshot_hash = canonical_snapshot_sha256(manifest, package_hash)
@@ -294,16 +353,19 @@ def _project_stage_context(
     files: dict[str, str] = {
         "/persona/project.md": project,
         "/persona/l0.md": l0,
-        "/persona/l1-summary.md": _extract_required_section(
-            snapshot.text("l1"), (("摘要", "summary"),), "l1 summary"
-        ),
-        "/persona/l2-summary.md": _extract_required_section(
-            snapshot.text("l2"), (("摘要", "summary"),), "l2 summary"
-        ),
         "/persona/l3-summary.md": _extract_required_section(
             snapshot.text("l3"), (("摘要", "summary"),), "l3 summary"
         ),
     }
+    if snapshot.manifest["schema_version"] == PERSONA_SCHEMA_V2:
+        files["/persona/soul.md"] = snapshot.text("soul")
+    else:
+        files["/persona/l1-summary.md"] = _extract_required_section(
+            snapshot.text("l1"), (("摘要", "summary"),), "l1 summary"
+        )
+        files["/persona/l2-summary.md"] = _extract_required_section(
+            snapshot.text("l2"), (("摘要", "summary"),), "l2 summary"
+        )
     l4_context = _stage_l4_context(snapshot.text("l4"), stage)
     if l4_context:
         files["/persona/l4.md"] = l4_context
@@ -442,7 +504,7 @@ class PersonaCatalog:
 
         temporary = Path(tempfile.mkdtemp(prefix=f".{snapshot_hash}.", dir=self.snapshot_root))
         try:
-            for name in sorted(EXPECTED_ENTRY_NAMES):
+            for name in sorted(package._raw_entries):
                 destination = temporary / name
                 with destination.open("xb") as stream:
                     stream.write(package._raw_entries[name])
@@ -545,6 +607,12 @@ class PersonaCatalog:
                     exc.code,
                 )
                 continue
+            if package.schema_version != CURRENT_PERSONA_SCHEMA:
+                logger.warning(
+                    "persona package rejected path=%s code=legacy_persona_not_selectable",
+                    child.name,
+                )
+                continue
             candidates[package.summary.persona_id].append(package)
         selectable: dict[str, ValidatedPersonaPackage] = {}
         for persona_id, packages in candidates.items():
@@ -559,18 +627,32 @@ class PersonaCatalog:
         return selectable
 
 
-def _validate_package_directory(package_path: Path) -> None:
+def _validate_package_root(package_path: Path) -> None:
     if package_path.is_symlink() or not package_path.is_dir():
         raise PersonaPackageError("unsafe_package_path", "Persona package must be a real directory")
+
+
+def _validate_package_directory(
+    package_path: Path,
+    schema_version: str,
+    logical_files: tuple[tuple[str, str], ...],
+) -> None:
     try:
         entries = tuple(package_path.iterdir())
     except OSError as exc:
         raise PersonaPackageError("package_unreadable", "Persona package cannot be read") from exc
     names = {entry.name for entry in entries}
-    if names != EXPECTED_ENTRY_NAMES or len(entries) != len(EXPECTED_ENTRY_NAMES):
+    if (schema_version == PERSONA_SCHEMA_V2 and names.intersection({"l1.md", "l2.md"})) or (
+        schema_version == PERSONA_SCHEMA_V1 and "soul.md" in names
+    ):
+        raise PersonaPackageError(
+            "mixed_persona_schema", "Persona package cannot mix Soul with L1 or L2"
+        )
+    expected_entry_names = frozenset({MANIFEST_NAME, *(name for _, name in logical_files)})
+    if names != expected_entry_names or len(entries) != len(expected_entry_names):
         raise PersonaPackageError(
             "invalid_package_entries",
-            "Persona package must contain only manifest.json and the nine fixed Markdown files",
+            "Persona package entries do not match its schema version",
         )
     for entry in entries:
         if entry.is_symlink() or not entry.is_file():
@@ -666,7 +748,12 @@ def _require_heading_groups(
         )
 
 
-def _validate_required_structure(logical_name: str, text: str) -> None:
+def _validate_required_structure(
+    logical_name: str,
+    text: str,
+    *,
+    schema_version: str,
+) -> None:
     if not text.strip():
         raise PersonaPackageError("empty_markdown", f"{logical_name}.md cannot be empty")
     headings = _headings(text)
@@ -675,11 +762,12 @@ def _validate_required_structure(logical_name: str, text: str) -> None:
             "required_heading_missing", f"{logical_name}.md must use Markdown headings"
         )
 
+    paradigm_layers = (("L1",), ("L2",)) if schema_version == PERSONA_SCHEMA_V1 else (("Soul",),)
+    project_layers = (("L1",), ("L2",)) if schema_version == PERSONA_SCHEMA_V1 else (("Soul",),)
     common: dict[str, tuple[tuple[str, ...], ...]] = {
         "paradigm": (
             ("L0",),
-            ("L1",),
-            ("L2",),
+            *paradigm_layers,
             ("L3",),
             ("L4",),
             ("L5",),
@@ -701,8 +789,7 @@ def _validate_required_structure(logical_name: str, text: str) -> None:
             ("变体", "variant"),
             ("雷区", "红线", "redline"),
             ("温度", "temperature"),
-            ("L1",),
-            ("L2",),
+            *project_layers,
             ("L3",),
             ("L4",),
             ("L5",),
@@ -720,6 +807,14 @@ def _validate_required_structure(logical_name: str, text: str) -> None:
         ),
         "l1": (("来源画像", "先天刻画", "原局", "profile"), ("摘要", "summary")),
         "l2": (("来源画像", "先天刻画", "星盘", "profile"), ("摘要", "summary")),
+        "soul": (
+            ("身份", "identity"),
+            ("观察与表达", "观察", "表达", "observation", "expression"),
+            ("创作能量", "能量", "creativeenergy"),
+            ("生产性张力", "张力", "tension"),
+            ("避免", "avoid"),
+            ("权限与仲裁", "权限", "仲裁", "authority", "arbitration"),
+        ),
         "l3": (
             ("手法", "method"),
             ("认知", "cognition"),
@@ -743,7 +838,9 @@ def _validate_required_structure(logical_name: str, text: str) -> None:
     if logical_name == "l0":
         _validate_l0_markers(text)
     if logical_name == "project":
-        _validate_project_statuses(text)
+        _validate_project_statuses(text, schema_version=schema_version)
+    if logical_name == "soul":
+        _validate_soul(text)
 
 
 def _validate_l0_markers(text: str) -> None:
@@ -823,13 +920,31 @@ def extract_l0_variant_ids(text: str) -> tuple[str, ...]:
     return tuple(ids)
 
 
-def _validate_project_statuses(text: str) -> None:
-    for layer in range(1, 7):
-        section = _extract_required_section(text, ((f"L{layer}",),), f"project L{layer} summary")
+def _validate_project_statuses(text: str, *, schema_version: str) -> None:
+    layers: tuple[str, ...]
+    if schema_version == PERSONA_SCHEMA_V1:
+        layers = tuple(f"L{layer}" for layer in range(1, 7))
+    else:
+        layers = ("Soul", "L3", "L4", "L5", "L6")
+    for layer in layers:
+        section = _extract_required_section(text, ((layer,),), f"project {layer} summary")
         if not _STATUS_RE.search(section):
             raise PersonaPackageError(
-                "project_status_missing", f"Project L{layer} summary needs a status marker"
+                "project_status_missing", f"Project {layer} summary needs a status marker"
             )
+
+
+def _validate_soul(text: str) -> None:
+    if len(text) > MAX_SOUL_CHARS:
+        raise PersonaPackageError(
+            "soul_too_large", f"Soul exceeds the {MAX_SOUL_CHARS}-character limit"
+        )
+    if _PENDING_RE.search(text):
+        raise PersonaPackageError("soul_pending", "Soul contains an unconfirmed marker")
+    if not _STATUS_RE.search(text) or not _OWNERSHIP_RE.search(text):
+        raise PersonaPackageError(
+            "soul_marker_invalid", "Soul needs confirmed status and ownership markers"
+        )
 
 
 def _extract_required_section(

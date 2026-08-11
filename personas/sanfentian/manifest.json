@@ -1,22 +1,22 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "persona_id": "sanfentian",
   "display_name": "三分甜 · 言情",
-  "version": "0.1.0-prototype",
+  "version": "0.2.0-soul-prototype",
   "created_at": "2026-07-30T00:00:00Z",
-  "package_sha256": "abfe479d2093da5d13a8ada4afbaddaeabfa4143e6f0a171138b36a88318da3f",
+  "package_sha256": "6d2a4d3c1c5870a626c8204fe841fd1f5a4d36f22693d67cb6d1942b2efabd0f",
   "files": {
     "paradigm": {
       "path": "paradigm.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "bf0654e322f02d532ba9858d83765a175c903b04b6b7440e19837c6175c2ab00"
+      "sha256": "f123930cd596aec1db37ef3344afc827e7945b5fee9e957a8874ed84e56caa13"
     },
     "project": {
       "path": "project.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "d45a1f6005ce609f0b58ef9d3ac96f321da67de74776d741c138a9cd9a90172f"
+      "sha256": "4f15915e33ea7673ac761e6110bb32119a7e8520beb925bf786440225e01da7c"
     },
     "l0": {
       "path": "l0.md",
@@ -24,17 +24,11 @@
       "encoding": "utf-8",
       "sha256": "59780216e49e4d270f8e0b6fbf2018e8fc06762dd0f5998a21a209944bdf7d37"
     },
-    "l1": {
-      "path": "l1.md",
+    "soul": {
+      "path": "soul.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "39e81253b7e300f82be2e9ef0d2111bab3b4379dfe9b8153796cc9ea3b3f178f"
-    },
-    "l2": {
-      "path": "l2.md",
-      "media_type": "text/markdown",
-      "encoding": "utf-8",
-      "sha256": "42f1ebf921f93d741fd2a5157ce9ecd4679751321e3fb2e540b535f44d20bdd3"
+      "sha256": "c20385985d86e6ca6c94574c27853b44739ae30077ae76ab9a26e519e7e4100d"
     },
     "l3": {
       "path": "l3.md",

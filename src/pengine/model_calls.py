@@ -87,7 +87,15 @@ CREATE TABLE IF NOT EXISTS model_calls (
     redacted_response TEXT,
     response_model_ids_json TEXT,
     safe_message TEXT,
-    supersedes_call_id TEXT
+    supersedes_call_id TEXT,
+    persona_schema_version TEXT,
+    persona_id TEXT,
+    persona_version TEXT,
+    persona_snapshot_sha256 TEXT,
+    soul_sha256 TEXT,
+    soul_char_count INTEGER,
+    soul_mount_path TEXT,
+    soul_full_text_loaded INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -178,6 +186,14 @@ class ModelCallContext:
     candidate: str | None = None
     batch: str | None = None
     operation_id: str | None = None
+    persona_schema_version: str | None = None
+    persona_id: str | None = None
+    persona_version: str | None = None
+    persona_snapshot_sha256: str | None = None
+    soul_sha256: str | None = None
+    soul_char_count: int | None = None
+    soul_mount_path: str | None = None
+    soul_full_text_loaded: bool = False
 
     def reset(self) -> None:
         self.run_id = None
@@ -190,6 +206,14 @@ class ModelCallContext:
         self.candidate = None
         self.batch = None
         self.operation_id = None
+        self.persona_schema_version = None
+        self.persona_id = None
+        self.persona_version = None
+        self.persona_snapshot_sha256 = None
+        self.soul_sha256 = None
+        self.soul_char_count = None
+        self.soul_mount_path = None
+        self.soul_full_text_loaded = False
 
 
 class StageCallBudgetExceeded(RuntimeError):
@@ -262,6 +286,14 @@ class ModelCallRecord:
     response_model_ids_json: str | None = None
     safe_message: str | None = None
     supersedes_call_id: str | None = None
+    persona_schema_version: str | None = None
+    persona_id: str | None = None
+    persona_version: str | None = None
+    persona_snapshot_sha256: str | None = None
+    soul_sha256: str | None = None
+    soul_char_count: int | None = None
+    soul_mount_path: str | None = None
+    soul_full_text_loaded: bool = False
 
 
 def new_call_id() -> str:
@@ -311,6 +343,14 @@ def build_started_record(
         episode_number=context.episode_number,
         candidate=context.candidate,
         batch=context.batch,
+        persona_schema_version=context.persona_schema_version,
+        persona_id=context.persona_id,
+        persona_version=context.persona_version,
+        persona_snapshot_sha256=context.persona_snapshot_sha256,
+        soul_sha256=context.soul_sha256,
+        soul_char_count=context.soul_char_count,
+        soul_mount_path=context.soul_mount_path,
+        soul_full_text_loaded=context.soul_full_text_loaded,
     )
 
 
@@ -475,6 +515,14 @@ _COLUMNS = (
     "response_model_ids_json",
     "safe_message",
     "supersedes_call_id",
+    "persona_schema_version",
+    "persona_id",
+    "persona_version",
+    "persona_snapshot_sha256",
+    "soul_sha256",
+    "soul_char_count",
+    "soul_mount_path",
+    "soul_full_text_loaded",
 )
 
 _UPSERT_SQL = f"""
@@ -514,6 +562,14 @@ _MODEL_CALL_ALTERS = (
     "ALTER TABLE model_calls ADD COLUMN provider_error_code TEXT",
     "ALTER TABLE model_calls ADD COLUMN redacted_response TEXT",
     "ALTER TABLE model_calls ADD COLUMN response_model_ids_json TEXT",
+    "ALTER TABLE model_calls ADD COLUMN persona_schema_version TEXT",
+    "ALTER TABLE model_calls ADD COLUMN persona_id TEXT",
+    "ALTER TABLE model_calls ADD COLUMN persona_version TEXT",
+    "ALTER TABLE model_calls ADD COLUMN persona_snapshot_sha256 TEXT",
+    "ALTER TABLE model_calls ADD COLUMN soul_sha256 TEXT",
+    "ALTER TABLE model_calls ADD COLUMN soul_char_count INTEGER",
+    "ALTER TABLE model_calls ADD COLUMN soul_mount_path TEXT",
+    "ALTER TABLE model_calls ADD COLUMN soul_full_text_loaded INTEGER NOT NULL DEFAULT 0",
 )
 
 
@@ -558,7 +614,7 @@ class ModelCallStore:
             for row in self._connection.execute("PRAGMA table_info(model_calls)").fetchall()
         }
         for statement in _MODEL_CALL_ALTERS:
-            column = statement.split()[-2]
+            column = statement.split()[5]
             if column not in existing:
                 self._connection.execute(statement)
 

@@ -97,6 +97,19 @@ def drain_audit_writes() -> None:
             )
 
 
+def _persona_event_fields(record: ModelCallRecord) -> dict[str, Any]:
+    return {
+        "persona_schema_version": record.persona_schema_version,
+        "persona_id": record.persona_id,
+        "persona_version": record.persona_version,
+        "persona_snapshot_sha256": record.persona_snapshot_sha256,
+        "soul_sha256": record.soul_sha256,
+        "soul_char_count": record.soul_char_count,
+        "soul_mount_path": record.soul_mount_path,
+        "soul_full_text_loaded": record.soul_full_text_loaded,
+    }
+
+
 class _SerialChatAnthropic(ChatAnthropic):
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
         kwargs["parallel_tool_calls"] = False
@@ -254,6 +267,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 model=self.model_id,
                 repair_round=context.repair_round,
                 error_code="agent_execution_limit",
+                **_persona_event_fields(record),
             )
             _MODEL_CALL_LOGGER.warning(
                 "model_call event=error role=%s requested_model_id=%s call_id=%s "
@@ -287,6 +301,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 model=self.model_id,
                 repair_round=context.repair_round,
                 error_code="preflight_blocked",
+                **_persona_event_fields(record),
             )
             _MODEL_CALL_LOGGER.info(
                 "model_call event=error role=%s requested_model_id=%s call_id=%s "
@@ -327,6 +342,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             call_id=record.call_id,
             model=record.model,
             repair_round=context.repair_round,
+            **_persona_event_fields(record),
         )
         _MODEL_CALL_LOGGER.info(
             "model_call event=start role=%s requested_model_id=%s call_id=%s "
@@ -511,6 +527,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             finish_reason=record.finish_reason,
             duration_seconds=record.duration_seconds,
             response_model_ids=response_model_ids,
+            **_persona_event_fields(record),
         )
 
     def _log_record(self, record: ModelCallRecord) -> None:

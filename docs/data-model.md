@@ -91,14 +91,14 @@ Creation 1
 ### 人格
 
 ```text
-per-file sha256（固定九文件顺序）
+per-file sha256（按 persona schema 固定顺序）
         ↓
 package_sha256 = SHA256(concat(file_hashes))
         ↓
 snapshot_sha256 = SHA256(domain + package_sha256 + canonical_manifest)
 ```
 
-manifest 自身不放进 `package_sha256`，避免循环；但规范化 manifest 会参与 `snapshot_sha256`，所以人格身份和九份 Markdown 内容共同决定最终快照。
+manifest 自身不放进 `package_sha256`，避免循环；但规范化 manifest 会参与 `snapshot_sha256`，所以人格身份和该 schema 的完整 Markdown 集合共同决定最终快照。新任务使用包含 `soul.md` 的 v2 八文件集合；历史 v1 snapshot 仍保持原九文件身份。
 
 ### 设计
 

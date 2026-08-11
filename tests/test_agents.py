@@ -26,6 +26,7 @@ from persona_factory import create_persona_package
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from pengine.agents import (
+    _CANON_REVIEWER_PROMPT,
     _EPISODE_PLANNER_PROMPT,
     _EPISODE_REPAIR_PROMPT,
     _EPISODE_REVIEWER_PROMPT,
@@ -36,6 +37,7 @@ from pengine.agents import (
     _SERIES_REVIEWER_PROMPT,
     _SPECIALIST_SKILL_SOURCES,
     _STORY_ARCHITECT_PROMPT,
+    _STORY_REPAIR_PROMPT,
     REVIEW_FILE_PERMISSIONS,
     SKILLED_WRITE_PERMISSIONS,
     VIRTUAL_FILE_PERMISSIONS,
@@ -79,6 +81,7 @@ from pengine.agents import (
     _supervisor_prompt,
     _validate_outline_repair_patch_targets,
     _validate_result_language,
+    _with_inline_soul,
     flatten_cr_candidate,
 )
 from pengine.config import Settings
@@ -4029,6 +4032,37 @@ def test_specialist_prompts_apply_l0_by_stage_without_copying_source_content() -
     assert "初心 vs 现实的落差" not in combined
     assert "warmth before harm" not in combined
     assert "explanatory voiceover" not in combined
+
+
+def test_all_model_stage_prompts_read_full_advisory_soul() -> None:
+    prompts = (
+        _STORY_ARCHITECT_PROMPT,
+        _EPISODE_PLANNER_PROMPT,
+        _SCRIPT_WRITER_PROMPT,
+        _EPISODE_REPAIR_PROMPT,
+        _QUALITY_REVIEWER_PROMPT,
+        _EPISODE_REVIEWER_PROMPT,
+        _SERIES_REVIEWER_PROMPT,
+        _CANON_REVIEWER_PROMPT,
+        _STORY_REPAIR_PROMPT,
+    )
+
+    for prompt in prompts:
+        assert "When /persona/soul.md is present, read its complete text" in prompt
+        assert "Never summarize, retrieve, slice, or silently truncate Soul" in prompt
+        assert "must never pass or reject work" in prompt
+        assert "hard Canon" in prompt
+        assert "StoryContract" in prompt
+
+
+def test_direct_patch_prompt_inlines_the_complete_soul_only_for_v2() -> None:
+    soul = "# Soul\n\nfirst line\nlast line"
+    prompt = _with_inline_soul("Repair the candidate.", {"/persona/soul.md": soul})
+
+    assert prompt.count(soul) == 1
+    assert "Complete text of /persona/soul.md:" in prompt
+    assert "Never summarize, retrieve, slice, or silently truncate Soul" in prompt
+    assert _with_inline_soul("Repair the candidate.", {}) == "Repair the candidate."
 
 
 def test_l4_reviewer_prompt_only_locks_explicit_verbatim_facts() -> None:

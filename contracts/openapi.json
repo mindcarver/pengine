@@ -33,7 +33,7 @@
                           "persona_id": "example-non-production",
                           "display_name": "非生产示例人格",
                           "version": "0.0.0-example",
-                          "snapshot_sha256": "3353503b56a85aaa0da1eb61b81e9e598ac200199610ef5bdfe8402f248126fd"
+                  "snapshot_sha256": "b33deac3aa96086a3344b10181d2a517fbdde54e69eb706fcc28ce732e8e2587"
                         }
                       ]
                     }

@@ -1,22 +1,22 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "persona_id": "xinggui",
   "display_name": "星轨 · 科幻",
-  "version": "0.1.0-prototype",
+  "version": "0.2.0-soul-prototype",
   "created_at": "2026-07-30T00:00:00Z",
-  "package_sha256": "4647ba7ae0be584dbc347d6545fd0b31622e2431afb38f2365d6b2635c1fae3e",
+  "package_sha256": "80c1392dfe1a9ee6a5deda52a394012d1cb0205d8bf796a8c3f4569ac0e2af03",
   "files": {
     "paradigm": {
       "path": "paradigm.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "bf0654e322f02d532ba9858d83765a175c903b04b6b7440e19837c6175c2ab00"
+      "sha256": "f123930cd596aec1db37ef3344afc827e7945b5fee9e957a8874ed84e56caa13"
     },
     "project": {
       "path": "project.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "d7921e6be869658e2d55a372313fa427d204cb617acc67cf225da85b1d0cc0c3"
+      "sha256": "0791ff75b3641aa9abdcd58364b759f040f97b1b20fa73a9c3f480da25705be6"
     },
     "l0": {
       "path": "l0.md",
@@ -24,17 +24,11 @@
       "encoding": "utf-8",
       "sha256": "07bf17a2e9fafab7e82a31628a8bcdc85f79985b1304fad7d6776cbeda34d3b1"
     },
-    "l1": {
-      "path": "l1.md",
+    "soul": {
+      "path": "soul.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "8c5a55d4cdbd8994c1a45c2f9e30176ed230f2250cb11c08b55771cb4d0f0dc2"
-    },
-    "l2": {
-      "path": "l2.md",
-      "media_type": "text/markdown",
-      "encoding": "utf-8",
-      "sha256": "1739c838d94aae72108c32f2be42ffbc5c18987b69f0818e44034ba0806bffa6"
+      "sha256": "ef5ce01424aa418dfc6e99c8d05ff402866d71d8382aa87c9fa02861114d659f"
     },
     "l3": {
       "path": "l3.md",

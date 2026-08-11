@@ -45,6 +45,14 @@ def record_model_call_event(
     finish_reason: str | None = None,
     duration_seconds: float | None = None,
     response_model_ids: list[str] | None = None,
+    persona_schema_version: str | None = None,
+    persona_id: str | None = None,
+    persona_version: str | None = None,
+    persona_snapshot_sha256: str | None = None,
+    soul_sha256: str | None = None,
+    soul_char_count: int | None = None,
+    soul_mount_path: str | None = None,
+    soul_full_text_loaded: bool = False,
 ) -> None:
     """Record queryable, content-safe lineage for one outbound model call.
 
@@ -101,6 +109,14 @@ def record_model_call_event(
             "error_code": error_code,
             "finish_reason": finish_reason,
             "duration_seconds": duration_seconds,
+            "persona_schema_version": persona_schema_version,
+            "persona_id": persona_id,
+            "persona_version": persona_version,
+            "persona_snapshot_sha256": persona_snapshot_sha256,
+            "soul_sha256": soul_sha256,
+            "soul_char_count": soul_char_count,
+            "soul_mount_path": soul_mount_path,
+            "soul_full_text_loaded": soul_full_text_loaded,
         },
     )
 
