@@ -424,7 +424,12 @@ def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMe
             {
                 "stage": "accepting_l0",
                 "passed": True,
-                "evidence": "符合 L0",
+                "evidence": (
+                    "母题兑现：人物用行动回答母题。\n"
+                    "选定侧面：创作方向贯穿全剧。\n"
+                    "雷区：未发现解释性表达。\n"
+                    "温度：情绪克制且峰后有收拍。"
+                ),
                 "feedback_handling": [],
             },
         ),
@@ -3999,6 +4004,30 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "locked story contract priority" in _EPISODE_REPAIR_PROMPT
     assert "verbatim_fact_missing" in _EPISODE_REPAIR_PROMPT
     assert "required_verbatim_facts" in _EPISODE_REPAIR_PROMPT
+
+
+def test_specialist_prompts_apply_l0_by_stage_without_copying_source_content() -> None:
+    assert "complete /persona/l0.md" in _STORY_ARCHITECT_PROMPT
+    assert "exact declared [ID:<value>]" in _STORY_ARCHITECT_PROMPT
+    assert "protagonist, central conflict, choice, cost, and ending" in (_STORY_ARCHITECT_PROMPT)
+    assert "who carries the ideal" in _STORY_ARCHITECT_PROMPT
+    assert "selected L0 facet" in _EPISODE_PLANNER_PROMPT
+    assert "warmth before harm" in _EPISODE_PLANNER_PROMPT
+    assert "red lines and emotional temperature" in _SCRIPT_WRITER_PROMPT
+    assert "visible action, choice, and relationship pressure" in _SCRIPT_WRITER_PROMPT
+    for label in ("母题兑现：", "选定侧面：", "雷区：", "温度："):
+        assert label in _QUALITY_REVIEWER_PROMPT
+    assert "do not reselect or reopen L0" in _QUALITY_REVIEWER_PROMPT
+
+    combined = "\n".join(
+        (
+            _STORY_ARCHITECT_PROMPT,
+            _EPISODE_PLANNER_PROMPT,
+            _SCRIPT_WRITER_PROMPT,
+            _QUALITY_REVIEWER_PROMPT,
+        )
+    )
+    assert "初心 vs 现实的落差" not in combined
 
 
 def test_l4_reviewer_prompt_only_locks_explicit_verbatim_facts() -> None:
