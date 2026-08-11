@@ -13,6 +13,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 
 from pengine.agents import (
+    L0_GATE_EVIDENCE_LABELS,
     AgentExecutionLimitError,
     AgentProtocolError,
     CheckpointUnavailableError,
@@ -33,7 +34,7 @@ from pengine.model_calls import (
     new_operation_id,
 )
 from pengine.observability import content_fingerprint, record_langfuse_event
-from pengine.personas import PersonaCatalog, PersonaPackageError
+from pengine.personas import PersonaCatalog, PersonaPackageError, extract_l0_variant_ids
 from pengine.relay import (
     PreflightBlockedError,
     RelayError,
@@ -205,6 +206,31 @@ _ALL_STAGES = (
     *_SPECIALIST_STAGES,
     InternalStage.ASSEMBLING_DELIVERY,
 )
+
+
+def _validate_l0_checkpoint_payload(
+    stage: InternalStage,
+    payload: Mapping[str, Any],
+    explicit_variant_ids: tuple[str, ...],
+) -> None:
+    if (
+        stage is InternalStage.SELECTING_L0_VARIANT
+        and explicit_variant_ids
+        and payload.get("selected_l0_variant") not in explicit_variant_ids
+    ):
+        raise AgentProtocolError(
+            "The selected L0 variant is not one of the persona's declared IDs",
+            stage=stage,
+        )
+    if stage is InternalStage.ACCEPTING_L0 and payload.get("passed") is True:
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, str) or any(
+            label not in evidence for label in L0_GATE_EVIDENCE_LABELS
+        ):
+            raise AgentProtocolError(
+                "Passing L0 evidence is missing one or more required sections",
+                stage=stage,
+            )
 
 
 def _exception_type_chain(exc: BaseException) -> tuple[str, ...]:
@@ -589,6 +615,7 @@ class Worker:
                     approved[InternalStage.LOADING_PERSONA] = loading_payload
 
                 persona_files = self._persona_files(work)
+                explicit_l0_variant_ids = extract_l0_variant_ids(persona_files["/persona/l0.md"])
 
                 if InternalStage.GENERATING_EPISODE_OUTLINE in approved and not work.episode_plans:
                     current_stage = InternalStage.GENERATING_EPISODE_SCRIPTS
@@ -646,6 +673,11 @@ class Worker:
                     payload: Mapping[str, Any],
                 ) -> None:
                     approved_payload = dict(payload)
+                    _validate_l0_checkpoint_payload(
+                        stage,
+                        approved_payload,
+                        explicit_l0_variant_ids,
+                    )
                     review_call_id = None
                     if (
                         stage is InternalStage.GENERATING_EPISODE_OUTLINE

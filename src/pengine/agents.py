@@ -189,6 +189,7 @@ _GENERATION_TOOL_ALLOWLIST = frozenset(
 )
 _REVIEW_TOOL_ALLOWLIST = frozenset({"read_file"})
 _REPAIR_TOOL_ALLOWLIST = frozenset({"read_file", "calculate_arithmetic"})
+L0_GATE_EVIDENCE_LABELS = ("母题兑现：", "选定侧面：", "雷区：", "温度：")
 
 _INTERNAL_RUNTIME_LEAK_POLICY = (
     "Screenplay form or story-world subject matter is not internal-runtime-leak evidence by "
@@ -217,15 +218,23 @@ def _with_internal_runtime_leak_policy(prompt: str) -> str:
 
 
 _STORY_ARCHITECT_PROMPT = (
-    "Read the relevant /persona context. Return only the structured result for "
+    "Read the complete /persona/l0.md and the relevant /persona context. Return only the "
+    "structured result for "
     "the stage named in the delegated request. For selecting_l0_variant, set "
     "selected_l0_variant and selection_rationale, and leave every content field "
-    "null. When the locked output language is zh-CN, write the variant title and "
+    "null. When L0 variants declare [ID:<value>] markers, selected_l0_variant must be one "
+    "exact declared [ID:<value>] value without a title, rename, or invented option. For a "
+    "legacy L0 without IDs, return a concise variant title. When the locked output language "
+    "is zh-CN, write the legacy variant title and "
     "rationale in Simplified Chinese only. Never append an English translation, "
     "Latin subtitle, acronym, or parenthetical English gloss. For "
     "generating_story_outline, set content to the complete story outline and leave "
-    "every other field null. For generating_character_relationships, populate "
+    "every other field null. Translate the L0 mother theme and approved selected facet into "
+    "the protagonist, central conflict, choice, cost, and ending instead of explaining the "
+    "theme in prose. For generating_character_relationships, populate "
     "character_biographies and relationship_logic and leave every other field null; "
+    "use the approved L0 facet to establish who carries the ideal and who or what applies "
+    "the reality pressure; "
     "the two fields are one mutually consistent package, so reconcile every "
     "character identity, age, alias, motive, secret, family and relationship "
     "direction, and causal logic across both before returning, and preserve only "
@@ -239,7 +248,10 @@ _STORY_ARCHITECT_PROMPT = (
 _EPISODE_PLANNER_PROMPT = (
     "Read /workspace/creation-request.md, /workspace/approved-checkpoints.json, "
     "/workspace/story_outline.md, /workspace/character_biographies.md, and "
-    "/workspace/relationship_logic.md, then apply the persona rules. Return only the "
+    "/workspace/relationship_logic.md, plus the complete /persona/l0.md, then apply the "
+    "approved selected L0 facet. Distribute pressure escalation, warmth before harm, no more "
+    "than one emotional peak per episode, and a closing beat after the peak according to L0. "
+    "Return only the "
     "structured episode-outline result. Preserve every explicit numeric "
     "constraint from the script requirements. When the requirements do not "
     "specify an episode count, read the stage-specific persona L4 file and use "
@@ -277,10 +289,14 @@ _EPISODE_PLANNER_PROMPT = (
 )
 
 _SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
-    "Read /workspace/story_contract.json and /workspace/series_state.json, then return a "
+    "Read /workspace/story_contract.json, /workspace/series_state.json, and the complete "
+    "/persona/l0.md, then return a "
     "complete non-null state_delta bound to the supplied contract hash. Put only changes from "
     "the requested episode in every state_delta list; never copy cumulative prior state into a "
-    "delta. Follow the single episode plan and persona rules without changing any "
+    "delta. Follow the approved selected L0 facet and enforce its red lines and emotional "
+    "temperature. Express the mother theme through visible action, choice, and relationship "
+    "pressure rather than explanatory voiceover, psychological exposition, or ornamental "
+    "declaration. Follow the single episode plan and persona rules without changing any "
     "locked episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
     "returning, reread every approved upstream artifact and audit this episode "
     "against them. Treat contract characters as continuity-bearing identities, not as a "
@@ -349,7 +365,13 @@ _QUALITY_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "against the approved artifacts supplied in the delegated request. Always return "
     "the structured stage, passed decision, and concrete evidence; never "
     "return prose instead. Keep feedback_handling empty for accepting_l0 "
-    "and for an initial run. For a revision's accepting_l4 gate, itemize "
+    "and for an initial run. At accepting_l0, read the complete /persona/l0.md and the approved "
+    "selected facet, then review mother-theme fulfillment, facet consistency, red-line "
+    "compliance, and emotional temperature against all approved artifacts. When passed=true, "
+    "evidence must contain these exact four labeled sections: 母题兑现：, 选定侧面：, 雷区：, "
+    "温度：. Give concrete episode or scene locations, excerpts, and reasons where applicable. "
+    "At accepting_l4, keep L0 as read-only context, review only L4 craft, and do not reselect "
+    "or reopen L0. For a revision's accepting_l4 gate, itemize "
     "every frozen feedback item. For accepting_l4, story_contract.json is authoritative "
     "for exact fact wording: reject a fact for not appearing contiguously word-for-word "
     "only when that fact has verbatim=true. kind=text, the value field, quotation marks, "
@@ -575,9 +597,11 @@ class StoryArchitectResult(StrictModel):
     selected_l0_variant: NonEmptyText | None = Field(
         default=None,
         description=(
-            "Required only for selecting_l0_variant. For zh-CN output, use a concise "
-            "Simplified Chinese title only; do not add an English translation, Latin "
-            "subtitle, acronym, or parenthetical English gloss. Must be null for every "
+            "Required only for selecting_l0_variant. When /persona/l0.md declares explicit "
+            "[ID:<value>] markers, return the exact selected ID value. Otherwise, for zh-CN "
+            "output, use a concise Simplified Chinese title only; do not add an English "
+            "translation, Latin subtitle, acronym, or parenthetical English gloss. Must be "
+            "null for every "
             "generation stage."
         ),
     )

@@ -54,6 +54,8 @@ _STATUS_RE = re.compile(
 _PENDING_RE = re.compile(r"(?:AI(?:结构化)?(?:草稿)?待(?:真人)?确认|AI草稿待定)")
 _OWNERSHIP_RE = re.compile(r"(?:归属\s*[:：]\s*\S+|归属(?:创作者|作者|真人))")
 _WORD_RE = re.compile(r"[0-9A-Za-z_\-\u3400-\u9fff]+")
+_L0_VARIANT_ID_RE = re.compile(r"\[ID:([A-Za-z0-9][A-Za-z0-9_-]{0,31})\]")
+_L0_VARIANT_ID_PREFIX_RE = re.compile(r"\[\s*ID\s*:", re.IGNORECASE)
 
 
 class PersonaPackageError(ValueError):
@@ -779,6 +781,46 @@ def _validate_l0_markers(text: str) -> None:
             "l0_marker_missing",
             "L0 variants, red lines, and temperature each need at least one marked item",
         )
+    extract_l0_variant_ids(text)
+
+
+def extract_l0_variant_ids(text: str) -> tuple[str, ...]:
+    """Return explicit IDs from confirmed L0 variant items, if the persona declares them."""
+
+    variant_items: list[str] = []
+    active = False
+    for line in text.splitlines():
+        heading = _HEADING_RE.match(line)
+        if heading:
+            active = _heading_matches(heading.group(2), ("变体", "variant"))
+            continue
+        item = _LIST_ITEM_RE.match(line)
+        if active and item and not _PENDING_RE.search(item.group(1)):
+            variant_items.append(item.group(1))
+
+    ids: list[str] = []
+    for item in variant_items:
+        markers = tuple(_L0_VARIANT_ID_RE.finditer(item))
+        prefixes = tuple(_L0_VARIANT_ID_PREFIX_RE.finditer(item))
+        if prefixes and (len(prefixes) != 1 or len(markers) != 1):
+            raise PersonaPackageError(
+                "l0_variant_id_invalid",
+                "Every explicit L0 variant ID must use one [ID:<value>] marker",
+            )
+        if markers:
+            ids.append(markers[0].group(1))
+
+    if ids and len(ids) != len(variant_items):
+        raise PersonaPackageError(
+            "l0_variant_id_missing",
+            "Every confirmed L0 variant needs an ID when explicit IDs are used",
+        )
+    if len(ids) != len(set(ids)):
+        raise PersonaPackageError(
+            "l0_variant_id_duplicate",
+            "Explicit L0 variant IDs must be unique",
+        )
+    return tuple(ids)
 
 
 def _validate_project_statuses(text: str) -> None:

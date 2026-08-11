@@ -504,7 +504,13 @@ class UnifiedWorkflow:
             await approve_stage(InternalStage.GENERATING_EPISODE_SCRIPTS, payload)
             approved[InternalStage.GENERATING_EPISODE_SCRIPTS] = payload
 
-        l0_payload = {"stage": "accepting_l0", "passed": True, "evidence": "L0 证据"}
+        l0_evidence = (
+            "母题兑现：人物用行动回答母题。\n"
+            "选定侧面：创作方向贯穿全剧。\n"
+            "雷区：未发现解释性表达。\n"
+            "温度：情绪克制且峰后有收拍。"
+        )
+        l0_payload = {"stage": "accepting_l0", "passed": True, "evidence": l0_evidence}
         l4_payload = {
             "stage": "accepting_l4",
             "passed": True,
@@ -534,7 +540,7 @@ class UnifiedWorkflow:
             ),
             selected_l0_variant=approved[InternalStage.SELECTING_L0_VARIANT]["selected_l0_variant"],
             selection_rationale=approved[InternalStage.SELECTING_L0_VARIANT]["selection_rationale"],
-            l0_gate=GateResult(passed=True, evidence="L0 证据"),
+            l0_gate=GateResult(passed=True, evidence=l0_evidence),
             l4_gate=GateResult(passed=True, evidence="L4 证据"),
             feedback_handling=[],
         )

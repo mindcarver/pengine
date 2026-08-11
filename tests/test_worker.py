@@ -12,7 +12,7 @@ import httpx
 import openai
 import pytest
 from langgraph.errors import GraphRecursionError
-from persona_factory import create_persona_package
+from persona_factory import NON_PRODUCTION_CONTENT, create_persona_package
 
 from pengine.agents import AgentProtocolError, EpisodeTimeoutError, QualityGateRejectedError
 from pengine.config import Settings
@@ -34,8 +34,21 @@ from pengine.worker import Worker, _episode_error_message
 
 
 class DeterministicWorkflow:
-    def __init__(self, episode_count: int = 2) -> None:
+    def __init__(
+        self,
+        episode_count: int = 2,
+        *,
+        selected_l0_variant: str = "主动选择",
+        l0_evidence: str = (
+            "母题兑现：人物用行动回答母题。\n"
+            "选定侧面：创作方向贯穿全剧。\n"
+            "雷区：未发现解释性表达。\n"
+            "温度：情绪克制且峰后有收拍。"
+        ),
+    ) -> None:
         self.episode_count = episode_count
+        self.selected_l0_variant = selected_l0_variant
+        self.l0_evidence = l0_evidence
 
     async def execute(
         self,
@@ -87,7 +100,7 @@ class DeterministicWorkflow:
         payloads: dict[InternalStage, dict[str, Any]] = {
             InternalStage.SELECTING_L0_VARIANT: {
                 "stage": "selecting_l0_variant",
-                "selected_l0_variant": "主动选择",
+                "selected_l0_variant": self.selected_l0_variant,
                 "selection_rationale": "符合测试故事",
             },
             InternalStage.GENERATING_STORY_OUTLINE: {
@@ -114,7 +127,7 @@ class DeterministicWorkflow:
             InternalStage.ACCEPTING_L0: {
                 "stage": "accepting_l0",
                 "passed": True,
-                "evidence": "L0 evidence",
+                "evidence": self.l0_evidence,
             },
             InternalStage.ACCEPTING_L4: {
                 "stage": "accepting_l4",
@@ -173,9 +186,9 @@ class DeterministicWorkflow:
                 episode_outline="分集大纲",
                 episode_scripts=aggregate,
             ),
-            selected_l0_variant="主动选择",
+            selected_l0_variant=self.selected_l0_variant,
             selection_rationale="符合测试故事",
-            l0_gate=GateResult(passed=True, evidence="L0 evidence"),
+            l0_gate=GateResult(passed=True, evidence=self.l0_evidence),
             l4_gate=GateResult(passed=True, evidence="L4 evidence"),
             feedback_handling=handling,
         )
@@ -544,15 +557,141 @@ class RaisingWorkflow:
         raise self.error
 
 
-async def _services(tmp_path: Path):
+async def _services(tmp_path: Path, *, l0: str | None = None):
     persona_root = tmp_path / "personas"
-    create_persona_package(persona_root / "active")
+    create_persona_package(
+        persona_root / "active",
+        content_overrides={"l0": l0} if l0 is not None else None,
+    )
     settings = Settings(persona_root=persona_root, data_dir=tmp_path / "data")
     catalog = PersonaCatalog(persona_root, settings.snapshot_root)
     repository = Repository(settings.database_path)
     await repository.initialize()
     snapshot = catalog.create_snapshot("test-persona")
     return settings, catalog, repository, snapshot
+
+
+def _id_based_l0() -> str:
+    return NON_PRODUCTION_CONTENT["l0"].replace(
+        "- [真人已定][归属:创作者] 在困境中主动选择。",
+        "- [ID:A][真人已定][归属:创作者] 在困境中主动选择。\n"
+        "- [ID:B][真人已定][归属:创作者] 在规则中守住承诺。",
+    )
+
+
+async def _creation_checkpoints(
+    repository: Repository,
+    creation_id: UUID,
+) -> dict[InternalStage, Any]:
+    async with repository._connection() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+                (str(creation_id),),
+            )
+        ).fetchone()
+    assert row is not None
+    return dict(await repository.get_business_checkpoints(UUID(row["id"])))
+
+
+@pytest.mark.asyncio
+async def test_worker_persists_declared_l0_variant_id(tmp_path: Path) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path, l0=_id_based_l0())
+    accepted = await repository.create_creation(
+        "declared-l0-id",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人在规则中守住承诺。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=DeterministicWorkflow(selected_l0_variant="A"),
+        worker_id="declared-l0-id-worker",
+    )
+
+    assert await worker.run_once() is True
+
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "succeeded"
+    assert resource.initial.result.delivery_report.selected_l0_variant == "A"
+    checkpoints = await _creation_checkpoints(repository, accepted.creation_id)
+    assert checkpoints[InternalStage.SELECTING_L0_VARIANT]["selected_l0_variant"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_worker_rejects_undeclared_l0_variant_before_checkpoint(tmp_path: Path) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path, l0=_id_based_l0())
+    accepted = await repository.create_creation(
+        "undeclared-l0-id",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人在规则中守住承诺。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=DeterministicWorkflow(selected_l0_variant="E"),
+        worker_id="undeclared-l0-id-worker",
+    )
+
+    assert await worker.run_once() is True
+
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "failed"
+    assert resource.initial.failure.code == "structured_output_invalid"
+    assert resource.initial.failure.failed_stage == InternalStage.SELECTING_L0_VARIANT
+    checkpoints = await _creation_checkpoints(repository, accepted.creation_id)
+    assert InternalStage.SELECTING_L0_VARIANT not in checkpoints
+
+
+@pytest.mark.asyncio
+async def test_worker_rejects_incomplete_passing_l0_evidence_before_checkpoint(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "incomplete-l0-evidence",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人在规则中守住承诺。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=DeterministicWorkflow(
+            l0_evidence=(
+                "母题兑现：人物用行动回答母题。\n"
+                "选定侧面：创作方向贯穿全剧。\n"
+                "雷区：未发现解释性表达。"
+            )
+        ),
+        worker_id="incomplete-l0-evidence-worker",
+    )
+
+    assert await worker.run_once() is True
+
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "failed"
+    assert resource.initial.failure.code == "structured_output_invalid"
+    assert resource.initial.failure.failed_stage == InternalStage.ACCEPTING_L0
+    checkpoints = await _creation_checkpoints(repository, accepted.creation_id)
+    assert InternalStage.ACCEPTING_L0 not in checkpoints
 
 
 @pytest.mark.asyncio

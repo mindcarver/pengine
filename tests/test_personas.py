@@ -17,6 +17,7 @@ from pengine.personas import (
     PersonaCatalog,
     PersonaPackageError,
     canonical_package_sha256,
+    extract_l0_variant_ids,
     validate_persona_package,
 )
 from pengine.schemas import InternalStage
@@ -113,6 +114,52 @@ def test_l0_items_require_explicit_status_and_ownership(tmp_path: Path) -> None:
         validate_persona_package(package)
 
     assert exc_info.value.code == "l0_marker_invalid"
+
+
+def test_l0_explicit_variant_ids_are_extracted_from_confirmed_items() -> None:
+    l0 = NON_PRODUCTION_CONTENT["l0"].replace(
+        "- [真人已定][归属:创作者] 在困境中主动选择。",
+        "- [ID:A][真人已定][归属:创作者] 在困境中主动选择。\n"
+        "- [ID:B][真人已定][归属:创作者] 在规则中守住承诺。",
+    )
+
+    assert extract_l0_variant_ids(l0) == ("A", "B")
+
+
+@pytest.mark.parametrize(
+    ("replacement", "expected_code"),
+    [
+        (
+            "- [ID:A][真人已定][归属:创作者] 在困境中主动选择。\n"
+            "- [ID:A][真人已定][归属:创作者] 在规则中守住承诺。",
+            "l0_variant_id_duplicate",
+        ),
+        (
+            "- [ID: A][真人已定][归属:创作者] 在困境中主动选择。",
+            "l0_variant_id_invalid",
+        ),
+        (
+            "- [ID:A][真人已定][归属:创作者] 在困境中主动选择。\n"
+            "- [真人已定][归属:创作者] 在规则中守住承诺。",
+            "l0_variant_id_missing",
+        ),
+    ],
+)
+def test_l0_explicit_variant_ids_reject_ambiguous_contracts(
+    tmp_path: Path,
+    replacement: str,
+    expected_code: str,
+) -> None:
+    l0 = NON_PRODUCTION_CONTENT["l0"].replace(
+        "- [真人已定][归属:创作者] 在困境中主动选择。",
+        replacement,
+    )
+    package = create_persona_package(tmp_path / "persona", content_overrides={"l0": l0})
+
+    with pytest.raises(PersonaPackageError) as exc_info:
+        validate_persona_package(package)
+
+    assert exc_info.value.code == expected_code
 
 
 def test_manifest_path_escape_and_symlink_are_rejected(tmp_path: Path) -> None:
@@ -333,6 +380,37 @@ def test_stage_context_is_bounded_read_only_projection(tmp_path: Path) -> None:
             max_chars=10,
         )
     assert exc_info.value.code == "stage_context_too_large"
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        InternalStage.SELECTING_L0_VARIANT,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+        InternalStage.ACCEPTING_L0,
+        InternalStage.ACCEPTING_L4,
+    ],
+)
+def test_complete_l0_is_available_to_every_specialist_stage(
+    tmp_path: Path,
+    stage: InternalStage,
+) -> None:
+    catalog, _ = _catalog(tmp_path)
+    snapshot = catalog.create_snapshot("test-persona")
+
+    context = catalog.load_stage_context(snapshot.summary.snapshot_sha256, stage)
+
+    assert context.files["/persona/l0.md"] == (
+        NON_PRODUCTION_CONTENT["l0"]
+        .replace(
+            "- [AI草稿待真人确认][归属:创作者] 待定变体不得作为确认规则。\n",
+            "",
+        )
+        .strip()
+    )
 
 
 def test_l5_l6_retrieval_is_query_and_output_bounded(tmp_path: Path) -> None:
