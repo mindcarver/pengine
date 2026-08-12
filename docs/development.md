@@ -117,6 +117,17 @@ uv build --no-sources
 
 创建任务会把有效包复制为内容寻址 snapshot。不要在运行中的任务里替换 snapshot 目录，也不要手工编辑 SQLite 中的 snapshot hash。
 
+L3/L4 的当前实现合同分别记录在 [L3 实际实现设计]({{ site.baseurl }}/l3-integration/) 与
+[L4 实际实现设计]({{ site.baseurl }}/l4-integration/)。修改这两层时至少运行：
+
+```bash
+uv run pytest tests/test_personas.py tests/test_agents.py tests/test_worker.py \
+  tests/test_model_calls.py tests/test_repository.py tests/test_unified_integration.py -q
+```
+
+真实模型对照是显式 opt-in，分别使用 `PENGINE_RUN_L3_ABC=1` 和 `PENGINE_RUN_L4_ABC=1`；
+接入设计当前不包含 L5/L6，不能顺手扩大为检索或学习闭环改造。
+
 ## 5. 修改代码的最小闭环
 
 ```text
