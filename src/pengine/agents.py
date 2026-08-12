@@ -113,6 +113,13 @@ _BILINGUAL_GLOSS_SUFFIX = re.compile(r"\s*[（(][^()（）]*[A-Za-z][^()（）]*
 _INFER_OUTPUT_LANGUAGE = object()
 _TRANSLATABLE_LANGUAGE_VALUE = object()
 _REGISTERED_PROFILE_KEYS: set[str] = set()
+_REQUIRED_READ_PATHS_OPEN = "<pengine-required-read-paths>"
+_REQUIRED_READ_PATHS_CLOSE = "</pengine-required-read-paths>"
+_REQUIRED_READ_PATHS_BLOCK = re.compile(
+    rf"{re.escape(_REQUIRED_READ_PATHS_OPEN)}\s*(.*?)\s*"
+    rf"{re.escape(_REQUIRED_READ_PATHS_CLOSE)}",
+    re.DOTALL,
+)
 # outline gets a light single-lens pass with up to two repair rounds; character
 # + relationships get the full two-lens review with up to four repair rounds.
 _MAX_OUTLINE_REPAIR_ROUNDS = 2
@@ -2414,12 +2421,125 @@ def _description_with_workspace_paths(
     )
 
 
+def _description_with_required_read_paths(
+    description: str,
+    paths: Iterable[str],
+) -> str:
+    without_previous = _REQUIRED_READ_PATHS_BLOCK.sub("", description).rstrip()
+    required = sorted(set(paths))
+    if not required:
+        return without_previous
+    manifest = "\n".join(required)
+    return (
+        f"{without_previous}\nBefore returning the structured review result, successfully call "
+        "read_file for every path in this required-read manifest. A prose response, a failed "
+        "read, or a result returned before every read succeeds is not a completed review.\n"
+        f"{_REQUIRED_READ_PATHS_OPEN}\n{manifest}\n{_REQUIRED_READ_PATHS_CLOSE}"
+    )
+
+
+def _required_read_paths(messages: Sequence[Any]) -> tuple[str, ...]:
+    for message in reversed(messages):
+        if not isinstance(message, HumanMessage) or not isinstance(message.content, str):
+            continue
+        matches = list(_REQUIRED_READ_PATHS_BLOCK.finditer(message.content))
+        if not matches:
+            continue
+        paths = tuple(
+            dict.fromkeys(
+                line.strip()
+                for line in matches[-1].group(1).splitlines()
+                if line.strip().startswith("/workspace/")
+            )
+        )
+        return paths
+    return ()
+
+
+def _required_read_outcomes(
+    messages: Sequence[Any],
+) -> tuple[frozenset[str], frozenset[str]]:
+    read_calls: dict[str, str] = {}
+    successful: set[str] = set()
+    failed: set[str] = set()
+    for message in messages:
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls:
+                if call.get("name") != "read_file":
+                    continue
+                call_id = call.get("id")
+                args = call.get("args")
+                if (
+                    isinstance(call_id, str)
+                    and isinstance(args, Mapping)
+                    and isinstance(args.get("file_path"), str)
+                ):
+                    read_calls[call_id] = args["file_path"]
+        elif isinstance(message, ToolMessage) and isinstance(message.tool_call_id, str):
+            path = read_calls.get(message.tool_call_id)
+            if path is not None and message.status == "error":
+                failed.add(path)
+            elif path is not None:
+                successful.add(path)
+    return frozenset(successful), frozenset(failed)
+
+
+def _successful_required_reads(messages: Sequence[Any]) -> frozenset[str]:
+    return _required_read_outcomes(messages)[0]
+
+
+def _failed_required_reads(messages: Sequence[Any]) -> frozenset[str]:
+    return _required_read_outcomes(messages)[1]
+
+
+def _missing_required_reads(messages: Sequence[Any]) -> tuple[str, ...]:
+    required = _required_read_paths(messages)
+    if not required:
+        return ()
+    successful = _successful_required_reads(messages)
+    return tuple(path for path in required if path not in successful)
+
+
+def _response_reads_required_path(
+    response: ModelResponse,
+    missing_paths: Sequence[str],
+) -> bool:
+    missing = set(missing_paths)
+    calls = [
+        call
+        for message in response.result
+        if isinstance(message, AIMessage)
+        for call in message.tool_calls
+    ]
+    if response.structured_response is not None or not calls:
+        return False
+    if any(call.get("name") != "read_file" for call in calls):
+        return False
+    return any(
+        isinstance(call.get("args"), Mapping) and call["args"].get("file_path") in missing
+        for call in calls
+    )
+
+
+def _required_read_correction(missing_paths: Sequence[str]) -> HumanMessage:
+    manifest = "\n".join(f"- {path}" for path in missing_paths)
+    return HumanMessage(
+        content=(
+            "The structured review result cannot be accepted because required inputs have not "
+            "all been read successfully. Call read_file now for the missing exact paths below. "
+            "Do not return prose or a structured result until every listed read succeeds:\n"
+            f"{manifest}"
+        )
+    )
+
+
 def _subagent_request(
     request: ToolCallRequest,
     *,
     subagent_type: str,
     description: str,
     files: Mapping[str, str],
+    required_read_paths: Iterable[str] = (),
 ) -> ToolCallRequest:
     existing_files = request.state.get("files") if isinstance(request.state, Mapping) else None
     task_files = {
@@ -2427,11 +2547,16 @@ def _subagent_request(
         **files,
     }
     with_files = _request_with_files(request, files)
+    task_description = _description_with_workspace_paths(description, task_files)
+    task_description = _description_with_required_read_paths(
+        task_description,
+        required_read_paths,
+    )
     return with_files.override(
         tool_call={
             **request.tool_call,
             "args": {
-                "description": _description_with_workspace_paths(description, task_files),
+                "description": task_description,
                 "subagent_type": subagent_type,
             },
         }
@@ -3503,6 +3628,13 @@ class StructuredResultMiddleware(AgentMiddleware):
             request = request.override(messages=cleaned_messages)
 
         result_tool_names = {spec.name for spec in response_format.schema_specs}
+        missing_required_reads = _missing_required_reads(list(request.messages))
+        failed_required_reads = _failed_required_reads(list(request.messages))
+        if failed_required_reads:
+            raise AgentProtocolError(
+                "Review subagent could not read a required input",
+                safe_message="审核代理无法读取必需输入。",
+            )
         validation_errors = _structured_validation_failure_turns(
             list(request.messages),
             result_tool_names,
@@ -3514,7 +3646,9 @@ class StructuredResultMiddleware(AgentMiddleware):
         if validation_errors >= _STRUCTURED_VALIDATION_FAILURE_LIMIT:
             raise AgentProtocolError("Subagent returned invalid structured output")
 
-        if validation_errors:
+        if missing_required_reads:
+            model_request = request
+        elif validation_errors:
             messages = _compact_structured_validation_messages(
                 list(request.messages),
                 result_tool_names,
@@ -3551,6 +3685,24 @@ class StructuredResultMiddleware(AgentMiddleware):
         else:
             model_request = request
         response = await handler(model_request)
+        if missing_required_reads:
+            if _response_reads_required_path(response, missing_required_reads):
+                return response
+            corrective_response = await handler(
+                request.override(
+                    messages=[
+                        *request.messages,
+                        *response.result,
+                        _required_read_correction(missing_required_reads),
+                    ]
+                )
+            )
+            if _response_reads_required_path(corrective_response, missing_required_reads):
+                return corrective_response
+            raise AgentProtocolError(
+                "Review subagent returned a result before reading every required input",
+                safe_message="审核代理未读取全部必需输入。",
+            )
         if response.structured_response is not None:
             return response
         returned_tool_names = {
@@ -4696,6 +4848,19 @@ class StageGuardMiddleware(AgentMiddleware):
                 )
             return await handler(candidate_request)
 
+        approved_review_files = {
+            path: data["content"]
+            for path, data in _review_workspace_files(self.approved_payloads).items()
+        }
+        review_files = {
+            **approved_review_files,
+            **files,
+        }
+        state_files = request.state.get("files") if isinstance(request.state, Mapping) else None
+        required_read_paths = list(review_files)
+        if isinstance(state_files, Mapping) and "/workspace/creation-request.md" in state_files:
+            required_read_paths.append("/workspace/creation-request.md")
+
         review_request = _subagent_request(
             request,
             subagent_type=subagent_type,
@@ -4704,13 +4869,8 @@ class StageGuardMiddleware(AgentMiddleware):
                 if self.language_contract
                 else description
             ),
-            files={
-                **{
-                    path: data["content"]
-                    for path, data in _review_workspace_files(self.approved_payloads).items()
-                },
-                **files,
-            },
+            files=review_files,
+            required_read_paths=required_read_paths,
         )
 
         async def invoke(
@@ -4755,7 +4915,10 @@ class StageGuardMiddleware(AgentMiddleware):
                         **review_request.tool_call,
                         "args": {
                             **review_request.tool_call["args"],
-                            "description": retry_description,
+                            "description": _description_with_required_read_paths(
+                                retry_description,
+                                ["/workspace/review_to_translate.json"],
+                            ),
                         },
                     },
                     state=_request_state_after_result(review_request, review_result),
