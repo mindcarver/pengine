@@ -220,18 +220,26 @@ def _validate_persona_checkpoint_payload(
     stage: InternalStage,
     payload: Mapping[str, Any],
     explicit_variant_ids: tuple[str, ...],
-) -> None:
+) -> dict[str, Any]:
+    validated_payload = dict(payload)
+    if stage is InternalStage.SELECTING_L0_VARIANT and explicit_variant_ids:
+        selected = validated_payload.get("selected_l0_variant")
+        if isinstance(selected, str):
+            for variant_id in explicit_variant_ids:
+                if selected == f"[ID:{variant_id}]":
+                    validated_payload["selected_l0_variant"] = variant_id
+                    break
     if (
         stage is InternalStage.SELECTING_L0_VARIANT
         and explicit_variant_ids
-        and payload.get("selected_l0_variant") not in explicit_variant_ids
+        and validated_payload.get("selected_l0_variant") not in explicit_variant_ids
     ):
         raise AgentProtocolError(
             "The selected L0 variant is not one of the persona's declared IDs",
             stage=stage,
         )
-    if stage is InternalStage.ACCEPTING_L0 and payload.get("passed") is True:
-        evidence = payload.get("evidence")
+    if stage is InternalStage.ACCEPTING_L0 and validated_payload.get("passed") is True:
+        evidence = validated_payload.get("evidence")
         if not isinstance(evidence, str) or any(
             label not in evidence for label in L0_GATE_EVIDENCE_LABELS
         ):
@@ -239,8 +247,8 @@ def _validate_persona_checkpoint_payload(
                 "Passing L0 evidence is missing one or more required sections",
                 stage=stage,
             )
-    if stage is InternalStage.ACCEPTING_L4 and payload.get("passed") is True:
-        evidence = payload.get("evidence")
+    if stage is InternalStage.ACCEPTING_L4 and validated_payload.get("passed") is True:
+        evidence = validated_payload.get("evidence")
         if not isinstance(evidence, str) or any(
             label not in evidence for label in L4_GATE_EVIDENCE_LABELS
         ):
@@ -253,7 +261,7 @@ def _validate_persona_checkpoint_payload(
         InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: "consistency_review",
         InternalStage.GENERATING_EPISODE_OUTLINE: "contract_review",
     }.get(stage)
-    review = payload.get(review_field) if review_field is not None else None
+    review = validated_payload.get(review_field) if review_field is not None else None
     if (
         isinstance(review, Mapping)
         and review.get("passed") is True
@@ -263,6 +271,7 @@ def _validate_persona_checkpoint_payload(
             "Passing stage review evidence is missing the required L4 hard-rule section",
             stage=stage,
         )
+    return validated_payload
 
 
 def _exception_type_chain(exc: BaseException) -> tuple[str, ...]:
@@ -740,10 +749,9 @@ class Worker:
                     stage: InternalStage,
                     payload: Mapping[str, Any],
                 ) -> None:
-                    approved_payload = dict(payload)
-                    _validate_persona_checkpoint_payload(
+                    approved_payload = _validate_persona_checkpoint_payload(
                         stage,
-                        approved_payload,
+                        payload,
                         explicit_l0_variant_ids,
                     )
                     review_call_id = None

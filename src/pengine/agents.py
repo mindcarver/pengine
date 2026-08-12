@@ -801,7 +801,8 @@ class StoryArchitectResult(StrictModel):
         default=None,
         description=(
             "Required only for selecting_l0_variant. When /persona/l0.md declares explicit "
-            "[ID:<value>] markers, return the exact selected ID value. Otherwise, for zh-CN "
+            "[ID:<value>] markers, return only the selected ID value without its marker. "
+            "For [ID:D], return D, not [ID:D]. Otherwise, for zh-CN "
             "output, use a concise Simplified Chinese title only; do not add an English "
             "translation, Latin subtitle, acronym, or parenthetical English gloss. Must be "
             "null for every "

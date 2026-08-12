@@ -44,6 +44,7 @@ class DeterministicWorkflow:
         episode_count: int = 2,
         *,
         selected_l0_variant: str = "主动选择",
+        result_l0_variant: str | None = None,
         l0_evidence: str = (
             "母题兑现：人物用行动回答母题。\n"
             "选定侧面：创作方向贯穿全剧。\n"
@@ -53,6 +54,7 @@ class DeterministicWorkflow:
     ) -> None:
         self.episode_count = episode_count
         self.selected_l0_variant = selected_l0_variant
+        self.result_l0_variant = result_l0_variant or selected_l0_variant
         self.l0_evidence = l0_evidence
 
     async def execute(
@@ -195,7 +197,7 @@ class DeterministicWorkflow:
                 episode_outline="分集大纲",
                 episode_scripts=aggregate,
             ),
-            selected_l0_variant=self.selected_l0_variant,
+            selected_l0_variant=self.result_l0_variant,
             selection_rationale="符合测试故事",
             l0_gate=GateResult(passed=True, evidence=self.l0_evidence),
             l4_gate=GateResult(
@@ -730,6 +732,73 @@ async def test_worker_persists_declared_l0_variant_id(tmp_path: Path) -> None:
     assert resource.initial.result.delivery_report.selected_l0_variant == "A"
     checkpoints = await _creation_checkpoints(repository, accepted.creation_id)
     assert checkpoints[InternalStage.SELECTING_L0_VARIANT]["selected_l0_variant"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_worker_normalizes_wrapped_declared_l0_variant_id(tmp_path: Path) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path, l0=_id_based_l0())
+    accepted = await repository.create_creation(
+        "wrapped-declared-l0-id",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人在规则中守住承诺。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=DeterministicWorkflow(
+            selected_l0_variant="[ID:A]",
+            result_l0_variant="A",
+        ),
+        worker_id="wrapped-declared-l0-id-worker",
+    )
+
+    assert await worker.run_once() is True
+
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "succeeded"
+    assert resource.initial.result.delivery_report.selected_l0_variant == "A"
+    checkpoints = await _creation_checkpoints(repository, accepted.creation_id)
+    assert checkpoints[InternalStage.SELECTING_L0_VARIANT]["selected_l0_variant"] == "A"
+
+
+@pytest.mark.parametrize(
+    "selected_l0_variant",
+    ("[ID:E]", "[ID:]", "ID:A", "[ID:A] extra", "prefix [ID:A]"),
+)
+def test_worker_rejects_unknown_or_malformed_wrapped_l0_variant_id(
+    selected_l0_variant: str,
+) -> None:
+    with pytest.raises(AgentProtocolError, match="not one of the persona's declared IDs"):
+        _validate_persona_checkpoint_payload(
+            InternalStage.SELECTING_L0_VARIANT,
+            {
+                "selected_l0_variant": selected_l0_variant,
+                "selection_rationale": "符合测试故事",
+            },
+            ("A", "B", "C", "D"),
+        )
+
+
+def test_worker_preserves_l0_label_when_persona_has_no_declared_ids() -> None:
+    payload = {
+        "selected_l0_variant": "[ID:传统标题]",
+        "selection_rationale": "符合测试故事",
+    }
+
+    assert (
+        _validate_persona_checkpoint_payload(
+            InternalStage.SELECTING_L0_VARIANT,
+            payload,
+            (),
+        )
+        == payload
+    )
 
 
 @pytest.mark.asyncio
