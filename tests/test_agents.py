@@ -19,7 +19,6 @@ from langchain.agents.structured_output import (
 )
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
@@ -118,7 +117,6 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
     bound_tool_names: list[list[str]] = Field(default_factory=list)
     bound_tool_descriptions: list[list[str]] = Field(default_factory=list)
     model_system_prompts: list[str] = Field(default_factory=list)
-    auto_read_required_paths: bool = True
 
     def bind_tools(
         self,
@@ -139,16 +137,6 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         self.model_system_prompts.append(
             "\n\n".join(message.text for message in messages if isinstance(message, SystemMessage))
         )
-        if self.auto_read_required_paths:
-            successful = _successful_required_reads(messages)
-            missing = [path for path in _required_read_paths(messages) if path not in successful]
-            if missing:
-                response = _tool_call(
-                    "read_file",
-                    {"file_path": missing[0]},
-                    100_000 + len(messages),
-                )
-                return ChatResult(generations=[ChatGeneration(message=response)])
         return super()._generate(
             messages,
             stop=stop,
@@ -2517,13 +2505,8 @@ async def test_structured_result_requires_every_declared_file_read_before_result
 
     read_paths: list[str] = []
     model = ToolCallingFakeModel(
-        auto_read_required_paths=False,
         responses=[
-            AIMessage(content="I am ready to return the review."),
-            _tool_call("read_file", {"file_path": "/workspace/a.md"}, 1),
-            _tool_call("Result", {"value": "premature"}, 2),
-            _tool_call("read_file", {"file_path": "/workspace/b.md"}, 3),
-            _tool_call("Result", {"value": "done"}, 4),
+            _tool_call("Result", {"value": "done"}, 1),
         ],
     )
     read_file = StructuredTool.from_function(
@@ -2555,7 +2538,81 @@ async def test_structured_result_requires_every_declared_file_read_before_result
 
     assert result["structured_response"] == Result(value="done")
     assert read_paths == ["/workspace/a.md", "/workspace/b.md"]
-    assert all("read_file" in names for names in model.bound_tool_names)
+    assert len(model.bound_tool_names) == 1
+    assert set(model.bound_tool_names[0]) == {"read_file", "Result"}
+
+
+@pytest.mark.asyncio
+async def test_engine_schedules_every_required_canon_read_before_first_model_call() -> None:
+    paths = (
+        "/workspace/approved-checkpoints.json",
+        "/workspace/creation-request.md",
+        "/workspace/current_character_biographies.md",
+        "/workspace/current_relationship_logic.md",
+        "/workspace/story_outline.md",
+    )
+    review = CanonReviewerResult(
+        passed=True,
+        evidence="已读取全部必需输入，未发现硬连续性矛盾。",
+        issues=[],
+    )
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[
+            HumanMessage(
+                content=(
+                    "Review every mounted input before returning a result.\n"
+                    "<pengine-required-read-paths>\n"
+                    + "\n".join((*paths, paths[2]))
+                    + "\n</pengine-required-read-paths>"
+                )
+            )
+        ],
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+        response_format=ToolStrategy(CanonReviewerResult),
+    )
+    handler_calls: list[ModelRequest] = []
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        handler_calls.append(candidate)
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=review,
+        )
+
+    middleware = StructuredResultMiddleware()
+    observed_paths: list[str] = []
+    for expected_path in paths:
+        response = await middleware.awrap_model_call(request, handler)
+
+        assert handler_calls == []
+        assert response.structured_response is None
+        assert len(response.result) == 1
+        message = response.result[0]
+        assert isinstance(message, AIMessage)
+        assert len(message.tool_calls) == 1
+        call = message.tool_calls[0]
+        assert call["name"] == "read_file"
+        assert call["args"] == {"file_path": expected_path}
+        observed_paths.append(expected_path)
+        request = request.override(
+            messages=[
+                *request.messages,
+                message,
+                ToolMessage(
+                    content=f"contents for {expected_path}",
+                    name="read_file",
+                    tool_call_id=call["id"],
+                ),
+            ]
+        )
+
+    response = await middleware.awrap_model_call(request, handler)
+
+    assert response.structured_response == review
+    assert len(handler_calls) == 1
+    assert observed_paths == list(paths)
+    assert _successful_required_reads(request.messages) == frozenset(paths)
 
 
 @pytest.mark.asyncio
@@ -2603,7 +2660,7 @@ async def test_structured_result_rejects_result_after_failed_required_read() -> 
 
 
 @pytest.mark.asyncio
-async def test_unread_canon_path_evidence_fails_as_input_protocol_not_language() -> None:
+async def test_unread_canon_result_is_blocked_until_engine_schedules_required_reads() -> None:
     paths = (
         "/workspace/current_character_biographies.md",
         "/workspace/current_relationship_logic.md",
@@ -2655,17 +2712,54 @@ async def test_unread_canon_path_evidence_fails_as_input_protocol_not_language()
             structured_response=premature_review,
         )
 
-    with pytest.raises(AgentProtocolError) as error:
-        await StructuredResultMiddleware().awrap_model_call(request, handler)
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
 
-    assert error.value.safe_message == "审核代理未读取全部必需输入。"
-    assert len(calls) == 2
-    assert all(any(_tool_name(tool) == "read_file" for tool in call.tools) for call in calls)
+    assert calls == []
+    assert response.structured_response is None
+    assert len(response.result) == 1
+    message = response.result[0]
+    assert isinstance(message, AIMessage)
+    assert message.tool_calls[0]["name"] == "read_file"
+    assert message.tool_calls[0]["args"] == {"file_path": paths[0]}
     _validate_result_language(
         premature_review,
         output_language=SIMPLIFIED_CHINESE,
         stage=InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
     )
+
+
+@pytest.mark.asyncio
+async def test_required_read_fails_closed_when_read_file_tool_is_missing() -> None:
+    class Result(BaseModel):
+        value: str
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[
+            HumanMessage(
+                content=(
+                    "Review the input.\n"
+                    "<pengine-required-read-paths>\n"
+                    "/workspace/candidate.md\n"
+                    "</pengine-required-read-paths>"
+                )
+            )
+        ],
+        tools=[],
+        response_format=ToolStrategy(Result),
+    )
+    calls = 0
+
+    async def handler(_: ModelRequest) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        return ModelResponse(result=[AIMessage(content="")])
+
+    with pytest.raises(AgentProtocolError) as error:
+        await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert calls == 0
+    assert error.value.safe_message == "审核代理缺少必需的读取工具。"
 
 
 @pytest.mark.asyncio
