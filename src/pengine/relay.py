@@ -5,7 +5,7 @@ import logging
 import re
 import ssl
 import threading
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -119,10 +119,42 @@ def _persona_event_fields(record: ModelCallRecord) -> dict[str, Any]:
 
 
 class _SerialChatAnthropic(ChatAnthropic):
+    def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        seen_model_ids: dict[str, str] = {}
+        for chunk in super()._stream(*args, **kwargs):
+            yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
+
+    async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        seen_model_ids: dict[str, str] = {}
+        async for chunk in super()._astream(*args, **kwargs):
+            yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
+
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
         kwargs["parallel_tool_calls"] = False
         kwargs["tool_choice"] = "auto" if self.model in _AUTO_TOOL_CHOICE_MODELS else "any"
         return super().bind_tools(tools, **kwargs)
+
+
+def _deduplicate_stream_model_identity(chunk: Any, seen_model_ids: dict[str, str]) -> Any:
+    """Prevent identical stream identity evidence from being string-concatenated.
+
+    LangChain concatenates repeated string response metadata while aggregating chunks.
+    A relay that repeats the same Anthropic ``message_start`` would therefore turn
+    ``claude-opus-5`` into ``claude-opus-5claude-opus-5``. Drop only an exact duplicate
+    from a later chunk; differing values remain and fail the downstream identity gate.
+    """
+    metadata = getattr(getattr(chunk, "message", None), "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return chunk
+    for key in ("model", "model_name"):
+        value = metadata.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if seen_model_ids.get(key) == value:
+            metadata.pop(key)
+        else:
+            seen_model_ids[key] = value
+    return chunk
 
 
 class _SerialChatDeepSeek(ChatDeepSeek):
