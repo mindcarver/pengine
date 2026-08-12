@@ -14,3 +14,6 @@ data/
 *.sqlite3
 pytest-of-*/
 .venv
+.zcode/*
+.playwright-mcp
+.DS_Store
