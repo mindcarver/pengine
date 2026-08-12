@@ -2,9 +2,9 @@
   "schema_version": "3.0.0",
   "persona_id": "xinggui",
   "display_name": "星轨 · 科幻",
-  "version": "0.3.0-l3-prototype",
-  "created_at": "2026-07-30T00:00:00Z",
-  "package_sha256": "80c1392dfe1a9ee6a5deda52a394012d1cb0205d8bf796a8c3f4569ac0e2af03",
+  "version": "0.3.1-product-params",
+  "created_at": "2026-08-12T00:00:00Z",
+  "package_sha256": "6a66d1ac1ab6a5998d2a347d68e7353079c87999255f03f7c8cb6aebb32c892a",
   "files": {
     "paradigm": {
       "path": "paradigm.md",
@@ -40,7 +40,7 @@
       "path": "l4.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "284063769880a3410e62211651e65f1335100c461301f9e5c7480752a0761b62"
+      "sha256": "e059385ffd9ee9e6454135231d12269e45360ed931c813c168779c3ab3d495da"
     },
     "l5": {
       "path": "l5.md",

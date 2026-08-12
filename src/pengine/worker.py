@@ -14,6 +14,8 @@ from langgraph.errors import GraphRecursionError
 
 from pengine.agents import (
     L0_GATE_EVIDENCE_LABELS,
+    L4_GATE_EVIDENCE_LABELS,
+    L4_STAGE_EVIDENCE_LABEL,
     AgentExecutionLimitError,
     AgentProtocolError,
     CheckpointUnavailableError,
@@ -214,7 +216,7 @@ _ALL_STAGES = (
 )
 
 
-def _validate_l0_checkpoint_payload(
+def _validate_persona_checkpoint_payload(
     stage: InternalStage,
     payload: Mapping[str, Any],
     explicit_variant_ids: tuple[str, ...],
@@ -237,6 +239,30 @@ def _validate_l0_checkpoint_payload(
                 "Passing L0 evidence is missing one or more required sections",
                 stage=stage,
             )
+    if stage is InternalStage.ACCEPTING_L4 and payload.get("passed") is True:
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, str) or any(
+            label not in evidence for label in L4_GATE_EVIDENCE_LABELS
+        ):
+            raise AgentProtocolError(
+                "Passing L4 evidence is missing one or more required authority sections",
+                stage=stage,
+            )
+    review_field = {
+        InternalStage.GENERATING_STORY_OUTLINE: "consistency_review",
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: "consistency_review",
+        InternalStage.GENERATING_EPISODE_OUTLINE: "contract_review",
+    }.get(stage)
+    review = payload.get(review_field) if review_field is not None else None
+    if (
+        isinstance(review, Mapping)
+        and review.get("passed") is True
+        and L4_STAGE_EVIDENCE_LABEL not in str(review.get("evidence", ""))
+    ):
+        raise AgentProtocolError(
+            "Passing stage review evidence is missing the required L4 hard-rule section",
+            stage=stage,
+        )
 
 
 def _exception_type_chain(exc: BaseException) -> tuple[str, ...]:
@@ -715,7 +741,7 @@ class Worker:
                     payload: Mapping[str, Any],
                 ) -> None:
                     approved_payload = dict(payload)
-                    _validate_l0_checkpoint_payload(
+                    _validate_persona_checkpoint_payload(
                         stage,
                         approved_payload,
                         explicit_l0_variant_ids,

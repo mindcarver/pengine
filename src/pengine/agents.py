@@ -190,6 +190,8 @@ _GENERATION_TOOL_ALLOWLIST = frozenset(
 _REVIEW_TOOL_ALLOWLIST = frozenset({"read_file"})
 _REPAIR_TOOL_ALLOWLIST = frozenset({"read_file", "calculate_arithmetic"})
 L0_GATE_EVIDENCE_LABELS = ("母题兑现：", "选定侧面：", "雷区：", "温度：")
+L4_STAGE_EVIDENCE_LABEL = "L4硬规则："
+L4_GATE_EVIDENCE_LABELS = ("L4-A：", "短剧硬规则：", "产品参数：")
 
 _INTERNAL_RUNTIME_LEAK_POLICY = (
     "Screenplay form or story-world subject matter is not internal-runtime-leak evidence by "
@@ -259,6 +261,23 @@ def _with_l3_policy(prompt: str) -> str:
     return "\n\n".join((prompt, _L3_POLICY))
 
 
+_L4_POLICY = (
+    "When an applicable stage-specific /persona/l4/<stage>.md projection is present, read it "
+    "completely. Only rules explicitly labeled as creator-confirmed hard rules may block a "
+    "generation or review; confirmed creative advice is advisory and non-blocking. A creator's "
+    "long-form background, genre preference, market translation, or inferred short-drama fit is "
+    "never a hard gate unless the creator explicitly confirmed it as one. Pengine owns episode "
+    "count, duration, and scene-count defaults; they are product parameters, not the creator's "
+    "screenplay view; explicit user requirements and locked production parameters override those "
+    "Pengine defaults. Never attribute a Pengine parameter to the creator. Apply this authority "
+    "order: user requirements and locked Canon, L0, creator-confirmed L4 hard rules, L3, then Soul."
+)
+
+
+def _with_l4_policy(prompt: str) -> str:
+    return "\n\n".join((prompt, _L4_POLICY))
+
+
 def _with_inline_soul(prompt: str, persona_files: Mapping[str, str]) -> str:
     """Provide the full Soul to direct model calls that cannot read virtual files."""
     soul = persona_files.get("/persona/soul.md")
@@ -272,6 +291,19 @@ def _with_inline_soul(prompt: str, persona_files: Mapping[str, str]) -> str:
             soul,
         )
     )
+
+
+def _require_l4_stage_evidence(
+    review: SemanticReview | StructuralReviewResult,
+    *,
+    stage: InternalStage,
+) -> None:
+    if review.passed and L4_STAGE_EVIDENCE_LABEL not in review.evidence:
+        raise AgentProtocolError(
+            "Passing stage review evidence is missing the required L4 hard-rule section",
+            stage=stage,
+            safe_message="通过的阶段审查缺少 L4 硬规则证据。",
+        )
 
 
 _STORY_ARCHITECT_PROMPT = (
@@ -426,7 +458,8 @@ _QUALITY_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "compliance, and emotional temperature against all approved artifacts. When passed=true, "
     "evidence must contain these exact four labeled sections: 母题兑现：, 选定侧面：, 雷区：, "
     "温度：. Give concrete episode or scene locations, excerpts, and reasons where applicable. "
-    "At accepting_l4, keep L0 as read-only context, review only L4 craft, and do not reselect "
+    "At accepting_l4, read /persona/l4/accepting_l4.md, keep L0 as read-only context, review "
+    "only L4 craft, and do not reselect "
     "or reopen L0. For a revision's accepting_l4 gate, itemize "
     "every frozen feedback item. For accepting_l4, story_contract.json is authoritative "
     "for exact fact wording: reject a fact for not appearing contiguously word-for-word "
@@ -438,7 +471,9 @@ _QUALITY_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "revision-feedback item, or the output/schema protocol. Ordinary screenplay format, style, "
     "or matters of taste are not sufficient reasons to set passed=false. At accepting_l4, only "
     "an internal-runtime leak that meets the policy's provenance and evidence standard is a "
-    "blocking leakage defect."
+    "blocking leakage defect. When accepting_l4 passes, evidence must contain these exact three "
+    "labeled sections: L4-A：, 短剧硬规则：, 产品参数：. The 产品参数 section must identify "
+    "Pengine as owner and state whether an explicit user or locked parameter overrode the default."
 )
 
 _EPISODE_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
@@ -470,7 +505,8 @@ _SERIES_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "/workspace/series_prefix.json is a trusted runtime envelope: episode_number and JSON framing "
     "are trusted runtime metadata, not screenplay content. Judge leakage only inside "
     "episodes[].content. Never repair content and never reinterpret the design to make the "
-    "prefix pass."
+    "prefix pass. When passed=true, evidence must include the exact label L4硬规则： and identify "
+    "the applicable creator-confirmed hard rules checked."
 )
 
 _CANON_REVIEWER_PROMPT = _with_soul_policy(
@@ -484,7 +520,8 @@ _CANON_REVIEWER_PROMPT = _with_soul_policy(
     "current index and expected value where applicable. The runtime applies every "
     "target atomically and validates the combined StoryContract. Give every target "
     "a unique target_id and never grant a whole collection implicitly. Never repair "
-    "or rewrite the candidate."
+    "or rewrite the candidate. When passed=true, evidence must include the exact label "
+    "L4硬规则： and identify the applicable creator-confirmed hard rules checked."
 )
 
 _STORY_REPAIR_PROMPT = _with_soul_policy(
@@ -513,6 +550,16 @@ _EPISODE_REPAIR_PROMPT = _with_l3_policy(_EPISODE_REPAIR_PROMPT)
 _QUALITY_REVIEWER_PROMPT = _with_l3_policy(_QUALITY_REVIEWER_PROMPT)
 _EPISODE_REVIEWER_PROMPT = _with_l3_policy(_EPISODE_REVIEWER_PROMPT)
 _SERIES_REVIEWER_PROMPT = _with_l3_policy(_SERIES_REVIEWER_PROMPT)
+
+_STORY_ARCHITECT_PROMPT = _with_l4_policy(_STORY_ARCHITECT_PROMPT)
+_EPISODE_PLANNER_PROMPT = _with_l4_policy(_EPISODE_PLANNER_PROMPT)
+_SCRIPT_WRITER_PROMPT = _with_l4_policy(_SCRIPT_WRITER_PROMPT)
+_CANON_REVIEWER_PROMPT = _with_l4_policy(_CANON_REVIEWER_PROMPT)
+_STORY_REPAIR_PROMPT = _with_l4_policy(_STORY_REPAIR_PROMPT)
+_EPISODE_REPAIR_PROMPT = _with_l4_policy(_EPISODE_REPAIR_PROMPT)
+_QUALITY_REVIEWER_PROMPT = _with_l4_policy(_QUALITY_REVIEWER_PROMPT)
+_EPISODE_REVIEWER_PROMPT = _with_l4_policy(_EPISODE_REVIEWER_PROMPT)
+_SERIES_REVIEWER_PROMPT = _with_l4_policy(_SERIES_REVIEWER_PROMPT)
 
 
 def _suffix_rewrite_feedback_for_episode(
@@ -3674,6 +3721,17 @@ class StageGuardMiddleware(AgentMiddleware):
             "Treat those files as the sole authority for approved creative facts. Do not "
             "reuse or restate derived story facts from the supervisor conversation."
         )
+        if stage in {
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+            InternalStage.GENERATING_EPISODE_SCRIPTS,
+            InternalStage.ACCEPTING_L4,
+        }:
+            description += (
+                f" Read /persona/l4/{stage.value}.md as the only applicable L4 projection "
+                "for this stage."
+            )
         if self.language_contract:
             description = f"{description}\n{self.language_contract}"
         args = {**args, "description": description}
@@ -3902,6 +3960,7 @@ class StageGuardMiddleware(AgentMiddleware):
                 )
                 review = _merge_canon_reviews([review, backstop])
             if review.passed:
+                _require_l4_stage_evidence(review, stage=stage)
                 approved_payload = parsed.model_dump(mode="json")
                 return _result_with_payload(result, approved_payload), {
                     **approved_payload,
@@ -4295,6 +4354,10 @@ class StageGuardMiddleware(AgentMiddleware):
                                 safe_message="分集大纲审查目标未能绑定当前合同。",
                             ) from corrected_exc
             if review.passed:
+                _require_l4_stage_evidence(
+                    review,
+                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                )
                 return _result_with_payload(result, payload), {
                     **candidate,
                     "contract_review": review.model_dump(
@@ -4900,6 +4963,10 @@ class StageGuardMiddleware(AgentMiddleware):
                 "/workspace/current_episode_plan.md": plan.plan,
             },
             schema=StructuralReviewResult,
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+        )
+        _require_l4_stage_evidence(
+            result,
             stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
         )
         review_id = await self.register_series_review(

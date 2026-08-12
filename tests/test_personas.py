@@ -350,8 +350,10 @@ def test_restart_scoped_snapshot_and_projection_caches_avoid_revalidation(
     assert same_story_context is story_context
     assert "/persona/l5.md" not in story_context.files
     assert "/persona/l6.md" not in story_context.files
+    assert "重要变化必须有可拍或可听的证据" in story_context.files["/persona/l4.md"]
     assert "必须呈现主角的主动选择" in story_context.files["/persona/l4.md"]
     assert "场景必须承担叙事功能" not in story_context.files["/persona/l4.md"]
+    assert "重要变化必须有可拍或可听的证据" in script_context.files["/persona/l4.md"]
     assert "场景必须承担叙事功能" in script_context.files["/persona/l4.md"]
     assert "必须呈现主角的主动选择" not in script_context.files["/persona/l4.md"]
 
@@ -371,6 +373,7 @@ def test_stage_context_is_bounded_read_only_projection(tmp_path: Path) -> None:
     assert "/persona/l5.md" not in context.files
     assert "/persona/l6.md" not in context.files
     assert "待定变体不得作为确认规则" not in context.files["/persona/l0.md"]
+    assert "重要变化必须有可拍或可听的证据" in context.files["/persona/l4.md"]
     assert "必须呈现主角的主动选择" in context.files["/persona/l4.md"]
     assert "场景必须承担叙事功能" not in context.files["/persona/l4.md"]
     with pytest.raises(TypeError):
@@ -382,6 +385,48 @@ def test_stage_context_is_bounded_read_only_projection(tmp_path: Path) -> None:
             max_chars=10,
         )
     assert exc_info.value.code == "stage_context_too_large"
+
+
+@pytest.mark.parametrize(
+    ("stage", "included", "excluded"),
+    [
+        (
+            InternalStage.GENERATING_STORY_OUTLINE,
+            "必须呈现主角的主动选择",
+            "每个核心人物必须有独立欲望",
+        ),
+        (
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            "每个核心人物必须有独立欲望",
+            "每集必须推进人物处境",
+        ),
+        (
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+            "每集必须推进人物处境",
+            "场景必须承担叙事功能",
+        ),
+        (
+            InternalStage.GENERATING_EPISODE_SCRIPTS,
+            "场景必须承担叙事功能",
+            "必须呈现主角的主动选择",
+        ),
+    ],
+)
+def test_generation_l4_projection_contains_common_rule_and_only_current_stage(
+    tmp_path: Path,
+    stage: InternalStage,
+    included: str,
+    excluded: str,
+) -> None:
+    catalog, _ = _catalog(tmp_path)
+    snapshot = catalog.create_snapshot("test-persona")
+
+    l4 = catalog.load_stage_context(snapshot.summary.snapshot_sha256, stage).files["/persona/l4.md"]
+
+    assert "重要变化必须有可拍或可听的证据" in l4
+    assert included in l4
+    assert excluded not in l4
+    assert "Pengine 默认基线：6 集" in l4
 
 
 @pytest.mark.parametrize(
