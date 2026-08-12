@@ -103,12 +103,12 @@ uv build --no-sources
 
 人格不是随便放几个 Markdown 文件：
 
-1. 复制一个完整 persona v2 八文件目录；
+1. 复制一个完整 persona v3 八文件目录；
 2. 修改 manifest 的身份、版本和每个文件 hash；
 3. 重新计算 `package_sha256`；
 4. 用 [`contracts/persona-package.schema.json`](https://github.com/mindcarver/pengine/blob/main/contracts/persona-package.schema.json) 校验；
 5. 确保必需标题、状态标记和归属信息完整；
-6. 确保 `soul.md` 已确认、未超过 8,000 字符，且包内不存在 `l1.md` 或 `l2.md`；
+6. 确保 `soul.md` 与 `l3.md` 均已确认、各自未超过 8,000 字符，且包内不存在 `l1.md` 或 `l2.md`；
 7. 先运行 `tests/test_personas.py`、`tests/test_bundled_personas.py` 和完整测试；
 8. 不把包含个人隐私、未授权作品或 provider 机密的人格包提交到公开仓库。
 

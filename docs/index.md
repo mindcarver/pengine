@@ -126,7 +126,7 @@ uv run pengine
 | 事实 | 当前权威来源 |
 | --- | --- |
 | HTTP 路径、请求/响应 schema、错误 | [`contracts/openapi.json`](https://github.com/mindcarver/pengine/blob/main/contracts/openapi.json) |
-| 人格 manifest、v1/v2 文件集合与 hash | [`contracts/persona-package.schema.json`](https://github.com/mindcarver/pengine/blob/main/contracts/persona-package.schema.json) 与 `src/pengine/personas.py` |
+| 人格 manifest、v1/v2/v3 文件集合与 hash | [`contracts/persona-package.schema.json`](https://github.com/mindcarver/pengine/blob/main/contracts/persona-package.schema.json) 与 `src/pengine/personas.py` |
 | HTTP 适配与状态查询 | `src/pengine/api.py` |
 | 业务状态、事务、幂等、迁移 | `src/pengine/repository.py` |
 | 租约、恢复、阶段推进和交付提交 | `src/pengine/worker.py` |

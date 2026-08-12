@@ -17,6 +17,7 @@ from persona_factory import NON_PRODUCTION_CONTENT, create_persona_package
 from pengine.agents import AgentProtocolError, EpisodeTimeoutError, QualityGateRejectedError
 from pengine.config import Settings
 from pengine.errors import DomainError
+from pengine.model_calls import ModelCallState
 from pengine.personas import PersonaCatalog
 from pengine.relay import PreflightBlockedError, RelayError, RelayIdentityError
 from pengine.repository import Repository
@@ -592,6 +593,38 @@ async def _creation_checkpoints(
         ).fetchone()
     assert row is not None
     return dict(await repository.get_business_checkpoints(UUID(row["id"])))
+
+
+@pytest.mark.asyncio
+async def test_worker_mounts_only_safe_full_l3_audit_metadata(tmp_path: Path) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    await repository.create_creation(
+        "l3-audit-metadata",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人在困境中作出选择。",
+            requirements="生成短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=RaisingWorkflow(RuntimeError("stop after persona load")),
+        worker_id="l3-audit-worker",
+    )
+    worker._model_call_state = ModelCallState()
+
+    assert await worker.run_once() is True
+
+    context = worker._model_call_state.context
+    assert context.persona_schema_version == "3.0.0"
+    assert context.l3_sha256 == snapshot.manifest["files"]["l3"]["sha256"]
+    assert context.l3_char_count == len(snapshot.text("l3"))
+    assert context.l3_mount_path == "/persona/l3.md"
+    assert context.l3_full_text_mounted is True
+    assert not hasattr(context, "l3_text")
 
 
 @pytest.mark.asyncio

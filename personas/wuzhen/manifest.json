@@ -1,8 +1,8 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "3.0.0",
   "persona_id": "wuzhen",
   "display_name": "雾枕 · 悬疑",
-  "version": "0.2.0-soul-prototype",
+  "version": "0.3.0-l3-prototype",
   "created_at": "2026-07-30T00:00:00Z",
   "package_sha256": "decc10d328e54c1eb44ee829d6aa9a797800fe85fbca05f6bd50a886ba566de4",
   "files": {

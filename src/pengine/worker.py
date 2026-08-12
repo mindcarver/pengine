@@ -36,6 +36,7 @@ from pengine.model_calls import (
 from pengine.observability import content_fingerprint, record_langfuse_event
 from pengine.personas import (
     PERSONA_SCHEMA_V2,
+    PERSONA_SCHEMA_V3,
     PersonaCatalog,
     PersonaPackageError,
     extract_l0_variant_ids,
@@ -613,7 +614,12 @@ class Worker:
                     )
                 snapshot = self.catalog.resolve_snapshot(work.persona.snapshot_sha256)
                 schema_version = str(snapshot.manifest["schema_version"])
-                soul_text = snapshot.text("soul") if schema_version == PERSONA_SCHEMA_V2 else None
+                soul_text = (
+                    snapshot.text("soul")
+                    if schema_version in {PERSONA_SCHEMA_V2, PERSONA_SCHEMA_V3}
+                    else None
+                )
+                l3_text = snapshot.text("l3") if schema_version == PERSONA_SCHEMA_V3 else None
                 persona_trace_metadata.update(
                     {
                         "persona_schema_version": schema_version,
@@ -628,6 +634,14 @@ class Worker:
                         "soul_char_count": len(soul_text) if soul_text is not None else None,
                         "soul_mount_path": "/persona/soul.md" if soul_text is not None else None,
                         "soul_full_text_loaded": soul_text is not None,
+                        "l3_sha256": (
+                            snapshot.manifest["files"]["l3"]["sha256"]
+                            if l3_text is not None
+                            else None
+                        ),
+                        "l3_char_count": len(l3_text) if l3_text is not None else None,
+                        "l3_mount_path": "/persona/l3.md" if l3_text is not None else None,
+                        "l3_full_text_mounted": l3_text is not None,
                     }
                 )
                 if model_call_state is not None:

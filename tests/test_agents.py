@@ -82,6 +82,7 @@ from pengine.agents import (
     _validate_outline_repair_patch_targets,
     _validate_result_language,
     _with_inline_soul,
+    _with_l3_policy,
     flatten_cr_candidate,
 )
 from pengine.config import Settings
@@ -4055,11 +4056,38 @@ def test_all_model_stage_prompts_read_full_advisory_soul() -> None:
         assert "StoryContract" in prompt
 
 
-def test_direct_patch_prompt_inlines_the_complete_soul_only_for_v2() -> None:
+def test_all_model_stage_prompts_enforce_l3_method_and_authority_boundaries() -> None:
+    prompts = (
+        _STORY_ARCHITECT_PROMPT,
+        _EPISODE_PLANNER_PROMPT,
+        _SCRIPT_WRITER_PROMPT,
+        _EPISODE_REPAIR_PROMPT,
+        _QUALITY_REVIEWER_PROMPT,
+        _EPISODE_REVIEWER_PROMPT,
+        _SERIES_REVIEWER_PROMPT,
+        _CANON_REVIEWER_PROMPT,
+        _STORY_REPAIR_PROMPT,
+    )
+
+    for prompt in prompts:
+        assert "When /persona/l3.md is present, read its complete text" in prompt
+        assert "never use L3 to add, rename, reweight, or reselect an L0 variant" in prompt
+        assert "do not reopen the approved direction" in prompt
+        assert "never use L3 to rediffuse" in prompt
+        assert "L3 is not Gate evidence" in prompt
+        assert "SeriesState" in prompt
+
+
+def test_direct_patch_prompt_inlines_soul_but_not_l3() -> None:
     soul = "# Soul\n\nfirst line\nlast line"
-    prompt = _with_inline_soul("Repair the candidate.", {"/persona/soul.md": soul})
+    l3 = "# L3\n\nprivate complete method"
+    prompt = _with_inline_soul(
+        _with_l3_policy("Repair the candidate."),
+        {"/persona/soul.md": soul, "/persona/l3.md": l3},
+    )
 
     assert prompt.count(soul) == 1
+    assert l3 not in prompt
     assert "Complete text of /persona/soul.md:" in prompt
     assert "Never summarize, retrieve, slice, or silently truncate Soul" in prompt
     assert _with_inline_soul("Repair the candidate.", {}) == "Repair the candidate."

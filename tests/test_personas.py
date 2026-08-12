@@ -48,7 +48,7 @@ def test_discover_returns_only_complete_valid_package(tmp_path: Path) -> None:
     assert len(personas) == 1
     assert personas[0].persona_id == "test-persona"
     assert personas[0].display_name == "非生产测试人格"
-    assert personas[0].version == "2.0.0-test"
+    assert personas[0].version == "3.0.0-test"
     assert len(personas[0].snapshot_sha256) == 64
 
 
@@ -270,17 +270,17 @@ def test_version_only_change_creates_new_identity_preserving_snapshot(
     first = catalog.create_snapshot("test-persona")
     first_package_hash = first.manifest["package_sha256"]
 
-    create_persona_package(package_dir, version="2.0.1-test")
+    create_persona_package(package_dir, version="3.0.1-test")
     restarted_catalog = PersonaCatalog(catalog.source_root, catalog.snapshot_root)
     second = restarted_catalog.create_snapshot("test-persona")
 
     assert second.manifest["package_sha256"] == first_package_hash
     assert second.summary.snapshot_sha256 != first.summary.snapshot_sha256
     assert restarted_catalog.resolve_snapshot(first.summary.snapshot_sha256).summary.version == (
-        "2.0.0-test"
+        "3.0.0-test"
     )
     assert restarted_catalog.resolve_snapshot(second.summary.snapshot_sha256).summary.version == (
-        "2.0.1-test"
+        "3.0.1-test"
     )
 
 
@@ -291,14 +291,14 @@ def test_later_source_version_does_not_change_existing_snapshot(tmp_path: Path) 
 
     create_persona_package(
         package_dir,
-        version="2.0.0-test",
+        version="3.0.0-test",
         content_overrides={"l5": NON_PRODUCTION_CONTENT["l5"].replace("《霜桥》", "《新霜桥》")},
     )
     restarted_catalog = PersonaCatalog(catalog.source_root, catalog.snapshot_root)
     second = restarted_catalog.create_snapshot("test-persona")
     resolved_first = restarted_catalog.resolve_snapshot(first.summary.snapshot_sha256)
 
-    assert second.summary.version == "2.0.0-test"
+    assert second.summary.version == "3.0.0-test"
     assert second.summary.snapshot_sha256 != first.summary.snapshot_sha256
     assert package_bytes(resolved_first.path) == first_bytes
     assert resolved_first.text("l5") == first.text("l5")
@@ -441,6 +441,28 @@ def test_complete_soul_is_available_to_every_specialist_stage(
     assert "/persona/l2-summary.md" not in context.files
 
 
+@pytest.mark.parametrize(
+    "stage",
+    [
+        InternalStage.GENERATING_STORY_OUTLINE,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+    ],
+)
+def test_v3_complete_l3_is_available_to_every_generation_stage_without_summary(
+    tmp_path: Path,
+    stage: InternalStage,
+) -> None:
+    catalog, _ = _catalog(tmp_path)
+    snapshot = catalog.create_snapshot("test-persona")
+
+    context = catalog.load_stage_context(snapshot.summary.snapshot_sha256, stage)
+
+    assert context.files["/persona/l3.md"] == NON_PRODUCTION_CONTENT["l3"]
+    assert "/persona/l3-summary.md" not in context.files
+
+
 def test_l5_l6_retrieval_is_query_and_output_bounded(tmp_path: Path) -> None:
     catalog, _ = _catalog(tmp_path)
     snapshot = catalog.create_snapshot("test-persona")
@@ -477,7 +499,7 @@ def test_l5_l6_retrieval_is_query_and_output_bounded(tmp_path: Path) -> None:
         (lambda package: (package / "soul.md").unlink(), "invalid_package_entries"),
     ],
 )
-def test_v2_rejects_mixed_or_missing_soul_package(
+def test_v3_rejects_mixed_or_missing_soul_package(
     tmp_path: Path,
     mutate: object,
     expected_code: str,
@@ -491,7 +513,7 @@ def test_v2_rejects_mixed_or_missing_soul_package(
     assert exc_info.value.code == expected_code
 
 
-def test_v2_rejects_manifest_that_declares_soul_and_legacy_layers(tmp_path: Path) -> None:
+def test_v3_rejects_manifest_that_declares_soul_and_legacy_layers(tmp_path: Path) -> None:
     package = create_persona_package(
         tmp_path / "persona",
         manifest_mutator=lambda manifest: manifest["files"].update(
@@ -515,12 +537,39 @@ def test_v2_rejects_manifest_that_declares_soul_and_legacy_layers(tmp_path: Path
         (NON_PRODUCTION_CONTENT["soul"] + ("扩" * 8_000), "soul_too_large"),
     ],
 )
-def test_v2_soul_status_and_size_fail_closed(
+def test_v3_soul_status_and_size_fail_closed(
     tmp_path: Path,
     soul: str,
     expected_code: str,
 ) -> None:
     package = create_persona_package(tmp_path / "persona", content_overrides={"soul": soul})
+
+    with pytest.raises(PersonaPackageError) as exc_info:
+        validate_persona_package(package)
+
+    assert exc_info.value.code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("l3", "expected_code"),
+    [
+        (
+            NON_PRODUCTION_CONTENT["l3"].replace("状态：创作者已确认", "状态：AI草稿待真人确认"),
+            "l3_pending",
+        ),
+        (NON_PRODUCTION_CONTENT["l3"] + ("扩" * 8_000), "l3_too_large"),
+        (
+            NON_PRODUCTION_CONTENT["l3"].replace(" · 归属：创作者", ""),
+            "l3_marker_invalid",
+        ),
+    ],
+)
+def test_v3_l3_status_ownership_and_size_fail_closed(
+    tmp_path: Path,
+    l3: str,
+    expected_code: str,
+) -> None:
+    package = create_persona_package(tmp_path / "persona", content_overrides={"l3": l3})
 
     with pytest.raises(PersonaPackageError) as exc_info:
         validate_persona_package(package)
@@ -555,6 +604,34 @@ def test_v1_source_is_not_selectable_but_snapshot_keeps_legacy_projection(
     assert "/persona/soul.md" not in context.files
     assert "表达具有向前推动的能量" in context.files["/persona/l1-summary.md"]
     assert "冲突表现克制" in context.files["/persona/l2-summary.md"]
+
+
+def test_v2_source_is_not_selectable_but_snapshot_keeps_summary_projection(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "personas"
+    source = create_persona_package(
+        source_root / "legacy",
+        schema_version="2.0.0",
+        version="2.0.0-test",
+    )
+    package = validate_persona_package(source)
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    shutil.copytree(source, snapshot_root / package.summary.snapshot_sha256)
+    catalog = PersonaCatalog(source_root, snapshot_root)
+
+    assert catalog.discover() == []
+    assert catalog.get("test-persona") is None
+
+    context = catalog.load_stage_context(
+        package.summary.snapshot_sha256,
+        InternalStage.GENERATING_STORY_OUTLINE,
+    )
+
+    assert context.files["/persona/soul.md"] == package.text("soul")
+    assert "擅长人物选择，系统补足结构校验。" in (context.files["/persona/l3-summary.md"])
+    assert "/persona/l3.md" not in context.files
 
 
 def test_canonical_hash_is_order_sensitive_and_manifest_is_excluded(tmp_path: Path) -> None:

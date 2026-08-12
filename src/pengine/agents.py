@@ -234,6 +234,31 @@ def _with_soul_policy(prompt: str) -> str:
     return "\n\n".join((prompt, _SOUL_POLICY))
 
 
+_L3_POLICY = (
+    "When /persona/l3.md is present, read its complete text without summarizing, retrieving, "
+    "slicing, or silently truncating it. L3 is a creative decision method, not story facts or "
+    "a creator biography. During selecting_l0_variant, never use L3 to add, rename, reweight, "
+    "or reselect an L0 variant. During story-outline and character-relationship generation, "
+    "use L3 only to explore materially different unlocked paths, select one against the user "
+    "request, approved L0, character credibility, and executable causality, then converge on "
+    "one main causal line without exposing discarded options or private reasoning. During "
+    "episode-outline and episode-script generation, do not reopen the approved direction; grow "
+    "only details still unlocked by the active contracts and persisted series state. During "
+    "repair, address only confirmed issues with bounded changes and never use L3 to rediffuse, "
+    "rewrite unrelated content, or reopen approved upstream decisions. During review, L3 is "
+    "not Gate evidence: never pass or reject work because it does or does not resemble L3. L3 "
+    "cannot override the user request, approved checkpoints, hard Canon, /persona/l0.md, the "
+    "applicable L4 craft contract, StoryContract, SeriesBible, SeriesState, episode count, "
+    "production parameters, or approved series prefix. Never copy the creator method into all "
+    "characters or expose MBTI, cognitive functions, source people, source documents, or this "
+    "workflow's explanation in the finished work."
+)
+
+
+def _with_l3_policy(prompt: str) -> str:
+    return "\n\n".join((prompt, _L3_POLICY))
+
+
 def _with_inline_soul(prompt: str, persona_files: Mapping[str, str]) -> str:
     """Provide the full Soul to direct model calls that cannot read virtual files."""
     soul = persona_files.get("/persona/soul.md")
@@ -478,6 +503,16 @@ _EPISODE_REPAIR_PROMPT = _with_soul_policy(_EPISODE_REPAIR_PROMPT)
 _QUALITY_REVIEWER_PROMPT = _with_soul_policy(_QUALITY_REVIEWER_PROMPT)
 _EPISODE_REVIEWER_PROMPT = _with_soul_policy(_EPISODE_REVIEWER_PROMPT)
 _SERIES_REVIEWER_PROMPT = _with_soul_policy(_SERIES_REVIEWER_PROMPT)
+
+_STORY_ARCHITECT_PROMPT = _with_l3_policy(_STORY_ARCHITECT_PROMPT)
+_EPISODE_PLANNER_PROMPT = _with_l3_policy(_EPISODE_PLANNER_PROMPT)
+_SCRIPT_WRITER_PROMPT = _with_l3_policy(_SCRIPT_WRITER_PROMPT)
+_CANON_REVIEWER_PROMPT = _with_l3_policy(_CANON_REVIEWER_PROMPT)
+_STORY_REPAIR_PROMPT = _with_l3_policy(_STORY_REPAIR_PROMPT)
+_EPISODE_REPAIR_PROMPT = _with_l3_policy(_EPISODE_REPAIR_PROMPT)
+_QUALITY_REVIEWER_PROMPT = _with_l3_policy(_QUALITY_REVIEWER_PROMPT)
+_EPISODE_REVIEWER_PROMPT = _with_l3_policy(_EPISODE_REVIEWER_PROMPT)
+_SERIES_REVIEWER_PROMPT = _with_l3_policy(_SERIES_REVIEWER_PROMPT)
 
 
 def _suffix_rewrite_feedback_for_episode(
@@ -5515,7 +5550,7 @@ class DeepAgentWorkflow:
                 "candidate or alter approved upstream content. The runtime rejects a total "
                 "line-change budget that reaches half of the candidate."
             )
-            instruction = _with_inline_soul(instruction, persona_files)
+            instruction = _with_inline_soul(_with_l3_policy(instruction), persona_files)
             if output_language_contract:
                 instruction = f"{instruction}\n{output_language_contract}"
             if correction:
@@ -5565,7 +5600,7 @@ class DeepAgentWorkflow:
                 "empty patch is valid when the runtime mutations alone fully resolve the issue. "
                 "Preserve every field unrelated to the confirmed issues."
             )
-            instruction = _with_inline_soul(instruction, persona_files)
+            instruction = _with_inline_soul(_with_l3_policy(instruction), persona_files)
             if output_language_contract:
                 instruction = f"{instruction}\n{output_language_contract}"
             if correction:

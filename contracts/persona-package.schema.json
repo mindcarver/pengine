@@ -65,6 +65,16 @@
           "$ref": "#/$defs/files_v2"
         }
       }
+    },
+    {
+      "properties": {
+        "schema_version": {
+          "const": "3.0.0"
+        },
+        "files": {
+          "$ref": "#/$defs/files_v3"
+        }
+      }
     }
   ],
   "$defs": {
@@ -263,6 +273,30 @@
       }
     },
     "files_v2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "paradigm",
+        "project",
+        "l0",
+        "soul",
+        "l3",
+        "l4",
+        "l5",
+        "l6"
+      ],
+      "properties": {
+        "paradigm": { "$ref": "#/$defs/paradigm" },
+        "project": { "$ref": "#/$defs/project" },
+        "l0": { "$ref": "#/$defs/l0" },
+        "soul": { "$ref": "#/$defs/soul" },
+        "l3": { "$ref": "#/$defs/l3" },
+        "l4": { "$ref": "#/$defs/l4" },
+        "l5": { "$ref": "#/$defs/l5" },
+        "l6": { "$ref": "#/$defs/l6" }
+      }
+    },
+    "files_v3": {
       "type": "object",
       "additionalProperties": false,
       "required": [

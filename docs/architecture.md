@@ -130,7 +130,7 @@ review     = ChatDeepSeek  / deepseek-v4-flash
 `48` 次、审核调用 `32` 次；剧本阶段另有全剧生成 `192`、审核 `128` 的总上限，同时
 仍受单集对应角色上限约束。预算在出站前原子保留，超限不会触发 provider 请求。
 
-## 4. 人格包：从 persona v2 到不可变上下文
+## 4. 人格包：从 persona v3 到不可变上下文
 
 一个可选择人格必须包含 `manifest.json` 和以下固定文件：
 
@@ -151,9 +151,9 @@ l3.md        l4.md      l5.md  l6.md
 人格上下文按职责投影：
 
 - `/persona/` 是只读虚拟上下文；
-- `project`、完整 L0、完整 Soul、L3 摘要和按阶段选择的 L4 内容进入工作上下文；
-- v2 的 Soul 在所有模型阶段读取同一份全文，不摘要、不检索、不切片、不静默截断；
-- 历史 v1 snapshot 继续使用 L1/L2 摘要路径，但 v1 source package 不再用于新任务；
+- `project`、完整 L0、完整 Soul、完整 L3 和按阶段选择的 L4 内容进入工作上下文；
+- v3 的 Soul 与 L3 读取同一份完整文本，不摘要、不检索、不切片、不静默截断；L3 只约束创作决策方式，不能重选 L0、覆盖合同或成为 Reviewer Gate；
+- 历史 v1/v2 snapshot 继续使用原 L3 摘要以及各自的 L1/L2 或 Soul 路径，但 v1/v2 source package 不再用于新任务；
 - L5/L6 走有界检索，受结果数量和字符数限制；
 - `/workspace/` 是该 Agent thread 的临时 scratch；
 - 不配置 `StoreBackend`，不会形成跨任务可写记忆。
