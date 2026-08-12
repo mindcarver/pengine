@@ -1036,6 +1036,17 @@ def _stage_l4_context(text: str, stage: InternalStage) -> str:
         return text.strip()
     aliases = _STAGE_L4_ALIASES[stage]
     if aliases:
+        try:
+            sections.append(
+                _extract_required_section(
+                    text,
+                    (("全阶段通则", "commonrules"),),
+                    "L4 common generation rules",
+                )
+            )
+        except PersonaPackageError as exc:
+            if exc.code != "required_section_missing":
+                raise
         for alias_group in aliases:
             label = f"L4 {stage.value} {alias_group[0]}"
             sections.append(_extract_required_section(text, (alias_group,), label))

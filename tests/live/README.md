@@ -46,6 +46,17 @@ confirmed full L3, a similarly sized neutral L3, and the historical one-line sum
 checks single-line causal convergence, functional branches, L0/Canon authority, source privacy,
 character independence, and that L3 never becomes a review gate.
 
+Run the isolated L4 A/B/C authority probe with:
+
+```bash
+PENGINE_RUN_L4_ABC=1 uv run pytest -m live_model tests/live/test_l4_persona_e2e.py -vv -s
+```
+
+It copies the compiled persona to a temporary directory, records the real review call in a
+temporary SQLite database, and proves three distinct decisions: an explicit hard-rule conflict
+blocks, deviation from confirmed advice does not block, and a locked user parameter overrides
+the Pengine default without being attributed to the creator.
+
 Every run writes durable evidence under `.artifacts/live-e2e/<timestamp>-<id>/`
 by default, outside the shared `data/` tree. The directory contains safe
 configuration metadata, the server log, persona and creation responses, poll and

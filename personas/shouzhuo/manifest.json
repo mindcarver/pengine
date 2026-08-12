@@ -2,9 +2,9 @@
   "schema_version": "3.0.0",
   "persona_id": "shouzhuo",
   "display_name": "守拙 · 正剧",
-  "version": "0.4.0-l3",
-  "created_at": "2026-07-30T00:00:00Z",
-  "package_sha256": "3880a50b10a9f58ec0b076f724b8b257e1e21e385ce649fac42bc8794d652430",
+  "version": "0.5.0-l4",
+  "created_at": "2026-08-12T00:00:00Z",
+  "package_sha256": "9688d8241ffa868d27af7dbf991bed0ad68706bc3bb0eea0ba1c98a0fb30a135",
   "files": {
     "paradigm": {
       "path": "paradigm.md",
@@ -16,7 +16,7 @@
       "path": "project.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "6ca1c05f24b625372757a90eae028fdcce23ec871c91dc532dc0d21515238618"
+      "sha256": "eeafaac28d15d7063c2a2064cc45b0d07f45a9315470362f2b83593d29bd604e"
     },
     "l0": {
       "path": "l0.md",
@@ -40,7 +40,7 @@
       "path": "l4.md",
       "media_type": "text/markdown",
       "encoding": "utf-8",
-      "sha256": "bc773487b5d2a7a1fa45cb88eef0af5f03ade251b4443c9f1a1402c8514f2bb6"
+      "sha256": "4572976bba82f8185a0a86815e7327889134ad9b96e359c9cc2bb5aa9cf7be6b"
     },
     "l5": {
       "path": "l5.md",

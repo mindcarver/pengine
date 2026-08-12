@@ -76,9 +76,10 @@ loading_persona
 1. `story_architect` 生成故事大纲。
 2. `story_architect` 生成角色和关系逻辑。
 3. `episode_planner` 生成分集大纲和 `StoryContract`。
-4. 合同经过确定性校验，再由绑定该候选的 `canon_reviewer` 独立审核。
-5. 合同及其 Markdown 投影、hash 一起写入 approved checkpoint。
-6. 设计同步阶段将投影组装为一个 `SeriesBible` candidate；不允许把不同候选的故事大纲、人物关系和分集大纲拼在一起。
+4. 故事、人物关系和合同审核只把明确的 L4 硬规则冲突列为 blocker；通过证据以 `L4硬规则：` 标识所检查的适用规则，确认建议或审美偏好不阻断。
+5. 合同经过确定性校验，再由绑定该候选的 `canon_reviewer` 独立审核。
+6. 合同及其 Markdown 投影、hash 一起写入 approved checkpoint。
+7. 设计同步阶段将投影组装为一个 `SeriesBible` candidate；不允许把不同候选的故事大纲、人物关系和分集大纲拼在一起。
 
 这里有一个必须显式保留的当前限制：第 3 步仍是一次结构化模型调用，返回全量
 `episode_plans`、合同事实/线索/义务和里程碑。schema 没有限制集数上限，但 60–100 集
@@ -108,7 +109,7 @@ script_writer
 ### 3.4 最终闸门和交付
 
 1. Worker 从每个已锁定集重建完整剧本 checkpoint，复验合同 hash、剧本 hash 和状态 hash。
-2. `quality_reviewer` 对完整内容生成 L0 和 L4 证据。
+2. `quality_reviewer` 对完整内容生成 L0 和 L4 证据；L4 通过证据必须分别包含 `L4-A：`、`短剧硬规则：`、`产品参数：`，其中产品参数明确归属 Pengine 并说明是否被用户/锁定参数覆盖。
 3. `series_reviewer` 对绑定当前设计/batch/active-prefix 的结构审查做最终分类。
 4. 两个质量 gate 和绑定全剧审查都通过后，Repository 在同一业务边界内写入 `Delivery` 并把 run 置为 `succeeded`。
 5. `ContentPackage` 固定包含：故事大纲、人物小传、关系逻辑、分集大纲、分集剧本；`DeliveryReport` 单独保存人格快照、L0/L4 证据、归属声明和修订反馈覆盖。

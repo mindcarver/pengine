@@ -31,7 +31,11 @@ from pengine.schemas import (
     RevisionRequest,
     WorkflowResult,
 )
-from pengine.worker import Worker, _episode_error_message
+from pengine.worker import (
+    Worker,
+    _episode_error_message,
+    _validate_persona_checkpoint_payload,
+)
 
 
 class DeterministicWorkflow:
@@ -133,7 +137,11 @@ class DeterministicWorkflow:
             InternalStage.ACCEPTING_L4: {
                 "stage": "accepting_l4",
                 "passed": True,
-                "evidence": "L4 evidence",
+                "evidence": (
+                    "L4-A：人物选择保持一致。\n"
+                    "短剧硬规则：各阶段硬规则均有场景证据。\n"
+                    "产品参数：采用 Pengine 默认参数。"
+                ),
                 "feedback_handling": [item.model_dump(mode="json") for item in handling],
             },
         }
@@ -190,9 +198,76 @@ class DeterministicWorkflow:
             selected_l0_variant=self.selected_l0_variant,
             selection_rationale="符合测试故事",
             l0_gate=GateResult(passed=True, evidence=self.l0_evidence),
-            l4_gate=GateResult(passed=True, evidence="L4 evidence"),
+            l4_gate=GateResult(
+                passed=True,
+                evidence=(
+                    "L4-A：人物选择保持一致。\n"
+                    "短剧硬规则：各阶段硬规则均有场景证据。\n"
+                    "产品参数：采用 Pengine 默认参数。"
+                ),
+            ),
             feedback_handling=handling,
         )
+
+
+def test_passing_l4_gate_requires_authority_labeled_evidence() -> None:
+    with pytest.raises(AgentProtocolError, match="Passing L4 evidence"):
+        _validate_persona_checkpoint_payload(
+            InternalStage.ACCEPTING_L4,
+            {"passed": True, "evidence": "整体符合短剧要求。"},
+            (),
+        )
+
+    _validate_persona_checkpoint_payload(
+        InternalStage.ACCEPTING_L4,
+        {
+            "passed": True,
+            "evidence": (
+                "L4-A：人物与情感成立。\n"
+                "短剧硬规则：适用硬规则均有证据。\n"
+                "产品参数：用户明确要求 3 集，覆盖 Pengine 的 6 集默认值。"
+            ),
+        },
+        (),
+    )
+
+
+@pytest.mark.parametrize(
+    ("stage", "review_field"),
+    [
+        (InternalStage.GENERATING_STORY_OUTLINE, "consistency_review"),
+        (InternalStage.GENERATING_CHARACTER_RELATIONSHIPS, "consistency_review"),
+        (InternalStage.GENERATING_EPISODE_OUTLINE, "contract_review"),
+    ],
+)
+def test_passing_generation_review_requires_l4_hard_rule_evidence(
+    stage: InternalStage,
+    review_field: str,
+) -> None:
+    with pytest.raises(AgentProtocolError, match="Passing stage review"):
+        _validate_persona_checkpoint_payload(
+            stage,
+            {
+                review_field: {
+                    "passed": True,
+                    "evidence": "合同一致。",
+                    "issues": [],
+                }
+            },
+            (),
+        )
+
+    _validate_persona_checkpoint_payload(
+        stage,
+        {
+            review_field: {
+                "passed": True,
+                "evidence": "L4硬规则：适用硬规则均有具体证据。",
+                "issues": [],
+            }
+        },
+        (),
+    )
 
 
 class ProviderFailureWorkflow(DeterministicWorkflow):

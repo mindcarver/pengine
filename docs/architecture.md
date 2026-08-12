@@ -153,6 +153,8 @@ l3.md        l4.md      l5.md  l6.md
 - `/persona/` 是只读虚拟上下文；
 - `project`、完整 L0、完整 Soul、完整 L3 和按阶段选择的 L4 内容进入工作上下文；
 - v3 的 Soul 与 L3 读取同一份完整文本，不摘要、不检索、不切片、不静默截断；L3 只约束创作决策方式，不能重选 L0、覆盖合同或成为 Reviewer Gate；
+- 四个生成阶段的 L4 投影固定为 `L4-A + 全阶段通则 + 当前阶段规则 + Pengine 参数`，不得读取其他阶段规则；`accepting_l4` 才读取完整 L4；
+- 只有明确标为创作者确认的 L4 硬规则可成为阻断依据。创作建议只指导生成，题材适配和未经确认的 AI/市场转译不进入 Gate；6 集、时长和场数属于 Pengine 默认产品参数，用户或锁定合同优先；
 - 历史 v1/v2 snapshot 继续使用原 L3 摘要以及各自的 L1/L2 或 Soul 路径，但 v1/v2 source package 不再用于新任务；
 - L5/L6 走有界检索，受结果数量和字符数限制；
 - `/workspace/` 是该 Agent thread 的临时 scratch；

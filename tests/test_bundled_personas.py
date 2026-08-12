@@ -17,7 +17,7 @@ EXPECTED_PERSONAS = {
 }
 
 
-def test_bundled_prototype_personas_are_valid_and_traceable(tmp_path: Path) -> None:
+def test_bundled_personas_are_valid_and_traceable(tmp_path: Path) -> None:
     catalog = PersonaCatalog(ROOT / "personas", tmp_path / "snapshots")
 
     summaries = {summary.persona_id: summary for summary in catalog.discover()}
@@ -39,15 +39,20 @@ def test_bundled_prototype_personas_are_valid_and_traceable(tmp_path: Path) -> N
             "l6",
         }
         content = "\n".join(package.text(logical_name) for logical_name, _ in LOGICAL_FILES)
-        assert "仅作本地原型临时启用" in content
-        assert "非创作者人格定稿" in content
-        assert "归属：原型项目方" in content
-        assert "原型基线：6 集" in package.text("l4")
+        assert "Pengine 默认基线：6 集" in package.text("l4")
+        assert "所有者：Pengine" in package.text("l4")
         assert "24 集" not in package.text("l4")
         assert "## Soul 状态" in package.text("project")
         assert "## 观察与表达" not in package.text("project")
         assert "## 创作能量" not in package.text("project")
         assert len(package.text("soul")) <= 8_000
+
+    for persona_id in EXPECTED_PERSONAS.keys() - {"shouzhuo"}:
+        package = validate_persona_package(ROOT / "personas" / persona_id)
+        content = "\n".join(package.text(logical_name) for logical_name, _ in LOGICAL_FILES)
+        assert "仅作本地原型临时启用" in content
+        assert "非创作者人格定稿" in content
+        assert "归属：原型项目方" in content
 
 
 def test_shouzhuo_alone_carries_the_confirmed_l0_source() -> None:
@@ -79,3 +84,49 @@ def test_shouzhuo_alone_carries_the_confirmed_l0_source() -> None:
         assert extract_l0_variant_ids(other_l0) == ()
         assert "初心 vs 现实的落差" not in other_l0
         assert "先比较至少三条实质不同的可能路径" not in other_l3
+
+
+def test_shouzhuo_l4_contains_only_confirmed_short_drama_authority() -> None:
+    packages = {
+        persona_id: validate_persona_package(ROOT / "personas" / persona_id)
+        for persona_id in EXPECTED_PERSONAS
+    }
+    l4 = packages["shouzhuo"].text("l4")
+    project = packages["shouzhuo"].text("project")
+
+    assert "状态：创作者已确认 · 归属：守拙" in l4
+    assert "L4 来源指纹：sha256:" in l4
+    assert "#### 硬规则" in l4
+    assert "#### 已确认创作建议" in l4
+    assert "### 全阶段通则" in l4
+    assert "创作建议不得单独作为通过或拒绝的理由" in l4
+    assert "人物或关系的重要变化必须由事件触发" in l4
+    assert "每集至少发生一次有意义的状态变化" in l4
+    assert "用户明确要求或锁定生产参数优先" in l4
+    assert "状态：创作者已确认 · 归属：守拙" in project
+
+    for excluded_long_drama_constraint in (
+        "24 集",
+        "900—1300",
+        "900-1300",
+        "1.5 万",
+        "30 场",
+        "36 种",
+    ):
+        assert excluded_long_drama_constraint not in l4
+
+    product_projections = {
+        tuple(
+            line
+            for line in package.text("l4").splitlines()
+            if line.startswith("> 所有者：Pengine") or line.startswith("Pengine 默认基线：")
+        )
+        for package in packages.values()
+    }
+    assert product_projections == {
+        (
+            "> 所有者：Pengine。以下为产品默认值，不是创作者剧本观；"
+            "用户明确要求或锁定生产参数优先。",
+            "Pengine 默认基线：6 集；每集约 2 分钟、2—3 场。",
+        )
+    }

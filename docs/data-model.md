@@ -100,6 +100,8 @@ snapshot_sha256 = SHA256(domain + package_sha256 + canonical_manifest)
 
 manifest 自身不放进 `package_sha256`，避免循环；但规范化 manifest 会参与 `snapshot_sha256`，所以人格身份和该 schema 的完整 Markdown 集合共同决定最终快照。新任务使用完整挂载 `soul.md` 与 `l3.md` 的 v3 八文件集合；历史 v1/v2 snapshot 仍保持原身份和 L3 摘要投影。
 
+L4 的来源正文不进入快照：快照只保存经过授权编译的 `l4.md` 及来源指纹。旧任务继续解析创建时绑定的旧 snapshot；人格版本升级只影响之后创建的新任务。Pengine 产品参数暂作为各 persona `l4.md` 的一致投影，但其权属不因此变成创作者规则。
+
 ### 设计
 
 SeriesBible 候选的投影、合同和设计内容都属于同一个 candidate。候选、全局审核、promotion、design epoch 必须绑定同一 candidate/hash；旧候选不能借用新候选的审核结果。

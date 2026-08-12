@@ -444,7 +444,11 @@ def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMe
             {
                 "stage": "accepting_l4",
                 "passed": True,
-                "evidence": "符合 L4",
+                "evidence": (
+                    "L4-A：人物与情感成立。\n"
+                    "短剧硬规则：适用硬规则均有证据。\n"
+                    "产品参数：采用 Pengine 默认参数。"
+                ),
                 "feedback_handling": [],
             },
         ),
@@ -469,7 +473,11 @@ def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMe
             responses.append(
                 _tool_call(
                     "CanonReviewerResult",
-                    {"passed": True, "evidence": "故事大纲一致", "issues": []},
+                    {
+                        "passed": True,
+                        "evidence": "L4硬规则：故事大纲适用硬规则一致。",
+                        "issues": [],
+                    },
                     index,
                 )
             )
@@ -480,7 +488,11 @@ def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMe
                 responses.append(
                     _tool_call(
                         "CanonReviewerResult",
-                        {"passed": True, "evidence": "故事工件一致", "issues": []},
+                        {
+                            "passed": True,
+                            "evidence": "L4硬规则：人物关系适用硬规则一致。",
+                            "issues": [],
+                        },
                         index,
                     )
                 )
@@ -489,7 +501,11 @@ def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMe
             responses.append(
                 _tool_call(
                     "CanonReviewerResult",
-                    {"passed": True, "evidence": "合同一致", "issues": []},
+                    {
+                        "passed": True,
+                        "evidence": "L4硬规则：合同与分集大纲适用硬规则一致。",
+                        "issues": [],
+                    },
                     index,
                 )
             )
@@ -540,7 +556,11 @@ def _successful_responses_unified() -> list[AIMessage]:
             unified.append(
                 _tool_call(
                     "StructuralReviewResult",
-                    {"passed": True, "category": "pass", "evidence": "全系列一致"},
+                    {
+                        "passed": True,
+                        "category": "pass",
+                        "evidence": "L4硬规则：全系列适用硬规则一致。",
+                    },
                     index,
                 )
             )
@@ -4078,6 +4098,32 @@ def test_all_model_stage_prompts_enforce_l3_method_and_authority_boundaries() ->
         assert "SeriesState" in prompt
 
 
+def test_all_model_stage_prompts_enforce_l4_authority_boundaries() -> None:
+    prompts = (
+        _STORY_ARCHITECT_PROMPT,
+        _EPISODE_PLANNER_PROMPT,
+        _SCRIPT_WRITER_PROMPT,
+        _EPISODE_REPAIR_PROMPT,
+        _QUALITY_REVIEWER_PROMPT,
+        _EPISODE_REVIEWER_PROMPT,
+        _SERIES_REVIEWER_PROMPT,
+        _CANON_REVIEWER_PROMPT,
+        _STORY_REPAIR_PROMPT,
+    )
+
+    for prompt in prompts:
+        assert "Only rules explicitly labeled as creator-confirmed hard rules" in prompt
+        assert "confirmed creative advice is advisory and non-blocking" in prompt
+        assert "Pengine owns episode count, duration, and scene-count defaults" in prompt
+        assert "explicit user requirements and locked production parameters override" in prompt
+
+    assert "L4-A：" in _QUALITY_REVIEWER_PROMPT
+    assert "短剧硬规则：" in _QUALITY_REVIEWER_PROMPT
+    assert "产品参数：" in _QUALITY_REVIEWER_PROMPT
+    assert "L4硬规则：" in _CANON_REVIEWER_PROMPT
+    assert "L4硬规则：" in _SERIES_REVIEWER_PROMPT
+
+
 def test_direct_patch_prompt_inlines_soul_but_not_l3() -> None:
     soul = "# Soul\n\nfirst line\nlast line"
     l3 = "# L3\n\nprivate complete method"
@@ -4822,7 +4868,11 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
             else:
                 assert "二十二岁" in current
                 assert "电话对象写成程屿" in current
-                payload = {"passed": True, "evidence": "故事工件一致", "issues": []}
+                payload = {
+                    "passed": True,
+                    "evidence": "L4硬规则：故事工件一致",
+                    "issues": [],
+                }
             payload["prior_issue_closures"] = _resolved_prior_story_closures(candidate)
         return ToolMessage(
             content=json.dumps(payload, ensure_ascii=False),
@@ -5058,7 +5108,11 @@ async def test_story_consistency_converges_at_fourth_repair_round() -> None:
                 assert "值班记录与手记" in current
                 assert "人物摘要仍称陈伯一直知情" not in current
                 assert "关系摘要仍称陈伯一直知情" not in current
-                payload = {"passed": True, "evidence": "故事工件一致", "issues": []}
+                payload = {
+                    "passed": True,
+                    "evidence": "L4硬规则：故事工件一致",
+                    "issues": [],
+                }
             payload["prior_issue_closures"] = _resolved_prior_story_closures(candidate)
         return ToolMessage(
             content=json.dumps(payload, ensure_ascii=False),
@@ -5116,7 +5170,11 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
         outline_review_index + 2,
         _tool_call(
             "CanonReviewerResult",
-            {"passed": True, "evidence": "修复后合同一致", "issues": []},
+            {
+                "passed": True,
+                "evidence": "L4硬规则：修复后合同一致",
+                "issues": [],
+            },
             102,
         ),
     )
@@ -5303,7 +5361,11 @@ async def test_outline_canon_review_receives_structured_episode_plans() -> None:
                     ],
                 }
                 if len(reviewed_plans) == 1
-                else {"passed": True, "evidence": "合同一致", "issues": []}
+                else {
+                    "passed": True,
+                    "evidence": "L4硬规则：合同一致",
+                    "issues": [],
+                }
             )
         return ToolMessage(
             content=json.dumps(payload, ensure_ascii=False),
@@ -5401,7 +5463,11 @@ async def test_outline_review_target_mismatch_gets_one_fresh_review_before_repai
                 assert "/workspace/invalid_contract_review.json" in candidate_request.state["files"]
                 assert "could not bind" in candidate_request.tool_call["args"]["description"]
             else:
-                payload = {"passed": True, "evidence": "修复后合同一致", "issues": []}
+                payload = {
+                    "passed": True,
+                    "evidence": "L4硬规则：修复后合同一致",
+                    "issues": [],
+                }
                 return ToolMessage(
                     content=json.dumps(payload, ensure_ascii=False),
                     tool_call_id="call-outline-review-target-correction",
@@ -6033,7 +6099,11 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
             assert "trusted runtime metadata" in description
             assert "episodes[].content" in description
             series_review_inputs.append(dict(subagent_request.state["files"]))
-            payload = {"passed": True, "category": "pass", "evidence": "全系列一致"}
+            payload = {
+                "passed": True,
+                "category": "pass",
+                "evidence": "L4硬规则：全系列一致",
+            }
         else:
             assert subagent_type == "episode_reviewer"
             payload = {"passed": True, "evidence": "完整前缀一致", "issues": []}
@@ -6087,7 +6157,7 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
             "episode_number": 2,
             "passed": True,
             "category": "pass",
-            "evidence": "全系列一致",
+            "evidence": "L4硬规则：全系列一致",
             "earliest_affected_episode": None,
         }
     ]

@@ -354,7 +354,7 @@ class UnifiedWorkflow:
                 "story_contract_markdown": render_story_contract_markdown(contract, contract_hash),
                 "contract_review": {
                     "passed": True,
-                    "evidence": "独立合同审查通过。",
+                    "evidence": "L4硬规则：独立合同审查通过。",
                     "issues": [],
                 },
                 "contract_repair_rounds": 0,
@@ -514,7 +514,11 @@ class UnifiedWorkflow:
         l4_payload = {
             "stage": "accepting_l4",
             "passed": True,
-            "evidence": "L4 证据",
+            "evidence": (
+                "L4-A：人物与情感成立。\n"
+                "短剧硬规则：适用硬规则均有证据。\n"
+                "产品参数：采用 Pengine 默认参数。"
+            ),
             "feedback_handling": [],
         }
         for stage, stage_payload in (
@@ -541,7 +545,14 @@ class UnifiedWorkflow:
             selected_l0_variant=approved[InternalStage.SELECTING_L0_VARIANT]["selected_l0_variant"],
             selection_rationale=approved[InternalStage.SELECTING_L0_VARIANT]["selection_rationale"],
             l0_gate=GateResult(passed=True, evidence=l0_evidence),
-            l4_gate=GateResult(passed=True, evidence="L4 证据"),
+            l4_gate=GateResult(
+                passed=True,
+                evidence=(
+                    "L4-A：人物与情感成立。\n"
+                    "短剧硬规则：适用硬规则均有证据。\n"
+                    "产品参数：采用 Pengine 默认参数。"
+                ),
+            ),
             feedback_handling=[],
         )
 

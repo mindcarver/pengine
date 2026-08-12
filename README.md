@@ -75,7 +75,7 @@ WebSocket 或跨项目可写记忆。
 系统采用模块化单体：一个进程、一个 Worker、一次处理一个创作任务，不依赖外部
 消息队列或远程 Agent。
 
-<h2 align="center">02 · Persona v3、Soul 与 L3</h2>
+<h2 align="center">02 · Persona v3、Soul、L3 与 L4</h2>
 
 新任务使用 persona v3。每个人格目录必须包含一个 `manifest.json` 和八个 UTF-8 Markdown 文件：
 
@@ -100,6 +100,8 @@ persona/
 - 历史 v1/v2 snapshot 仍按原 L3 摘要和各自的 L1/L2 或 Soul 投影恢复，但 v1/v2 source package 不再用于新任务；
 - Soul 不做摘要、检索、切片或静默截断，且不得覆盖用户、Canon、L0、L4 或 L3；
 - v3 的完整 L3 作为创作决策方法进入工作上下文，不做摘要、检索、切片或静默截断；它不能重选 L0、重开已批准方向或成为 Reviewer Gate；
+- L4 按阶段投影：四个生成阶段只读取 `L4-A + 全阶段通则 + 当前阶段规则 + Pengine 参数`，最终 L4 Gate 读取完整 L4；
+- L4 中只有明确标为创作者确认的“硬规则”能阻断，已确认创作建议只指导生成；集数、时长和场数默认值归 Pengine，用户明确要求或锁定参数优先；
 - L5/L6 只按需、限量检索，不整文件注入模型上下文。
 
 规范见
@@ -187,8 +189,8 @@ Relay 后人工继续。只有全部分集锁定、聚合哈希复验通过，
 
 要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及一个能以同一组 URL／密钥
 同时提供 Anthropic Messages 生成路由和所选审核协议的 relay。
-仓库已内置四套临时原型人格包。
-这四套人格当前统一采用 6 集原型基线，不代表创作者人格定稿。
+仓库内置四套人格包。守拙的 L0、Soul、L3 与 L4 已按确认资料接入；雾枕、三分甜和星轨仍是临时原型。
+四套人格都投影同一组 Pengine 默认产品参数：6 集、每集约 2 分钟、2—3 场。这些默认值不是任何创作者的剧本观，用户明确要求或锁定生产参数优先。
 
 ```bash
 uv sync --locked --all-groups
