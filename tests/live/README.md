@@ -57,6 +57,17 @@ temporary SQLite database, and proves three distinct decisions: an explicit hard
 blocks, deviation from confirmed advice does not block, and a locked user parameter overrides
 the Pengine default without being attributed to the creator.
 
+Run the isolated Project authority probe with:
+
+```bash
+PENGINE_RUN_PROJECT_ABC=1 uv run pytest -m live_model tests/live/test_project_persona_e2e.py -vv -s
+```
+
+It sends the complete compiled Project exactly once to the generation route, keeps the full
+Project out of the review route, records both real calls in a temporary SQLite database, and
+checks locked user authority, absence of Project-created story facts, runtime privacy, and that
+Project resemblance never becomes an independent review gate.
+
 Every run writes durable evidence under `.artifacts/live-e2e/<timestamp>-<id>/`
 by default, outside the shared `data/` tree. The directory contains safe
 configuration metadata, the server log, persona and creation responses, poll and

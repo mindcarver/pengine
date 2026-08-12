@@ -278,6 +278,53 @@ def _with_l4_policy(prompt: str) -> str:
     return "\n\n".join((prompt, _L4_POLICY))
 
 
+_PROJECT_CREATIVE_POLICY = (
+    "The complete /persona/project.md below is the runtime constitution for this persona. "
+    "Apply it to every content-generating or content-modifying decision without summarizing, "
+    "retrieving, slicing, or silently truncating it. Project routes existing authority and "
+    "workflow responsibilities; it is not a new source of story facts or an additional Gate. "
+    "It cannot override the user request, frozen feedback, approved checkpoints, hard Canon, "
+    "StoryContract, SeriesBible, SeriesState, locked production parameters, /persona/l0.md, or "
+    "applicable creator-confirmed L4 hard rules. Keep its text, source fingerprint, layer names, "
+    "paths, and runtime instructions out of the finished work."
+)
+_PROJECT_INLINE_MARKER = "Complete runtime constitution from /persona/project.md:"
+
+
+def _with_inline_project(prompt: str, persona_files: Mapping[str, str]) -> str:
+    """Inline the complete Project once for calls that can create or modify content."""
+    project = persona_files.get("/persona/project.md")
+    if not isinstance(project, str) or not project.strip():
+        raise AgentProtocolError(
+            "Persona project is missing or empty",
+            safe_message="当前人格缺少可用的 Project 宪章。",
+        )
+    if _PROJECT_INLINE_MARKER in prompt:
+        return prompt
+    return "\n\n".join(
+        (
+            prompt,
+            _PROJECT_CREATIVE_POLICY,
+            _PROJECT_INLINE_MARKER,
+            project,
+        )
+    )
+
+
+_PROJECT_REVIEW_BOUNDARY = (
+    "Project is a creative runtime constitution, not independent review evidence. Do not pass "
+    "or reject work because it does or does not resemble the persona identity or Project style. "
+    "Block only a direct conflict within this reviewer's assigned scope against the user request, "
+    "frozen feedback, approved checkpoints, hard Canon, continuity, structure, locked production "
+    "parameters, /persona/l0.md, applicable creator-confirmed L4 hard rules, or the output/schema "
+    "protocol. Project adds no separate Gate and must not be imitated by the reviewer."
+)
+
+
+def _with_project_review_boundary(prompt: str) -> str:
+    return "\n\n".join((prompt, _PROJECT_REVIEW_BOUNDARY))
+
+
 def _with_inline_soul(prompt: str, persona_files: Mapping[str, str]) -> str:
     """Provide the full Soul to direct model calls that cannot read virtual files."""
     soul = persona_files.get("/persona/soul.md")
@@ -560,6 +607,11 @@ _EPISODE_REPAIR_PROMPT = _with_l4_policy(_EPISODE_REPAIR_PROMPT)
 _QUALITY_REVIEWER_PROMPT = _with_l4_policy(_QUALITY_REVIEWER_PROMPT)
 _EPISODE_REVIEWER_PROMPT = _with_l4_policy(_EPISODE_REVIEWER_PROMPT)
 _SERIES_REVIEWER_PROMPT = _with_l4_policy(_SERIES_REVIEWER_PROMPT)
+
+_QUALITY_REVIEWER_PROMPT = _with_project_review_boundary(_QUALITY_REVIEWER_PROMPT)
+_CANON_REVIEWER_PROMPT = _with_project_review_boundary(_CANON_REVIEWER_PROMPT)
+_EPISODE_REVIEWER_PROMPT = _with_project_review_boundary(_EPISODE_REVIEWER_PROMPT)
+_SERIES_REVIEWER_PROMPT = _with_project_review_boundary(_SERIES_REVIEWER_PROMPT)
 
 
 def _suffix_rewrite_feedback_for_episode(
@@ -3375,9 +3427,11 @@ class ToolAllowlistMiddleware(AgentMiddleware):
         elif result_tool_names:
             results = ", ".join(sorted(result_tool_names))
             prompt = (
-                "The working phase is complete. Return exactly one valid structured "
-                f"result tool call using {results} and the completed work already present "
-                "in the conversation."
+                "The working phase is complete. Do not generate, revise, repair, expand, "
+                "summarize, or otherwise change the completed content. Return exactly one "
+                f"valid structured result tool call using {results}; copy the completed work "
+                "already present in the conversation into the required fields without changing "
+                "its content."
             )
         else:
             prompt = self.system_prompt
@@ -5617,7 +5671,10 @@ class DeepAgentWorkflow:
                 "candidate or alter approved upstream content. The runtime rejects a total "
                 "line-change budget that reaches half of the candidate."
             )
-            instruction = _with_inline_soul(_with_l3_policy(instruction), persona_files)
+            instruction = _with_inline_project(
+                _with_inline_soul(_with_l3_policy(instruction), persona_files),
+                persona_files,
+            )
             if output_language_contract:
                 instruction = f"{instruction}\n{output_language_contract}"
             if correction:
@@ -5667,7 +5724,10 @@ class DeepAgentWorkflow:
                 "empty patch is valid when the runtime mutations alone fully resolve the issue. "
                 "Preserve every field unrelated to the confirmed issues."
             )
-            instruction = _with_inline_soul(_with_l3_policy(instruction), persona_files)
+            instruction = _with_inline_project(
+                _with_inline_soul(_with_l3_policy(instruction), persona_files),
+                persona_files,
+            )
             if output_language_contract:
                 instruction = f"{instruction}\n{output_language_contract}"
             if correction:
@@ -5688,15 +5748,25 @@ class DeepAgentWorkflow:
             )
             return _outline_repair_result(response)
 
-        story_architect_prompt = bind_language(_STORY_ARCHITECT_PROMPT)
-        episode_planner_prompt = bind_language(_EPISODE_PLANNER_PROMPT)
-        script_writer_prompt = bind_language(_SCRIPT_WRITER_PROMPT)
+        story_architect_prompt = bind_language(
+            _with_inline_project(_STORY_ARCHITECT_PROMPT, persona_files)
+        )
+        episode_planner_prompt = bind_language(
+            _with_inline_project(_EPISODE_PLANNER_PROMPT, persona_files)
+        )
+        script_writer_prompt = bind_language(
+            _with_inline_project(_SCRIPT_WRITER_PROMPT, persona_files)
+        )
         quality_reviewer_prompt = bind_language(_QUALITY_REVIEWER_PROMPT)
         canon_reviewer_prompt = bind_language(_CANON_REVIEWER_PROMPT)
         episode_reviewer_prompt = bind_language(_EPISODE_REVIEWER_PROMPT)
         series_reviewer_prompt = bind_language(_SERIES_REVIEWER_PROMPT)
-        episode_repair_prompt = bind_language(_EPISODE_REPAIR_PROMPT)
-        story_repair_prompt = bind_language(_STORY_REPAIR_PROMPT)
+        episode_repair_prompt = bind_language(
+            _with_inline_project(_EPISODE_REPAIR_PROMPT, persona_files)
+        )
+        story_repair_prompt = bind_language(
+            _with_inline_project(_STORY_REPAIR_PROMPT, persona_files)
+        )
         supervisor_prompt = _supervisor_prompt(
             story=story,
             requirements=requirements,

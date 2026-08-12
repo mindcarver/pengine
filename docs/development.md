@@ -111,8 +111,9 @@ uv build --no-sources
 6. 确保 `soul.md` 与 `l3.md` 均已确认、各自未超过 8,000 字符，且包内不存在 `l1.md` 或 `l2.md`；
 7. L4 必须把创作者确认硬规则、确认建议和 Pengine 产品参数分区；未经确认的 AI/市场转译、长剧体量和题材适配判断不得混入硬 Gate；
 8. 原始访谈、Markdown/DOCX 或其他 L9 来源不进入 Git、snapshot、Prompt、SQLite 或观测系统；运行资产只保留已授权编译内容和来源指纹；
-9. 先运行 `tests/test_personas.py`、`tests/test_bundled_personas.py` 和完整测试；
-10. 不把包含个人隐私、未授权作品或 provider 机密的人格包提交到公开仓库。
+9. `project.md` 是运行宪章：修改时必须保留必需标题、更新文件与包 hash，并验证创作/修复请求全文内联、Supervisor/Reviewer 隔离、旧 snapshot 不变；
+10. 先运行 `tests/test_personas.py`、`tests/test_bundled_personas.py`、`tests/test_agents.py` 和完整测试；Project 行为的真实模型验证使用 `PENGINE_RUN_PROJECT_ABC=1 uv run pytest -m live_model tests/live/test_project_persona_e2e.py -vv -s`；
+11. 不把包含个人隐私、未授权作品或 provider 机密的人格包提交到公开仓库。
 
 创建任务会把有效包复制为内容寻址 snapshot。不要在运行中的任务里替换 snapshot 目录，也不要手工编辑 SQLite 中的 snapshot hash。
 
