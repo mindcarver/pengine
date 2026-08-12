@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 MANIFEST_NAME = "manifest.json"
 PERSONA_SCHEMA_V1 = "1.0.0"
 PERSONA_SCHEMA_V2 = "2.0.0"
-CURRENT_PERSONA_SCHEMA = PERSONA_SCHEMA_V2
+PERSONA_SCHEMA_V3 = "3.0.0"
+CURRENT_PERSONA_SCHEMA = PERSONA_SCHEMA_V3
 V1_LOGICAL_FILES: tuple[tuple[str, str], ...] = (
     ("paradigm", "paradigm.md"),
     ("project", "project.md"),
@@ -47,15 +48,17 @@ V2_LOGICAL_FILES: tuple[tuple[str, str], ...] = (
     ("l5", "l5.md"),
     ("l6", "l6.md"),
 )
+V3_LOGICAL_FILES = V2_LOGICAL_FILES
 LOGICAL_FILES_BY_SCHEMA = MappingProxyType(
     {
         PERSONA_SCHEMA_V1: V1_LOGICAL_FILES,
         PERSONA_SCHEMA_V2: V2_LOGICAL_FILES,
+        PERSONA_SCHEMA_V3: V3_LOGICAL_FILES,
     }
 )
 # The public default describes packages selectable for new work. Historical v1
 # callers must pass their schema version explicitly.
-LOGICAL_FILES = V2_LOGICAL_FILES
+LOGICAL_FILES = V3_LOGICAL_FILES
 DEFAULT_SCHEMA_PATH = (
     Path(__file__).resolve().parents[2] / "contracts" / "persona-package.schema.json"
 )
@@ -65,6 +68,7 @@ DEFAULT_RETRIEVAL_MAX_CHARS = 6_000
 DEFAULT_RETRIEVAL_RESULT_CHARS = 1_200
 MAX_RETRIEVAL_LIMIT = 20
 MAX_SOUL_CHARS = 8_000
+MAX_L3_CHARS = 8_000
 SNAPSHOT_HASH_DOMAIN = b"pengine-persona-snapshot-v1\0"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -225,7 +229,8 @@ def validate_persona_package(
     declared_files = manifest.get("files") if isinstance(manifest, Mapping) else None
     declared_file_names = set(declared_files) if isinstance(declared_files, Mapping) else set()
     if (
-        declared_schema == PERSONA_SCHEMA_V2 and declared_file_names.intersection({"l1", "l2"})
+        declared_schema in {PERSONA_SCHEMA_V2, PERSONA_SCHEMA_V3}
+        and declared_file_names.intersection({"l1", "l2"})
     ) or (declared_schema == PERSONA_SCHEMA_V1 and "soul" in declared_file_names):
         raise PersonaPackageError(
             "mixed_persona_schema", "Persona package cannot mix Soul with L1 or L2"
@@ -353,11 +358,15 @@ def _project_stage_context(
     files: dict[str, str] = {
         "/persona/project.md": project,
         "/persona/l0.md": l0,
-        "/persona/l3-summary.md": _extract_required_section(
-            snapshot.text("l3"), (("摘要", "summary"),), "l3 summary"
-        ),
     }
-    if snapshot.manifest["schema_version"] == PERSONA_SCHEMA_V2:
+    schema_version = snapshot.manifest["schema_version"]
+    if schema_version == PERSONA_SCHEMA_V3:
+        files["/persona/l3.md"] = snapshot.text("l3")
+    else:
+        files["/persona/l3-summary.md"] = _extract_required_section(
+            snapshot.text("l3"), (("摘要", "summary"),), "l3 summary"
+        )
+    if schema_version in {PERSONA_SCHEMA_V2, PERSONA_SCHEMA_V3}:
         files["/persona/soul.md"] = snapshot.text("soul")
     else:
         files["/persona/l1-summary.md"] = _extract_required_section(
@@ -642,9 +651,10 @@ def _validate_package_directory(
     except OSError as exc:
         raise PersonaPackageError("package_unreadable", "Persona package cannot be read") from exc
     names = {entry.name for entry in entries}
-    if (schema_version == PERSONA_SCHEMA_V2 and names.intersection({"l1.md", "l2.md"})) or (
-        schema_version == PERSONA_SCHEMA_V1 and "soul.md" in names
-    ):
+    if (
+        schema_version in {PERSONA_SCHEMA_V2, PERSONA_SCHEMA_V3}
+        and names.intersection({"l1.md", "l2.md"})
+    ) or (schema_version == PERSONA_SCHEMA_V1 and "soul.md" in names):
         raise PersonaPackageError(
             "mixed_persona_schema", "Persona package cannot mix Soul with L1 or L2"
         )
@@ -841,6 +851,8 @@ def _validate_required_structure(
         _validate_project_statuses(text, schema_version=schema_version)
     if logical_name == "soul":
         _validate_soul(text)
+    if logical_name == "l3" and schema_version == PERSONA_SCHEMA_V3:
+        _validate_l3(text)
 
 
 def _validate_l0_markers(text: str) -> None:
@@ -944,6 +956,17 @@ def _validate_soul(text: str) -> None:
     if not _STATUS_RE.search(text) or not _OWNERSHIP_RE.search(text):
         raise PersonaPackageError(
             "soul_marker_invalid", "Soul needs confirmed status and ownership markers"
+        )
+
+
+def _validate_l3(text: str) -> None:
+    if len(text) > MAX_L3_CHARS:
+        raise PersonaPackageError("l3_too_large", f"L3 exceeds the {MAX_L3_CHARS}-character limit")
+    if _PENDING_RE.search(text):
+        raise PersonaPackageError("l3_pending", "L3 contains an unconfirmed marker")
+    if not _STATUS_RE.search(text) or not _OWNERSHIP_RE.search(text):
+        raise PersonaPackageError(
+            "l3_marker_invalid", "L3 needs confirmed status and ownership markers"
         )
 
 

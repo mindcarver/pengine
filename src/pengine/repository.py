@@ -93,7 +93,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -1997,6 +1997,41 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 20
+            if schema_version == 20:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    model_call_columns = await (
+                        await connection.execute("PRAGMA table_info(model_calls)")
+                    ).fetchall()
+                    existing_columns = {column[1] for column in model_call_columns}
+                    additions = (
+                        ("l3_sha256", "ALTER TABLE model_calls ADD COLUMN l3_sha256 TEXT"),
+                        (
+                            "l3_char_count",
+                            "ALTER TABLE model_calls ADD COLUMN l3_char_count INTEGER",
+                        ),
+                        (
+                            "l3_mount_path",
+                            "ALTER TABLE model_calls ADD COLUMN l3_mount_path TEXT",
+                        ),
+                        (
+                            "l3_full_text_mounted",
+                            "ALTER TABLE model_calls ADD COLUMN l3_full_text_mounted "
+                            "INTEGER NOT NULL DEFAULT 0",
+                        ),
+                    )
+                    for column_name, statement in additions:
+                        if column_name not in existing_columns:
+                            await connection.execute(statement)
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (21)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 21
 
     async def setup(self) -> None:
         await self.initialize()

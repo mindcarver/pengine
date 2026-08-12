@@ -75,9 +75,9 @@ WebSocket 或跨项目可写记忆。
 系统采用模块化单体：一个进程、一个 Worker、一次处理一个创作任务，不依赖外部
 消息队列或远程 Agent。
 
-<h2 align="center">02 · Persona v2 与 Soul</h2>
+<h2 align="center">02 · Persona v3、Soul 与 L3</h2>
 
-新任务使用 persona v2。每个人格目录必须包含一个 `manifest.json` 和八个 UTF-8 Markdown 文件：
+新任务使用 persona v3。每个人格目录必须包含一个 `manifest.json` 和八个 UTF-8 Markdown 文件：
 
 ```text
 persona/
@@ -94,11 +94,12 @@ persona/
 
 源文件始终只读。创建任务时，Pengine 会复制并验证人格包：
 
-- `package_sha256` 按 v2 固定顺序标识八个 Markdown 内容；
+- `package_sha256` 按 v3 固定顺序标识八个 Markdown 内容；
 - `snapshot_sha256` 同时纳入规范化 manifest 身份；
 - 旧任务永远引用原快照，新版本只影响新任务；
-- 历史 v1 snapshot 仍按原 L1/L2 摘要投影恢复，但 v1 source package 不再用于新任务；
+- 历史 v1/v2 snapshot 仍按原 L3 摘要和各自的 L1/L2 或 Soul 投影恢复，但 v1/v2 source package 不再用于新任务；
 - Soul 不做摘要、检索、切片或静默截断，且不得覆盖用户、Canon、L0、L4 或 L3；
+- v3 的完整 L3 作为创作决策方法进入工作上下文，不做摘要、检索、切片或静默截断；它不能重选 L0、重开已批准方向或成为 Reviewer Gate；
 - L5/L6 只按需、限量检索，不整文件注入模型上下文。
 
 规范见

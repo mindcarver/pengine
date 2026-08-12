@@ -27,7 +27,8 @@ V2_LOGICAL_FILES: tuple[tuple[str, str], ...] = (
     ("l5", "l5.md"),
     ("l6", "l6.md"),
 )
-LOGICAL_FILES = V2_LOGICAL_FILES
+V3_LOGICAL_FILES = V2_LOGICAL_FILES
+LOGICAL_FILES = V3_LOGICAL_FILES
 
 NON_PRODUCTION_CONTENT: dict[str, str] = {
     "paradigm": """\
@@ -238,6 +239,11 @@ Soul 不得覆盖用户要求、Canon、L0、L4、L3 或 StoryContract。
 """,
     }
 )
+V2_NON_PRODUCTION_CONTENT = dict(NON_PRODUCTION_CONTENT)
+NON_PRODUCTION_CONTENT["l3"] = NON_PRODUCTION_CONTENT["l3"].replace(
+    "> NON-PRODUCTION TEST FIXTURE",
+    "> NON-PRODUCTION TEST FIXTURE\n>\n> 状态：创作者已确认 · 归属：创作者",
+)
 
 
 def create_persona_package(
@@ -245,8 +251,8 @@ def create_persona_package(
     *,
     persona_id: str = "test-persona",
     display_name: str = "非生产测试人格",
-    version: str = "2.0.0-test",
-    schema_version: str = "2.0.0",
+    version: str = "3.0.0-test",
+    schema_version: str = "3.0.0",
     content_overrides: dict[str, str] | None = None,
     manifest_mutator: Callable[[dict[str, Any]], None] | None = None,
 ) -> Path:
@@ -256,6 +262,9 @@ def create_persona_package(
         contents = dict(V1_NON_PRODUCTION_CONTENT)
     elif schema_version == "2.0.0":
         logical_files = V2_LOGICAL_FILES
+        contents = dict(V2_NON_PRODUCTION_CONTENT)
+    elif schema_version == "3.0.0":
+        logical_files = V3_LOGICAL_FILES
         contents = dict(NON_PRODUCTION_CONTENT)
     else:
         raise ValueError(f"Unsupported test persona schema: {schema_version}")

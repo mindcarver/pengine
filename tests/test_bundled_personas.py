@@ -27,7 +27,7 @@ def test_bundled_prototype_personas_are_valid_and_traceable(tmp_path: Path) -> N
     } == EXPECTED_PERSONAS
     for persona_id in EXPECTED_PERSONAS:
         package = validate_persona_package(ROOT / "personas" / persona_id)
-        assert package.manifest["schema_version"] == "2.0.0"
+        assert package.manifest["schema_version"] == "3.0.0"
         assert set(package.manifest["files"]) == {
             "paradigm",
             "project",
@@ -58,6 +58,7 @@ def test_shouzhuo_alone_carries_the_confirmed_l0_source() -> None:
 
     shouzhuo_l0 = packages["shouzhuo"].text("l0")
     shouzhuo_soul = packages["shouzhuo"].text("soul")
+    shouzhuo_l3 = packages["shouzhuo"].text("l3")
     assert extract_l0_variant_ids(shouzhuo_l0) == ("A", "B", "C", "D")
     assert "初心 vs 现实的落差" in shouzhuo_l0
     assert "每集至多一次情绪峰值" in shouzhuo_l0
@@ -66,8 +67,15 @@ def test_shouzhuo_alone_carries_the_confirmed_l0_source() -> None:
     assert re.search(r"\b(?:19|20)\d{2}\b", shouzhuo_soul) is None
     for private_source_fragment in ("出生：", "四柱", "十神", "行运"):
         assert private_source_fragment not in shouzhuo_soul
+        assert private_source_fragment not in shouzhuo_l3
+    assert "2d8651e818af1d5d36890dc7ece57ca9b664db89a0c58f164f80e3d1f37b4436" in (shouzhuo_l3)
+    assert "状态：创作者已确认 · 归属：守拙" in shouzhuo_l3
+    assert "先比较至少三条实质不同的可能路径" in shouzhuo_l3
+    assert "选择一条主因果线" in shouzhuo_l3
 
     for persona_id in EXPECTED_PERSONAS.keys() - {"shouzhuo"}:
         other_l0 = packages[persona_id].text("l0")
+        other_l3 = packages[persona_id].text("l3")
         assert extract_l0_variant_ids(other_l0) == ()
         assert "初心 vs 现实的落差" not in other_l0
+        assert "先比较至少三条实质不同的可能路径" not in other_l3

@@ -1,8 +1,8 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "3.0.0",
   "persona_id": "xinggui",
   "display_name": "星轨 · 科幻",
-  "version": "0.2.0-soul-prototype",
+  "version": "0.3.0-l3-prototype",
   "created_at": "2026-07-30T00:00:00Z",
   "package_sha256": "80c1392dfe1a9ee6a5deda52a394012d1cb0205d8bf796a8c3f4569ac0e2af03",
   "files": {

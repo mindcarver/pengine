@@ -95,7 +95,11 @@ CREATE TABLE IF NOT EXISTS model_calls (
     soul_sha256 TEXT,
     soul_char_count INTEGER,
     soul_mount_path TEXT,
-    soul_full_text_loaded INTEGER NOT NULL DEFAULT 0
+    soul_full_text_loaded INTEGER NOT NULL DEFAULT 0,
+    l3_sha256 TEXT,
+    l3_char_count INTEGER,
+    l3_mount_path TEXT,
+    l3_full_text_mounted INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -194,6 +198,10 @@ class ModelCallContext:
     soul_char_count: int | None = None
     soul_mount_path: str | None = None
     soul_full_text_loaded: bool = False
+    l3_sha256: str | None = None
+    l3_char_count: int | None = None
+    l3_mount_path: str | None = None
+    l3_full_text_mounted: bool = False
 
     def reset(self) -> None:
         self.run_id = None
@@ -214,6 +222,10 @@ class ModelCallContext:
         self.soul_char_count = None
         self.soul_mount_path = None
         self.soul_full_text_loaded = False
+        self.l3_sha256 = None
+        self.l3_char_count = None
+        self.l3_mount_path = None
+        self.l3_full_text_mounted = False
 
 
 class StageCallBudgetExceeded(RuntimeError):
@@ -294,6 +306,10 @@ class ModelCallRecord:
     soul_char_count: int | None = None
     soul_mount_path: str | None = None
     soul_full_text_loaded: bool = False
+    l3_sha256: str | None = None
+    l3_char_count: int | None = None
+    l3_mount_path: str | None = None
+    l3_full_text_mounted: bool = False
 
 
 def new_call_id() -> str:
@@ -351,6 +367,10 @@ def build_started_record(
         soul_char_count=context.soul_char_count,
         soul_mount_path=context.soul_mount_path,
         soul_full_text_loaded=context.soul_full_text_loaded,
+        l3_sha256=context.l3_sha256,
+        l3_char_count=context.l3_char_count,
+        l3_mount_path=context.l3_mount_path,
+        l3_full_text_mounted=context.l3_full_text_mounted,
     )
 
 
@@ -523,6 +543,10 @@ _COLUMNS = (
     "soul_char_count",
     "soul_mount_path",
     "soul_full_text_loaded",
+    "l3_sha256",
+    "l3_char_count",
+    "l3_mount_path",
+    "l3_full_text_mounted",
 )
 
 _UPSERT_SQL = f"""
@@ -570,6 +594,10 @@ _MODEL_CALL_ALTERS = (
     "ALTER TABLE model_calls ADD COLUMN soul_char_count INTEGER",
     "ALTER TABLE model_calls ADD COLUMN soul_mount_path TEXT",
     "ALTER TABLE model_calls ADD COLUMN soul_full_text_loaded INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE model_calls ADD COLUMN l3_sha256 TEXT",
+    "ALTER TABLE model_calls ADD COLUMN l3_char_count INTEGER",
+    "ALTER TABLE model_calls ADD COLUMN l3_mount_path TEXT",
+    "ALTER TABLE model_calls ADD COLUMN l3_full_text_mounted INTEGER NOT NULL DEFAULT 0",
 )
 
 

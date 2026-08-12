@@ -35,6 +35,17 @@ Run the complete initial-creation flow with one command:
 PENGINE_RUN_LIVE_E2E=1 uv run pytest -m live_model tests/live/test_real_model_e2e.py -vv -s
 ```
 
+Run the isolated L3 A/B/C behavior probe with:
+
+```bash
+PENGINE_RUN_L3_ABC=1 uv run pytest -m live_model tests/live/test_l3_persona_e2e.py -vv -s
+```
+
+The three groups keep story, L0, Soul, L4, models, and parameters fixed while comparing the
+confirmed full L3, a similarly sized neutral L3, and the historical one-line summary. The probe
+checks single-line causal convergence, functional branches, L0/Canon authority, source privacy,
+character independence, and that L3 never becomes a review gate.
+
 Every run writes durable evidence under `.artifacts/live-e2e/<timestamp>-<id>/`
 by default, outside the shared `data/` tree. The directory contains safe
 configuration metadata, the server log, persona and creation responses, poll and

@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "3.0.0",
   "persona_id": "example-non-production",
   "display_name": "非生产示例人格（仅用于契约校验）",
   "version": "0.0.0-example",

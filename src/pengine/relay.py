@@ -107,6 +107,10 @@ def _persona_event_fields(record: ModelCallRecord) -> dict[str, Any]:
         "soul_char_count": record.soul_char_count,
         "soul_mount_path": record.soul_mount_path,
         "soul_full_text_loaded": record.soul_full_text_loaded,
+        "l3_sha256": record.l3_sha256,
+        "l3_char_count": record.l3_char_count,
+        "l3_mount_path": record.l3_mount_path,
+        "l3_full_text_mounted": record.l3_full_text_mounted,
     }
 
 

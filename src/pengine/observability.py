@@ -53,6 +53,10 @@ def record_model_call_event(
     soul_char_count: int | None = None,
     soul_mount_path: str | None = None,
     soul_full_text_loaded: bool = False,
+    l3_sha256: str | None = None,
+    l3_char_count: int | None = None,
+    l3_mount_path: str | None = None,
+    l3_full_text_mounted: bool = False,
 ) -> None:
     """Record queryable, content-safe lineage for one outbound model call.
 
@@ -117,6 +121,10 @@ def record_model_call_event(
             "soul_char_count": soul_char_count,
             "soul_mount_path": soul_mount_path,
             "soul_full_text_loaded": soul_full_text_loaded,
+            "l3_sha256": l3_sha256,
+            "l3_char_count": l3_char_count,
+            "l3_mount_path": l3_mount_path,
+            "l3_full_text_mounted": l3_full_text_mounted,
         },
     )
 
