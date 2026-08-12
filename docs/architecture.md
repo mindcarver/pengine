@@ -72,7 +72,7 @@ Pengine 是一个**本地、单进程、单 Worker、SQLite 持久化、双角�
        │        │             │                │
        │        └─────────────┼────────────────┘
        │                      ▼
-       │              quality / canon / episode review
+       │              quality / canon / series review
        │                      │
        │           ┌──────────▼──────────┐
        │           │ role-bound relay    │
@@ -110,7 +110,7 @@ V1 进程只运行一个 Worker，并一次处理一个创作任务。Deep Agent
 | `script_writer` | 每集完整剧本 + `EpisodeStateDelta` | generation | 否 |
 | `quality_reviewer` | L0/L4 闸门证据、修订反馈覆盖 | review | 否 |
 | `canon_reviewer` | 故事候选/剧情合同的独立审查 | review | `canon-review` |
-| `episode_reviewer` | 单集连续性语义审查 | review | `episode-continuity-review` |
+| `episode_reviewer` | 无 active SeriesBible 的兼容路径单集语义审查；统一流程不逐集调用 | review | `episode-continuity-review` |
 | `series_reviewer` | 结构性里程碑和全剧审查，分类为通过/设计缺陷/剧本缺陷 | review | 审核范围由运行时注入 |
 | `episode_repair` | 只修复当前未锁定集 | generation | `continuity-repair` |
 | `story_repair` | 只修复未锁定的人物/关系候选 | generation | `story-repair` |
@@ -155,12 +155,16 @@ l3.md        l4.md      l5.md  l6.md
 - 内容生成和修复的实际 provider 请求会从该快照完整、逐字、恰好一次地内联 Project，不依赖模型主动 `read_file`；缺失或空 Project 在出站前失败关闭；
 - Supervisor 不带入完整 Project；Reviewer 只接收独立审核边界，不能以人格或 Project 相似度通过或拒绝候选；纯结果序列化重试只有在明确禁止改写内容时才省略全文；
 - v3 的 Soul 与 L3 读取同一份完整文本，不摘要、不检索、不切片、不静默截断；L3 只约束创作决策方式，不能重选 L0、覆盖合同或成为 Reviewer Gate；
-- 四个生成阶段的 L4 投影固定为 `L4-A + 全阶段通则 + 当前阶段规则 + Pengine 参数`，不得读取其他阶段规则；`accepting_l4` 才读取完整 L4；
+- L0 选择与 L0 Gate 的 L4 投影只有 L4-A；四个生成阶段的单文件投影固定为 `L4-A + 全阶段通则 + 当前阶段规则 + Pengine 参数`；`accepting_l4` 才读取完整 L4；
+- Worker 把七个专业阶段的投影以不同 `/persona/l4/<stage>.md` 路径预装进同一只读 VFS，当前阶段选择由 prompt 约束，不是按子 Agent 隔离的文件 ACL；Story/Outline 两条直接补丁调用不运行该 VFS，也不直接内联 L3/L4 正文，只执行 Reviewer 已确认的有界补丁；
 - 只有明确标为创作者确认的 L4 硬规则可成为阻断依据。创作建议只指导生成，题材适配和未经确认的 AI/市场转译不进入 Gate；6 集、时长和场数属于 Pengine 默认产品参数，用户或锁定合同优先；
 - 历史 v1/v2 snapshot 继续使用原 L3 摘要以及各自的 L1/L2 或 Soul 路径，但 v1/v2 source package 不再用于新任务；
 - L5/L6 走有界检索，受结果数量和字符数限制；
 - `/workspace/` 是该 Agent thread 的临时 scratch；
 - 不配置 `StoreBackend`，不会形成跨任务可写记忆。
+
+更细的代码路径、阶段矩阵和验收证据见 [L3 实际实现设计]({{ site.baseurl }}/l3-integration/)
+与 [L4 实际实现设计]({{ site.baseurl }}/l4-integration/)。两份接入设计当前不展开 L5/L6。
 
 ## 5. 剧情合同和 SeriesBible
 

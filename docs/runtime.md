@@ -104,17 +104,20 @@ L0、适用的 L4 硬规则和输出协议独立判断。结构化结果纠错�
 script_writer
   → script + EpisodeStateDelta
   → deterministic contract/state validation
-  → episode_reviewer semantic continuity review
   → optional bounded episode_repair
   → atomic candidate commit
+  → declared milestone/final-prefix series_reviewer
 ```
 
-只有提交成功的集才会进入 active pointer。当前集没提交时，API 不展示它的正文；已提交的前缀在刷新、结束或失败后仍可只读查看。
+统一 SeriesBible 流程不会为每一集调用 `episode_reviewer`：逐集候选先由确定性合同和状态规则校验；
+声明的结构里程碑与最终完整前缀再由 `series_reviewer` 做绑定当前 design/batch/prefix 的语义分类。
+没有 active SeriesBible 的兼容路径才保留逐集 `episode_reviewer`。只有提交成功的集才会进入
+active pointer；当前集没提交时，API 不展示它的正文，已提交前缀在刷新、结束或失败后仍可只读查看。
 
-每集至少需要一次生成和一次审核；修复会增加同集调用。默认剧本阶段整轮上限是生成
-`192`、审核 `128`，所以 80 集的最低调用量虽然落在上限内，但审核修复余量只有 `48`
-次，还要为结构里程碑审核留出空间。触顶时在出站前以 `agent_execution_limit` 阻断，
-不会让整轮无限调用。
+每集至少需要一次生成；确定性失败、结构里程碑拒绝或最终前缀拒绝会增加修复与复审调用。
+默认剧本阶段整轮上限是生成 `192`、审核 `128`。统一流程的审核调用量取决于里程碑、终审和
+修复次数，不能按“每集一次审核”简单推算。触顶时在出站前以 `agent_execution_limit` 阻断，
+不会让整轮无限调用，也不能把预算上限解释为长篇幅已通过生产验收。
 
 ### 3.4 最终闸门和交付
 
@@ -125,6 +128,10 @@ script_writer
 5. `ContentPackage` 固定包含：故事大纲、人物小传、关系逻辑、分集大纲、分集剧本；`DeliveryReport` 单独保存人格快照、L0/L4 证据、归属声明和修订反馈覆盖。
 
 没有通过最终闸门时，设计包或单集候选可以作为可读进度/证据存在，但不能被当作正式交付。
+
+L3/L4 在上述各阶段的真实文件、提示词、审核和持久化边界，分别见
+[L3 实际实现设计]({{ site.baseurl }}/l3-integration/) 与
+[L4 实际实现设计]({{ site.baseurl }}/l4-integration/)。
 
 ## 4. Run 状态机
 

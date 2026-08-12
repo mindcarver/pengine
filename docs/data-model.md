@@ -51,7 +51,7 @@ LangGraph checkpoint = 可恢复、但仍可能未批准的执行上下文
 
 ## 3. 逻辑表分组
 
-当前 `src/pengine/repository.py` 的迁移头版本为 `18`。下表按领域归纳表，而不是要求调用方直接依赖内部 SQL；SQL schema 变化必须通过迁移维护。
+当前 `src/pengine/repository.py` 的迁移头版本为 `21`。下表按领域归纳表，而不是要求调用方直接依赖内部 SQL；SQL schema 变化必须通过迁移维护。
 
 | 领域 | 逻辑表 | 作用 |
 | --- | --- | --- |
@@ -199,6 +199,11 @@ Schema 18 同时引入两组迁移：旧 `episode_attempts` 进入 `attempt_cycl
 `episode_attempt_cycles`/`episode_attempt_current`；`model_calls` 增加 `operation_id`，
 `business_checkpoints` 增加 `review_call_id` 以及相应索引。迁移在一个前向事务中完成。
 Schema 21 以加法迁移为 `model_calls` 增加四个 L3 挂载审计字段，旧行保持原样并使用安全默认值。
+
+L3 的正文不进入这些审计列，L4 的完整正文也不复制进 `DeliveryReport`：creation 通过
+`persona_snapshot_sha256` 绑定精确人格资产，L3 只记录安全挂载元数据，最终 L4 只保存
+`l4_gate` 证据。完整边界见 [L3 实际实现设计]({{ site.baseurl }}/l3-integration/) 与
+[L4 实际实现设计]({{ site.baseurl }}/l4-integration/)。
 
 ## 8. SQLite、WAL 与备份
 
