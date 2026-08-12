@@ -81,6 +81,16 @@ loading_persona
 6. 合同及其 Markdown 投影、hash 一起写入 approved checkpoint。
 7. 设计同步阶段将投影组装为一个 `SeriesBible` candidate；不允许把不同候选的故事大纲、人物关系和分集大纲拼在一起。
 
+所有可能产生或修改内容的工作请求都从当前 Persona 快照内联一次完整 Project：
+`story_architect`、`episode_planner`、`script_writer`、`story_repair`、`episode_repair`
+以及 Story/Outline 直接补丁调用均遵守这一规则。挂载 `/persona/project.md` 仍用于只读审计，
+但正确性不依赖模型主动读取。Project 缺失或为空时不会发起 provider 请求。
+
+Supervisor 只编排阶段，不接收完整 Project。Reviewer 只接收“不以人格或 Project 相似度
+作为 Gate”的审核边界，并继续按用户要求、冻结反馈、Canon、连续性、结构、制作参数、
+L0、适用的 L4 硬规则和输出协议独立判断。结构化结果纠错只有在系统提示明确禁止内容
+变更时才允许省略 Project。
+
 这里有一个必须显式保留的当前限制：第 3 步仍是一次结构化模型调用，返回全量
 `episode_plans`、合同事实/线索/义务和里程碑。schema 没有限制集数上限，但 60–100 集
 会显著放大输出截断、JSON 解析重试和单次全局编排失真的风险；当前实现没有按批次生成并

@@ -31,6 +31,9 @@ from pengine.agents import (
     _EPISODE_REPAIR_PROMPT,
     _EPISODE_REVIEWER_PROMPT,
     _INTERNAL_RUNTIME_LEAK_POLICY,
+    _PROJECT_CREATIVE_POLICY,
+    _PROJECT_INLINE_MARKER,
+    _PROJECT_REVIEW_BOUNDARY,
     _QUALITY_REVIEWER_PROMPT,
     _REPAIR_TOOL_ALLOWLIST,
     _SCRIPT_WRITER_PROMPT,
@@ -81,6 +84,7 @@ from pengine.agents import (
     _supervisor_prompt,
     _validate_outline_repair_patch_targets,
     _validate_result_language,
+    _with_inline_project,
     _with_inline_soul,
     _with_l3_policy,
     flatten_cr_candidate,
@@ -2488,6 +2492,8 @@ async def test_tool_allowlist_prompt_tracks_result_only_correction_request() -> 
     assert not _prompt_mentions_tool(model.model_system_prompts[-1], "read_file")
     assert _prompt_mentions_tool(model.model_system_prompts[-1], "Result")
     assert not _prompt_mentions_tool(model.model_system_prompts[-1], "ls")
+    assert "Do not generate, revise, repair, expand, summarize" in (model.model_system_prompts[-1])
+    assert "without changing its content" in model.model_system_prompts[-1]
 
 
 @pytest.mark.asyncio
@@ -4124,19 +4130,46 @@ def test_all_model_stage_prompts_enforce_l4_authority_boundaries() -> None:
     assert "L4硬规则：" in _SERIES_REVIEWER_PROMPT
 
 
-def test_direct_patch_prompt_inlines_soul_but_not_l3() -> None:
+def test_direct_patch_prompt_inlines_project_and_soul_but_not_l3_body() -> None:
+    project = "# Project\n\nPROJECT-UNIQUE-RUNTIME-CONSTITUTION"
     soul = "# Soul\n\nfirst line\nlast line"
     l3 = "# L3\n\nprivate complete method"
-    prompt = _with_inline_soul(
-        _with_l3_policy("Repair the candidate."),
-        {"/persona/soul.md": soul, "/persona/l3.md": l3},
+    persona_files = {
+        "/persona/project.md": project,
+        "/persona/soul.md": soul,
+        "/persona/l3.md": l3,
+    }
+    prompt = _with_inline_project(
+        _with_inline_soul(_with_l3_policy("Repair the candidate."), persona_files),
+        persona_files,
     )
 
+    assert prompt.count(project) == 1
     assert prompt.count(soul) == 1
     assert l3 not in prompt
+    assert _PROJECT_CREATIVE_POLICY in prompt
+    assert _PROJECT_INLINE_MARKER in prompt
     assert "Complete text of /persona/soul.md:" in prompt
     assert "Never summarize, retrieve, slice, or silently truncate Soul" in prompt
     assert _with_inline_soul("Repair the candidate.", {}) == "Repair the candidate."
+
+    assert _with_inline_project(prompt, persona_files) == prompt
+    for missing in ({}, {"/persona/project.md": "   "}):
+        with pytest.raises(AgentProtocolError) as error:
+            _with_inline_project("Generate content.", missing)
+        assert error.value.safe_message == "当前人格缺少可用的 Project 宪章。"
+
+
+def test_reviewer_prompts_keep_project_as_a_boundary_not_a_style_gate() -> None:
+    for prompt in (
+        _QUALITY_REVIEWER_PROMPT,
+        _CANON_REVIEWER_PROMPT,
+        _EPISODE_REVIEWER_PROMPT,
+        _SERIES_REVIEWER_PROMPT,
+    ):
+        assert _PROJECT_REVIEW_BOUNDARY in prompt
+        assert "Project adds no separate Gate" in prompt
+        assert _PROJECT_INLINE_MARKER not in prompt
 
 
 def test_l4_reviewer_prompt_only_locks_explicit_verbatim_facts() -> None:
@@ -4332,6 +4365,7 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
     async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
         raise AssertionError("No stage should run during topology capture")
 
+    project = "# Project\n\nPROJECT-UNIQUE-RUNTIME-CONSTITUTION"
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
         workflow = DeepAgentWorkflow(
@@ -4346,7 +4380,7 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
                 thread_id="routing-thread",
                 story="一句创意。",
                 requirements="生成短剧。",
-                persona_files={"/persona/project.md": "规则"},
+                persona_files={"/persona/project.md": project},
                 before_stage=before_stage,
                 approve_stage=approve_stage,
             )
@@ -4367,6 +4401,27 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
         "series_reviewer",
     }
     subagents_by_name = {spec["name"]: spec for spec in captured["subagents"]}
+    for name in (
+        "story_architect",
+        "episode_planner",
+        "script_writer",
+        "episode_repair",
+        "story_repair",
+    ):
+        system_prompt = subagents_by_name[name]["system_prompt"]
+        assert system_prompt.count(project) == 1
+        assert _PROJECT_CREATIVE_POLICY in system_prompt
+    for name in (
+        "quality_reviewer",
+        "canon_reviewer",
+        "episode_reviewer",
+        "series_reviewer",
+    ):
+        system_prompt = subagents_by_name[name]["system_prompt"]
+        assert project not in system_prompt
+        assert _PROJECT_REVIEW_BOUNDARY in system_prompt
+    assert project not in captured["system_prompt"]
+    assert _PROJECT_REVIEW_BOUNDARY not in captured["system_prompt"]
     for name in (
         "script_writer",
         "quality_reviewer",
@@ -4611,11 +4666,12 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         )
 
         episode_hooks, episode_attempts = _episode_hook_kwargs()
+        project = "# Project\n\nPROJECT-UNIQUE-RUNTIME-CONSTITUTION"
         result = await workflow.execute(
             thread_id="initial-thread",
             story="一个人回乡面对旧事。",
             requirements="生成完整短剧。",
-            persona_files={"/persona/project.md": "只读人格规则"},
+            persona_files={"/persona/project.md": project},
             before_stage=before_stage,
             approve_stage=approve_stage,
             **episode_hooks,
@@ -4657,6 +4713,29 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             "grep",
         }
         assert len(model.bound_tool_names) == len(model.model_system_prompts)
+        creative_result_tools = {
+            "StoryArchitectResult",
+            "EpisodePlannerResult",
+            "ScriptWriterResult",
+        }
+        reviewer_result_tools = {
+            "QualityReviewerResult",
+            "CanonReviewerResult",
+            "EpisodeReviewerResult",
+        }
+        for offered_tools, system_prompt in zip(
+            model.bound_tool_names,
+            model.model_system_prompts,
+            strict=True,
+        ):
+            tool_names = set(offered_tools)
+            if tool_names & creative_result_tools:
+                assert system_prompt.count(project) == 1
+            if tool_names & reviewer_result_tools:
+                assert project not in system_prompt
+                assert _PROJECT_REVIEW_BOUNDARY in system_prompt
+            if "WorkflowCompletion" in tool_names:
+                assert project not in system_prompt
         known_tool_names = {
             "task",
             "read_file",
@@ -5133,7 +5212,10 @@ async def test_story_consistency_converges_at_fourth_repair_round() -> None:
 
 
 @pytest.mark.asyncio
-async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) -> None:
+async def test_contract_review_repairs_once_before_outline_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
     outline_review_index = _index_of_tool_call(responses, "CanonReviewerResult", occurrence=4)
@@ -5179,6 +5261,15 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
         ),
     )
     approved: dict[InternalStage, dict[str, Any]] = {}
+    inlined_project_prompts: list[str] = []
+    original_inline_project = _with_inline_project
+
+    def capture_inline_project(prompt: str, persona_files: Mapping[str, str]) -> str:
+        inlined = original_inline_project(prompt, persona_files)
+        inlined_project_prompts.append(inlined)
+        return inlined
+
+    monkeypatch.setattr("pengine.agents._with_inline_project", capture_inline_project)
 
     async def before_stage(_: InternalStage) -> int:
         return 1
@@ -5188,8 +5279,10 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
 
     async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
         await saver.setup()
+        model = ToolCallingFakeModel(responses=responses)
+        project = "# Project\n\nPROJECT-DIRECT-OUTLINE-PATCH"
         workflow = _fake_workflow(
-            model=ToolCallingFakeModel(responses=responses),
+            model=model,
             checkpointer=saver,
             provider_profile_key="toolcallingfakemodel",
         )
@@ -5197,7 +5290,7 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
             thread_id="contract-repair-thread",
             story="故事",
             requirements="要求",
-            persona_files={"/persona/project.md": "规则"},
+            persona_files={"/persona/project.md": project},
             before_stage=before_stage,
             approve_stage=approve_stage,
             **_episode_hook_kwargs()[0],
@@ -5208,6 +5301,141 @@ async def test_contract_review_repairs_once_before_outline_lock(tmp_path: Path) 
     assert outline["contract_review"]["passed"] is True
     assert outline["content"] == "修复后的分集大纲"
     assert len(outline["story_contract_sha256"]) == 64
+    outline_patch_prompts = [
+        prompt
+        for prompt in inlined_project_prompts
+        if "Repair only the confirmed canon-review issues" in prompt
+    ]
+    assert len(outline_patch_prompts) == 1
+    assert outline_patch_prompts[0].count(project) == 1
+
+
+@pytest.mark.asyncio
+async def test_story_patch_direct_call_inlines_project_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "story-project-patch-checkpoints.sqlite3"
+    responses = _successful_responses()
+    story_result_index = _index_of_tool_call(
+        responses,
+        "StoryArchitectResult",
+        occurrence=2,
+    )
+    story_payload = copy.deepcopy(responses[story_result_index].tool_calls[0]["args"])
+    story_payload["content"] = "第一行保留。\n旧冲突。\n第三行保留。\n第四行保留。"
+    responses[story_result_index] = _tool_call(
+        "StoryArchitectResult",
+        story_payload,
+        story_result_index,
+    )
+    story_review_index = _index_of_tool_call(
+        responses,
+        "CanonReviewerResult",
+        occurrence=1,
+    )
+    failed_review_payload = {
+        "passed": False,
+        "evidence": "故事大纲含有已确认冲突",
+        "issues": [
+            {
+                "code": "stale_story_fact",
+                "message": "把旧冲突改为已修复事实。",
+                "script_excerpt": "旧冲突。",
+                "contract_mutation_required": False,
+            }
+        ],
+    }
+    responses[story_review_index] = _tool_call(
+        "CanonReviewerResult",
+        failed_review_payload,
+        story_review_index,
+    )
+    prior_issue_id = _canon_issue_ledger(CanonReviewerResult.model_validate(failed_review_payload))[
+        0
+    ]["issue_id"]
+    responses.insert(
+        story_review_index + 1,
+        _tool_call(
+            "StoryArtifactRepairPatch",
+            {
+                "stage": "generating_story_outline",
+                "line_replacements": [
+                    {
+                        "start_line": 2,
+                        "end_line": 2,
+                        "replacement": "已修复事实。",
+                    }
+                ],
+            },
+            201,
+        ),
+    )
+    responses.insert(
+        story_review_index + 2,
+        _tool_call(
+            "CanonReviewerResult",
+            {
+                "passed": True,
+                "evidence": "L4硬规则：修复后故事大纲一致。",
+                "issues": [],
+                "prior_issue_closures": [
+                    {
+                        "issue_id": prior_issue_id,
+                        "status": "resolved",
+                        "evidence": "当前第二行已改为已修复事实，旧冲突不再存在。",
+                    }
+                ],
+            },
+            202,
+        ),
+    )
+    approved: dict[InternalStage, dict[str, Any]] = {}
+    inlined_project_prompts: list[str] = []
+    original_inline_project = _with_inline_project
+
+    def capture_inline_project(prompt: str, persona_files: Mapping[str, str]) -> str:
+        inlined = original_inline_project(prompt, persona_files)
+        inlined_project_prompts.append(inlined)
+        return inlined
+
+    monkeypatch.setattr("pengine.agents._with_inline_project", capture_inline_project)
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
+        approved[stage] = payload
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        model = ToolCallingFakeModel(responses=responses)
+        project = "# Project\n\nPROJECT-DIRECT-STORY-PATCH"
+        workflow = _fake_workflow(
+            model=model,
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+        await workflow.execute(
+            thread_id="story-project-patch-thread",
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": project},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+            **_episode_hook_kwargs()[0],
+        )
+
+    assert approved[InternalStage.GENERATING_STORY_OUTLINE]["content"] == (
+        "第一行保留。\n已修复事实。\n第三行保留。\n第四行保留。"
+    )
+    story_patch_prompts = [
+        prompt
+        for prompt in inlined_project_prompts
+        if "Repair only the unlocked generating_story_outline candidate" in prompt
+    ]
+    assert len(story_patch_prompts) == 1
+    assert story_patch_prompts[0].count(project) == 1
 
 
 @pytest.mark.asyncio
