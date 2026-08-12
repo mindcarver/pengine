@@ -441,6 +441,53 @@ def test_identity_mismatch_persists_exact_response_models(tmp_path: Path) -> Non
     store.close()
 
 
+def test_official_gpt55_snapshot_persists_as_successful_raw_identity(
+    tmp_path: Path,
+) -> None:
+    store = ModelCallStore(tmp_path / "model_calls.sqlite3")
+    state = ModelCallState(store=store)
+    state.context.run_id = "run-gpt55-snapshot"
+    state.context.stage = "generating_character_relationships"
+    handler = _ModelCallAuditHandler(
+        role="review",
+        model_id="gpt-5.5",
+        adapter="openai",
+        provider="openai",
+        model_call_state=state,
+        context_limit_tokens=1_050_000,
+    )
+    call_id = uuid4()
+    handler.on_chat_model_start(
+        {},
+        [[{"role": "user", "content": "review"}]],
+        run_id=call_id,
+    )
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="",
+                        response_metadata={"model_name": "gpt-5.5-2026-04-23"},
+                    )
+                )
+            ]
+        ]
+    )
+
+    handler.on_llm_end(response, run_id=call_id)
+
+    row = store._connection.execute(
+        "SELECT status, error_code, error_type, response_model_ids_json "
+        "FROM model_calls WHERE run_id = 'run-gpt55-snapshot'"
+    ).fetchone()
+    assert row["status"] == "succeeded"
+    assert row["error_code"] is None
+    assert row["error_type"] is None
+    assert json.loads(row["response_model_ids_json"]) == ["gpt-5.5-2026-04-23"]
+    store.close()
+
+
 def test_langfuse_model_call_event_contains_response_identity(monkeypatch) -> None:
     captured: dict[str, Any] = {}
 
