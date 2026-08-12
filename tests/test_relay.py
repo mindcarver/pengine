@@ -6,8 +6,8 @@ import httpx
 import openai
 import pytest
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.outputs import ChatGeneration, LLMResult
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr
@@ -105,6 +105,67 @@ def test_model_call_audit_requires_exact_response_model_identity(caplog) -> None
 
     assert "requested_model_id=claude-opus-5" in caplog.text
     assert "response_model_id=claude-opus-5" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_models", "accepted"),
+    [
+        (["claude-opus-5", "claude-opus-5"], True),
+        (["claude-opus-5", "relay-fallback"], False),
+    ],
+)
+async def test_anthropic_stream_deduplicates_only_identical_model_identity_chunks(
+    monkeypatch, response_models: list[str], accepted: bool
+) -> None:
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        for model_id in response_models:
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    response_metadata={"model_name": model_id},
+                )
+            )
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(_role_settings(), role="generation")
+    chunks = [chunk async for chunk in model._astream([])]
+    combined = chunks[0]
+    for chunk in chunks[1:]:
+        combined += chunk
+    response = LLMResult(generations=[[combined]])
+    handler = _ModelCallAuditHandler(role="generation", model_id="claude-opus-5")
+
+    if accepted:
+        handler.on_llm_end(response, run_id=uuid4())
+        assert combined.message.response_metadata["model_name"] == "claude-opus-5"
+    else:
+        with pytest.raises(RelayIdentityError, match="identity did not match"):
+            handler.on_llm_end(response, run_id=uuid4())
+
+
+def test_anthropic_sync_stream_deduplicates_identical_model_identity_chunks(
+    monkeypatch,
+) -> None:
+    def fake_stream(*args, **kwargs):
+        del args, kwargs
+        for _ in range(2):
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    response_metadata={"model_name": "claude-opus-5"},
+                )
+            )
+
+    monkeypatch.setattr(ChatAnthropic, "_stream", fake_stream)
+    model = build_chat_model(_role_settings(), role="generation")
+    chunks = list(model._stream([]))
+    combined = chunks[0]
+    for chunk in chunks[1:]:
+        combined += chunk
+
+    assert combined.message.response_metadata["model_name"] == "claude-opus-5"
 
 
 def test_model_call_audit_accepts_official_gpt55_snapshot_identity(caplog) -> None:
@@ -275,7 +336,10 @@ def test_model_call_audit_scopes_script_budget_per_episode_and_stage(monkeypatch
     assert blocked[0]["error_code"] == "agent_execution_limit"
 
 
-@pytest.mark.parametrize("response_model", [None, "deepseek-v4-flash"])
+@pytest.mark.parametrize(
+    "response_model",
+    [None, "deepseek-v4-flash", "claude-opus-5claude-opus-5"],
+)
 def test_model_call_audit_rejects_missing_or_mismatched_response_identity(
     response_model: str | None,
 ) -> None:
