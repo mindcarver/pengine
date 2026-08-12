@@ -642,6 +642,7 @@ def test_story_architect_schema_exposes_stage_specific_field_contract() -> None:
         assert "generating_character_relationships" in properties[cr_field]["description"]
         assert "Must be null for selecting_l0_variant" in properties[cr_field]["description"]
     assert "selecting_l0_variant" in properties["selected_l0_variant"]["description"]
+    assert "For [ID:D], return D, not [ID:D]" in properties["selected_l0_variant"]["description"]
     assert "do not add an English translation" in (properties["selected_l0_variant"]["description"])
     assert "Must be null" in properties["selected_l0_variant"]["description"]
     assert "selecting_l0_variant" in properties["selection_rationale"]["description"]
