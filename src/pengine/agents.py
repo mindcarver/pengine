@@ -2500,36 +2500,21 @@ def _missing_required_reads(messages: Sequence[Any]) -> tuple[str, ...]:
     return tuple(path for path in required if path not in successful)
 
 
-def _response_reads_required_path(
-    response: ModelResponse,
-    missing_paths: Sequence[str],
-) -> bool:
-    missing = set(missing_paths)
-    calls = [
-        call
-        for message in response.result
-        if isinstance(message, AIMessage)
-        for call in message.tool_calls
-    ]
-    if response.structured_response is not None or not calls:
-        return False
-    if any(call.get("name") != "read_file" for call in calls):
-        return False
-    return any(
-        isinstance(call.get("args"), Mapping) and call["args"].get("file_path") in missing
-        for call in calls
-    )
-
-
-def _required_read_correction(missing_paths: Sequence[str]) -> HumanMessage:
-    manifest = "\n".join(f"- {path}" for path in missing_paths)
-    return HumanMessage(
-        content=(
-            "The structured review result cannot be accepted because required inputs have not "
-            "all been read successfully. Call read_file now for the missing exact paths below. "
-            "Do not return prose or a structured result until every listed read succeeds:\n"
-            f"{manifest}"
-        )
+def _scheduled_required_read(path: str, ordinal: int) -> ModelResponse:
+    return ModelResponse(
+        result=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": path},
+                        "id": (f"pengine-required-read-{ordinal}-{content_fingerprint(path)[:12]}"),
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
     )
 
 
@@ -3647,8 +3632,15 @@ class StructuredResultMiddleware(AgentMiddleware):
             raise AgentProtocolError("Subagent returned invalid structured output")
 
         if missing_required_reads:
-            model_request = request
-        elif validation_errors:
+            if not any(_model_request_tool_name(tool) == "read_file" for tool in request.tools):
+                raise AgentProtocolError(
+                    "Review subagent is missing the required read_file tool",
+                    safe_message="审核代理缺少必需的读取工具。",
+                )
+            required_read_count = len(_required_read_paths(list(request.messages)))
+            ordinal = required_read_count - len(missing_required_reads) + 1
+            return _scheduled_required_read(missing_required_reads[0], ordinal)
+        if validation_errors:
             messages = _compact_structured_validation_messages(
                 list(request.messages),
                 result_tool_names,
@@ -3685,24 +3677,6 @@ class StructuredResultMiddleware(AgentMiddleware):
         else:
             model_request = request
         response = await handler(model_request)
-        if missing_required_reads:
-            if _response_reads_required_path(response, missing_required_reads):
-                return response
-            corrective_response = await handler(
-                request.override(
-                    messages=[
-                        *request.messages,
-                        *response.result,
-                        _required_read_correction(missing_required_reads),
-                    ]
-                )
-            )
-            if _response_reads_required_path(corrective_response, missing_required_reads):
-                return corrective_response
-            raise AgentProtocolError(
-                "Review subagent returned a result before reading every required input",
-                safe_message="审核代理未读取全部必需输入。",
-            )
         if response.structured_response is not None:
             return response
         returned_tool_names = {
