@@ -177,7 +177,12 @@ L3/L4 在上述各阶段的真实文件、提示词、审核和持久化边界�
 | 暂时 relay/网络 | 请求开始后的连接、DNS、TLS、读取超时或重置；relay `429/502/503/504` | 首次在同一 run/thread 上进入 `auto_resuming`，遵守至少 10 秒或更长 `Retry-After` | 若同一用户阶段再次共享中断，`Continue` 或 `End` |
 | 语法正确地址但连接失败 | 主机名解析/连接失败，无法证明一定短暂 | 按受限 transport 路径计入调用预算，耗尽后失败 | 修正 relay 配置后新建任务 |
 | 配置/安全错误 | 缺 URL/key、非 loopback HTTP、证书校验失败 | 不自动降级，不切换模型 | 修正 `.env` 后重新运行 |
-| 模型身份错误 | 响应模型身份缺失、不等于配置模型或同时出现多个身份 | 丢弃响应，暂停为 `relay_identity_mismatch`，不自动重试 | 先核验 Relay；通过身份探测后 `Continue` |
+| 模型身份错误 | 响应身份缺失、同时出现多个身份，或不等于配置模型及其显式允许的官方快照 | 丢弃响应，暂停为 `relay_identity_mismatch`，不自动重试 | 先核验 Relay；通过身份探测后 `Continue` |
+
+模型身份只做显式、有限的别名归一化：请求 `gpt-5.5` 时允许 Relay 回报
+`gpt-5.5` 或 OpenAI 官方固定快照 `gpt-5.5-2026-04-23`。不得使用
+`gpt-5.5-*` 通配符；未来快照需要先核验再更新映射。无论精确匹配还是显式等价，
+SQLite、结构化日志和 Langfuse 都保留 Relay 实际回报的原始 `response_model_ids`。
 | 协议错误 | OpenAI/Anthropic tool 协议不匹配、结构化输出无效 | 终止为安全错误 | 检查 relay adapter 和响应合同 |
 | 上下文预算 | 未设置可信上限，或序列化请求 + 保留输出超出上限 | 请求前阻断，0 outbound call，运行暂停为 `context_budget` | 增加已验证上限、缩小上下文或结束任务 |
 | 内容审查不通过 | 合同、单集连续性、结构性里程碑失败 | 只做有界内容修复；预算耗尽后 `paused` | 需要 `authorize-repair` 才能消费一次授权周期，或保留并结束 |

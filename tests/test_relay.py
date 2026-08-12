@@ -107,6 +107,70 @@ def test_model_call_audit_requires_exact_response_model_identity(caplog) -> None
     assert "response_model_id=claude-opus-5" in caplog.text
 
 
+def test_model_call_audit_accepts_official_gpt55_snapshot_identity(caplog) -> None:
+    caplog.set_level("INFO", logger="uvicorn.error.pengine.model_calls")
+    handler = _ModelCallAuditHandler(role="review", model_id="gpt-5.5")
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="",
+                        response_metadata={"model_name": "gpt-5.5-2026-04-23"},
+                        tool_calls=[
+                            {
+                                "name": "CanonReviewerResult",
+                                "args": {"passed": True, "evidence": "通过", "issues": []},
+                                "id": "review-result",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                )
+            ]
+        ]
+    )
+
+    handler.on_llm_end(response, run_id=uuid4())
+
+    assert "requested_model_id=gpt-5.5" in caplog.text
+    assert "response_model_id=gpt-5.5-2026-04-23" in caplog.text
+    assert "identity_match=explicit_equivalent" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "response_models",
+    [
+        [],
+        ["gpt-5.5-2099-01-01"],
+        ["gpt-5.5-pro-2026-04-23"],
+        ["gpt-5.6-terra"],
+        ["gpt-5.5", "gpt-5.5-2026-04-23"],
+        ["gpt-5.5-2026-04-23", "deepseek-v4-flash"],
+    ],
+)
+def test_model_call_audit_rejects_unapproved_or_ambiguous_gpt55_identity(
+    response_models: list[str],
+) -> None:
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="untrusted",
+                        response_metadata={"model_name": model_id} if model_id else {},
+                    )
+                )
+                for model_id in (response_models or [""])
+            ]
+        ]
+    )
+    handler = _ModelCallAuditHandler(role="review", model_id="gpt-5.5")
+
+    with pytest.raises(RelayIdentityError, match="identity did not match"):
+        handler.on_llm_end(response, run_id=uuid4())
+
+
 def test_model_call_audit_enforces_the_review_budget_before_dispatch() -> None:
     state = ModelCallState()
     state.context.stage = "generating_character_relationships"
@@ -221,7 +285,7 @@ def test_model_call_audit_rejects_missing_or_mismatched_response_identity(
     )
     handler = _ModelCallAuditHandler(role="generation", model_id="claude-opus-5")
 
-    with pytest.raises(RelayIdentityError, match="identity did not exactly match") as excinfo:
+    with pytest.raises(RelayIdentityError, match="identity did not match") as excinfo:
         handler.on_llm_end(response, run_id=uuid4())
     assert excinfo.value.requested_model_id == "claude-opus-5"
     assert list(excinfo.value.response_model_ids) == (

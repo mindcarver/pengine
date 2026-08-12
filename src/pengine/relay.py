@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from math import ceil
+from types import MappingProxyType
 from typing import Any, Literal
 from uuid import UUID
 
@@ -44,6 +45,9 @@ from pengine.model_calls import (
 from pengine.observability import record_model_call_event
 
 _AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
+_RESPONSE_MODEL_ID_EQUIVALENTS = MappingProxyType(
+    {"gpt-5.5": frozenset({"gpt-5.5", "gpt-5.5-2026-04-23"})}
+)
 # Uvicorn owns the runtime log handlers. This child logger keeps the safe model-call
 # audit at INFO while ensuring it reaches the same server evidence stream.
 _MODEL_CALL_LOGGER = logging.getLogger("uvicorn.error.pengine.model_calls")
@@ -368,7 +372,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         response_model_ids = _response_model_ids(response)
         sorted_response_model_ids = sorted(response_model_ids)
         tokens, finish_reason = extract_provider_usage(response)
-        if {model_id.casefold() for model_id in response_model_ids} != {self.model_id.casefold()}:
+        if not _response_model_identity_matches(self.model_id, response_model_ids):
             identity_error = RelayIdentityError(
                 role=self.role,
                 requested_model_id=self.model_id,
@@ -412,12 +416,18 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             )
             if self.state is not None:
                 self.state.remember_succeeded(record)
+        identity_match = (
+            "exact"
+            if sorted_response_model_ids[0].casefold() == self.model_id.casefold()
+            else "explicit_equivalent"
+        )
         _MODEL_CALL_LOGGER.info(
             "model_call event=end role=%s requested_model_id=%s response_model_id=%s "
-            "call_id=%s usage_status=%s finish_reason=%s",
+            "identity_match=%s call_id=%s usage_status=%s finish_reason=%s",
             self.role,
             self.model_id,
             sorted_response_model_ids[0],
+            identity_match,
             physical_call_id,
             usage_status_from(tokens) if record is not None else "unavailable",
             finish_reason,
@@ -613,6 +623,17 @@ def _response_model_ids(response: LLMResult) -> set[str]:
             if isinstance(value, str) and value:
                 model_ids.add(value)
     return model_ids
+
+
+def _response_model_identity_matches(
+    requested_model_id: str,
+    response_model_ids: set[str],
+) -> bool:
+    if len(response_model_ids) != 1:
+        return False
+    requested = requested_model_id.casefold()
+    allowed = _RESPONSE_MODEL_ID_EQUIVALENTS.get(requested, frozenset({requested}))
+    return next(iter(response_model_ids)).casefold() in allowed
 
 
 @dataclass(frozen=True, slots=True)
@@ -882,7 +903,7 @@ class RelayIdentityError(RelayError):
         super().__init__(
             code="relay_incompatible",
             safe_message=(
-                "The relay response model identity did not exactly match "
+                "The relay response model identity did not match the allowed identities for "
                 f"{requested_model_id} (reported: {reported}). The response was discarded; "
                 "verify relay routing before continuing."
             ),
