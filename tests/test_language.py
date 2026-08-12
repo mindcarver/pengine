@@ -93,6 +93,29 @@ def test_chinese_lock_excludes_many_stable_ids_from_language_ratio() -> None:
     assert not has_obvious_language_mismatch(content, SIMPLIFIED_CHINESE)
 
 
+def test_chinese_lock_excludes_internal_virtual_paths_from_language_ratio() -> None:
+    content = (
+        "审核证据：实际输入位于 "
+        "/workspace/current_character_biographies.md、"
+        "/workspace/current_relationship_logic.md、"
+        "/workspace/previous_character_biographies.md、"
+        "/workspace/previous_relationship_logic.md、"
+        "/workspace/current_story_review.json 和 "
+        "/workspace/previous_story_review.json。"
+    )
+
+    assert not has_obvious_language_mismatch(content, SIMPLIFIED_CHINESE)
+
+
+def test_chinese_lock_still_rejects_english_beside_internal_virtual_path() -> None:
+    content = (
+        "审核证据：/workspace/current_relationship_logic.md。"
+        "The reviewer did not inspect the mounted source before rejecting it."
+    )
+
+    assert has_obvious_language_mismatch(content, SIMPLIFIED_CHINESE)
+
+
 def test_chinese_lock_allows_pure_machine_identifiers() -> None:
     assert not has_obvious_language_mismatch("L0-B", SIMPLIFIED_CHINESE)
     assert not has_obvious_language_mismatch("ep_01", SIMPLIFIED_CHINESE)

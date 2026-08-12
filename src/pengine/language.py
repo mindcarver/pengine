@@ -12,6 +12,10 @@ _LATIN_LETTER = re.compile(r"[A-Za-z]")
 _MACHINE_IDENTIFIER = re.compile(
     r"[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+|[A-Za-z]+\d+(?:[_-][A-Za-z0-9]+)*"
 )
+_INTERNAL_VIRTUAL_PATH = re.compile(
+    r"(?<![A-Za-z0-9_])/(?:workspace|persona|skills)"
+    r"(?:/[A-Za-z0-9._\-\u3400-\u4dbf\u4e00-\u9fff]+)+"
+)
 _LANGUAGE_NEUTRAL_NUMBER = re.compile(r"(?=.*\d)[0-9TtZ\s:./+%\-]+")
 _SHORT_ENGLISH_VERDICT = re.compile(
     r"(?:^|[：:\s])(fail(?:ed)?|pass(?:ed)?|no|yes|ok|true|false)[.!。]?\s*$",
@@ -71,13 +75,14 @@ def has_obvious_language_mismatch(
     if _SHORT_ENGLISH_VERDICT.search(stripped):
         return True
 
+    language_sample = _INTERNAL_VIRTUAL_PATH.sub("", text)
     language_sample = _MACHINE_IDENTIFIER.sub(
         lambda match: (
             ""
             if "_" in match.group(0) or any(character.isdigit() for character in match.group(0))
             else match.group(0)
         ),
-        text,
+        language_sample,
     )
     han_count = len(_HAN_CHARACTER.findall(language_sample))
     if han_count == 0:

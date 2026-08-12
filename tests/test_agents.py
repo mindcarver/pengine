@@ -19,6 +19,7 @@ from langchain.agents.structured_output import (
 )
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
@@ -75,11 +76,13 @@ from pengine.agents import (
     _outline_repair_context,
     _outline_repair_result,
     _request_with_canonical_workspace,
+    _required_read_paths,
     _result_with_payload,
     _story_patch_correction,
     _story_repair_context,
     _structured_output_retry_message,
     _structured_result_validation_correction,
+    _successful_required_reads,
     _suffix_rewrite_feedback_for_episode,
     _supervisor_prompt,
     _validate_outline_repair_patch_targets,
@@ -115,6 +118,7 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
     bound_tool_names: list[list[str]] = Field(default_factory=list)
     bound_tool_descriptions: list[list[str]] = Field(default_factory=list)
     model_system_prompts: list[str] = Field(default_factory=list)
+    auto_read_required_paths: bool = True
 
     def bind_tools(
         self,
@@ -135,6 +139,16 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         self.model_system_prompts.append(
             "\n\n".join(message.text for message in messages if isinstance(message, SystemMessage))
         )
+        if self.auto_read_required_paths:
+            successful = _successful_required_reads(messages)
+            missing = [path for path in _required_read_paths(messages) if path not in successful]
+            if missing:
+                response = _tool_call(
+                    "read_file",
+                    {"file_path": missing[0]},
+                    100_000 + len(messages),
+                )
+                return ChatResult(generations=[ChatGeneration(message=response)])
         return super()._generate(
             messages,
             stop=stop,
@@ -2494,6 +2508,164 @@ async def test_tool_allowlist_prompt_tracks_result_only_correction_request() -> 
     assert not _prompt_mentions_tool(model.model_system_prompts[-1], "ls")
     assert "Do not generate, revise, repair, expand, summarize" in (model.model_system_prompts[-1])
     assert "without changing its content" in model.model_system_prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_structured_result_requires_every_declared_file_read_before_result() -> None:
+    class Result(BaseModel):
+        value: str
+
+    read_paths: list[str] = []
+    model = ToolCallingFakeModel(
+        auto_read_required_paths=False,
+        responses=[
+            AIMessage(content="I am ready to return the review."),
+            _tool_call("read_file", {"file_path": "/workspace/a.md"}, 1),
+            _tool_call("Result", {"value": "premature"}, 2),
+            _tool_call("read_file", {"file_path": "/workspace/b.md"}, 3),
+            _tool_call("Result", {"value": "done"}, 4),
+        ],
+    )
+    read_file = StructuredTool.from_function(
+        lambda file_path: read_paths.append(file_path) or f"contents for {file_path}",
+        name="read_file",
+        description="Read one explicitly named workspace file.",
+    )
+    description = (
+        "Review both mounted inputs before returning a result.\n"
+        "<pengine-required-read-paths>\n"
+        "/workspace/a.md\n"
+        "/workspace/b.md\n"
+        "</pengine-required-read-paths>"
+    )
+    agent = create_agent(
+        model,
+        tools=[read_file],
+        middleware=[
+            StructuredResultMiddleware(),
+            ToolAllowlistMiddleware(
+                frozenset({"read_file"}),
+                system_prompt="Read every required file, then return the result.",
+            ),
+        ],
+        response_format=ToolStrategy(Result),
+    )
+
+    result = await agent.ainvoke({"messages": [HumanMessage(content=description)]})
+
+    assert result["structured_response"] == Result(value="done")
+    assert read_paths == ["/workspace/a.md", "/workspace/b.md"]
+    assert all("read_file" in names for names in model.bound_tool_names)
+
+
+@pytest.mark.asyncio
+async def test_structured_result_rejects_result_after_failed_required_read() -> None:
+    class Result(BaseModel):
+        value: str
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[
+            HumanMessage(
+                content=(
+                    "Review the input.\n"
+                    "<pengine-required-read-paths>\n"
+                    "/workspace/missing.md\n"
+                    "</pengine-required-read-paths>"
+                )
+            ),
+            _tool_call("read_file", {"file_path": "/workspace/missing.md"}, 1),
+            ToolMessage(
+                content="Error: file not found",
+                name="read_file",
+                tool_call_id="call-1",
+                status="error",
+            ),
+        ],
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+        response_format=ToolStrategy(Result),
+    )
+    calls = 0
+
+    async def handler(_: ModelRequest) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=Result(value="unreviewable"),
+        )
+
+    with pytest.raises(AgentProtocolError) as error:
+        await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert calls == 0
+    assert error.value.safe_message == "审核代理无法读取必需输入。"
+
+
+@pytest.mark.asyncio
+async def test_unread_canon_path_evidence_fails_as_input_protocol_not_language() -> None:
+    paths = (
+        "/workspace/current_character_biographies.md",
+        "/workspace/current_relationship_logic.md",
+        "/workspace/previous_character_biographies.md",
+        "/workspace/previous_relationship_logic.md",
+        "/workspace/current_story_review.json",
+        "/workspace/previous_story_review.json",
+    )
+    evidence = "审核代理声称未读取这些输入：" + "、".join(paths) + "。"
+    premature_review = CanonReviewerResult(
+        passed=False,
+        evidence=evidence,
+        issues=[
+            {
+                "code": "unreviewable_input",
+                "message": "未获得必需输入的实际内容。",
+                "contract_refs": [],
+                "script_excerpt": None,
+                "contract_mutation_required": False,
+            }
+        ],
+    )
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[
+            HumanMessage(
+                content=(
+                    "Review every mounted input before returning a result.\n"
+                    "<pengine-required-read-paths>\n"
+                    + "\n".join(paths)
+                    + "\n</pengine-required-read-paths>"
+                )
+            )
+        ],
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+        response_format=ToolStrategy(CanonReviewerResult),
+    )
+    calls: list[ModelRequest] = []
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        calls.append(candidate)
+        if len(calls) == 1:
+            return ModelResponse(
+                result=[AIMessage(content="I cannot review files that were not provided.")],
+                structured_response=None,
+            )
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=premature_review,
+        )
+
+    with pytest.raises(AgentProtocolError) as error:
+        await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert error.value.safe_message == "审核代理未读取全部必需输入。"
+    assert len(calls) == 2
+    assert all(any(_tool_name(tool) == "read_file" for tool in call.tools) for call in calls)
+    _validate_result_language(
+        premature_review,
+        output_language=SIMPLIFIED_CHINESE,
+        stage=InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+    )
 
 
 @pytest.mark.asyncio
@@ -7165,7 +7337,14 @@ async def test_semantic_review_language_repair_preserves_failed_decision() -> No
             "type": "tool_call",
         },
         tool=None,
-        state={},
+        state={
+            "files": {
+                "/workspace/creation-request.md": {
+                    "content": "故事要求",
+                    "encoding": "utf-8",
+                }
+            }
+        },
         runtime=None,
     )
 
@@ -7202,12 +7381,20 @@ async def test_semantic_review_language_repair_preserves_failed_decision() -> No
         handler=handler,
         subagent_type="canon_reviewer",
         description="Review the contract.",
-        files={},
+        files={"/workspace/candidate.md": "候选内容"},
         schema=CanonReviewerResult,
         stage=InternalStage.GENERATING_EPISODE_OUTLINE,
     )
 
     assert len(descriptions) == 2
+    assert _required_read_paths([HumanMessage(content=descriptions[0])]) == (
+        "/workspace/approved-checkpoints.json",
+        "/workspace/candidate.md",
+        "/workspace/creation-request.md",
+    )
+    assert _required_read_paths([HumanMessage(content=descriptions[1])]) == (
+        "/workspace/review_to_translate.json",
+    )
     assert "without changing the review decision" in descriptions[1]
     assert "do not perform a new review" in descriptions[1]
     assert review.passed is False
@@ -7215,7 +7402,7 @@ async def test_semantic_review_language_repair_preserves_failed_decision() -> No
 
 
 @pytest.mark.asyncio
-async def test_semantic_review_allows_chinese_issue_with_many_stable_ids() -> None:
+async def test_semantic_review_allows_chinese_issue_with_virtual_paths_and_stable_ids() -> None:
     calls = 0
 
     async def before_stage(_: InternalStage) -> int:
@@ -7252,7 +7439,14 @@ async def test_semantic_review_allows_chinese_issue_with_many_stable_ids() -> No
             content=json.dumps(
                 {
                     "passed": False,
-                    "evidence": "本集仍有连续性问题。",
+                    "evidence": (
+                        "已审阅 /workspace/current_character_biographies.md、"
+                        "/workspace/current_relationship_logic.md、"
+                        "/workspace/previous_character_biographies.md、"
+                        "/workspace/previous_relationship_logic.md、"
+                        "/workspace/current_story_review.json 和 "
+                        "/workspace/previous_story_review.json；本集仍有连续性问题。"
+                    ),
                     "issues": [
                         {
                             "code": "missing_locked_beats",
