@@ -201,6 +201,50 @@ renderCreation();
 if (!elements["result-workspace"].hidden) {
   throw new Error("ended initial run exposed unapproved drafts");
 }
+
+renderWorkspace = () => true;
+state.creation = {
+  persona: { display_name: "测试人格", version: "1" },
+  initial: { state: "succeeded" },
+  revision: {
+    state: "failed",
+    progress: {
+      current_stage: "generating_episode_outline",
+      completed_stages: ["determining_direction", "generating_story_outline"],
+      elapsed_seconds: 1391,
+      recovery_reason: "none",
+      final_review: { l0: "pending", l4: "pending" },
+      model_calls: [],
+      can_continue: false,
+      can_end: false,
+    },
+    failure: {
+      code: "structured_output_invalid",
+      message: "模型未返回有效的结构化结果。",
+      failed_stage: "generating_episode_outline",
+      attempt_count: 1,
+    },
+  },
+};
+renderCreation();
+if (elements["failure-panel"].hidden) {
+  throw new Error("failed revision stayed hidden behind the progress card");
+}
+if (elements["failure-title"].textContent !== "修订生成失败") {
+  throw new Error("failed revision did not use a terminal title");
+}
+if (!elements["failure-message"].textContent.includes("失败阶段：生成分集大纲")) {
+  throw new Error("failed revision did not expose its failed stage");
+}
+if (elements["failure-code"].textContent !== "错误代码：structured_output_invalid") {
+  throw new Error("failed revision did not expose its error code");
+}
+if (elements["failure-guidance"].hidden !== true || elements["failure-actions"].hidden !== true) {
+  throw new Error("failed revision exposed an unsupported recovery action");
+}
+if (elements["result-workspace"].hidden) {
+  throw new Error("failed revision hid the retained readable workspace");
+}
 """
     harness = f"""
 const fs = require("fs");
@@ -654,6 +698,18 @@ if (elements["progress-title"].textContent !== "生成故事大纲") throw new E
 if (elements["progress-elapsed"].textContent !== "02:05") throw new Error("wrong elapsed");
 if (stageItems[0].dataset.status !== "completed") throw new Error("completed stage lost");
 if (stageItems[1].dataset.status !== "current") throw new Error("current stage lost");
+
+state.creation = {
+  initial: { state: "succeeded", progress },
+  revision: {
+    state: "failed",
+    progress: { ...progress, current_stage: "generating_episode_outline" },
+  },
+};
+renderProgress();
+if (elements["progress-title"].textContent !== "失败于生成分集大纲") {
+  throw new Error("terminal revision was still presented as active generation");
+}
 
 state.creation = {
   initial: { state: "succeeded", progress },

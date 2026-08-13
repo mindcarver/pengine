@@ -828,6 +828,17 @@ function renderCreation() {
     showFailure(initial.failure, "初稿生成失败", {
       canStartNewCreation: true,
       showWorkspace,
+      stageLabel: USER_STAGE_LABELS.get(initial.failure?.failed_stage),
+    });
+    return;
+  }
+
+  const revision = state.creation.revision;
+  if (revision.state === "failed") {
+    const showWorkspace = renderWorkspace();
+    showFailure(revision.failure, "修订生成失败", {
+      showWorkspace,
+      stageLabel: USER_STAGE_LABELS.get(revision.failure?.failed_stage),
     });
     return;
   }
@@ -880,8 +891,9 @@ function renderProgress() {
   state.progressRunKind = kind;
   elements["run-progress"].hidden = false;
   elements["progress-kind"].textContent = kind === "initial" ? "初稿进度" : "修订进度";
+  const stageLabel = USER_STAGE_LABELS.get(progress.current_stage) || "正在读取阶段";
   elements["progress-title"].textContent =
-    USER_STAGE_LABELS.get(progress.current_stage) || "正在读取阶段";
+    run.state === "failed" ? `失败于${stageLabel}` : stageLabel;
   elements["progress-elapsed"].textContent = formatElapsed(progress.elapsed_seconds);
 
   const completed = new Set(progress.completed_stages);
@@ -1105,7 +1117,10 @@ function showFailure(failure, title, options = {}) {
   elements["result-workspace"].hidden = options.showWorkspace !== true;
   elements["failure-label"].textContent = "任务未完成";
   elements["failure-title"].textContent = title;
-  elements["failure-message"].textContent = failure?.message || "本地服务未提供失败说明。";
+  const failureMessage = failure?.message || "本地服务未提供失败说明。";
+  elements["failure-message"].textContent = options.stageLabel
+    ? `${failureMessage} 失败阶段：${options.stageLabel}。`
+    : failureMessage;
   const canStartNewCreation = options.canStartNewCreation === true;
   elements["failure-guidance"].hidden = !canStartNewCreation;
   elements["failure-guidance"].textContent = canStartNewCreation
