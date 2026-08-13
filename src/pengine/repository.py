@@ -28,14 +28,17 @@ from pengine.continuity import (
 )
 from pengine.errors import DomainError
 from pengine.language import OutputLanguage, infer_output_language
+from pengine.presentation import compile_delivery_presentation, recover_delivery_presentation
 from pengine.schemas import (
     AutoResumingRun,
+    ContentPackage,
     CreateCreationRequest,
     CreationAccepted,
     CreationResource,
     CreativeDirectionDraft,
     CreativeTextDraft,
     Delivery,
+    DeliveryPresentation,
     EndedRun,
     EpisodeDraft,
     EpisodePlan,
@@ -93,7 +96,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -242,6 +245,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
     run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
     content_package_json TEXT NOT NULL,
     delivery_report_json TEXT NOT NULL,
+    presentation_manifest_json TEXT,
+    presentation_manifest_sha256 TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -2032,6 +2037,35 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 21
+            if schema_version == 21:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    delivery_columns = await (
+                        await connection.execute("PRAGMA table_info(deliveries)")
+                    ).fetchall()
+                    existing_columns = {column[1] for column in delivery_columns}
+                    additions = (
+                        (
+                            "presentation_manifest_json",
+                            "ALTER TABLE deliveries ADD COLUMN presentation_manifest_json TEXT",
+                        ),
+                        (
+                            "presentation_manifest_sha256",
+                            "ALTER TABLE deliveries ADD COLUMN presentation_manifest_sha256 TEXT",
+                        ),
+                    )
+                    for column_name, statement in additions:
+                        if column_name not in existing_columns:
+                            await connection.execute(statement)
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (22)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 22
 
     async def setup(self) -> None:
         await self.initialize()
@@ -6811,16 +6845,46 @@ class Repository:
                         409,
                     )
 
+            story_checkpoint = await self._fetchone(
+                connection,
+                "SELECT payload_json FROM business_checkpoints WHERE run_id = ? AND stage = ?",
+                (str(run_id), InternalStage.GENERATING_STORY_OUTLINE.value),
+            )
+            relationship_checkpoint = await self._fetchone(
+                connection,
+                "SELECT payload_json FROM business_checkpoints WHERE run_id = ? AND stage = ?",
+                (str(run_id), InternalStage.GENERATING_CHARACTER_RELATIONSHIPS.value),
+            )
+            story_payload = json.loads(story_checkpoint["payload_json"]) if story_checkpoint else {}
+            relationship_payload = (
+                json.loads(relationship_checkpoint["payload_json"])
+                if relationship_checkpoint
+                else {}
+            )
+            presentation = compile_delivery_presentation(
+                creation_id=UUID(run["creation_id"]),
+                run_kind=run["kind"],
+                content=delivery.content_package,
+                story_hints=story_payload.get("story_navigation") or (),
+                character_hints=relationship_payload.get("character_navigation") or (),
+                relationship_hints=relationship_payload.get("relationship_navigation") or (),
+                episode_plans=plans,
+                episode_drafts=await self._episode_drafts(connection, run_id),
+            )
+            presentation_json = _json(presentation)
             await connection.execute(
                 """
                 INSERT INTO deliveries(
-                    run_id, content_package_json, delivery_report_json, created_at
-                ) VALUES (?, ?, ?, ?)
+                    run_id, content_package_json, delivery_report_json,
+                    presentation_manifest_json, presentation_manifest_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run_id),
                     _json(delivery.content_package),
                     _json(delivery.delivery_report),
+                    presentation_json,
+                    _text_hash(presentation_json),
                     timestamp,
                 ),
             )
@@ -7026,6 +7090,57 @@ class Repository:
                 revision=revision_status,
                 created_at=_datetime(creation["created_at"]),
                 updated_at=_datetime(creation["updated_at"]),
+            )
+
+    async def get_delivery_presentation(
+        self,
+        creation_id: UUID,
+        run_kind: Literal["initial", "revision"],
+    ) -> DeliveryPresentation:
+        async with self._connection() as connection:
+            creation = await self._fetchone(
+                connection,
+                "SELECT 1 FROM creations WHERE id = ?",
+                (str(creation_id),),
+            )
+            if creation is None:
+                raise DomainError("creation_not_found", "Creation not found.", 404)
+            order = "ASC" if run_kind == "initial" else "DESC"
+            run = await self._fetchone(
+                connection,
+                f"""
+                SELECT runs.id, runs.kind, runs.state,
+                       deliveries.content_package_json,
+                       deliveries.presentation_manifest_json,
+                       deliveries.presentation_manifest_sha256
+                FROM runs
+                LEFT JOIN deliveries ON deliveries.run_id = runs.id
+                WHERE runs.creation_id = ? AND runs.kind = ?
+                ORDER BY runs.sequence {order}
+                LIMIT 1
+                """,
+                (str(creation_id), run_kind),
+            )
+            if run is None or run["state"] != "succeeded" or run["content_package_json"] is None:
+                raise DomainError(
+                    "presentation_not_available",
+                    "The requested run has no formal delivery to present.",
+                    409,
+                )
+            content = ContentPackage.model_validate_json(run["content_package_json"])
+            manifest_json = run["presentation_manifest_json"]
+            if manifest_json is not None:
+                try:
+                    raw_manifest = json.loads(manifest_json)
+                except (TypeError, ValueError):
+                    raw_manifest = None
+            else:
+                raw_manifest = None
+            return recover_delivery_presentation(
+                raw_manifest=raw_manifest,
+                creation_id=creation_id,
+                run_kind=run_kind,
+                content=content,
             )
 
     async def get_run_work_item(self, run_id: UUID) -> RunWorkItem:

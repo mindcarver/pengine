@@ -1,3 +1,4 @@
+import hashlib
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -119,6 +120,199 @@ class DeliveryReport(StrictModel):
 class Delivery(StrictModel):
     content_package: ContentPackage
     delivery_report: DeliveryReport
+
+
+PresentationId = Annotated[
+    str,
+    StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"),
+]
+
+
+class PresentationItem(StrictModel):
+    id: PresentationId
+    label: NonEmptyText
+    ordinal: int = Field(ge=1)
+    content: NonBlankPreservedText
+    content_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_content_hash(self) -> "PresentationItem":
+        expected = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+        if self.content_sha256 != expected:
+            raise ValueError("Presentation item hash must match its content")
+        return self
+
+
+class StorySection(PresentationItem):
+    level: int = Field(ge=1, le=3)
+
+
+class CharacterEntry(PresentationItem):
+    group: Literal["core", "supporting", "other"] = "other"
+
+
+class RelationshipEntry(PresentationItem):
+    group: Literal["primary", "supporting", "other"] = "other"
+
+
+class EpisodeEntry(PresentationItem):
+    episode_number: int = Field(ge=1)
+    scenes: list[PresentationItem] = Field(default_factory=list)
+
+
+class StoryOutlinePresentation(StrictModel):
+    key: Literal["story_outline"] = "story_outline"
+    title: Literal["故事大纲"] = "故事大纲"
+    mode: Literal["structured", "source"]
+    source_text: NonBlankPreservedText
+    source_sha256: Sha256
+    sections: list[StorySection] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_integrity(self) -> "StoryOutlinePresentation":
+        _validate_presentation_artifact(
+            self.source_text, self.source_sha256, self.sections, self.mode
+        )
+        _validate_complete_partition(self.source_text, self.sections)
+        return self
+
+
+class CharacterBiographiesPresentation(StrictModel):
+    key: Literal["character_biographies"] = "character_biographies"
+    title: Literal["人物小传"] = "人物小传"
+    mode: Literal["structured", "source"]
+    source_text: NonBlankPreservedText
+    source_sha256: Sha256
+    characters: list[CharacterEntry] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_integrity(self) -> "CharacterBiographiesPresentation":
+        _validate_presentation_artifact(
+            self.source_text, self.source_sha256, self.characters, self.mode
+        )
+        _validate_complete_partition(self.source_text, self.characters)
+        return self
+
+
+class RelationshipLogicPresentation(StrictModel):
+    key: Literal["relationship_logic"] = "relationship_logic"
+    title: Literal["人物关系"] = "人物关系"
+    mode: Literal["structured", "source"]
+    source_text: NonBlankPreservedText
+    source_sha256: Sha256
+    relationships: list[RelationshipEntry] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_integrity(self) -> "RelationshipLogicPresentation":
+        _validate_presentation_artifact(
+            self.source_text, self.source_sha256, self.relationships, self.mode
+        )
+        _validate_complete_partition(self.source_text, self.relationships)
+        return self
+
+
+class EpisodeOutlinePresentation(StrictModel):
+    key: Literal["episode_outline"] = "episode_outline"
+    title: Literal["分集大纲"] = "分集大纲"
+    mode: Literal["structured", "source"]
+    source_text: NonBlankPreservedText
+    source_sha256: Sha256
+    episodes: list[EpisodeEntry] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_integrity(self) -> "EpisodeOutlinePresentation":
+        _validate_presentation_artifact(
+            self.source_text, self.source_sha256, self.episodes, self.mode
+        )
+        _validate_episode_entries(self.episodes)
+        return self
+
+
+class EpisodeScriptsPresentation(StrictModel):
+    key: Literal["episode_scripts"] = "episode_scripts"
+    title: Literal["分集剧本"] = "分集剧本"
+    mode: Literal["structured", "source"]
+    source_text: NonBlankPreservedText
+    source_sha256: Sha256
+    episodes: list[EpisodeEntry] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_integrity(self) -> "EpisodeScriptsPresentation":
+        _validate_presentation_artifact(
+            self.source_text, self.source_sha256, self.episodes, self.mode
+        )
+        _validate_episode_entries(self.episodes)
+        return self
+
+
+def _validate_presentation_artifact(
+    source_text: str,
+    source_sha256: str,
+    items: list[PresentationItem],
+    mode: Literal["structured", "source"],
+) -> None:
+    expected_source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+    if source_sha256 != expected_source_hash:
+        raise ValueError("Presentation source hash must match its source text")
+    if mode == "structured" and not items:
+        raise ValueError("Structured presentation artifacts require items")
+    if mode == "source" and items:
+        raise ValueError("Source presentation artifacts cannot contain items")
+    if len({item.id for item in items}) != len(items):
+        raise ValueError("Presentation item IDs must be unique")
+    if [item.ordinal for item in items] != list(range(1, len(items) + 1)):
+        raise ValueError("Presentation item ordinals must be contiguous from 1")
+    positions = [source_text.find(item.content) for item in items]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise ValueError("Presentation items must occur in source order")
+
+
+def _validate_complete_partition(source_text: str, items: list[PresentationItem]) -> None:
+    if items and "".join(item.content for item in items) != source_text:
+        raise ValueError("Structured presentation items must preserve the complete source")
+
+
+def _validate_episode_entries(entries: list[EpisodeEntry]) -> None:
+    if [entry.episode_number for entry in entries] != list(range(1, len(entries) + 1)):
+        raise ValueError("Presentation episode numbers must be contiguous from 1")
+
+
+class DeliveryPresentation(StrictModel):
+    schema_version: Literal[1] = 1
+    creation_id: UUID
+    run_kind: Literal["initial", "revision"]
+    status: Literal["complete", "partial", "source"]
+    story_outline: StoryOutlinePresentation
+    character_biographies: CharacterBiographiesPresentation
+    relationship_logic: RelationshipLogicPresentation
+    episode_outline: EpisodeOutlinePresentation
+    episode_scripts: EpisodeScriptsPresentation
+
+    @model_validator(mode="after")
+    def validate_modes_and_status(self) -> "DeliveryPresentation":
+        artifacts = (
+            (self.story_outline, self.story_outline.sections),
+            (self.character_biographies, self.character_biographies.characters),
+            (self.relationship_logic, self.relationship_logic.relationships),
+            (self.episode_outline, self.episode_outline.episodes),
+            (self.episode_scripts, self.episode_scripts.episodes),
+        )
+        for artifact, items in artifacts:
+            if artifact.mode == "structured" and not items:
+                raise ValueError("Structured presentation artifacts require items")
+            if artifact.mode == "source" and items:
+                raise ValueError("Source presentation artifacts cannot contain items")
+        modes = {artifact.mode for artifact, _ in artifacts}
+        expected = (
+            "complete"
+            if modes == {"structured"}
+            else "source"
+            if modes == {"source"}
+            else "partial"
+        )
+        if self.status != expected:
+            raise ValueError("Presentation status must match artifact modes")
+        return self
 
 
 class RunFailure(StrictModel):
@@ -553,6 +747,7 @@ class CommandError(StrictModel):
         "persona_not_found",
         "persona_package_unavailable",
         "creation_not_found",
+        "presentation_not_available",
         "idempotency_conflict",
         "revision_not_allowed",
         "revision_feedback_locked",

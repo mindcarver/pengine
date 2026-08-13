@@ -43,7 +43,7 @@ const PERSONA_PROFILES = {
 const FORMAL_ARTIFACTS = [
   { key: "story_outline", title: "故事大纲", overline: "DELIVERABLE 01" },
   { key: "character_biographies", title: "人物小传", overline: "DELIVERABLE 02" },
-  { key: "relationship_logic", title: "关系逻辑", overline: "DELIVERABLE 03" },
+  { key: "relationship_logic", title: "人物关系", overline: "DELIVERABLE 03" },
   { key: "episode_outline", title: "分集大纲", overline: "DELIVERABLE 04" },
   { key: "episode_scripts", title: "分集剧本", overline: "DELIVERABLE 05" },
 ];
@@ -112,6 +112,7 @@ const REVIEW_STATUS_LABELS = {
 };
 
 const STORAGE_KEY = "pengine.currentCreationId";
+const READING_STORAGE_KEY = "pengine.deliveryReadingPosition";
 const POLL_INTERVAL_MS = 1800;
 const DEFAULT_REQUIREMENTS = "按所选人格完成一部完整短剧。";
 
@@ -124,6 +125,9 @@ const state = {
   activeArtifact: "story_outline",
   activeDraftRunKind: "",
   activeEpisode: null,
+  presentations: { initial: null, revision: null },
+  presentationLoading: { initial: false, revision: false },
+  readingPositions: readReadingPositions(),
   pollTimer: null,
   loadingCreation: false,
   pendingFeedback: "",
@@ -229,11 +233,16 @@ function cacheElements() {
     "version-initial",
     "version-revision",
     "version-note",
+    "open-revision",
+    "close-revision",
     "artifact-tabs",
     "artifact-panel",
     "artifact-title",
     "artifact-overline",
     "artifact-version-mark",
+    "section-nav",
+    "section-items",
+    "presentation-status",
     "episode-navigator",
     "episode-progress-summary",
     "episode-tabs",
@@ -290,8 +299,12 @@ function bindEvents() {
   elements["progress-stages"].addEventListener("click", handleStageClick);
   elements["artifact-tabs"].addEventListener("click", handleArtifactClick);
   elements["artifact-tabs"].addEventListener("keydown", handleHorizontalTabs);
+  elements["section-items"].addEventListener("click", handleSectionClick);
+  elements["section-items"].addEventListener("keydown", handleHorizontalTabs);
   elements["episode-tabs"].addEventListener("click", handleEpisodeClick);
   elements["episode-tabs"].addEventListener("keydown", handleHorizontalTabs);
+  elements["open-revision"].addEventListener("click", openRevisionDrawer);
+  elements["close-revision"].addEventListener("click", closeRevisionDrawer);
 
   window.addEventListener("beforeunload", stopPolling);
   document.addEventListener("visibilitychange", () => {
@@ -304,6 +317,17 @@ function bindEvents() {
 async function initialize() {
   const currentId = readCurrentCreationId();
   state.creationId = currentId;
+  const hashPosition = readReadingHash(currentId);
+  state.activeVersion =
+    hashPosition?.version || state.readingPositions[`${currentId}:activeVersion`] || "initial";
+  state.activeArtifact =
+    hashPosition?.artifact ||
+    state.readingPositions[`${currentId}:${state.activeVersion}:activeArtifact`] ||
+    "story_outline";
+  if (hashPosition?.itemId) {
+    state.readingPositions[`${currentId}:${state.activeVersion}:${state.activeArtifact}`] =
+      hashPosition.itemId;
+  }
   state.workspaceView = currentId ? "progress" : "selection";
   renderWorkspaceViews();
   renderSeries();
@@ -464,6 +488,8 @@ async function handleCreate(event) {
     state.activeArtifact = "story_outline";
     state.activeDraftRunKind = "";
     state.activeEpisode = null;
+    state.presentations = { initial: null, revision: null };
+    state.presentationLoading = { initial: false, revision: false };
     state.pendingFeedback = "";
     writeCurrentCreationId(state.creationId);
     setWorkspaceView("progress");
@@ -670,6 +696,9 @@ function renderCreation() {
     setWorkspaceView("progress");
   } else if (shouldOpenReader()) {
     setWorkspaceView("reading");
+  }
+  if (state.workspaceView === "reading" && elements["presentation-status"]) {
+    void loadPresentation(state.activeVersion);
   }
   renderProgress();
 
@@ -1212,6 +1241,56 @@ function isFormalRun(run) {
   return Boolean(run && run.state === "succeeded" && run.result && run.result.content_package);
 }
 
+async function loadPresentation(kind) {
+  const run = kind === "revision" ? state.creation?.revision : state.creation?.initial;
+  if (
+    !state.creationId ||
+    !isFormalRun(run) ||
+    state.presentations[kind] ||
+    state.presentationLoading[kind]
+  ) {
+    return;
+  }
+  state.presentationLoading[kind] = true;
+  if (!state.presentations[kind] && elements["presentation-status"]) {
+    elements["presentation-status"].textContent = "正在整理";
+  }
+  try {
+    const presentation = await apiRequest(
+      `/creations/${encodeURIComponent(state.creationId)}/runs/${kind}/presentation`,
+    );
+    state.presentations[kind] = presentation;
+    setServiceState("ready", "本地服务已连接");
+  } catch (error) {
+    if (!state.presentations[kind] && elements["presentation-status"]) {
+      elements["presentation-status"].textContent = "完整原文";
+    }
+    if (elements.toast) {
+      showToast(`成品目录读取失败：${formatError(error)}`);
+    }
+  } finally {
+    state.presentationLoading[kind] = false;
+    if (state.workspaceView === "reading" && state.activeVersion === kind) {
+      renderArtifact();
+    }
+  }
+}
+
+function presentationArtifact(key) {
+  return state.presentations[state.activeVersion]?.[key] || null;
+}
+
+function presentationItems(artifact) {
+  if (!artifact || artifact.mode !== "structured") {
+    return [];
+  }
+  if (Array.isArray(artifact.sections)) return artifact.sections;
+  if (Array.isArray(artifact.characters)) return artifact.characters;
+  if (Array.isArray(artifact.relationships)) return artifact.relationships;
+  if (Array.isArray(artifact.episodes)) return artifact.episodes;
+  return [];
+}
+
 function artifactViewsForRun(run) {
   if (isFormalRun(run)) {
     return FORMAL_ARTIFACTS.flatMap((artifact) => {
@@ -1314,8 +1393,13 @@ function renderWorkspace() {
   if (elements["result-workspace"].dataset) {
     elements["result-workspace"].dataset.mode = state.workspaceView;
   }
-  elements["revision-desk"].hidden =
-    state.workspaceView !== "reading" || state.creation.initial.state !== "succeeded";
+  const canRevise = state.workspaceView === "reading" && state.creation.initial.state === "succeeded";
+  if (elements["open-revision"]) {
+    elements["open-revision"].hidden = !canRevise;
+  }
+  if (!canRevise) {
+    closeRevisionDrawer();
+  }
   renderVersionControls();
   renderArtifact();
   if (!elements["revision-desk"].hidden) {
@@ -1352,6 +1436,32 @@ function renderVersionControls() {
   }
   elements["version-note"].textContent =
     state.activeVersion === "revision" ? "正在查看修订后的完整交付" : "正在查看首次交付";
+}
+
+function openRevisionDrawer() {
+  if (!elements["revision-desk"] || !elements["close-revision"]) {
+    return;
+  }
+  elements["revision-desk"].hidden = false;
+  if (document.body) {
+    document.body.dataset.revisionOpen = "true";
+  }
+  renderRevision();
+  elements["close-revision"].focus();
+}
+
+function closeRevisionDrawer() {
+  if (!elements["revision-desk"]) {
+    return;
+  }
+  const wasOpen = !elements["revision-desk"].hidden;
+  elements["revision-desk"].hidden = true;
+  if (document.body) {
+    delete document.body.dataset.revisionOpen;
+  }
+  if (wasOpen && state.workspaceView === "reading" && elements["open-revision"]) {
+    elements["open-revision"].focus();
+  }
 }
 
 function renderArtifact() {
@@ -1398,10 +1508,69 @@ function renderArtifact() {
   elements["episode-navigator"].hidden = !showEpisodeNavigator;
   elements["artifact-content"].hidden = showEpisodeNavigator;
   if (showEpisodeNavigator) {
+    if (elements["section-nav"]) {
+      elements["section-nav"].hidden = true;
+    }
     renderEpisodeNavigator(run);
     return;
   }
-  elements["artifact-content"].textContent = artifact.content;
+  if (artifact.isDraft || state.workspaceView !== "reading" || !elements["section-nav"]) {
+    elements["artifact-content"].textContent = artifact.content;
+    return;
+  }
+  const projected = presentationArtifact(artifact.key);
+  const items = presentationItems(projected);
+  const source = projected?.source_text || artifact.content;
+  const positionKey = `${state.creationId}:${state.activeVersion}:${artifact.key}`;
+  let activeItem = items.find((item) => item.id === state.readingPositions[positionKey]);
+  if (!activeItem && items.length) {
+    [activeItem] = items;
+    state.readingPositions[positionKey] = activeItem.id;
+    writeReadingPositions();
+  }
+  renderSectionNavigation(items, activeItem, projected);
+  renderReadableText(elements["artifact-content"], activeItem?.content || source);
+}
+
+function renderSectionNavigation(items, activeItem, projected) {
+  const nav = elements["section-nav"];
+  nav.hidden = items.length === 0;
+  elements["presentation-status"].textContent = projected?.mode === "structured"
+    ? "已按结构整理"
+    : "完整原文";
+  if (!items.length) {
+    elements["section-items"].replaceChildren();
+    return;
+  }
+  const buttons = items.map((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.role = "tab";
+    button.dataset.sectionId = item.id;
+    button.setAttribute("aria-controls", "artifact-content");
+    button.setAttribute("aria-selected", String(item.id === activeItem?.id));
+    button.tabIndex = item.id === activeItem?.id ? 0 : -1;
+    const number = document.createElement("span");
+    number.textContent = String(item.ordinal).padStart(2, "0");
+    const label = document.createElement("strong");
+    label.textContent = item.label;
+    button.append(number, label);
+    return button;
+  });
+  elements["section-items"].replaceChildren(...buttons);
+}
+
+function renderReadableText(container, content) {
+  const blocks = String(content || "")
+    .split(/\n\s*\n/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block) => {
+      const paragraph = document.createElement("p");
+      paragraph.textContent = block;
+      return paragraph;
+    });
+  container.replaceChildren(...blocks);
 }
 
 function renderEpisodeNavigator(run) {
@@ -1650,8 +1819,15 @@ function handleVersionClick(event) {
     return;
   }
   state.activeVersion = button.dataset.version;
+  state.readingPositions[`${state.creationId}:activeVersion`] = state.activeVersion;
+  state.activeArtifact =
+    state.readingPositions[`${state.creationId}:${state.activeVersion}:activeArtifact`] ||
+    "story_outline";
+  writeReadingPositions();
+  writeReadingHash();
   renderVersionControls();
   renderArtifact();
+  void loadPresentation(state.activeVersion);
 }
 
 function handleArtifactClick(event) {
@@ -1660,7 +1836,25 @@ function handleArtifactClick(event) {
     return;
   }
   state.activeArtifact = button.dataset.artifact;
+  state.readingPositions[`${state.creationId}:${state.activeVersion}:activeArtifact`] =
+    state.activeArtifact;
+  writeReadingPositions();
+  writeReadingHash();
   renderArtifact();
+  elements["artifact-content"].focus({ preventScroll: true });
+}
+
+function handleSectionClick(event) {
+  const button = event.target.closest("[data-section-id]");
+  if (!button) {
+    return;
+  }
+  const positionKey = `${state.creationId}:${state.activeVersion}:${state.activeArtifact}`;
+  state.readingPositions[positionKey] = button.dataset.sectionId;
+  writeReadingPositions();
+  writeReadingHash(button.dataset.sectionId);
+  renderArtifact();
+  elements["artifact-content"].focus({ preventScroll: true });
 }
 
 function handleStageClick(event) {
@@ -1743,6 +1937,9 @@ function setWorkspaceView(view) {
   }
   state.workspaceView = view;
   renderWorkspaceViews();
+  if (view === "reading" && elements["presentation-status"]) {
+    void loadPresentation(state.activeVersion);
+  }
   return true;
 }
 
@@ -1771,6 +1968,9 @@ function renderWorkspaceViews() {
     state.workspaceView = state.creationId ? "progress" : "selection";
   }
   const showingCurrent = ["progress", "reading"].includes(state.workspaceView);
+  if (document.body) {
+    document.body.dataset.workspaceView = state.workspaceView;
+  }
   selectionView.hidden = state.workspaceView !== "selection";
   briefView.hidden = state.workspaceView !== "brief";
   currentView.hidden = !showingCurrent;
@@ -1972,6 +2172,63 @@ function writeCurrentCreationId(creationId) {
     window.localStorage.setItem(STORAGE_KEY, creationId);
   } catch {
     showToast("浏览器未允许保存当前作品编号；本次页面内仍可继续查看。");
+  }
+}
+
+function readReadingPositions() {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(READING_STORAGE_KEY) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeReadingPositions() {
+  try {
+    window.localStorage.setItem(READING_STORAGE_KEY, JSON.stringify(state.readingPositions));
+  } catch {
+    // Reading position is optional and never affects the delivered content.
+  }
+}
+
+function readReadingHash(creationId) {
+  try {
+    const params = new URLSearchParams(window.location.hash.slice(1));
+    const value = JSON.parse(params.get("read") || "null");
+    if (
+      value?.creationId !== creationId ||
+      !["initial", "revision"].includes(value?.version) ||
+      !FORMAL_ARTIFACTS.some((artifact) => artifact.key === value?.artifact)
+    ) {
+      return null;
+    }
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function writeReadingHash(itemId = null) {
+  try {
+    const positionKey = `${state.creationId}:${state.activeVersion}:${state.activeArtifact}`;
+    const params = new URLSearchParams(window.location.hash.slice(1));
+    params.set(
+      "read",
+      JSON.stringify({
+        creationId: state.creationId,
+        version: state.activeVersion,
+        artifact: state.activeArtifact,
+        itemId: itemId || state.readingPositions[positionKey] || null,
+      }),
+    );
+    window.history.replaceState(
+      null,
+      "",
+      `${window.location.pathname}${window.location.search}#${params.toString()}`,
+    );
+  } catch {
+    // URL state is optional; localStorage remains the primary restoration path.
   }
 }
 

@@ -19,6 +19,7 @@ from pengine.schemas import (
     CreateCreationRequest,
     CreationAccepted,
     CreationResource,
+    DeliveryPresentation,
     PersonaList,
     RevisionAccepted,
     RevisionRequest,
@@ -158,6 +159,25 @@ def create_app(
         if resource is None:
             raise DomainError("creation_not_found", "Creation not found.", 404)
         return resource
+
+    @app.get(
+        "/creations/{creation_id}/runs/{run_kind}/presentation",
+        operation_id="getDeliveryPresentation",
+        response_model=DeliveryPresentation,
+        summary="Read one succeeded run as a structured delivery presentation",
+        responses={
+            404: {"description": "Creation not found", "model": CommandError},
+            409: {
+                "description": "The requested run has no formal delivery",
+                "model": CommandError,
+            },
+        },
+    )
+    async def get_delivery_presentation(
+        creation_id: UUID,
+        run_kind: Literal["initial", "revision"],
+    ) -> DeliveryPresentation:
+        return await resolved_repository.get_delivery_presentation(creation_id, run_kind)
 
     @app.post(
         "/creations/{creation_id}/revision",

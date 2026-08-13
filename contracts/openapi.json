@@ -33,7 +33,7 @@
                           "persona_id": "example-non-production",
                           "display_name": "非生产示例人格",
                           "version": "0.0.0-example",
-                  "snapshot_sha256": "e1bf5a772e1a10851a9abd801323966c339204802d55918fb0877d48a690fcde"
+                          "snapshot_sha256": "e1bf5a772e1a10851a9abd801323966c339204802d55918fb0877d48a690fcde"
                         }
                       ]
                     }
@@ -508,6 +508,79 @@
           },
           "422": {
             "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/creations/{creation_id}/runs/{run_kind}/presentation": {
+      "get": {
+        "summary": "Read one succeeded run as a structured delivery presentation",
+        "operationId": "getDeliveryPresentation",
+        "parameters": [
+          {
+            "name": "creation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Creation Id"
+            }
+          },
+          {
+            "name": "run_kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "initial",
+                "revision"
+              ],
+              "type": "string",
+              "title": "Run Kind"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryPresentation"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Creation not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The requested run has no formal delivery",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         }
       }
@@ -2143,12 +2216,6 @@
         "title": "ValidationError"
       },
       "CommandError": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "code",
-          "message"
-        ],
         "properties": {
           "code": {
             "type": "string",
@@ -2157,6 +2224,7 @@
               "persona_not_found",
               "persona_package_unavailable",
               "creation_not_found",
+              "presentation_not_available",
               "idempotency_conflict",
               "revision_not_allowed",
               "revision_feedback_locked",
@@ -2164,13 +2232,23 @@
               "repair_authorization_stale",
               "series_bible_rebuild_exhausted",
               "service_unavailable"
-            ]
+            ],
+            "title": "Code"
           },
           "message": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Message"
           }
-        }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "CommandError"
       },
       "Sha256": {
         "type": "string",
@@ -3360,6 +3438,561 @@
         ],
         "title": "RepairAuthorization",
         "description": "The exact one-cycle repair authorization shown at a repair-authorization pause.\n\nIt binds the active lineage and carries the review evidence, affected range,\nand a reference token count for the active design projections and retained\nprefix at the pause. This is neither a lower bound nor a total cycle forecast;\nactual repair input and output can differ (RPR-A8/A9)."
+      },
+      "RelationshipEntry": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "title": "Id"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Label"
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Ordinal"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Content"
+          },
+          "content_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Content Sha256"
+          },
+          "group": {
+            "type": "string",
+            "enum": [
+              "primary",
+              "supporting",
+              "other"
+            ],
+            "title": "Group",
+            "default": "other"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "ordinal",
+          "content",
+          "content_sha256"
+        ],
+        "title": "RelationshipEntry"
+      },
+      "EpisodeScriptsPresentation": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "const": "episode_scripts",
+            "title": "Key",
+            "default": "episode_scripts"
+          },
+          "title": {
+            "type": "string",
+            "const": "分集剧本",
+            "title": "Title",
+            "default": "分集剧本"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "structured",
+              "source"
+            ],
+            "title": "Mode"
+          },
+          "source_text": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Source Text"
+          },
+          "source_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Source Sha256"
+          },
+          "episodes": {
+            "items": {
+              "$ref": "#/components/schemas/EpisodeEntry"
+            },
+            "type": "array",
+            "title": "Episodes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "mode",
+          "source_text",
+          "source_sha256"
+        ],
+        "title": "EpisodeScriptsPresentation"
+      },
+      "CharacterBiographiesPresentation": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "const": "character_biographies",
+            "title": "Key",
+            "default": "character_biographies"
+          },
+          "title": {
+            "type": "string",
+            "const": "人物小传",
+            "title": "Title",
+            "default": "人物小传"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "structured",
+              "source"
+            ],
+            "title": "Mode"
+          },
+          "source_text": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Source Text"
+          },
+          "source_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Source Sha256"
+          },
+          "characters": {
+            "items": {
+              "$ref": "#/components/schemas/CharacterEntry"
+            },
+            "type": "array",
+            "title": "Characters"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "mode",
+          "source_text",
+          "source_sha256"
+        ],
+        "title": "CharacterBiographiesPresentation"
+      },
+      "StoryOutlinePresentation": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "const": "story_outline",
+            "title": "Key",
+            "default": "story_outline"
+          },
+          "title": {
+            "type": "string",
+            "const": "故事大纲",
+            "title": "Title",
+            "default": "故事大纲"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "structured",
+              "source"
+            ],
+            "title": "Mode"
+          },
+          "source_text": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Source Text"
+          },
+          "source_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Source Sha256"
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/StorySection"
+            },
+            "type": "array",
+            "title": "Sections"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "mode",
+          "source_text",
+          "source_sha256"
+        ],
+        "title": "StoryOutlinePresentation"
+      },
+      "RelationshipLogicPresentation": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "const": "relationship_logic",
+            "title": "Key",
+            "default": "relationship_logic"
+          },
+          "title": {
+            "type": "string",
+            "const": "人物关系",
+            "title": "Title",
+            "default": "人物关系"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "structured",
+              "source"
+            ],
+            "title": "Mode"
+          },
+          "source_text": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Source Text"
+          },
+          "source_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Source Sha256"
+          },
+          "relationships": {
+            "items": {
+              "$ref": "#/components/schemas/RelationshipEntry"
+            },
+            "type": "array",
+            "title": "Relationships"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "mode",
+          "source_text",
+          "source_sha256"
+        ],
+        "title": "RelationshipLogicPresentation"
+      },
+      "DeliveryPresentation": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 1,
+            "title": "Schema Version",
+            "default": 1
+          },
+          "creation_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Creation Id"
+          },
+          "run_kind": {
+            "type": "string",
+            "enum": [
+              "initial",
+              "revision"
+            ],
+            "title": "Run Kind"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial",
+              "source"
+            ],
+            "title": "Status"
+          },
+          "story_outline": {
+            "$ref": "#/components/schemas/StoryOutlinePresentation"
+          },
+          "character_biographies": {
+            "$ref": "#/components/schemas/CharacterBiographiesPresentation"
+          },
+          "relationship_logic": {
+            "$ref": "#/components/schemas/RelationshipLogicPresentation"
+          },
+          "episode_outline": {
+            "$ref": "#/components/schemas/EpisodeOutlinePresentation"
+          },
+          "episode_scripts": {
+            "$ref": "#/components/schemas/EpisodeScriptsPresentation"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "creation_id",
+          "run_kind",
+          "status",
+          "story_outline",
+          "character_biographies",
+          "relationship_logic",
+          "episode_outline",
+          "episode_scripts"
+        ],
+        "title": "DeliveryPresentation"
+      },
+      "EpisodeOutlinePresentation": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "const": "episode_outline",
+            "title": "Key",
+            "default": "episode_outline"
+          },
+          "title": {
+            "type": "string",
+            "const": "分集大纲",
+            "title": "Title",
+            "default": "分集大纲"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "structured",
+              "source"
+            ],
+            "title": "Mode"
+          },
+          "source_text": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Source Text"
+          },
+          "source_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Source Sha256"
+          },
+          "episodes": {
+            "items": {
+              "$ref": "#/components/schemas/EpisodeEntry"
+            },
+            "type": "array",
+            "title": "Episodes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "mode",
+          "source_text",
+          "source_sha256"
+        ],
+        "title": "EpisodeOutlinePresentation"
+      },
+      "EpisodeEntry": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "title": "Id"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Label"
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Ordinal"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Content"
+          },
+          "content_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Content Sha256"
+          },
+          "episode_number": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Episode Number"
+          },
+          "scenes": {
+            "items": {
+              "$ref": "#/components/schemas/PresentationItem"
+            },
+            "type": "array",
+            "title": "Scenes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "ordinal",
+          "content",
+          "content_sha256",
+          "episode_number"
+        ],
+        "title": "EpisodeEntry"
+      },
+      "PresentationItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "title": "Id"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Label"
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Ordinal"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Content"
+          },
+          "content_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Content Sha256"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "ordinal",
+          "content",
+          "content_sha256"
+        ],
+        "title": "PresentationItem"
+      },
+      "CharacterEntry": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "title": "Id"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Label"
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Ordinal"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Content"
+          },
+          "content_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Content Sha256"
+          },
+          "group": {
+            "type": "string",
+            "enum": [
+              "core",
+              "supporting",
+              "other"
+            ],
+            "title": "Group",
+            "default": "other"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "ordinal",
+          "content",
+          "content_sha256"
+        ],
+        "title": "CharacterEntry"
+      },
+      "StorySection": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "title": "Id"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Label"
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Ordinal"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Content"
+          },
+          "content_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Content Sha256"
+          },
+          "level": {
+            "type": "integer",
+            "maximum": 3.0,
+            "minimum": 1.0,
+            "title": "Level"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "ordinal",
+          "content",
+          "content_sha256",
+          "level"
+        ],
+        "title": "StorySection"
       }
     }
   },

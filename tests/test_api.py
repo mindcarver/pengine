@@ -12,7 +12,7 @@ from pengine.api import _error_response, create_app
 from pengine.config import Settings
 from pengine.errors import DomainError
 from pengine.repository import Repository
-from pengine.schemas import InternalStage
+from pengine.schemas import ContentPackage, Delivery, DeliveryReport, GateResult, InternalStage
 
 
 def _app(tmp_path: Path):
@@ -61,6 +61,7 @@ async def test_frontend_and_assets_are_served_with_run_control_openapi(
         ("GET", "/personas"),
         ("POST", "/creations"),
         ("GET", "/creations/{creation_id}"),
+        ("GET", "/creations/{creation_id}/runs/{run_kind}/presentation"),
         ("POST", "/creations/{creation_id}/revision"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/retry-final-review"),
@@ -116,6 +117,75 @@ async def test_snapshot_creation_runs_outside_event_loop_thread(
     assert accepted.status_code == 202
     assert snapshot_threads
     assert snapshot_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_delivery_presentation_is_read_only_and_historical_safe(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
+    ):
+        missing = await client.get(f"/creations/{uuid4()}/runs/initial/presentation")
+        assert missing.status_code == 404
+        assert missing.json()["code"] == "creation_not_found"
+
+        accepted = await client.post(
+            "/creations",
+            headers={"Idempotency-Key": "presentation-create"},
+            json={
+                "persona_id": "test-persona",
+                "story": "一个人回乡。",
+                "requirements": "生成完整短剧。",
+            },
+        )
+        creation_id = accepted.json()["creation_id"]
+        unavailable = await client.get(f"/creations/{creation_id}/runs/initial/presentation")
+        assert unavailable.status_code == 409
+        assert unavailable.json()["code"] == "presentation_not_available"
+
+        lease = await app.state.repository.lease_next_job("presentation-worker", 30)
+        assert lease is not None
+        creation = (await client.get(f"/creations/{creation_id}")).json()
+        persona = creation["persona"]
+        delivery = Delivery(
+            content_package=ContentPackage(
+                story_outline="故事大纲",
+                character_biographies="人物小传",
+                relationship_logic="人物关系",
+                episode_outline="分集大纲",
+                episode_scripts="分集剧本",
+            ),
+            delivery_report=DeliveryReport(
+                persona_id=persona["persona_id"],
+                persona_version=persona["version"],
+                persona_snapshot_sha256=persona["snapshot_sha256"],
+                selected_l0_variant="归返",
+                selection_rationale="符合故事。",
+                l0_gate=GateResult(passed=True, evidence="L0 通过"),
+                l4_gate=GateResult(passed=True, evidence="L4 通过"),
+                ownership_statement="由操作人员保留最终判断。",
+                feedback_handling=[],
+            ),
+        )
+        await app.state.repository.succeed_run(lease.run_id, delivery)
+        async with app.state.repository._transaction() as connection:
+            await connection.execute(
+                "UPDATE deliveries SET presentation_manifest_json = NULL, "
+                "presentation_manifest_sha256 = NULL WHERE run_id = ?",
+                (str(lease.run_id),),
+            )
+
+        async with app.state.repository._connection() as observer:
+            before = (await (await observer.execute("PRAGMA data_version")).fetchone())[0]
+            presented = await client.get(f"/creations/{creation_id}/runs/initial/presentation")
+            after = (await (await observer.execute("PRAGMA data_version")).fetchone())[0]
+
+        assert presented.status_code == 200
+        assert presented.json()["status"] == "source"
+        assert presented.json()["story_outline"]["source_text"] == "故事大纲"
+        assert before == after
+        assert await app.state.repository.get_run_model_calls(lease.run_id) == []
 
 
 @pytest.mark.asyncio
