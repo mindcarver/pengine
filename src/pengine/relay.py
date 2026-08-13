@@ -886,6 +886,16 @@ _TOOL_PROTOCOL_REJECTION = re.compile(
 )
 
 
+def _is_generic_upstream_failure(failure: _ProviderFailure | None) -> bool:
+    """Recognize the relay's content-free wrapper for an upstream outage."""
+    return (
+        failure is not None
+        and failure.http_status == 400
+        and failure.provider_code == "upstream_error"
+        and failure.detail.casefold() == "upstream request failed"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RelayAdapter:
     model: BaseChatModel
@@ -1163,6 +1173,17 @@ def classify_relay_exception(exc: Exception) -> RelayError:
     status = failure.http_status if failure is not None else None
     if status is not None:
         evidence = _provider_evidence(failure)
+        if _is_generic_upstream_failure(failure):
+            return RelayError(
+                code="relay_unavailable",
+                safe_message=(
+                    "The model relay reported a temporary upstream failure (HTTP 400). "
+                    f"Provider response: {evidence}"
+                ),
+                http_status=status,
+                provider_error_code=failure.provider_code,
+                redacted_body=failure.redacted_body,
+            )
         if (
             status == 400
             and failure is not None
@@ -1224,6 +1245,8 @@ def retryable_relay_interruption(exc: Exception) -> RetryableRelayInterruption |
     if _is_retryable_status_error(exc):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
     if _is_upstream_stream_error(exc):
+        return RetryableRelayInterruption(_retry_delay_seconds(exc))
+    if _is_generic_upstream_failure(_extract_provider_failure(exc)):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
     return None
 
