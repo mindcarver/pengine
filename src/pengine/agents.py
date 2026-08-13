@@ -4524,14 +4524,14 @@ class StageGuardMiddleware(AgentMiddleware):
                         subagent_type="canon_reviewer",
                         description=(
                             f"{review_description} The previous review's repair target could not "
-                            f"bind to the current contract ({exc}). Reread the current JSON and "
-                            "return one complete corrected review. Preserve the substantive "
-                            "decision unless the current artifacts themselves prove it wrong."
+                            f"bind to the current contract ({exc}). Discard that review and every "
+                            "claimed current value from it. Reread the current JSON. Independently "
+                            "reevaluate every claimed contradiction against the supplied "
+                            "artifacts. Return one complete fresh review. If a contradiction still "
+                            "exists, copy every expected_value exactly from the current JSON. Pass "
+                            "when current artifacts do not prove a blocking contradiction."
                         ),
-                        files={
-                            **review_files,
-                            "/workspace/invalid_contract_review.json": review.model_dump_json(),
-                        },
+                        files=review_files,
                         schema=CanonReviewerResult,
                         stage=InternalStage.GENERATING_EPISODE_OUTLINE,
                     )

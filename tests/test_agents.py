@@ -6064,8 +6064,12 @@ async def test_outline_review_target_mismatch_gets_one_fresh_review_before_repai
                 expected_value = "错误旧值"
             elif review_calls == 2:
                 expected_value = "不得增加人物"
-                assert "/workspace/invalid_contract_review.json" in candidate_request.state["files"]
+                assert (
+                    "/workspace/invalid_contract_review.json"
+                    not in candidate_request.state["files"]
+                )
                 assert "could not bind" in candidate_request.tool_call["args"]["description"]
+                assert "Discard that review" in candidate_request.tool_call["args"]["description"]
             else:
                 payload = {
                     "passed": True,
@@ -6176,7 +6180,10 @@ async def test_outline_review_target_mismatch_fails_closed_after_fresh_review() 
             assert subagent_type == "canon_reviewer"
             review_calls += 1
             if review_calls == 2:
-                assert "/workspace/invalid_contract_review.json" in candidate_request.state["files"]
+                assert (
+                    "/workspace/invalid_contract_review.json"
+                    not in candidate_request.state["files"]
+                )
             payload = {
                 "passed": False,
                 "evidence": "禁止项与正式事实冲突。",
