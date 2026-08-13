@@ -904,3 +904,50 @@ def test_on_llm_error_persists_redacted_provider_400_evidence(tmp_path: Path) ->
     assert row["redacted_response"] is not None
     assert "secret-value" not in row["redacted_response"]
     store.close()
+
+
+def test_on_llm_error_persists_generic_upstream_400_evidence(tmp_path: Path) -> None:
+    from pengine.relay import _ModelCallAuditHandler
+
+    store = ModelCallStore(tmp_path / "model_calls.sqlite3")
+    state = ModelCallState(store=store)
+    state.context.run_id = "run-upstream-400"
+    state.context.stage = "accepting_l4"
+    handler = _ModelCallAuditHandler(
+        role="review",
+        model_id="gpt-5.5",
+        adapter="openai",
+        provider="openai",
+        model_call_state=state,
+        context_limit_tokens=128_000,
+        reserved_output_tokens=64_000,
+    )
+    callback_run_id = uuid4()
+    handler.on_chat_model_start(
+        {},
+        [[{"role": "user", "content": "审核全剧。"}]],
+        run_id=callback_run_id,
+    )
+    request = httpx.Request("POST", "https://relay.example/v1/chat/completions")
+    body = {
+        "code": None,
+        "message": "Upstream request failed",
+        "param": "",
+        "type": "upstream_error",
+    }
+    error = openai.BadRequestError(
+        "Upstream request failed",
+        response=httpx.Response(400, request=request, json=body),
+        body=body,
+    )
+
+    handler.on_llm_error(error, run_id=callback_run_id)
+
+    row = store._connection.execute(
+        "SELECT http_status, provider_error_code, redacted_response "
+        "FROM model_calls WHERE run_id = 'run-upstream-400'"
+    ).fetchone()
+    assert row["http_status"] == 400
+    assert row["provider_error_code"] == "upstream_error"
+    assert json.loads(row["redacted_response"]) == body
+    store.close()

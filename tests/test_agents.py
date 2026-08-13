@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import openai
 import pytest
 from langchain.agents import create_agent
 from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
@@ -1262,6 +1263,42 @@ async def test_loop_relay_retry_survives_transient_interruption() -> None:
         agents_module.retryable_relay_interruption = original
 
     assert result == "recovered"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_loop_relay_retry_survives_generic_http_400_upstream_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact provider failure from Issue #137 stays inside the bounded L4 loop."""
+    from pengine.agents import _with_loop_relay_retry
+
+    calls = 0
+    request = httpx.Request("POST", "https://relay.example/v1/chat/completions")
+    body = {
+        "code": None,
+        "message": "Upstream request failed",
+        "param": "",
+        "type": "upstream_error",
+    }
+
+    async def flaky_call() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise openai.BadRequestError(
+                "Upstream request failed",
+                response=httpx.Response(400, request=request, json=body),
+                body=body,
+            )
+        return "recovered"
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("pengine.agents.asyncio.sleep", no_sleep)
+
+    assert await _with_loop_relay_retry(flaky_call) == "recovered"
     assert calls == 2
 
 

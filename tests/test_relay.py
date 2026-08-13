@@ -591,6 +591,51 @@ def test_classify_relay_exception_400_content_rejection_is_not_tool_protocol() -
     assert "secret" not in mapped.safe_message
 
 
+def test_generic_http_400_upstream_failure_is_retryable_unavailable() -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/chat/completions")
+    body = {
+        "code": None,
+        "message": "Upstream request failed",
+        "param": "",
+        "type": "upstream_error",
+    }
+    error = openai.BadRequestError(
+        "Upstream request failed",
+        response=httpx.Response(400, request=request, json=body),
+        body=body,
+    )
+
+    mapped = classify_relay_exception(error)
+    interruption = retryable_relay_interruption(error)
+
+    assert mapped.code == "relay_unavailable"
+    assert mapped.http_status == 400
+    assert mapped.provider_error_code == "upstream_error"
+    assert "temporary upstream failure" in mapped.safe_message
+    assert interruption is not None
+    assert interruption.retry_delay_seconds == MIN_RELAY_RETRY_DELAY_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("message", "code"),
+    [
+        ("insufficient tool messages following tool_calls message", "upstream_error"),
+        ("maximum context length exceeded", "context_length_exceeded"),
+        ("Upstream request failed", "invalid_request_error"),
+    ],
+)
+def test_specific_http_400_request_failures_remain_terminal(
+    message: str,
+    code: str,
+) -> None:
+    error = _openai_bad_request(message=message, code=code)
+
+    mapped = classify_relay_exception(error)
+
+    assert mapped.code == "relay_rejected"
+    assert retryable_relay_interruption(error) is None
+
+
 def test_classify_relay_exception_400_tool_protocol_keeps_incompatible() -> None:
     """A provider 400 that does reject the tool protocol stays relay_incompatible,
     but now carries the precise status and truthful provider detail."""
