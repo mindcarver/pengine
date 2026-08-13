@@ -4622,6 +4622,36 @@ def test_evidence_contract_exposes_episode_verbatim_facts_and_rejected_issue() -
     ]
 
 
+def test_evidence_contract_includes_required_and_callback_clues() -> None:
+    payload = _story_contract(episode_count=3).model_dump(mode="json")
+    payload["clues"] = [
+        {
+            "clue_id": "second_signature",
+            "description": "第一集揭示、第二集义务使用、第三集回扣的第二签名",
+            "introduced_episode": 1,
+            "explained_episode": 1,
+            "callback_episode": 3,
+            "introduction_is_visible_or_audible": True,
+        }
+    ]
+    payload["episode_obligations"][1]["required_clue_ids"] = ["second_signature"]
+    contract = StoryContract.model_validate(payload)
+
+    episode_two = _evidence_contract(contract, 2, phase="initial_episode_write")
+    episode_three = _evidence_contract(contract, 3, phase="initial_episode_write")
+
+    assert episode_two["required_evidence_target_ids"] == [
+        "fact_ep2",
+        "obligation_ep2",
+        "second_signature",
+    ]
+    assert episode_three["required_evidence_target_ids"] == [
+        "fact_ep3",
+        "obligation_ep3",
+        "second_signature",
+    ]
+
+
 def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> None:
     assert _SPECIALIST_SKILL_SOURCES == {
         "canon_reviewer": ["/skills/canon-review"],
@@ -6284,6 +6314,9 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
         for item in invalid_writer_payload["state_delta"]["evidence"]
         if item["target_id"] != "fact_ep1"
     ]
+    invalid_writer_payload["state_delta"]["evidence"].append(
+        {"target_id": "stale_target", "excerpt": "钩子1"}
+    )
     responses[writer_index] = _tool_call("ScriptWriterResult", invalid_writer_payload, writer_index)
     responses[review_index] = _tool_call(
         "EpisodeReviewerResult",
@@ -6402,6 +6435,8 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     evidence_issues = evidence_contract["rejected_issues"]
     assert {issue["code"] for issue in evidence_issues} == {
         "evidence_coverage_mismatch",
+        "missing_evidence_targets",
+        "unexpected_evidence_targets",
         "verbatim_fact_missing",
     }
     coverage_issue = next(
@@ -6426,7 +6461,9 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     assert "Do not rewrite a label merely because it is an alias" in repair_description
     assert "generic or descriptive label" in repair_description
     assert "speaker_contract.json" not in repair_description
-    assert 'issue.contract_refs: ["fact_ep1", "obligation_ep1"]' in repair_description
+    assert (
+        'issue.contract_refs: ["fact_ep1", "obligation_ep1", "stale_target"]' in repair_description
+    )
     assert "exact set" in repair_description
     assert "no extras" in repair_description
     assert "no duplicates" in repair_description

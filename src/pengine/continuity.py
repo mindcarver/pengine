@@ -564,6 +564,33 @@ def bind_episode_delta_to_contract(
     )
 
 
+def required_episode_evidence_target_ids(
+    contract: StoryContract,
+    episode_number: int,
+) -> list[str]:
+    obligation = next(
+        item for item in contract.episode_obligations if item.episode_number == episode_number
+    )
+    return sorted(
+        {
+            *(
+                fact.fact_id
+                for fact in contract.facts
+                if fact.first_revealed_episode == episode_number
+            ),
+            *(
+                clue.clue_id
+                for clue in contract.clues
+                if clue.introduced_episode == episode_number
+                or clue.explained_episode == episode_number
+                or clue.callback_episode == episode_number
+            ),
+            *obligation.required_clue_ids,
+            obligation.obligation_id,
+        }
+    )
+
+
 def build_episode_lock(
     *,
     contract: StoryContract,
@@ -688,9 +715,6 @@ def validate_episode_candidate(
     expected_resolved = {
         clue.clue_id for clue in contract.clues if clue.explained_episode == episode
     }
-    expected_callbacks = {
-        clue.clue_id for clue in contract.clues if clue.callback_episode == episode
-    }
     if set(delta.introduced_clue_ids) != expected_introduced:
         issues.append(
             _issue(
@@ -720,14 +744,7 @@ def validate_episode_candidate(
             )
         )
 
-    expected_evidence = (
-        expected_facts
-        | expected_introduced
-        | expected_resolved
-        | expected_callbacks
-        | {obligation.obligation_id}
-        | set(obligation.required_clue_ids)
-    )
+    expected_evidence = set(required_episode_evidence_target_ids(contract, episode))
     evidence = {item.target_id: item.excerpt for item in delta.evidence}
     provided_targets = set(evidence)
     missing_targets = sorted(expected_evidence - provided_targets)
