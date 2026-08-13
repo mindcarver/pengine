@@ -2661,6 +2661,85 @@ async def test_structured_result_rejects_result_after_failed_required_read() -> 
 
 
 @pytest.mark.asyncio
+async def test_structured_result_allows_failed_non_required_read() -> None:
+    class Result(BaseModel):
+        value: str
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[
+            HumanMessage(content="Read the input, then return the result."),
+            _tool_call("read_file", {"file_path": "/workspace/one-line.json"}, 1),
+            ToolMessage(
+                content="Error: Line offset 1 exceeds file length (1 lines)",
+                name="read_file",
+                tool_call_id="call-1",
+                status="error",
+            ),
+        ],
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+        response_format=ToolStrategy(Result),
+    )
+    expected = Result(value="done")
+
+    async def handler(_: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=expected,
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == expected
+
+
+@pytest.mark.asyncio
+async def test_failed_non_required_read_does_not_block_completed_required_reads() -> None:
+    class Result(BaseModel):
+        value: str
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[
+            HumanMessage(
+                content=(
+                    "Review the input.\n"
+                    "<pengine-required-read-paths>\n"
+                    "/workspace/required.md\n"
+                    "</pengine-required-read-paths>"
+                )
+            ),
+            _tool_call("read_file", {"file_path": "/workspace/required.md"}, 1),
+            ToolMessage(
+                content="required contents",
+                name="read_file",
+                tool_call_id="call-1",
+            ),
+            _tool_call("read_file", {"file_path": "/workspace/optional.md"}, 2),
+            ToolMessage(
+                content="Error: file not found",
+                name="read_file",
+                tool_call_id="call-2",
+                status="error",
+            ),
+        ],
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+        response_format=ToolStrategy(Result),
+    )
+    expected = Result(value="reviewed")
+
+    async def handler(_: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=expected,
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == expected
+
+
+@pytest.mark.asyncio
 async def test_unread_canon_result_is_blocked_until_engine_schedules_required_reads() -> None:
     paths = (
         "/workspace/current_character_biographies.md",

@@ -2490,7 +2490,8 @@ def _successful_required_reads(messages: Sequence[Any]) -> frozenset[str]:
 
 
 def _failed_required_reads(messages: Sequence[Any]) -> frozenset[str]:
-    return _required_read_outcomes(messages)[1]
+    required = frozenset(_required_read_paths(messages))
+    return _required_read_outcomes(messages)[1] & required
 
 
 def _missing_required_reads(messages: Sequence[Any]) -> tuple[str, ...]:
