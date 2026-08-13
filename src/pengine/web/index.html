@@ -14,8 +14,8 @@
       content="Pengine 本地短剧创作工作台：选择编剧人格，提交故事，并查看真实生成与修订结果。"
     >
     <title>Pengine · 短剧编辑部</title>
-    <link rel="stylesheet" href="/static/styles.css">
-    <script src="/static/app.js" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260813-2">
+    <script src="/static/app.js?v=20260813-2" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>
@@ -481,6 +481,11 @@
                     <div id="episode-content" role="tabpanel" tabindex="0"></div>
                   </section>
                   <div id="artifact-content" tabindex="0"></div>
+                  <nav class="episode-stepper" id="episode-stepper" aria-label="分集翻页" hidden>
+                    <button id="previous-episode" type="button">← 上一集</button>
+                    <span id="episode-position" aria-live="polite"></span>
+                    <button id="next-episode" type="button">下一集 →</button>
+                  </nav>
                 </article>
               </div>
 

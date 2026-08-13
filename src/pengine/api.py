@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Annotated, Literal, Protocol, get_args
 from uuid import UUID
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -89,9 +89,22 @@ def create_app(
     app.state.worker = worker
     app.mount("/static", StaticFiles(directory=_WEB_ROOT), name="static")
 
+    @app.middleware("http")
+    async def require_web_asset_revalidation(request: Request, call_next) -> Response:
+        response = await call_next(request)
+        if request.url.path == "/":
+            response.headers["Cache-Control"] = "no-store"
+        elif request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     @app.get("/", include_in_schema=False)
     async def frontend() -> FileResponse:
-        return FileResponse(_WEB_ROOT / "index.html", media_type="text/html")
+        return FileResponse(
+            _WEB_ROOT / "index.html",
+            media_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.exception_handler(DomainError)
     async def handle_domain_error(_, exc: DomainError) -> JSONResponse:

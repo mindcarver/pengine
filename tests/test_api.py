@@ -1,5 +1,7 @@
+import hashlib
 import shutil
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -43,11 +45,14 @@ async def test_frontend_and_assets_are_served_with_run_control_openapi(
 
     assert page.status_code == 200
     assert page.headers["content-type"].startswith("text/html")
+    assert page.headers["cache-control"] == "no-store"
     assert "<!doctype html>" in page.text.lower()
     assert stylesheet.status_code == 200
     assert stylesheet.headers["content-type"].startswith("text/css")
+    assert stylesheet.headers["cache-control"] == "no-cache"
     assert script.status_code == 200
     assert "javascript" in script.headers["content-type"]
+    assert script.headers["cache-control"] == "no-cache"
     assert "重试本次修订" not in script.text
     assert 'revisionState === "available" && !state.pendingFeedback' in script.text
 
@@ -153,8 +158,8 @@ async def test_delivery_presentation_is_read_only_and_historical_safe(tmp_path: 
                 story_outline="故事大纲",
                 character_biographies="人物小传",
                 relationship_logic="人物关系",
-                episode_outline="分集大纲",
-                episode_scripts="分集剧本",
+                episode_outline="第一集详细大纲\n第二集详细大纲",
+                episode_scripts="第 1 集剧本\n第 2 集剧本",
             ),
             delivery_report=DeliveryReport(
                 persona_id=persona["persona_id"],
@@ -170,6 +175,31 @@ async def test_delivery_presentation_is_read_only_and_historical_safe(tmp_path: 
         )
         await app.state.repository.succeed_run(lease.run_id, delivery)
         async with app.state.repository._transaction() as connection:
+            now = datetime.now(UTC).isoformat()
+            for episode_number in (1, 2):
+                plan = f"第 {episode_number} 集计划"
+                script = f"第 {episode_number} 集剧本"
+                await connection.execute(
+                    "INSERT INTO episode_plans(run_id, episode_number, plan, plan_sha256) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        str(lease.run_id),
+                        episode_number,
+                        plan,
+                        hashlib.sha256(plan.encode()).hexdigest(),
+                    ),
+                )
+                await connection.execute(
+                    "INSERT INTO episode_drafts(run_id, episode_number, content, "
+                    "content_sha256, completed_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        str(lease.run_id),
+                        episode_number,
+                        script,
+                        hashlib.sha256(script.encode()).hexdigest(),
+                        now,
+                    ),
+                )
             await connection.execute(
                 "UPDATE deliveries SET presentation_manifest_json = NULL, "
                 "presentation_manifest_sha256 = NULL WHERE run_id = ?",
@@ -182,8 +212,10 @@ async def test_delivery_presentation_is_read_only_and_historical_safe(tmp_path: 
             after = (await (await observer.execute("PRAGMA data_version")).fetchone())[0]
 
         assert presented.status_code == 200
-        assert presented.json()["status"] == "source"
+        assert presented.json()["status"] == "partial"
         assert presented.json()["story_outline"]["source_text"] == "故事大纲"
+        assert len(presented.json()["episode_outline"]["episodes"]) == 2
+        assert len(presented.json()["episode_scripts"]["episodes"]) == 2
         assert before == after
         assert await app.state.repository.get_run_model_calls(lease.run_id) == []
 

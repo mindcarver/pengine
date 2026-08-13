@@ -221,3 +221,46 @@ def test_missing_or_unknown_manifest_returns_all_source_artifacts() -> None:
         assert recovered.status == "source"
         assert recovered.episode_outline.mode == "source"
         assert recovered.episode_scripts.mode == "source"
+
+
+def test_historical_recovery_uses_authoritative_episode_records_without_rewriting_source() -> None:
+    creation_id = uuid4()
+    content = ContentPackage(
+        story_outline="故事",
+        character_biographies="人物",
+        relationship_logic="关系",
+        episode_outline="第一集｜详细聚合大纲\n第二集｜详细聚合大纲",
+        episode_scripts="第一集剧本\n第二集剧本",
+    )
+    plans = [
+        EpisodePlan(episode_number=1, plan="第一集简明计划"),
+        EpisodePlan(episode_number=2, plan="第二集简明计划"),
+    ]
+    drafts = [
+        EpisodeDraft(
+            episode_number=number,
+            content=f"第{'一' if number == 1 else '二'}集剧本",
+            content_sha256="a" * 64,
+            completed_at=datetime.now(UTC),
+        )
+        for number in (1, 2)
+    ]
+
+    recovered = recover_delivery_presentation(
+        raw_manifest=None,
+        creation_id=creation_id,
+        run_kind="initial",
+        content=content,
+        episode_plans=plans,
+        episode_drafts=drafts,
+    )
+
+    assert recovered.status == "partial"
+    assert recovered.episode_outline.mode == "structured"
+    assert [item.content for item in recovered.episode_outline.episodes] == [
+        "第一集简明计划",
+        "第二集简明计划",
+    ]
+    assert recovered.episode_outline.source_text == content.episode_outline
+    assert recovered.episode_scripts.mode == "structured"
+    assert [item.episode_number for item in recovered.episode_scripts.episodes] == [1, 2]

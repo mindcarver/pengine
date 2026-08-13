@@ -248,6 +248,10 @@ function cacheElements() {
     "episode-tabs",
     "episode-content",
     "artifact-content",
+    "episode-stepper",
+    "previous-episode",
+    "episode-position",
+    "next-episode",
     "revision-desk",
     "revision-description",
     "revision-form",
@@ -305,6 +309,13 @@ function bindEvents() {
   elements["episode-tabs"].addEventListener("keydown", handleHorizontalTabs);
   elements["open-revision"].addEventListener("click", openRevisionDrawer);
   elements["close-revision"].addEventListener("click", closeRevisionDrawer);
+  elements["previous-episode"]?.addEventListener("click", () => moveFormalEpisode(-1));
+  elements["next-episode"]?.addEventListener("click", () => moveFormalEpisode(1));
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !elements["revision-desk"].hidden) {
+      closeRevisionDrawer();
+    }
+  });
 
   window.addEventListener("beforeunload", stopPolling);
   document.addEventListener("visibilitychange", () => {
@@ -1505,6 +1516,9 @@ function renderArtifact() {
       ? "修订稿"
       : "初稿";
   const showEpisodeNavigator = artifact.isEpisodeNavigator === true;
+  if (elements["episode-stepper"]) {
+    elements["episode-stepper"].hidden = true;
+  }
   elements["episode-navigator"].hidden = !showEpisodeNavigator;
   elements["artifact-content"].hidden = showEpisodeNavigator;
   if (showEpisodeNavigator) {
@@ -1530,6 +1544,37 @@ function renderArtifact() {
   }
   renderSectionNavigation(items, activeItem, projected);
   renderReadableText(elements["artifact-content"], activeItem?.content || source);
+  renderEpisodeStepper(items, activeItem, artifact.key);
+}
+
+function renderEpisodeStepper(items, activeItem, artifactKey) {
+  const isEpisodeArtifact = artifactKey === "episode_outline" || artifactKey === "episode_scripts";
+  if (!elements["episode-stepper"] || !isEpisodeArtifact || items.length < 1 || !activeItem) {
+    return;
+  }
+  const index = items.findIndex((item) => item.id === activeItem.id);
+  elements["episode-stepper"].hidden = false;
+  elements["previous-episode"].disabled = index <= 0;
+  elements["next-episode"].disabled = index >= items.length - 1;
+  elements["episode-position"].textContent = `第 ${index + 1} / ${items.length} 集`;
+}
+
+function moveFormalEpisode(offset) {
+  const projected = presentationArtifact(state.activeArtifact);
+  const items = presentationItems(projected);
+  const positionKey = `${state.creationId}:${state.activeVersion}:${state.activeArtifact}`;
+  const currentIndex = items.findIndex(
+    (item) => item.id === state.readingPositions[positionKey],
+  );
+  const target = items[currentIndex + offset];
+  if (!target) {
+    return;
+  }
+  state.readingPositions[positionKey] = target.id;
+  writeReadingPositions();
+  writeReadingHash(target.id);
+  renderArtifact();
+  elements["artifact-content"].focus({ preventScroll: true });
 }
 
 function renderSectionNavigation(items, activeItem, projected) {

@@ -7136,11 +7136,14 @@ class Repository:
                     raw_manifest = None
             else:
                 raw_manifest = None
+            run_id = UUID(run["id"])
             return recover_delivery_presentation(
                 raw_manifest=raw_manifest,
                 creation_id=creation_id,
                 run_kind=run_kind,
                 content=content,
+                episode_plans=await self._episode_plans(connection, run_id),
+                episode_drafts=await self._episode_drafts(connection, run_id),
             )
 
     async def get_run_work_item(self, run_id: UUID) -> RunWorkItem:
