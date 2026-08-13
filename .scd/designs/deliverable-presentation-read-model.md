@@ -76,7 +76,7 @@ Compiler 不调用模型、不读取 persona、不解释文学语义。人物分
 - 避免轮询资源长期携带重复展示数据；
 - initial/revision 使用同一读取语义；
 - 只接受成功且存在 formal delivery 的 run；
-- 历史 delivery 没有 manifest 时返回 HTTP 200、整体 `source` 状态和五类完整原文；
+- 历史 delivery 没有 manifest 时返回 HTTP 200；若已有连续且验证通过的 `episode_plans` / `episode_drafts`，只读投影为按集导航，其他文稿保持 `source`，且不回填数据库、不调用模型；
 - 创建不存在返回 `creation_not_found`；指定 run 尚无正式交付返回 `presentation_not_available`。
 
 API 不暴露内部 checkpoint、数据库行、提示词或模型导航提示，只返回经过 Compiler 验证的读取模型。

@@ -2152,6 +2152,43 @@ body[data-workspace-view="reading"] .flow-nav {
   box-shadow: -12px 0 30px rgba(23, 20, 17, 0.2);
 }
 
+#result-workspace[data-mode="reading"] .revision-desk[hidden] {
+  display: none;
+}
+
+.episode-stepper {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgba(90, 69, 45, 0.22);
+}
+
+.episode-stepper[hidden] {
+  display: none;
+}
+
+.episode-stepper button {
+  border: 1px solid rgba(72, 57, 40, 0.35);
+  padding: 0.55rem 0.8rem;
+  color: var(--ink);
+  background: transparent;
+  cursor: pointer;
+}
+
+.episode-stepper button:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+
+#episode-position {
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 0.68rem;
+}
+
 .revision-close {
   position: absolute;
   top: 1rem;

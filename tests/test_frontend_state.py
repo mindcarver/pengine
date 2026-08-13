@@ -1362,6 +1362,22 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
+def test_formal_episode_navigation_and_revision_drawer_contracts_are_wired() -> None:
+    root = Path(__file__).parents[1]
+    page = (root / "src" / "pengine" / "web" / "index.html").read_text()
+    script = (root / "src" / "pengine" / "web" / "app.js").read_text()
+    styles = (root / "src" / "pengine" / "web" / "styles.css").read_text()
+
+    assert "styles.css?v=20260813-2" in page
+    assert "app.js?v=20260813-2" in page
+    assert 'id="previous-episode"' in page
+    assert 'id="next-episode"' in page
+    assert "moveFormalEpisode(-1)" in script
+    assert "moveFormalEpisode(1)" in script
+    assert 'event.key === "Escape"' in script
+    assert ".revision-desk[hidden]" in styles
+
+
 def test_workbench_presents_one_active_unfinished_series_bible_design() -> None:
     script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
     assertions = """

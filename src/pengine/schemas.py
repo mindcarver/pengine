@@ -222,7 +222,11 @@ class EpisodeOutlinePresentation(StrictModel):
     @model_validator(mode="after")
     def validate_integrity(self) -> "EpisodeOutlinePresentation":
         _validate_presentation_artifact(
-            self.source_text, self.source_sha256, self.episodes, self.mode
+            self.source_text,
+            self.source_sha256,
+            self.episodes,
+            self.mode,
+            require_source_membership=False,
         )
         _validate_episode_entries(self.episodes)
         return self
@@ -250,6 +254,8 @@ def _validate_presentation_artifact(
     source_sha256: str,
     items: list[PresentationItem],
     mode: Literal["structured", "source"],
+    *,
+    require_source_membership: bool = True,
 ) -> None:
     expected_source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
     if source_sha256 != expected_source_hash:
@@ -262,9 +268,10 @@ def _validate_presentation_artifact(
         raise ValueError("Presentation item IDs must be unique")
     if [item.ordinal for item in items] != list(range(1, len(items) + 1)):
         raise ValueError("Presentation item ordinals must be contiguous from 1")
-    positions = [source_text.find(item.content) for item in items]
-    if any(position < 0 for position in positions) or positions != sorted(positions):
-        raise ValueError("Presentation items must occur in source order")
+    if require_source_membership:
+        positions = [source_text.find(item.content) for item in items]
+        if any(position < 0 for position in positions) or positions != sorted(positions):
+            raise ValueError("Presentation items must occur in source order")
 
 
 def _validate_complete_partition(source_text: str, items: list[PresentationItem]) -> None:

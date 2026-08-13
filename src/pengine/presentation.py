@@ -175,18 +175,21 @@ def _relationships(
 def _episodes(
     source: str,
     values: Sequence[tuple[int, str]],
+    *,
+    require_source_membership: bool = True,
 ) -> list[EpisodeEntry]:
     expected = list(range(1, len(values) + 1))
     if [number for number, _ in values] != expected:
         return []
-    positions: list[int] = []
-    for _, content in values:
-        position = source.find(content)
-        if position < 0 or source.find(content, position + 1) >= 0:
+    if require_source_membership:
+        positions: list[int] = []
+        for _, content in values:
+            position = source.find(content)
+            if position < 0 or source.find(content, position + 1) >= 0:
+                return []
+            positions.append(position)
+        if positions != sorted(positions) or len(set(positions)) != len(positions):
             return []
-        positions.append(position)
-    if positions != sorted(positions) or len(set(positions)) != len(positions):
-        return []
     return [
         EpisodeEntry(
             id=f"episode-{number}",
@@ -218,6 +221,7 @@ def compile_delivery_presentation(
     outline_entries = _episodes(
         content.episode_outline,
         [(plan.episode_number, plan.plan) for plan in episode_plans],
+        require_source_membership=False,
     )
     episode_outline = (
         EpisodeOutlinePresentation(
@@ -277,12 +281,16 @@ def recover_delivery_presentation(
     creation_id: UUID,
     run_kind: Literal["initial", "revision"],
     content: ContentPackage,
+    episode_plans: Sequence[EpisodePlan] = (),
+    episode_drafts: Sequence[EpisodeDraft] = (),
 ) -> DeliveryPresentation:
     """Keep valid stored artifacts and downgrade only invalid ones to source mode."""
     fallback = compile_delivery_presentation(
         creation_id=creation_id,
         run_kind=run_kind,
         content=content,
+        episode_plans=episode_plans,
+        episode_drafts=episode_drafts,
     )
     if not isinstance(raw_manifest, Mapping):
         return fallback
