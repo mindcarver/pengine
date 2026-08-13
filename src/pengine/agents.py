@@ -49,6 +49,7 @@ from pengine.continuity import (
     canonical_model_hash,
     initial_series_state,
     render_story_contract_markdown,
+    required_episode_evidence_target_ids,
     story_contract_sha256,
     validate_episode_candidate,
 )
@@ -482,9 +483,10 @@ _EPISODE_REPAIR_PROMPT = (
     "First read /skills/continuity-repair/SKILL.md. Follow that skill while keeping the locked "
     "contract and earlier episodes unchanged. Read /workspace/evidence_contract.json together "
     "with the explicitly named candidate, upstream files, "
-    "and review. For evidence_coverage_mismatch, use the issue.contract_refs collection as the "
-    "exact required evidence target set: rebuild evidence with no extras, no duplicates, every "
-    "required target exactly once, and every excerpt copied verbatim from the screenplay. When "
+    "and review. For evidence_coverage_mismatch, missing_evidence_targets, or "
+    "unexpected_evidence_targets, use required_evidence_target_ids from the evidence contract "
+    "as the exact target set: rebuild evidence with no extras, no duplicates, every required "
+    "target exactly once, and every excerpt copied verbatim from the screenplay. When "
     "the review contains "
     "unknown_speaker issues, repair only a contextually proven new continuity-bearing character "
     "that directly conflicts with explicit hard Canon. Resolve the narrative identity conflict "
@@ -655,25 +657,7 @@ def _evidence_contract(
     rejected_issues: list[Any] | None = None,
     phase: str,
 ) -> dict[str, Any]:
-    obligation = next(
-        item for item in contract.episode_obligations if item.episode_number == episode_number
-    )
-    required_target_ids = sorted(
-        {
-            *(
-                fact.fact_id
-                for fact in contract.facts
-                if fact.first_revealed_episode == episode_number
-            ),
-            *(
-                clue.clue_id
-                for clue in contract.clues
-                if clue.introduced_episode == episode_number
-                or clue.explained_episode == episode_number
-            ),
-            obligation.obligation_id,
-        }
-    )
+    required_target_ids = required_episode_evidence_target_ids(contract, episode_number)
     required_verbatim_facts = [
         {
             "fact_id": fact.fact_id,
@@ -5501,7 +5485,14 @@ class StageGuardMiddleware(AgentMiddleware):
                     issue for issue in review.issues if issue.code == "unknown_speaker"
                 ]
                 evidence_coverage_issues = [
-                    issue for issue in review.issues if issue.code == "evidence_coverage_mismatch"
+                    issue
+                    for issue in review.issues
+                    if issue.code
+                    in {
+                        "evidence_coverage_mismatch",
+                        "missing_evidence_targets",
+                        "unexpected_evidence_targets",
+                    }
                 ]
                 verbatim_fact_issues = [
                     issue for issue in review.issues if issue.code == "verbatim_fact_missing"
@@ -5544,8 +5535,9 @@ class StageGuardMiddleware(AgentMiddleware):
                     )
                 if evidence_coverage_issues:
                     repair_description += (
-                        " Evidence coverage repair is mandatory. Use the exact required target "
-                        "IDs from issue.contract_refs: "
+                        " Evidence coverage repair is mandatory. Treat "
+                        "/workspace/evidence_contract.json required_evidence_target_ids as the "
+                        "exact target set; observed discrepancies are issue.contract_refs: "
                         f"{json.dumps(evidence_contract_references, ensure_ascii=False)}. "
                         "Return exactly one state_delta.evidence entry per required target ID "
                         "and remove every unexpected target. Rebuild the exact set: no extras, "
