@@ -801,6 +801,31 @@ class StoryArchitectResult(StrictModel):
             "be null for every generation stage."
         ),
     )
+    story_navigation: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "For generating_story_outline only: ordered reading anchors. Each item must "
+            "contain label, anchor, and level (1..3). anchor must be one complete unique "
+            "line copied verbatim from content."
+        ),
+    )
+    character_navigation: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "For generating_character_relationships only: ordered biography anchors. "
+            "Each item must contain label, anchor, and group (core, supporting, or other). "
+            "anchor must be one complete unique line copied verbatim from "
+            "character_biographies."
+        ),
+    )
+    relationship_navigation: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "For generating_character_relationships only: ordered relationship anchors. "
+            "Each item must contain label, anchor, and group (primary, supporting, or other). "
+            "anchor must be one complete unique line copied verbatim from relationship_logic."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_stage_payload(self) -> "StoryArchitectResult":

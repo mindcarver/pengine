@@ -363,7 +363,10 @@
                     </button>
                   </div>
                 </div>
-                <p class="version-note" id="version-note">正在查看首次交付</p>
+                <div class="reader-actions">
+                  <p class="version-note" id="version-note">正在查看首次交付</p>
+                  <button class="text-button" id="open-revision" type="button">修改本稿</button>
+                </div>
               </div>
 
               <div class="artifact-layout">
@@ -411,7 +414,7 @@
                     data-artifact="relationship_logic"
                     tabindex="-1"
                   >
-                    <span>03</span>关系逻辑
+                    <span>03</span>人物关系
                   </button>
                   <button
                     id="artifact-tab-episode-outline"
@@ -436,6 +439,14 @@
                     <span>05</span>分集剧本
                   </button>
                 </div>
+
+                <nav class="section-nav" id="section-nav" aria-labelledby="section-nav-title">
+                  <div class="section-nav-heading">
+                    <p class="toolbar-label" id="section-nav-title">文稿目录</p>
+                    <span id="presentation-status">正在整理</span>
+                  </div>
+                  <div id="section-items" role="tablist" aria-label="选择当前文稿章节"></div>
+                </nav>
 
                 <article
                   class="artifact-paper"
@@ -467,13 +478,14 @@
                       role="tablist"
                       aria-label="选择已生成的分集草稿"
                     ></div>
-                    <pre id="episode-content" role="tabpanel" tabindex="0"></pre>
+                    <div id="episode-content" role="tabpanel" tabindex="0"></div>
                   </section>
-                  <pre id="artifact-content"></pre>
+                  <div id="artifact-content" tabindex="0"></div>
                 </article>
               </div>
 
-              <section class="revision-desk" id="revision-desk" aria-labelledby="revision-title">
+              <section class="revision-desk" id="revision-desk" aria-labelledby="revision-title" hidden>
+                <button class="revision-close" id="close-revision" type="button" aria-label="关闭全量重写面板">×</button>
                 <div class="revision-intro">
                   <p class="eyebrow">ONE REVISION</p>
                   <h3 id="revision-title">一次全量重写</h3>

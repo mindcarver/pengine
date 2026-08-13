@@ -44,12 +44,49 @@ def test_openapi_exposes_creation_and_run_control_operations() -> None:
         ("GET", "/personas"),
         ("POST", "/creations"),
         ("GET", "/creations/{creation_id}"),
+        ("GET", "/creations/{creation_id}/runs/{run_kind}/presentation"),
         ("POST", "/creations/{creation_id}/revision"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/retry-final-review"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/authorize-repair"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
     }
+
+
+def test_openapi_exposes_delivery_presentation_read_model() -> None:
+    openapi = json.loads((ROOT / "contracts/openapi.json").read_text())
+    operation = openapi["paths"]["/creations/{creation_id}/runs/{run_kind}/presentation"]["get"]
+    schemas = openapi["components"]["schemas"]
+    generated = create_app(settings=Settings()).openapi()
+
+    assert operation["operationId"] == "getDeliveryPresentation"
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/DeliveryPresentation"
+    }
+    assert schemas["DeliveryPresentation"]["properties"]["status"]["enum"] == [
+        "complete",
+        "partial",
+        "source",
+    ]
+    assert schemas["EpisodeEntry"]["properties"]["episode_number"]["minimum"] == 1
+    assert (
+        operation
+        == generated["paths"]["/creations/{creation_id}/runs/{run_kind}/presentation"]["get"]
+    )
+    for name in (
+        "PresentationItem",
+        "StorySection",
+        "CharacterEntry",
+        "RelationshipEntry",
+        "EpisodeEntry",
+        "StoryOutlinePresentation",
+        "CharacterBiographiesPresentation",
+        "RelationshipLogicPresentation",
+        "EpisodeOutlinePresentation",
+        "EpisodeScriptsPresentation",
+        "DeliveryPresentation",
+    ):
+        assert schemas[name] == generated["components"]["schemas"][name]
 
 
 def test_openapi_exposes_durable_episode_drafts_for_readable_runs() -> None:
