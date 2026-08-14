@@ -1695,7 +1695,7 @@ Promise.resolve(result).catch((error) => {{
 def test_story_section_navigation_preserves_hierarchy() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"
-    styles = (root / "src" / "pengine" / "web" / "styles.css").read_text()
+    styles = (root / "src" / "pengine" / "web" / "styles.css").read_text(encoding="utf-8")
     assert '#section-items button[data-level="2"]' in styles
     assert '#section-items button[data-level="3"]' in styles
 
