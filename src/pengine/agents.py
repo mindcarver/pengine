@@ -122,7 +122,7 @@ _REQUIRED_READ_PATHS_BLOCK = re.compile(
     re.DOTALL,
 )
 _STORY_OUTLINE_EPISODE_SECTION = re.compile(
-    r"^[ \t]*(?:#{1,6}[ \t]+|[-+*][ \t]+)?\*{0,2}[ \t]*"
+    r"^[ \t]*(?:#{1,6}[ \t]+|[-+*][ \t]+|[0-9]+[.)][ \t]+)?\*{0,2}[ \t]*"
     r"(?:第[ \t]*(?:\d+|[一二三四五六七八九十百零〇两]+)[ \t]*集"
     r"(?:[ \t]*[|｜:：·-])?|episode[ \t]+\d+\b)",
     re.IGNORECASE | re.MULTILINE,

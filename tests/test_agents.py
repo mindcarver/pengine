@@ -4395,6 +4395,8 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
         "# 《旧照》故事大纲\n\n## 第 1 集｜回来\n\n知雨回到家。",
         "# 《旧照》故事大纲\n\n- **第一集：回来**\n\n知雨回到家。",
         "# The Photograph\n\n## Episode 1: Return\n\nZhiyu comes home.",
+        "# 《旧照》故事大纲\n\n1. 第一集：回来\n\n知雨回到家。",
+        "# The Photograph\n\n1) Episode 1: Return\n\nZhiyu comes home.",
     ],
 )
 def test_story_outline_rejects_episode_by_episode_sections(content: str) -> None:
