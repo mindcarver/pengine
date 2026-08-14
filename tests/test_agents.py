@@ -4361,6 +4361,9 @@ def test_structured_output_retry_does_not_echo_model_input_or_custom_error_value
 
 def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "future dialogue counts" in _STORY_ARCHITECT_PROMPT
+    assert "Reserve episode-by-episode breakdowns for generating_episode_outline" in (
+        _STORY_ARCHITECT_PROMPT
+    )
     assert "Never append an English translation" in _STORY_ARCHITECT_PROMPT
     assert "episode-specific action" in _EPISODE_PLANNER_PROMPT
     assert "dates, countdowns, amounts, counts, and arithmetic" in _EPISODE_PLANNER_PROMPT
@@ -4384,6 +4387,39 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "Unspecified creative details remain the writer's choice" in _SCRIPT_WRITER_PROMPT
     assert "explicitly locked or formally committed aliases" in _SCRIPT_WRITER_PROMPT
     assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "# 《旧照》故事大纲\n\n## 第 1 集｜回来\n\n知雨回到家。",
+        "# 《旧照》故事大纲\n\n- **第一集：回来**\n\n知雨回到家。",
+        "# The Photograph\n\n## Episode 1: Return\n\nZhiyu comes home.",
+    ],
+)
+def test_story_outline_rejects_episode_by_episode_sections(content: str) -> None:
+    with pytest.raises(ValidationError, match="belongs in generating_episode_outline"):
+        StoryArchitectResult(stage="generating_story_outline", content=content)
+
+
+def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> None:
+    result = StoryArchitectResult(
+        stage="generating_story_outline",
+        content=(
+            "# 《旧照》故事大纲\n\n"
+            "## 阶段一 · 暖先到（第 1—2 集）\n\n"
+            "知雨回家并发现父亲留下的旧照。"
+        ),
+        story_navigation=[
+            {
+                "label": "阶段一 暖先到",
+                "anchor": "## 阶段一 · 暖先到（第 1—2 集）",
+                "level": 2,
+            }
+        ],
+    )
+
+    assert result.story_navigation[0]["level"] == 2
     assert "continuity-bearing identities, not as a screenplay-label whitelist" in (
         _SCRIPT_WRITER_PROMPT
     )

@@ -2082,16 +2082,25 @@ body[data-workspace-view="reading"] .flow-nav {
 }
 
 #section-items button {
+  --section-indent: 0rem;
   display: grid;
   grid-template-columns: 1.8rem 1fr;
   gap: 0.35rem;
   width: 100%;
-  padding: 0.65rem 0.55rem;
+  padding: 0.65rem 0.55rem 0.65rem calc(0.55rem + var(--section-indent));
   border: 1px solid transparent;
   color: var(--ink-soft);
   background: transparent;
   text-align: left;
   cursor: pointer;
+}
+
+#section-items button[data-level="2"] {
+  --section-indent: 0.7rem;
+}
+
+#section-items button[data-level="3"] {
+  --section-indent: 1.4rem;
 }
 
 #section-items button span {
