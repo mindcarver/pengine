@@ -1604,9 +1604,12 @@ function renderSectionNavigation(items, activeItem, projected) {
   }
   const buttons = items.map((item) => {
     const button = document.createElement("button");
+    const itemLevel = Number(item.level);
+    const level = Number.isInteger(itemLevel) && itemLevel >= 1 && itemLevel <= 3 ? itemLevel : 1;
     button.type = "button";
     button.role = "tab";
     button.dataset.sectionId = item.id;
+    button.dataset.level = String(level);
     button.setAttribute("aria-controls", "artifact-content");
     button.setAttribute("aria-selected", String(item.id === activeItem?.id));
     button.tabIndex = item.id === activeItem?.id ? 0 : -1;

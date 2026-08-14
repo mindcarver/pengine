@@ -1690,3 +1690,79 @@ Promise.resolve(result).catch((error) => {{
         capture_output=True,
         text=True,
     )
+
+
+def test_story_section_navigation_preserves_hierarchy() -> None:
+    root = Path(__file__).parents[1]
+    script_path = root / "src" / "pengine" / "web" / "app.js"
+    styles = (root / "src" / "pengine" / "web" / "styles.css").read_text(encoding="utf-8")
+    assert '#section-items button[data-level="2"]' in styles
+    assert '#section-items button[data-level="3"]' in styles
+
+    assertions = """
+const sectionItems = {
+  children: [],
+  replaceChildren(...children) { this.children = children; },
+};
+Object.assign(elements, {
+  "section-nav": { hidden: true },
+  "presentation-status": { textContent: "" },
+  "section-items": sectionItems,
+});
+renderSectionNavigation(
+  [
+    { id: "story-1", ordinal: 1, label: "主因果线", level: 1 },
+    { id: "story-2", ordinal: 2, label: "阶段一", level: 2 },
+    { id: "story-3", ordinal: 3, label: "阶段细节", level: 3 },
+    { id: "story-4", ordinal: 4, label: "历史数据" },
+  ],
+  { id: "story-2" },
+  { mode: "structured" },
+);
+const levels = sectionItems.children.map((button) => button.dataset.level);
+if (JSON.stringify(levels) !== JSON.stringify(["1", "2", "3", "1"])) {
+  throw new Error(`section hierarchy was lost: ${JSON.stringify(levels)}`);
+}
+if (sectionItems.children[1].attributes["aria-selected"] !== "true") {
+  throw new Error("hierarchical item selection changed");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+function makeElement(tagName) {{
+  return {{
+    tagName,
+    dataset: {{}},
+    attributes: {{}},
+    children: [],
+    setAttribute(name, value) {{ this.attributes[name] = value; }},
+    append(...children) {{ this.children.push(...children); }},
+  }};
+}}
+const context = {{
+  document: {{
+    addEventListener() {{}},
+    createElement: makeElement,
+  }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(() => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )

@@ -121,6 +121,12 @@ _REQUIRED_READ_PATHS_BLOCK = re.compile(
     rf"{re.escape(_REQUIRED_READ_PATHS_CLOSE)}",
     re.DOTALL,
 )
+_STORY_OUTLINE_EPISODE_SECTION = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+|[-+*][ \t]+|[0-9]+[.)][ \t]+)?\*{0,2}[ \t]*"
+    r"(?:第[ \t]*(?:\d+|[一二三四五六七八九十百零〇两]+)[ \t]*集"
+    r"(?:[ \t]*[|｜:：·-])?|episode[ \t]+\d+\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
 # outline gets a light single-lens pass with up to two repair rounds; character
 # + relationships get the full two-lens review with up to four repair rounds.
 _MAX_OUTLINE_REPAIR_ROUNDS = 2
@@ -373,8 +379,14 @@ _STORY_ARCHITECT_PROMPT = (
     "rationale in Simplified Chinese only. Never append an English translation, "
     "Latin subtitle, acronym, or parenthetical English gloss. For "
     "generating_story_outline, set content to the complete story outline and leave "
-    "every other field null. Apply the current persona's L0 mother theme and approved selected "
-    "facet to the protagonist, central conflict, choice, cost, and ending. Do not invent a "
+    "every other field null. Reserve episode-by-episode breakdowns for "
+    "generating_episode_outline: do not create individual episode headings, episode summaries, "
+    "scene lists, or episode hooks here. Express progression only through global story beats and "
+    "act or phase-level turns, even when the episode count is already known. Mention only the "
+    "concise character roles needed to understand that arc; full biographies belong to "
+    "generating_character_relationships. Apply the current persona's L0 mother theme and "
+    "approved selected facet to the protagonist, central conflict, choice, cost, and ending. "
+    "Do not invent a "
     "universal interpretation of those rules. For generating_character_relationships, populate "
     "character_biographies and relationship_logic and leave every other field null; "
     "use the approved L0 facet to establish the character and relationship pressures required "
@@ -763,6 +775,8 @@ class StoryArchitectResult(StrictModel):
         default=None,
         description=(
             "Required for generating_story_outline: the complete story outline. "
+            "It may contain global and act/phase-level progression but must not contain "
+            "episode-by-episode headings or summaries, which belong to generating_episode_outline. "
             "Must be null for selecting_l0_variant and generating_character_relationships."
         ),
     )
@@ -847,6 +861,11 @@ class StoryArchitectResult(StrictModel):
                 or self.selection_rationale
             ):
                 raise ValueError("generating_story_outline requires only content")
+            if self.content and _STORY_OUTLINE_EPISODE_SECTION.search(self.content):
+                raise ValueError(
+                    "Episode-by-episode content belongs in generating_episode_outline, not the "
+                    "story outline"
+                )
         elif (
             not self.character_biographies
             or not self.relationship_logic
