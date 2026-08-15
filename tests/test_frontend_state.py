@@ -923,6 +923,7 @@ Object.assign(elements, {
     querySelectorAll() { return [elements["version-initial"], elements["version-revision"]]; },
   },
   "version-note": { textContent: "" },
+  "export-delivery": { hidden: true, disabled: true },
   "artifact-tabs": {
     querySelectorAll() { return artifactButtons; },
     querySelector(selector) {
@@ -1059,6 +1060,7 @@ Object.assign(elements, {
   "version-revision": versionButtons[1],
   "version-tabs": { querySelectorAll() { return versionButtons; } },
   "version-note": { textContent: "" },
+  "export-delivery": { hidden: true, disabled: true },
   "artifact-tabs": {
     querySelectorAll() { return artifactButtons; },
     querySelector(selector) {
@@ -1772,3 +1774,157 @@ Promise.resolve(result).catch((error) => {{
         capture_output=True,
         text=True,
     )
+
+
+def test_formal_delivery_exports_the_selected_version_as_markdown() -> None:
+    root = Path(__file__).parents[1]
+    script_path = root / "src" / "pengine" / "web" / "app.js"
+    page = (root / "src" / "pengine" / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'id="export-delivery"' in page
+    assert "正式成品可导出" in page
+
+    assertions = """
+const contentPackage = {
+  story_outline: "故事大纲原文",
+  character_biographies: "人物小传原文",
+  relationship_logic: "人物关系原文",
+  episode_outline: "分集大纲原文",
+  episode_scripts: "分集剧本原文",
+};
+const initial = { state: "succeeded", result: { content_package: contentPackage } };
+const revision = { state: "succeeded", result: { content_package: contentPackage } };
+const initialExport = createDeliveryExport(initial, {
+  creationId: "abcd1234-creation",
+  kind: "initial",
+  persona: { display_name: "守拙", version: "0.6.0" },
+  exportedAt: new Date("2026-08-15T02:00:00.000Z"),
+});
+if (initialExport.filename !== "意态短剧_ABCD1234_初稿.md") {
+  throw new Error(`unexpected initial filename: ${initialExport.filename}`);
+}
+const orderedHeadings = [
+  "## 01 故事大纲",
+  "## 02 人物小传",
+  "## 03 人物关系",
+  "## 04 分集大纲",
+  "## 05 分集剧本",
+];
+let previous = -1;
+for (const heading of orderedHeadings) {
+  const position = initialExport.content.indexOf(heading);
+  if (position <= previous) throw new Error(`export section order changed at ${heading}`);
+  previous = position;
+}
+for (const value of Object.values(contentPackage)) {
+  if (!initialExport.content.includes(value)) throw new Error(`export omitted ${value}`);
+}
+if (!initialExport.content.includes("稿件版本：初稿")) throw new Error("initial label missing");
+if (!initialExport.content.includes("导出时间：2026-08-15T02:00:00.000Z")) {
+  throw new Error("export time missing");
+}
+const revisionExport = createDeliveryExport(revision, {
+  creationId: "abcd1234-creation",
+  kind: "revision",
+  persona: { display_name: "守拙", version: "0.6.0" },
+  exportedAt: "2026-08-15T02:00:00.000Z",
+});
+if (!revisionExport.filename.endsWith("_修订稿.md")) throw new Error("revision filename wrong");
+if (!revisionExport.content.includes("稿件版本：修订稿")) throw new Error("revision label missing");
+
+const incomplete = structuredClone(initial);
+incomplete.result.content_package.episode_scripts = "";
+let incompleteBlocked = false;
+try {
+  createDeliveryExport(incomplete, {
+    creationId: "abcd1234-creation",
+    kind: "initial",
+    exportedAt: new Date("2026-08-15T02:00:00.000Z"),
+  });
+} catch (error) {
+  incompleteBlocked = error.message === "delivery_artifact_missing:episode_scripts";
+}
+if (!incompleteBlocked) throw new Error("incomplete formal package was exported");
+
+Object.assign(elements, {
+  "export-delivery": { hidden: true, disabled: true },
+  toast: { textContent: "", hidden: true },
+});
+state.workspaceView = "progress";
+state.creationId = "abcd1234-creation";
+state.creation = {
+  persona: { display_name: "守拙", version: "0.6.0" },
+  initial,
+  revision: { state: "failed" },
+};
+state.activeVersion = "revision";
+renderExportControl();
+if (!elements["export-delivery"].hidden || !elements["export-delivery"].disabled) {
+  throw new Error("failed revision exposed export");
+}
+state.activeVersion = "initial";
+renderExportControl();
+if (elements["export-delivery"].hidden || elements["export-delivery"].disabled) {
+  throw new Error("successful initial delivery hid export");
+}
+
+handleExportDelivery();
+if (downloadState.downloaded !== 1) throw new Error("export did not trigger one download");
+if (!downloadState.lastLink.download.endsWith("_初稿.md")) {
+  throw new Error("download used wrong version");
+}
+if (!downloadState.blobParts[0].startsWith("\ufeff# 意态短剧成品包")) {
+  throw new Error("download omitted UTF-8 BOM or document title");
+}
+if (downloadState.revokedUrl !== "blob:test") throw new Error("download URL was not released");
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const downloadState = {{ blobParts: [], lastLink: null, revokedUrl: "", downloaded: 0 }};
+class FakeBlob {{
+  constructor(parts, options) {{ downloadState.blobParts = parts; this.options = options; }}
+}}
+const context = {{
+  downloadState,
+  Blob: FakeBlob,
+  URL: {{
+    createObjectURL() {{ return "blob:test"; }},
+    revokeObjectURL(value) {{ downloadState.revokedUrl = value; }},
+  }},
+  structuredClone,
+  document: {{
+    addEventListener() {{}},
+    body: {{ appendChild(link) {{ downloadState.lastLink = link; }} }},
+    createElement(tagName) {{
+      if (tagName !== "a") throw new Error(`unexpected element: ${{tagName}}`);
+      return {{
+        hidden: false,
+        href: "",
+        download: "",
+        click() {{ downloadState.downloaded += 1; }},
+        remove() {{}},
+      }};
+    }},
+  }},
+  window: {{ setTimeout(callback) {{ callback(); }} }},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(() => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    result = subprocess.run(
+        ["node", "-e", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

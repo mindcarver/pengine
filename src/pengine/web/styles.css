@@ -2007,6 +2007,22 @@ body[data-workspace-view="reading"] .flow-nav {
   gap: 1rem;
 }
 
+.reader-actions .text-button {
+  margin-top: 0;
+  white-space: nowrap;
+}
+
+.export-button {
+  padding: 0.38rem 0.65rem;
+  border: 1px solid currentColor;
+}
+
+.export-button:hover {
+  color: var(--paper-light);
+  border-color: var(--rust-deep);
+  background: var(--rust-deep);
+}
+
 #result-workspace[data-mode="reading"] .artifact-layout {
   display: grid;
   grid-template-columns: minmax(11rem, 13.5rem) minmax(0, 52.5rem);
@@ -2264,6 +2280,7 @@ body[data-workspace-view="reading"] .flow-nav {
 
   .reader-actions {
     margin-left: auto;
+    gap: 0.65rem;
   }
 
   .reader-actions .version-note {

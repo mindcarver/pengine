@@ -234,6 +234,7 @@ function cacheElements() {
     "version-initial",
     "version-revision",
     "version-note",
+    "export-delivery",
     "open-revision",
     "close-revision",
     "artifact-tabs",
@@ -308,6 +309,7 @@ function bindEvents() {
   elements["section-items"].addEventListener("keydown", handleHorizontalTabs);
   elements["episode-tabs"].addEventListener("click", handleEpisodeClick);
   elements["episode-tabs"].addEventListener("keydown", handleHorizontalTabs);
+  elements["export-delivery"].addEventListener("click", handleExportDelivery);
   elements["open-revision"].addEventListener("click", openRevisionDrawer);
   elements["close-revision"].addEventListener("click", closeRevisionDrawer);
   elements["previous-episode"]?.addEventListener("click", () => moveFormalEpisode(-1));
@@ -1287,6 +1289,12 @@ function isFormalRun(run) {
   return Boolean(run && run.state === "succeeded" && run.result && run.result.content_package);
 }
 
+function selectedRun() {
+  return state.activeVersion === "revision"
+    ? state.creation?.revision
+    : state.creation?.initial;
+}
+
 async function loadPresentation(kind) {
   const run = kind === "revision" ? state.creation?.revision : state.creation?.initial;
   if (
@@ -1472,9 +1480,8 @@ function renderVersionControls() {
     button.tabIndex = active ? 0 : -1;
   }
 
-  const run = state.activeVersion === "revision"
-    ? state.creation.revision
-    : state.creation.initial;
+  const run = selectedRun();
+  renderExportControl(run);
   if (!isFormalRun(run)) {
     elements["version-note"].textContent =
       `${draftLabel(state.activeVersion)}，尚未通过成品审核。`;
@@ -1482,6 +1489,71 @@ function renderVersionControls() {
   }
   elements["version-note"].textContent =
     state.activeVersion === "revision" ? "正在查看修订后的完整交付" : "正在查看首次交付";
+}
+
+function renderExportControl(run = selectedRun()) {
+  const available = isFormalRun(run);
+  elements["export-delivery"].hidden = !available;
+  elements["export-delivery"].disabled = !available;
+}
+
+function createDeliveryExport(run, { creationId, kind, persona, exportedAt = new Date() }) {
+  if (!isFormalRun(run)) {
+    throw new Error("delivery_not_formal");
+  }
+  const sections = FORMAL_ARTIFACTS.map((artifact, index) => {
+    const content = run.result.content_package[artifact.key];
+    if (typeof content !== "string" || !content.trim()) {
+      throw new Error(`delivery_artifact_missing:${artifact.key}`);
+    }
+    return `## ${String(index + 1).padStart(2, "0")} ${artifact.title}\n\n${content.trim()}`;
+  });
+  const versionLabel = kind === "revision" ? "修订稿" : "初稿";
+  const exportedTime = exportedAt instanceof Date ? exportedAt : new Date(exportedAt);
+  if (Number.isNaN(exportedTime.getTime())) {
+    throw new Error("delivery_export_time_invalid");
+  }
+  const metadata = [
+    "# 意态短剧成品包",
+    "",
+    `- 卷宗编号：${shortId(creationId)}`,
+    `- 稿件版本：${versionLabel}`,
+    `- 编剧人格：${persona?.display_name || "未标注"}`,
+    `- 人格版本：${persona?.version || "未标注"}`,
+    `- 导出时间：${exportedTime.toISOString()}`,
+    "",
+    "---",
+  ];
+  const safeId = shortId(creationId).replace(/[^0-9A-Z_-]/g, "-");
+  return {
+    content: [...metadata, "", ...sections].join("\n") + "\n",
+    filename: `意态短剧_${safeId}_${versionLabel}.md`,
+  };
+}
+
+function handleExportDelivery() {
+  try {
+    const run = selectedRun();
+    const exported = createDeliveryExport(run, {
+      creationId: state.creationId,
+      kind: state.activeVersion,
+      persona: state.creation?.persona,
+    });
+    const url = URL.createObjectURL(
+      new Blob([`\uFEFF${exported.content}`], { type: "text/markdown;charset=utf-8" }),
+    );
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = exported.filename;
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    showToast(`已导出${state.activeVersion === "revision" ? "修订稿" : "初稿"}成品。`);
+  } catch {
+    showToast("当前版本没有完整正式成品，无法导出。");
+  }
 }
 
 function openRevisionDrawer() {

@@ -366,6 +366,14 @@
                 </div>
                 <div class="reader-actions">
                   <p class="version-note" id="version-note">正在查看首次交付</p>
+                  <button
+                    class="text-button export-button"
+                    id="export-delivery"
+                    type="button"
+                    hidden
+                  >
+                    导出成品
+                  </button>
                   <button class="text-button" id="open-revision" type="button">修改本稿</button>
                 </div>
               </div>
@@ -530,7 +538,7 @@
 
     <footer class="footer">
       <p>PENGINE · LOCAL EDITORIAL WORKBENCH</p>
-      <p>所有文稿来自当前本地服务；本页不提供登录、云同步或导出。</p>
+      <p>所有文稿来自当前本地服务；正式成品可导出，本页不提供登录或云同步。</p>
     </footer>
 
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
