@@ -23,7 +23,6 @@ from pengine.agents import (
     QualityReviewerResult,
 )
 from pengine.config import Settings
-from pengine.errors import DomainError
 from pengine.model_calls import ModelCallContext, ModelCallState
 from pengine.personas import PersonaCatalog
 from pengine.relay import PreflightBlockedError, RelayError, RelayIdentityError
@@ -142,21 +141,6 @@ class DeterministicWorkflow:
                     for episode_number in range(1, self.episode_count + 1)
                 ],
             },
-            InternalStage.ACCEPTING_L0: {
-                "stage": "accepting_l0",
-                "passed": True,
-                "evidence": self.l0_evidence,
-            },
-            InternalStage.ACCEPTING_L4: {
-                "stage": "accepting_l4",
-                "passed": True,
-                "evidence": (
-                    "L4-A：人物选择保持一致。\n"
-                    "短剧硬规则：各阶段硬规则均有场景证据。\n"
-                    "产品参数：采用 Pengine 默认参数。"
-                ),
-                "feedback_handling": [item.model_dump(mode="json") for item in handling],
-            },
         }
         for stage, payload in payloads.items():
             if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
@@ -210,15 +194,6 @@ class DeterministicWorkflow:
             ),
             selected_l0_variant=self.result_l0_variant,
             selection_rationale="符合测试故事",
-            l0_gate=GateResult(passed=True, evidence=self.l0_evidence),
-            l4_gate=GateResult(
-                passed=True,
-                evidence=(
-                    "L4-A：人物选择保持一致。\n"
-                    "短剧硬规则：各阶段硬规则均有场景证据。\n"
-                    "产品参数：采用 Pengine 默认参数。"
-                ),
-            ),
             feedback_handling=handling,
         )
 
@@ -844,7 +819,7 @@ async def test_worker_rejects_undeclared_l0_variant_before_checkpoint(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_worker_rejects_incomplete_passing_l0_evidence_before_checkpoint(
+async def test_worker_does_not_schedule_final_l0_evidence_gate(
     tmp_path: Path,
 ) -> None:
     settings, catalog, repository, snapshot = await _services(tmp_path)
@@ -875,9 +850,7 @@ async def test_worker_rejects_incomplete_passing_l0_evidence_before_checkpoint(
 
     resource = await repository.get_creation(accepted.creation_id)
     assert resource is not None
-    assert resource.initial.state == "failed"
-    assert resource.initial.failure.code == "structured_output_invalid"
-    assert resource.initial.failure.failed_stage == InternalStage.ACCEPTING_L0
+    assert resource.initial.state == "succeeded"
     checkpoints = await _creation_checkpoints(repository, accepted.creation_id)
     assert InternalStage.ACCEPTING_L0 not in checkpoints
 
@@ -1381,8 +1354,8 @@ async def test_ten_episode_run_resumes_without_a_writer_call_for_committed_draft
     assert completed.initial.state == "succeeded"
     assert workflow.retry_drafts == [1, 2, 3, 4, 5]
     assert workflow.writer_commits == list(range(1, 11))
-    assert workflow.events.index("approve:accepting_l0") > workflow.events.index("commit:10")
-    assert workflow.events.index("approve:accepting_l4") > workflow.events.index("commit:10")
+    assert "approve:accepting_l0" not in workflow.events
+    assert "approve:accepting_l4" not in workflow.events
 
     async with repository._connection() as connection:
         row = await (
@@ -1523,7 +1496,7 @@ def test_episode_upstream_stream_decode_error_uses_relay_connection_prompt() -> 
 
 
 @pytest.mark.asyncio
-async def test_quality_rejection_never_re_reviews_unchanged_legacy_drafts(
+async def test_new_run_never_enters_legacy_quality_rejection(
     tmp_path: Path,
 ) -> None:
     settings, catalog, repository, snapshot = await _services(tmp_path)
@@ -1548,41 +1521,8 @@ async def test_quality_rejection_never_re_reviews_unchanged_legacy_drafts(
     assert await worker.run_once() is True
     rejected = await repository.get_creation(accepted.creation_id)
     assert rejected is not None
-    assert rejected.initial.state == "quality_rejected"
-    assert rejected.initial.quality_rejection.model_dump() == {
-        "code": "quality_gate_rejected",
-        "stage": "accepting_l0",
-        "evidence": "L0 审核发现核心冲突。",
-        "attempt_count": 1,
-        "can_retry": True,
-        "repair_plan": None,
-        "repair_state": "available",
-    }
-    first_retry = await repository.retry_final_review(
-        creation_id=accepted.creation_id,
-        run_kind="initial",
-        idempotency_key="quality-retry-review",
-    )
-    replay_retry = await repository.retry_final_review(
-        creation_id=accepted.creation_id,
-        run_kind="initial",
-        idempotency_key="quality-retry-review",
-    )
-    with pytest.raises(DomainError) as duplicate_retry:
-        await repository.retry_final_review(
-            creation_id=accepted.creation_id,
-            run_kind="initial",
-            idempotency_key="quality-retry-review-again",
-        )
-    assert first_retry == replay_retry
-    assert first_retry.run_state == "queued"
-    assert duplicate_retry.value.code == "run_not_controllable"
-
-    assert await worker.run_once() is True
-    still_rejected = await repository.get_creation(accepted.creation_id)
-    assert still_rejected is not None
-    assert still_rejected.initial.state == "quality_rejected"
-    assert still_rejected.initial.quality_rejection.repair_state == "blocked"
+    assert rejected.initial.state == "succeeded"
+    assert workflow.calls == 1
     assert workflow.retry_stages == []
 
 
