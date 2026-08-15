@@ -77,10 +77,10 @@ async def test_frontend_and_assets_are_served_with_run_control_openapi(
     retry = app.openapi()["paths"]["/creations/{creation_id}/runs/{run_kind}/retry-final-review"][
         "post"
     ]
-    assert retry["summary"] == "Retry a rejected L0 or L4 final review"
-    assert "only the rejected final-review gate" in retry["description"]
+    assert retry["summary"] == "Repair the rejected evidence scope and re-run final review"
+    assert "never re-reviews unchanged drafts" in retry["description"]
     assert retry["responses"]["202"]["description"] == (
-        "Final review queued or an identical accepted retry command replayed"
+        "Bounded repair queued or an identical accepted command replayed"
     )
     assert retry["responses"]["409"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/CommandError"
@@ -506,6 +506,8 @@ async def test_quality_rejected_final_review_can_retry_the_same_run(tmp_path: Pa
             "evidence": "L0 创作内核与人物选择不一致。",
             "attempt_count": 1,
             "can_retry": True,
+            "repair_plan": None,
+            "repair_state": "available",
         }
 
         first_retry = await client.post(

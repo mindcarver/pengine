@@ -21,6 +21,8 @@ from pengine.schemas import (
     CreateCreationRequest,
     InternalStage,
     PersonaSnapshot,
+    QualityRepairIssue,
+    QualityRepairPlan,
 )
 from pengine.series_bible import (
     SeriesBible,
@@ -695,8 +697,173 @@ async def test_incomplete_active_batch_cannot_assemble_formal_delivery(
 # ---------------------------------------------------------------------------
 
 
+async def test_quality_repair_activates_new_bound_batch_and_preserves_other_content(
+    repository: Repository,
+) -> None:
+    accepted, lease = await create_leased_run(repository)
+    contract, active, committed = await seed_batch_with_episodes(
+        repository,
+        lease.run_id,
+        up_to=3,
+    )
+    async with repository._connection() as connection:
+        await connection.execute(
+            """
+            UPDATE episode_candidates
+            SET state_delta_json = json_set(
+                state_delta_json,
+                '$.evidence[0].excerpt',
+                '旧版本未逐字保留的状态证据'
+            )
+            WHERE candidate_id = ?
+            """,
+            (committed[1].candidate_id,),
+        )
+        await connection.commit()
+    aggregate = dict(await repository.episode_aggregate_checkpoint_payload(lease.run_id))
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+        {"stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value, **aggregate},
+        now=NOW,
+    )
+    excerpt = committed[1].content.splitlines()[0]
+    plan = QualityRepairPlan(
+        scope="episode_content",
+        rationale="第二集的判断句必须落成可拍动作。",
+        issues=[
+            QualityRepairIssue(
+                issue_id="l0-episode-2",
+                rule_source="L0 雷区",
+                episode_number=2,
+                exact_excerpt=excerpt,
+                repair_instruction="保留事实，只补一个可拍动作。",
+            )
+        ],
+    )
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.ACCEPTING_L0,
+        now=NOW,
+    )
+    await repository.reject_quality_gate(
+        lease.run_id,
+        stage=InternalStage.ACCEPTING_L0,
+        evidence="第二集使用叙述性判断。",
+        repair_plan=plan,
+        now=NOW,
+    )
+    await repository.retry_final_review(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="bound-quality-repair",
+        now=NOW,
+    )
+    retry_lease = await repository.lease_next_job("quality-repair-worker", 30, now=NOW)
+    assert retry_lease is not None
+    await repository.mark_run_running(lease.run_id, now=NOW)
+
+    old_batch = await repository.get_script_batch_lineage(lease.run_id)
+    assert old_batch is not None
+    repaired_content = committed[1].content.replace(
+        excerpt,
+        f"{excerpt}\n她把纸折好，压在空碗下面。",
+        1,
+    )
+    new_batch = await repository.apply_quality_episode_patches(
+        lease.run_id,
+        expected_batch_id=old_batch.batch_id,
+        patched_contents={2: (repaired_content, "quality-repair-call")},
+        stage=InternalStage.ACCEPTING_L0,
+        rejection_attempt=1,
+        now=NOW,
+    )
+
+    repaired = await repository.get_active_episode_candidates(lease.run_id)
+    assert new_batch.batch_epoch == old_batch.batch_epoch + 1
+    assert [item.content for item in repaired] == [
+        committed[0].content,
+        repaired_content,
+        committed[2].content,
+    ]
+    assert repaired[0].call_id == committed[0].call_id
+    assert repaired[1].call_id == "quality-repair-call"
+    assert repaired[2].call_id == committed[2].call_id
+    assert [item.series_state_sha256 for item in repaired] == [
+        item.series_state_sha256 for item in committed
+    ]
+    checkpoints = await repository.get_business_checkpoints(lease.run_id)
+    assert InternalStage.ACCEPTING_L0 not in checkpoints
+    assert checkpoints[InternalStage.GENERATING_EPISODE_SCRIPTS]["stage"] == (
+        InternalStage.GENERATING_EPISODE_SCRIPTS.value
+    )
+    refreshed = await repository.episode_aggregate_checkpoint_payload(lease.run_id)
+    assert (
+        refreshed["episode_hashes"]
+        == checkpoints[InternalStage.GENERATING_EPISODE_SCRIPTS]["episode_hashes"]
+    )
+
+
+async def test_quality_repair_rejects_change_outside_saved_excerpt(
+    repository: Repository,
+) -> None:
+    accepted, lease = await create_leased_run(repository)
+    _, _, committed = await seed_batch_with_episodes(repository, lease.run_id, up_to=3)
+    aggregate = dict(await repository.episode_aggregate_checkpoint_payload(lease.run_id))
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+        {"stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value, **aggregate},
+        now=NOW,
+    )
+    excerpt = committed[1].content.splitlines()[0]
+    plan = QualityRepairPlan(
+        scope="episode_content",
+        rationale="只允许修改绑定句。",
+        issues=[
+            QualityRepairIssue(
+                issue_id="l0-episode-2",
+                rule_source="L0 雷区",
+                episode_number=2,
+                exact_excerpt=excerpt,
+                repair_instruction="改成动作。",
+            )
+        ],
+    )
+    await repository.record_stage_attempt(lease.run_id, InternalStage.ACCEPTING_L0, now=NOW)
+    await repository.reject_quality_gate(
+        lease.run_id,
+        stage=InternalStage.ACCEPTING_L0,
+        evidence="证据",
+        repair_plan=plan,
+        now=NOW,
+    )
+    await repository.retry_final_review(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="unbound-quality-repair",
+        now=NOW,
+    )
+    await repository.lease_next_job("quality-repair-worker", 30, now=NOW)
+    await repository.mark_run_running(lease.run_id, now=NOW)
+    batch = await repository.get_script_batch_lineage(lease.run_id)
+    assert batch is not None
+
+    with pytest.raises(DomainError) as unbound:
+        await repository.apply_quality_episode_patches(
+            lease.run_id,
+            expected_batch_id=batch.batch_id,
+            patched_contents={2: (committed[1].content + "\n未绑定的新结尾。", "repair-call")},
+            stage=InternalStage.ACCEPTING_L0,
+            rejection_attempt=1,
+            now=NOW,
+        )
+    assert unbound.value.code == "quality_repair_scope_violation"
+    assert (await repository.get_script_batch_lineage(lease.run_id)).batch_id == batch.batch_id
+
+
 async def test_v13_migration_preserves_existing_database(repository) -> None:
-    assert SCHEMA_VERSION == 22
+    assert SCHEMA_VERSION == 23
     accepted, lease = await create_leased_run(repository)
     contract, active, committed = await seed_batch_with_episodes(repository, lease.run_id, up_to=1)
     async with repository._connection() as connection:

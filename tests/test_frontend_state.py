@@ -473,7 +473,7 @@ def test_quality_rejection_retains_workspace_and_retries_the_final_review() -> N
     assert 'id="quality-rejection-details"' in page
     assert 'id="retry-final-review"' in page
     assert 'id="end-quality-rejected-run"' in page
-    assert "重新审核" in page
+    assert "按证据修复并重新审核" in page
 
     assertions = """
 const requests = [];
@@ -491,6 +491,7 @@ Object.assign(elements, {
   "quality-rejection-details": { hidden: true },
   "quality-rejection-stage": { textContent: "" },
   "quality-rejection-evidence": { textContent: "" },
+  "quality-rejection-repair": { textContent: "" },
   "quality-rejection-attempt": { textContent: "" },
   "failure-code": { textContent: "" },
   "failure-actions": { hidden: false },
@@ -515,6 +516,8 @@ state.creation = {
       evidence: "人物动机没有落实到行动。",
       attempt_count: 2,
       can_retry: true,
+      repair_plan: null,
+      repair_state: "available",
     },
   },
   revision: { state: "unavailable" },
@@ -529,6 +532,9 @@ if (!elements["failure-title"].textContent.includes("L0 创作内核")) {
 }
 if (!elements["quality-rejection-evidence"].textContent.includes("人物动机没有落实到行动")) {
   throw new Error("reviewer evidence was not rendered");
+}
+if (!elements["quality-rejection-repair"].textContent.includes("绑定到具体剧集原文")) {
+  throw new Error("legacy evidence-binding repair was not explained");
 }
 if (elements["quality-rejection-attempt"].textContent !== "审核尝试：第 2 次") {
   throw new Error("attempt count was not rendered");

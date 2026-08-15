@@ -49,6 +49,8 @@ from pengine.agents import (
     CanonReviewerResult,
     ContentReviewRejectedError,
     DeepAgentWorkflow,
+    EpisodeContentPatch,
+    EpisodeContentReplacement,
     EpisodePlannerResult,
     EpisodeReviewerResult,
     OutlineRepairPatch,
@@ -90,6 +92,8 @@ from pengine.agents import (
     _with_inline_project,
     _with_inline_soul,
     _with_l3_policy,
+    apply_episode_content_patch,
+    bind_quality_repair_plan,
     flatten_cr_candidate,
 )
 from pengine.config import Settings
@@ -108,7 +112,14 @@ from pengine.model_calls import (
 )
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
-from pengine.schemas import CreateCreationRequest, EpisodeDraft, EpisodePlan, InternalStage
+from pengine.schemas import (
+    CreateCreationRequest,
+    EpisodeDraft,
+    EpisodePlan,
+    InternalStage,
+    QualityRepairIssue,
+    QualityRepairPlan,
+)
 from pengine.series_bible import build_series_bible, project_series_bible
 from pengine.skill_assets import load_agent_skill_files
 from pengine.worker import Worker
@@ -1094,6 +1105,85 @@ def test_story_canon_unresolved_closure_retains_prior_issue() -> None:
     assert merged.passed is False
     assert [issue.code for issue in merged.issues] == ["relative_age_conflict"]
     assert "unresolved" in merged.evidence
+
+
+def test_quality_episode_patch_changes_only_authorized_exact_excerpt() -> None:
+    content = "内景。厨房。\n" + "母亲低头收碗。\n" * 30 + "她把诊断书推回去。"
+    plan = QualityRepairPlan(
+        scope="episode_content",
+        rationale="旁白判断必须改为可拍动作。",
+        issues=[
+            QualityRepairIssue(
+                issue_id="l0-1",
+                rule_source="L0 雷区",
+                episode_number=6,
+                exact_excerpt="她把诊断书推回去。",
+                repair_instruction="用动作承载处境，不增加解释性旁白。",
+            )
+        ],
+    )
+    patch = EpisodeContentPatch(
+        episode_number=6,
+        replacements=[
+            EpisodeContentReplacement(
+                old="她把诊断书推回去。",
+                new="她把诊断书推到桌子中央。",
+            )
+        ],
+    )
+
+    repaired = apply_episode_content_patch(
+        content,
+        patch,
+        allowed_excerpts={issue.exact_excerpt for issue in plan.issues},
+    )
+
+    assert repaired.endswith("她把诊断书推到桌子中央。")
+    assert repaired.count("母亲低头收碗。") == 30
+
+
+def test_quality_episode_patch_rejects_unbound_or_duplicate_excerpt() -> None:
+    patch = EpisodeContentPatch(
+        episode_number=6,
+        replacements=[EpisodeContentReplacement(old="她沉默。", new="她收起纸。")],
+    )
+    with pytest.raises(ValueError, match="quality_patch_target_not_authorized"):
+        apply_episode_content_patch(
+            "她沉默。",
+            patch,
+            allowed_excerpts={"旁白判断。"},
+        )
+    with pytest.raises(ValueError, match="quality_patch_target_not_unique"):
+        apply_episode_content_patch(
+            "她沉默。她沉默。",
+            patch,
+            allowed_excerpts={"她沉默。"},
+        )
+
+
+def test_quality_repair_plan_binds_model_excerpt_to_quoted_saved_evidence() -> None:
+    exact = "母亲的眼泪与哥哥那句话之后，她的证据越硬，人越可疑。"
+    plan = QualityRepairPlan(
+        scope="episode_content",
+        rationale="解释性判断可局部修复。",
+        issues=[
+            QualityRepairIssue(
+                issue_id="l0-episode-6",
+                rule_source="L0 雷区",
+                episode_number=6,
+                exact_excerpt="证据越多，她就越像一个病人。",
+                repair_instruction="改成可拍动作。",
+            )
+        ],
+    )
+
+    bound = bind_quality_repair_plan(
+        plan,
+        evidence=f"第6集直接写出“{exact}”而不是动作。",
+        episodes={6: f"场景结束。\n{exact}\n切黑。"},
+    )
+
+    assert bound.issues[0].exact_excerpt == exact
 
 
 @pytest.mark.asyncio

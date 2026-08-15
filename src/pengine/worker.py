@@ -694,6 +694,14 @@ class Worker:
                 persona_files = self._persona_files(work)
                 explicit_l0_variant_ids = extract_l0_variant_ids(persona_files["/persona/l0.md"])
 
+                if await self._handle_queued_quality_repair(
+                    work,
+                    approved=approved,
+                    persona_files=persona_files,
+                    model_call_state=model_call_state,
+                ):
+                    return
+
                 if InternalStage.GENERATING_EPISODE_OUTLINE in approved and not work.episode_plans:
                     current_stage = InternalStage.GENERATING_EPISODE_SCRIPTS
                     raise CheckpointUnavailableError(
@@ -1066,6 +1074,7 @@ class Worker:
                     work.run_id,
                     stage=exc.stage,
                     evidence=exc.evidence,
+                    repair_plan=exc.repair_plan,
                 )
                 logger.info(
                     "quality gate rejected run_id=%s creation_id=%s stage=%s attempt=%s",
@@ -1571,6 +1580,252 @@ class Worker:
                 stage=InternalStage.ASSEMBLING_DELIVERY,
             )
         return review.review_id
+
+    async def _handle_queued_quality_repair(
+        self,
+        work: RunWorkItem,
+        *,
+        approved: dict[InternalStage, Any],
+        persona_files: Mapping[str, str],
+        model_call_state: ModelCallState | None,
+    ) -> bool:
+        request = await self.repository.get_queued_quality_repair(work.run_id)
+        if request is None:
+            return False
+        try:
+            return await self._execute_queued_quality_repair(
+                work,
+                request=request,
+                approved=approved,
+                persona_files=persona_files,
+                model_call_state=model_call_state,
+            )
+        except (AgentProtocolError, DomainError, ValueError) as exc:
+            await self.repository.block_quality_repair(
+                work.run_id,
+                stage=InternalStage(request["stage"]),
+                rejection_attempt=request["rejection_attempt"],
+                evidence=f"受限修复未能安全提交：{exc}",
+            )
+            return True
+
+    async def _execute_queued_quality_repair(
+        self,
+        work: RunWorkItem,
+        *,
+        request: Mapping[str, Any],
+        approved: dict[InternalStage, Any],
+        persona_files: Mapping[str, str],
+        model_call_state: ModelCallState | None,
+    ) -> bool:
+        if not isinstance(self.workflow, DeepAgentWorkflow):
+            await self.repository.block_quality_repair(
+                work.run_id,
+                stage=InternalStage(request["stage"]),
+                rejection_attempt=request["rejection_attempt"],
+                evidence="当前运行时没有配置证据修复执行器。",
+            )
+            return True
+        stage = InternalStage(request["stage"])
+        outline = approved.get(InternalStage.GENERATING_EPISODE_OUTLINE)
+        active_design = await self.repository.get_run_series_bible(work.run_id)
+        batch = await self.repository.get_script_batch_lineage(work.run_id)
+        candidates = await self.repository.get_active_episode_candidates(work.run_id)
+        if (
+            not isinstance(outline, Mapping)
+            or not isinstance(outline.get("story_contract"), Mapping)
+            or active_design is None
+            or batch is None
+            or not candidates
+            or batch.batch_id != request["original_batch_id"]
+        ):
+            await self.repository.block_quality_repair(
+                work.run_id,
+                stage=stage,
+                rejection_attempt=request["rejection_attempt"],
+                evidence="审核证据无法绑定当前 StoryContract、设计或完整剧本批次。",
+            )
+            return True
+        episodes = {candidate.episode_number: candidate.content for candidate in candidates}
+        plan = request["plan"]
+        if plan is None:
+            if model_call_state is not None:
+                model_call_state.context.stage = stage.value
+                model_call_state.context.episode_number = None
+                model_call_state.context.operation_id = new_operation_id()
+            plan = await self.workflow.plan_quality_repair(
+                stage=stage,
+                evidence=request["evidence"] or "",
+                episodes=episodes,
+                persona_files=persona_files,
+                story_contract=outline["story_contract"],
+                output_language=work.output_language,
+            )
+            await self.repository.set_quality_repair_plan(
+                work.run_id,
+                stage=stage,
+                rejection_attempt=request["rejection_attempt"],
+                plan=plan,
+            )
+            if plan.scope != "episode_content":
+                return True
+        if plan.scope != "episode_content":
+            await self.repository.block_quality_repair(
+                work.run_id,
+                stage=stage,
+                rejection_attempt=request["rejection_attempt"],
+                evidence=plan.rationale,
+            )
+            return True
+
+        patched_contents: dict[int, tuple[str, str]] = {}
+        for episode_number in sorted({issue.episode_number for issue in plan.issues}):
+            if model_call_state is not None:
+                model_call_state.context.stage = stage.value
+                model_call_state.context.episode_number = episode_number
+                model_call_state.context.operation_id = new_operation_id()
+            repaired, _patch = await self.workflow.generate_quality_episode_patch(
+                stage=stage,
+                episode_number=episode_number,
+                content=episodes[episode_number],
+                plan=plan,
+                persona_files=persona_files,
+                story_contract=outline["story_contract"],
+                output_language=work.output_language,
+            )
+            operation_id = (
+                model_call_state.context.operation_id if model_call_state is not None else None
+            )
+            call_id = await self._require_physical_call_id(
+                run_id=work.run_id,
+                role="generation",
+                stage=stage,
+                episode_number=episode_number,
+                operation_id=operation_id,
+            )
+            patched_contents[episode_number] = (repaired, call_id)
+
+        preview = {
+            number: patched_contents.get(number, (content, ""))[0]
+            for number, content in episodes.items()
+        }
+        final_episode = max(preview)
+        if model_call_state is not None:
+            model_call_state.context.stage = InternalStage.GENERATING_EPISODE_SCRIPTS.value
+            model_call_state.context.episode_number = final_episode
+            model_call_state.context.operation_id = new_operation_id()
+        structural = await self.workflow.review_quality_repaired_series(
+            original_episodes=episodes,
+            repaired_episodes=preview,
+            repair_plan=plan,
+            story_contract=outline["story_contract"],
+            series_bible=active_design.model_dump(mode="json"),
+            output_language=work.output_language,
+        )
+        structural_operation = (
+            model_call_state.context.operation_id if model_call_state is not None else None
+        )
+        structural_call_id = await self._require_physical_call_id(
+            run_id=work.run_id,
+            role="review",
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            episode_number=final_episode,
+            operation_id=structural_operation,
+        )
+        if not structural.passed:
+            await self.repository.block_quality_repair(
+                work.run_id,
+                stage=stage,
+                rejection_attempt=request["rejection_attempt"],
+                evidence=structural.evidence,
+            )
+            return True
+
+        new_batch = await self.repository.apply_quality_episode_patches(
+            work.run_id,
+            expected_batch_id=batch.batch_id,
+            patched_contents=patched_contents,
+            stage=stage,
+            rejection_attempt=request["rejection_attempt"],
+        )
+        active_after = await self.repository.get_active_episode_candidates(work.run_id)
+        prefix_hash = active_prefix_hash(
+            [
+                {
+                    "episode_number": candidate.episode_number,
+                    "content_sha256": candidate.content_sha256,
+                }
+                for candidate in active_after
+            ]
+        )
+        await self.repository.register_series_review(
+            work.run_id,
+            review_type="final",
+            episode_number=final_episode,
+            design_candidate_id=active_design.candidate_id,
+            design_content_hash=active_design.content_hash,
+            design_epoch=active_design.design_epoch,
+            batch_id=new_batch.batch_id,
+            batch_epoch=new_batch.batch_epoch,
+            prefix_hash=prefix_hash,
+            call_id=structural_call_id,
+            passed=True,
+            category="pass",
+            evidence=structural.evidence,
+            earliest_affected_episode=None,
+        )
+
+        refreshed = await self.repository.get_run_work_item(work.run_id)
+        repaired_approved = dict(refreshed.business_checkpoints)
+        gates = [InternalStage.ACCEPTING_L0]
+        if stage is InternalStage.ACCEPTING_L4:
+            gates.append(InternalStage.ACCEPTING_L4)
+        for gate in gates:
+            await self.repository.record_stage_attempt(work.run_id, gate)
+            if model_call_state is not None:
+                model_call_state.context.stage = gate.value
+                model_call_state.context.episode_number = None
+                model_call_state.context.operation_id = new_operation_id()
+            result = await self.workflow.review_quality_gate(
+                stage=gate,
+                approved_artifacts={
+                    checkpoint.value: payload for checkpoint, payload in repaired_approved.items()
+                },
+                persona_files=persona_files,
+                output_language=work.output_language,
+            )
+            operation_id = (
+                model_call_state.context.operation_id if model_call_state is not None else None
+            )
+            review_call_id = await self._require_physical_call_id(
+                run_id=work.run_id,
+                role="review",
+                stage=gate,
+                episode_number=None,
+                operation_id=operation_id,
+            )
+            if not result.passed:
+                await self.repository.reject_quality_gate(
+                    work.run_id,
+                    stage=gate,
+                    evidence=result.evidence,
+                    repair_plan=result.repair_plan,
+                )
+                return True
+            payload = _validate_persona_checkpoint_payload(
+                gate,
+                result.model_dump(mode="json"),
+                (),
+            )
+            await self.repository.approve_checkpoint(
+                work.run_id,
+                gate,
+                payload,
+                review_call_id=review_call_id,
+            )
+            repaired_approved[gate] = payload
+        await self.repository.requeue_run_job(work.run_id)
+        return True
 
     async def _handle_milestone_rejection(
         self,

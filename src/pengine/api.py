@@ -231,17 +231,17 @@ def create_app(
         operation_id="retryFinalReview",
         status_code=202,
         response_model=RunControlAccepted,
-        summary="Retry a rejected L0 or L4 final review",
+        summary="Repair the rejected evidence scope and re-run final review",
         description=(
             "Queues the same quality_rejected run unless that gate has exhausted its "
-            "three-attempt limit. Durable checkpoints and drafts remain unchanged; the "
-            "worker re-executes only the rejected final-review gate. An identical "
-            "idempotency key replays its prior accepted response."
+            "three-attempt limit. The worker binds the saved evidence to exact episode "
+            "excerpts, applies one bounded immutable-batch repair, verifies the complete "
+            "series, and then re-runs L0 (and L4 when the original rejection was L4). "
+            "It never re-reviews unchanged drafts. An identical idempotency key replays "
+            "its prior accepted response."
         ),
         responses={
-            202: {
-                "description": "Final review queued or an identical accepted retry command replayed"
-            },
+            202: {"description": "Bounded repair queued or an identical accepted command replayed"},
             404: {"description": "Creation not found", "model": CommandError},
             409: {
                 "description": "The requested run cannot retry final review",
