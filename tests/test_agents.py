@@ -439,37 +439,6 @@ def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMe
                 "state_delta": _state_delta(contract, 1),
             },
         ),
-        (
-            "accepting_l0",
-            "quality_reviewer",
-            "QualityReviewerResult",
-            {
-                "stage": "accepting_l0",
-                "passed": True,
-                "evidence": (
-                    "母题兑现：人物用行动回答母题。\n"
-                    "选定侧面：创作方向贯穿全剧。\n"
-                    "雷区：未发现解释性表达。\n"
-                    "温度：情绪克制且峰后有收拍。"
-                ),
-                "feedback_handling": [],
-            },
-        ),
-        (
-            "accepting_l4",
-            "quality_reviewer",
-            "QualityReviewerResult",
-            {
-                "stage": "accepting_l4",
-                "passed": True,
-                "evidence": (
-                    "L4-A：人物与情感成立。\n"
-                    "短剧硬规则：适用硬规则均有证据。\n"
-                    "产品参数：采用 Pengine 默认参数。"
-                ),
-                "feedback_handling": [],
-            },
-        ),
     ]
     responses: list[AIMessage] = []
     index = 0
@@ -5282,8 +5251,6 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             "generating_story_outline",
             "generating_character_relationships",
             "generating_episode_outline",
-            "accepting_l0",
-            "accepting_l4",
         ]
         assert [stage for kind, stage in events if kind == "approve"] == [
             "selecting_l0_variant",
@@ -5291,8 +5258,6 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             "generating_character_relationships",
             "generating_episode_outline",
             "generating_episode_scripts",
-            "accepting_l0",
-            "accepting_l4",
         ]
         assert episode_attempts == [1]
 
@@ -5318,7 +5283,6 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             "ScriptWriterResult",
         }
         reviewer_result_tools = {
-            "QualityReviewerResult",
             "CanonReviewerResult",
             "EpisodeReviewerResult",
         }
@@ -5377,7 +5341,6 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             "StoryArchitectResult",
             "EpisodePlannerResult",
             "ScriptWriterResult",
-            "QualityReviewerResult",
             "CanonReviewerResult",
             "EpisodeReviewerResult",
         ):
@@ -7676,6 +7639,7 @@ def test_chinese_language_guard_covers_script_handoff() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="final L0/L4 quality gates are no longer scheduled")
 @pytest.mark.parametrize(
     ("initial_decision", "repaired_decision"),
     [(False, True), (True, False)],
@@ -8594,6 +8558,7 @@ async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="final L0/L4 quality gates are no longer scheduled")
 async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
@@ -8648,6 +8613,7 @@ async def test_failed_quality_gate_is_not_approved(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="final L0/L4 quality gates are no longer scheduled")
 async def test_quality_rejection_reuses_thread_and_only_retries_final_gates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8849,15 +8815,13 @@ async def test_out_of_order_stage_is_rejected_without_attempt_and_can_recover(
             **_episode_hook_kwargs()[0],
         )
 
-    expected = [
-        InternalStage.SELECTING_L0_VARIANT,
-        InternalStage.GENERATING_STORY_OUTLINE,
-        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
-        InternalStage.GENERATING_EPISODE_OUTLINE,
-        InternalStage.GENERATING_EPISODE_SCRIPTS,
-        InternalStage.ACCEPTING_L0,
-        InternalStage.ACCEPTING_L4,
-    ]
+        expected = [
+            InternalStage.SELECTING_L0_VARIANT,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+            InternalStage.GENERATING_EPISODE_SCRIPTS,
+        ]
     assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
     assert attempted == [
         stage for stage in expected if stage is not InternalStage.GENERATING_EPISODE_SCRIPTS
@@ -8945,8 +8909,6 @@ async def test_restart_reuses_thread_checkpoint_and_skips_approved_stage(
         InternalStage.GENERATING_STORY_OUTLINE,
         InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         InternalStage.GENERATING_EPISODE_OUTLINE,
-        InternalStage.ACCEPTING_L0,
-        InternalStage.ACCEPTING_L4,
     ]
 
 

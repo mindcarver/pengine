@@ -206,8 +206,6 @@ _SPECIALIST_STAGES = (
     InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
     InternalStage.GENERATING_EPISODE_OUTLINE,
     InternalStage.GENERATING_EPISODE_SCRIPTS,
-    InternalStage.ACCEPTING_L0,
-    InternalStage.ACCEPTING_L4,
 )
 _ALL_STAGES = (
     InternalStage.LOADING_PERSONA,
@@ -1002,11 +1000,6 @@ class Worker:
                     if suffix_rewrite_feedback is not None:
                         workflow_kwargs["suffix_rewrite_feedback"] = suffix_rewrite_feedback
                     result = await self.workflow.execute(**workflow_kwargs)
-                if work.run_kind == "revision" and not result.feedback_handling:
-                    raise AgentProtocolError(
-                        "Revision result omitted feedback handling",
-                        stage=InternalStage.ACCEPTING_L4,
-                    )
                 result = await self._validated_checkpoint_result(work, result, approved)
 
                 current_stage = InternalStage.ASSEMBLING_DELIVERY
@@ -1524,8 +1517,6 @@ class Worker:
                 persona_snapshot_sha256=work.persona.snapshot_sha256,
                 selected_l0_variant=result.selected_l0_variant,
                 selection_rationale=result.selection_rationale,
-                l0_gate=result.l0_gate,
-                l4_gate=result.l4_gate,
                 ownership_statement=(
                     "最终创作所有权与判断由内部操作人员保留。"
                     if work.output_language == "zh-CN"
@@ -2005,8 +1996,6 @@ class Worker:
             )
             aggregate_episode_scripts = aggregate_payload["content"]
             l0_selection = approved[InternalStage.SELECTING_L0_VARIANT]
-            l0_gate = approved[InternalStage.ACCEPTING_L0]
-            l4_gate = approved[InternalStage.ACCEPTING_L4]
             story_outline = approved[InternalStage.GENERATING_STORY_OUTLINE]
             character_relationships = approved[InternalStage.GENERATING_CHARACTER_RELATIONSHIPS]
             expected = WorkflowResult.model_validate(
@@ -2022,15 +2011,7 @@ class Worker:
                     },
                     "selected_l0_variant": l0_selection["selected_l0_variant"],
                     "selection_rationale": l0_selection["selection_rationale"],
-                    "l0_gate": {
-                        "passed": l0_gate["passed"],
-                        "evidence": l0_gate["evidence"],
-                    },
-                    "l4_gate": {
-                        "passed": l4_gate["passed"],
-                        "evidence": l4_gate["evidence"],
-                    },
-                    "feedback_handling": l4_gate.get("feedback_handling", []),
+                    "feedback_handling": result.feedback_handling,
                 }
             )
         except Exception as exc:
@@ -2052,7 +2033,8 @@ class Worker:
                 "Approved episode scripts or lock hashes differ from committed episodes",
                 stage=InternalStage.ASSEMBLING_DELIVERY,
             )
-        if result != expected:
+        normalized_result = result.model_copy(update={"l0_gate": None, "l4_gate": None})
+        if normalized_result != expected:
             raise AgentProtocolError(
                 "Supervisor result differs from approved specialist checkpoints",
                 stage=InternalStage.ASSEMBLING_DELIVERY,

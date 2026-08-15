@@ -111,8 +111,8 @@ class DeliveryReport(StrictModel):
     persona_snapshot_sha256: Sha256
     selected_l0_variant: NonEmptyText
     selection_rationale: NonEmptyText
-    l0_gate: GateResult
-    l4_gate: GateResult
+    l0_gate: GateResult | None = None
+    l4_gate: GateResult | None = None
     ownership_statement: NonEmptyText
     feedback_handling: list[FeedbackHandlingItem]
 
@@ -824,6 +824,6 @@ class WorkflowResult(StrictModel):
     content_package: ContentPackage
     selected_l0_variant: NonEmptyText
     selection_rationale: NonEmptyText
-    l0_gate: GateResult
-    l4_gate: GateResult
+    l0_gate: GateResult | None = None
+    l4_gate: GateResult | None = None
     feedback_handling: list[FeedbackHandlingItem] = Field(default_factory=list)

@@ -154,10 +154,14 @@ _TASK_OWNER = {
     InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: "story_architect",
     InternalStage.GENERATING_EPISODE_OUTLINE: "episode_planner",
     InternalStage.GENERATING_EPISODE_SCRIPTS: "script_writer",
+    # Retained only so already-persisted legacy gate runs can be read or resumed.
     InternalStage.ACCEPTING_L0: "quality_reviewer",
     InternalStage.ACCEPTING_L4: "quality_reviewer",
 }
-_ORDERED_SPECIALIST_STAGES = tuple(_TASK_OWNER)
+_ORDERED_SPECIALIST_STAGES = tuple(_STORY_STAGES) + (
+    InternalStage.GENERATING_EPISODE_OUTLINE,
+    InternalStage.GENERATING_EPISODE_SCRIPTS,
+)
 _RESULT_TOOL = {
     InternalStage.SELECTING_L0_VARIANT: "StoryArchitectResult",
     InternalStage.GENERATING_STORY_OUTLINE: "StoryArchitectResult",
@@ -3397,8 +3401,6 @@ def _workflow_result_from_checkpoints(
         )
     try:
         l0_selection = approved[InternalStage.SELECTING_L0_VARIANT]
-        l0_gate = approved[InternalStage.ACCEPTING_L0]
-        l4_gate = approved[InternalStage.ACCEPTING_L4]
         story_outline = approved[InternalStage.GENERATING_STORY_OUTLINE]
         character_relationships = approved[InternalStage.GENERATING_CHARACTER_RELATIONSHIPS]
         return WorkflowResult.model_validate(
@@ -3416,15 +3418,7 @@ def _workflow_result_from_checkpoints(
                 },
                 "selected_l0_variant": l0_selection["selected_l0_variant"],
                 "selection_rationale": l0_selection["selection_rationale"],
-                "l0_gate": {
-                    "passed": l0_gate["passed"],
-                    "evidence": l0_gate["evidence"],
-                },
-                "l4_gate": {
-                    "passed": l4_gate["passed"],
-                    "evidence": l4_gate["evidence"],
-                },
-                "feedback_handling": l4_gate.get("feedback_handling", []),
+                "feedback_handling": [],
             }
         )
     except AgentProtocolError:
@@ -6389,9 +6383,7 @@ class DeepAgentWorkflow:
             },
             {
                 "name": "quality_reviewer",
-                "description": (
-                    "Reviews the L0 and L4 gates and itemizes revision-feedback coverage."
-                ),
+                "description": "Legacy-only reviewer for already-persisted final gate runs.",
                 "system_prompt": quality_reviewer_prompt,
                 "model": self.review_model,
                 "tools": [],
@@ -6613,18 +6605,15 @@ Delegate every missing specialist stage exactly once, in this order:
 3. generating_character_relationships -> story_architect
 4. generating_episode_outline -> episode_planner
 5. generating_episode_scripts -> script_writer
-6. accepting_l0 -> quality_reviewer
-7. accepting_l4 -> quality_reviewer
 
 Every task description MUST begin with the exact token
 `[stage=<stage_name>]`. Issue exactly one task tool call per model turn and wait
 for its tool result before delegating the next stage. Do not delegate an already
-approved stage. Direct stage tasks only to the four owners listed above; the
+approved stage. Direct stage tasks only to the three owners listed above; the
 guarded runtime invokes contract review, episode review, and bounded repair
 specialists automatically. Treat /persona as read-only and /workspace as temporary
-thread scratch. Never claim a
-gate passed without the quality_reviewer evidence. After all stages are
-complete, return WorkflowCompletion only. Do not repeat the approved artifacts
+thread scratch. After all stages are complete, return WorkflowCompletion only.
+Do not repeat the approved artifacts
 or return partial content.
 
 Use each task description only to route the stage goal and repeat applicable
