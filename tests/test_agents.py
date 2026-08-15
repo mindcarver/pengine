@@ -1186,6 +1186,64 @@ def test_quality_repair_plan_binds_model_excerpt_to_quoted_saved_evidence() -> N
     assert bound.issues[0].exact_excerpt == exact
 
 
+def test_quality_repair_plan_corrects_wrong_episode_only_for_exact_numbered_quote() -> None:
+    exact = "母亲的眼泪与哥哥那句话之后，她的证据越硬，人越可疑。"
+    plan = QualityRepairPlan(
+        scope="episode_content",
+        rationale="解释性判断可局部修复。",
+        issues=[
+            QualityRepairIssue(
+                issue_id="l0-blocker",
+                rule_source="L0 雷区",
+                episode_number=7,
+                exact_excerpt=exact,
+                repair_instruction="删除解说母题的旁白。",
+            )
+        ],
+    )
+
+    bound = bind_quality_repair_plan(
+        plan,
+        evidence=(
+            f"第7集哥哥说“老林家女儿回来以后不太对”。\n雷区：未通过。第6集结尾直接写出“{exact}”。"
+        ),
+        episodes={
+            6: f"场景结束。\n{exact}\n本集终。",
+            7: "哥哥说：“老林家女儿回来以后不太对。”",
+        },
+    )
+
+    assert bound.issues[0].episode_number == 6
+    assert bound.issues[0].exact_excerpt == exact
+
+
+def test_quality_repair_plan_does_not_reassign_paraphrased_cross_episode_issue() -> None:
+    exact = "母亲的眼泪与哥哥那句话之后，她的证据越硬，人越可疑。"
+    plan = QualityRepairPlan(
+        scope="episode_content",
+        rationale="解释性判断可局部修复。",
+        issues=[
+            QualityRepairIssue(
+                issue_id="l0-blocker",
+                rule_source="L0 雷区",
+                episode_number=7,
+                exact_excerpt="证据越多，她越像一个病人。",
+                repair_instruction="删除解说母题的旁白。",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="quality_repair_evidence_not_bound"):
+        bind_quality_repair_plan(
+            plan,
+            evidence=(f"第6集结尾直接写出“{exact}”。\n第7集哥哥说“老林家女儿回来以后不太对”。"),
+            episodes={
+                6: f"场景结束。\n{exact}\n本集终。",
+                7: "哥哥说“老林家女儿回来以后不太对”。",
+            },
+        )
+
+
 @pytest.mark.asyncio
 async def test_story_repair_allows_two_bounded_targeted_patch_corrections() -> None:
     corrections: list[str | None] = []

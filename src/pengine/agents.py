@@ -1419,16 +1419,39 @@ def bind_quality_repair_plan(
     if plan.scope != "episode_content":
         return plan
     quoted = [match.strip() for match in re.findall(r"[“\"]([^”\"]+)[”\"]", evidence)]
+    explicit_episode_quotes = [
+        (int(match.group(1)), match.group(2).strip())
+        for match in re.finditer(
+            r"第\s*(\d+)\s*集[^。！？\n]{0,160}[“\"]([^”\"]+)[”\"]",
+            evidence,
+        )
+    ]
     seen_ids: set[str] = set()
     bound_issues = []
     for issue in plan.issues:
         content = episodes.get(issue.episode_number)
-        if issue.issue_id in seen_ids or content is None:
+        if issue.issue_id in seen_ids:
             raise ValueError("quality_repair_evidence_not_bound")
         seen_ids.add(issue.issue_id)
         excerpt = issue.exact_excerpt
-        if content.count(excerpt) != 1:
+        episode_number = issue.episode_number
+        if content is None or content.count(excerpt) != 1:
             stripped = excerpt.strip(" \t\r\n\"'“”‘’")
+            exact_cross_episode = [
+                (number, candidate)
+                for number, candidate in explicit_episode_quotes
+                if candidate == stripped
+                and (episode_content := episodes.get(number)) is not None
+                and episode_content.count(candidate) == 1
+            ]
+            if len(plan.issues) == 1 and len(exact_cross_episode) == 1:
+                episode_number, excerpt = exact_cross_episode[0]
+                bound_issues.append(
+                    issue.model_copy(
+                        update={"episode_number": episode_number, "exact_excerpt": excerpt}
+                    )
+                )
+                continue
             episode_quoted = [
                 match.strip()
                 for match in re.findall(
@@ -1436,26 +1459,27 @@ def bind_quality_repair_plan(
                     evidence,
                 )
             ]
-            candidate_pool = episode_quoted or quoted
+            candidate_pool = episode_quoted or quoted if content is not None else []
             candidates = []
             for candidate in candidate_pool:
-                if content.count(candidate) != 1:
+                if content is None or content.count(candidate) != 1:
                     continue
                 similarity = SequenceMatcher(None, stripped, candidate).ratio()
                 if (
-                    episode_quoted
+                    (episode_quoted and len(explicit_episode_quotes) == 1)
                     or stripped in candidate
                     or candidate in stripped
                     or similarity >= 0.72
                 ):
                     candidates.append((similarity, candidate))
             candidates.sort(reverse=True)
-            if not candidates or (
-                len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.1
-            ):
+            if candidates and (len(candidates) == 1 or candidates[0][0] - candidates[1][0] >= 0.1):
+                excerpt = candidates[0][1]
+            else:
                 raise ValueError("quality_repair_evidence_not_bound")
-            excerpt = candidates[0][1]
-        bound_issues.append(issue.model_copy(update={"exact_excerpt": excerpt}))
+        bound_issues.append(
+            issue.model_copy(update={"episode_number": episode_number, "exact_excerpt": excerpt})
+        )
     return plan.model_copy(update={"issues": bound_issues})
 
 
