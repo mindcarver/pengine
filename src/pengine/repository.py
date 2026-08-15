@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -52,6 +53,7 @@ from pengine.schemas import (
     PersonaSnapshot,
     QualityGateRejection,
     QualityRejectedRun,
+    QualityRepairPlan,
     QueuedRun,
     RepairAuthorization,
     RevisionAccepted,
@@ -96,7 +98,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -969,6 +971,31 @@ CREATE INDEX IF NOT EXISTS model_calls_operation_id
 ON model_calls(run_id, operation_id);
 """
 
+_SCHEMA_V23_QUALITY_GATE_REPAIR_SQL = """
+CREATE TABLE IF NOT EXISTS quality_gate_repairs (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK (stage IN ('accepting_l0', 'accepting_l4')),
+    rejection_attempt INTEGER NOT NULL CHECK (
+        rejection_attempt >= 1 AND rejection_attempt <= 3
+    ),
+    plan_json TEXT,
+    status TEXT NOT NULL CHECK (
+        status IN ('available', 'queued', 'repairing', 'applied', 'blocked')
+    ),
+    original_batch_id TEXT,
+    repaired_batch_id TEXT,
+    requested_at TEXT,
+    completed_at TEXT,
+    result_evidence TEXT,
+    PRIMARY KEY (run_id, stage, rejection_attempt),
+    FOREIGN KEY (run_id, stage, rejection_attempt)
+        REFERENCES quality_gate_rejections(run_id, stage, attempt_number)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS quality_gate_repairs_status
+ON quality_gate_repairs(status, requested_at);
+"""
+
 _SCHEMA_V12_SERIES_BIBLE_SQL = """
 CREATE TABLE IF NOT EXISTS series_bible_candidates (
     candidate_id TEXT PRIMARY KEY,
@@ -1269,6 +1296,25 @@ def canonical_payload_hash(payload: BaseModel | Mapping[str, Any]) -> str:
 
 def _text_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _is_bound_quality_patch(original: str, repaired: str, excerpts: list[str]) -> bool:
+    if repaired == original or not excerpts:
+        return False
+    ordered = sorted(excerpts, key=original.find)
+    if any(not excerpt or original.count(excerpt) != 1 for excerpt in ordered):
+        return False
+    cursor = 0
+    unchanged: list[str] = []
+    for excerpt in ordered:
+        start = original.find(excerpt, cursor)
+        if start < cursor:
+            return False
+        unchanged.append(original[cursor:start])
+        cursor = start + len(excerpt)
+    unchanged.append(original[cursor:])
+    pattern = "^" + ".*?".join(re.escape(part) for part in unchanged) + "$"
+    return re.fullmatch(pattern, repaired, flags=re.DOTALL) is not None
 
 
 def _json(value: Any) -> str:
@@ -2066,6 +2112,19 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 22
+            if schema_version == 22:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.executescript(_SCHEMA_V23_QUALITY_GATE_REPAIR_SQL)
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO pengine_schema(version) VALUES (23)"
+                    )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 23
 
     async def setup(self) -> None:
         await self.initialize()
@@ -3646,11 +3705,50 @@ class Repository:
                     }
                 )
         except Exception as exc:
-            raise DomainError(
-                "episode_lock_invalid",
-                "Every episode lock must match the approved story contract before review.",
-                409,
-            ) from exc
+            active_batch = await self._fetch_script_batch_lineage(connection, run_id)
+            applied_repair = (
+                await self._fetchone(
+                    connection,
+                    """
+                    SELECT repaired_batch_id
+                    FROM quality_gate_repairs
+                    WHERE run_id = ? AND status = 'applied'
+                    ORDER BY rejection_attempt DESC
+                    LIMIT 1
+                    """,
+                    (str(run_id),),
+                )
+                if active_batch is not None
+                else None
+            )
+            if (
+                active_batch is None
+                or applied_repair is None
+                or applied_repair["repaired_batch_id"] != active_batch["batch_id"]
+                or any(
+                    draft.series_state_sha256 is None or draft.contract_sha256 != contract_hash
+                    for draft in drafts
+                )
+            ):
+                raise DomainError(
+                    "episode_lock_invalid",
+                    "Every episode lock must match the approved story contract before review.",
+                    409,
+                ) from exc
+            episode_hashes = [
+                {
+                    "episode_number": draft.episode_number,
+                    "content_sha256": draft.content_sha256,
+                    "series_state_sha256": draft.series_state_sha256,
+                }
+                for draft in drafts
+            ]
+            return {
+                "content": content,
+                "contract_sha256": contract_hash,
+                "episode_hashes": episode_hashes,
+                "series_state_sha256": drafts[-1].series_state_sha256,
+            }
         return {
             "content": content,
             "contract_sha256": contract_hash,
@@ -5004,6 +5102,319 @@ class Repository:
             "prefix_candidates": prefix_candidates,
         }
 
+    async def apply_quality_episode_patches(
+        self,
+        run_id: UUID,
+        *,
+        expected_batch_id: str,
+        patched_contents: Mapping[int, tuple[str, str]],
+        stage: InternalStage,
+        rejection_attempt: int,
+        now: datetime | None = None,
+    ) -> ScriptBatchLineage:
+        """Atomically activate a new batch with only bound episode content changed.
+
+        Every episode is deterministically rebound into the new immutable batch. Non-target
+        content hashes must remain identical, and every rebuilt SeriesState must equal the
+        prior active state so later episodes cannot silently inherit changed continuity.
+        """
+        if not patched_contents:
+            raise DomainError("quality_repair_invalid", "No episode patch was supplied.", 409)
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            run = await self._fetchone(
+                connection,
+                "SELECT state, creation_id, kind FROM runs WHERE id = ?",
+                (str(run_id),),
+            )
+            if run is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if run["state"] != "running":
+                raise DomainError("run_not_running", "Workflow run is not running.", 409)
+            batch_row = await self._fetch_script_batch_lineage(connection, run_id)
+            if (
+                batch_row is None
+                or batch_row["status"] != "active"
+                or batch_row["batch_id"] != expected_batch_id
+            ):
+                raise DomainError(
+                    "quality_repair_stale",
+                    "The active script batch changed before the quality repair committed.",
+                    409,
+                )
+            old_batch = self._script_batch_lineage_from_row(batch_row)
+            repair_row = await self._fetchone(
+                connection,
+                """
+                SELECT plan_json, status
+                FROM quality_gate_repairs
+                WHERE run_id = ? AND stage = ? AND rejection_attempt = ?
+                """,
+                (str(run_id), stage.value, rejection_attempt),
+            )
+            if (
+                repair_row is None
+                or repair_row["status"] not in {"queued", "repairing"}
+                or repair_row["plan_json"] is None
+            ):
+                raise DomainError(
+                    "quality_repair_stale",
+                    "The evidence-bound quality repair is unavailable.",
+                    409,
+                )
+            repair_plan = QualityRepairPlan.model_validate_json(repair_row["plan_json"])
+            if repair_plan.scope != "episode_content":
+                raise DomainError(
+                    "quality_repair_invalid",
+                    "Only an episode-content plan can activate a repaired script batch.",
+                    409,
+                )
+            planned_episodes = {issue.episode_number for issue in repair_plan.issues}
+            if set(patched_contents) != planned_episodes:
+                raise DomainError(
+                    "quality_repair_scope_violation",
+                    "The repair must cover exactly the episodes named by the saved evidence.",
+                    409,
+                )
+            bound_excerpts = {
+                episode_number: [
+                    issue.exact_excerpt
+                    for issue in repair_plan.issues
+                    if issue.episode_number == episode_number
+                ]
+                for episode_number in patched_contents
+            }
+            if any(not excerpts for excerpts in bound_excerpts.values()):
+                raise DomainError(
+                    "quality_repair_scope_violation",
+                    "A patched episode was not named by the saved review evidence.",
+                    409,
+                )
+            active_pointers = json.loads(batch_row["active_pointers_json"])
+            plans = await self._episode_plans(connection, run_id)
+            plan_numbers = [plan.episode_number for plan in plans]
+            if set(int(number) for number in active_pointers) != set(plan_numbers):
+                raise DomainError(
+                    "episode_sequence_incomplete",
+                    "Every planned episode must be active before a quality repair.",
+                    409,
+                )
+            if not set(patched_contents).issubset(plan_numbers):
+                raise DomainError(
+                    "episode_not_planned",
+                    "A quality repair targeted an unplanned episode.",
+                    409,
+                )
+            old_candidates: list[EpisodeCandidate] = []
+            for episode_number in plan_numbers:
+                row = await self._fetch_episode_candidate(
+                    connection,
+                    run_id,
+                    active_pointers[str(episode_number)],
+                )
+                if row is None or row["status"] != "active":
+                    raise DomainError(
+                        "episode_predecessor_missing",
+                        "The active episode candidate is missing.",
+                        409,
+                    )
+                old_candidates.append(self._episode_candidate_from_row(row))
+            new_batch = ScriptBatchLineage(
+                batch_id=new_batch_id(),
+                run_id=str(run_id),
+                run_kind=old_batch.run_kind,
+                batch_epoch=old_batch.batch_epoch + 1,
+                status="active",
+                design_candidate_id=old_batch.design_candidate_id,
+                design_content_hash=old_batch.design_content_hash,
+                design_epoch=old_batch.design_epoch,
+                active_pointers={},
+                created_at=_datetime(timestamp),
+            )
+            predecessor_id = None
+            predecessor_hash = None
+            rebuilt: list[EpisodeCandidate] = []
+            for old in old_candidates:
+                content, call_id = patched_contents.get(
+                    old.episode_number,
+                    (old.content, old.call_id),
+                )
+                if old.episode_number in patched_contents and not _is_bound_quality_patch(
+                    old.content,
+                    content,
+                    bound_excerpts[old.episode_number],
+                ):
+                    raise DomainError(
+                        "quality_repair_scope_violation",
+                        "The repaired episode changed content outside the bound excerpts.",
+                        409,
+                    )
+                if (
+                    old.episode_number not in patched_contents
+                    and _text_hash(content) != old.content_sha256
+                ):
+                    raise DomainError(
+                        "quality_repair_scope_violation",
+                        "A non-target episode changed during quality repair.",
+                        409,
+                    )
+                candidate = old.model_copy(
+                    update={
+                        "candidate_id": new_candidate_id(),
+                        "batch_id": new_batch.batch_id,
+                        "batch_epoch": new_batch.batch_epoch,
+                        "version": 1,
+                        "content": content,
+                        "content_sha256": _text_hash(content),
+                        "predecessor_candidate_id": predecessor_id,
+                        "predecessor_sha256": predecessor_hash,
+                        "call_id": call_id,
+                        "status": "active",
+                        "created_at": _datetime(timestamp),
+                        "activated_at": _datetime(timestamp),
+                        "superseded_at": None,
+                    }
+                )
+                rebuilt.append(candidate)
+                predecessor_id = candidate.candidate_id
+                predecessor_hash = candidate.content_sha256
+
+            await self._supersede_active_batch(connection, run_id, batch_row, timestamp)
+            await connection.execute(
+                """
+                INSERT INTO script_batches(
+                    batch_id, run_id, creation_id, run_kind, batch_epoch, status,
+                    design_candidate_id, design_content_hash, design_epoch,
+                    active_pointers_json, suffix_rewrite_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_batch.batch_id,
+                    str(run_id),
+                    run["creation_id"],
+                    run["kind"],
+                    new_batch.batch_epoch,
+                    new_batch.design_candidate_id,
+                    new_batch.design_content_hash,
+                    new_batch.design_epoch,
+                    _json(
+                        {
+                            str(candidate.episode_number): candidate.candidate_id
+                            for candidate in rebuilt
+                        }
+                    ),
+                    int(batch_row["suffix_rewrite_count"]),
+                    timestamp,
+                ),
+            )
+            for candidate in rebuilt:
+                await self._insert_episode_candidate(connection, candidate, timestamp)
+                await self._upsert_active_draft_projection(connection, run_id, candidate)
+            checkpoint_row = await self._fetchone(
+                connection,
+                """
+                SELECT payload_json FROM business_checkpoints
+                WHERE run_id = ? AND stage = ?
+                """,
+                (str(run_id), InternalStage.GENERATING_EPISODE_SCRIPTS.value),
+            )
+            if checkpoint_row is None:
+                raise DomainError(
+                    "quality_repair_stale",
+                    "The approved episode checkpoint is unavailable for a bound repair.",
+                    409,
+                )
+            previous_aggregate = json.loads(checkpoint_row["payload_json"])
+            drafts = await self._episode_drafts(connection, run_id)
+            try:
+                aggregate = {
+                    **previous_aggregate,
+                    "stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                    "content": _aggregate_episode_scripts(plans, drafts),
+                }
+            except ValueError as exc:
+                raise DomainError(
+                    "episode_sequence_incomplete",
+                    "Every planned episode must be active after a quality repair.",
+                    409,
+                ) from exc
+            if "episode_hashes" in previous_aggregate:
+                aggregate["episode_hashes"] = [
+                    {
+                        "episode_number": candidate.episode_number,
+                        "content_sha256": candidate.content_sha256,
+                        "series_state_sha256": candidate.series_state_sha256,
+                    }
+                    for candidate in rebuilt
+                ]
+                aggregate["series_state_sha256"] = rebuilt[-1].series_state_sha256
+            checkpoint_cursor = await connection.execute(
+                """
+                UPDATE business_checkpoints
+                SET payload_json = ?, payload_sha256 = ?, approved_at = ?
+                WHERE run_id = ? AND stage = ?
+                """,
+                (
+                    _json(aggregate),
+                    canonical_payload_hash(aggregate),
+                    timestamp,
+                    str(run_id),
+                    InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+                ),
+            )
+            if checkpoint_cursor.rowcount != 1:
+                raise DomainError(
+                    "quality_repair_stale",
+                    "The approved episode checkpoint is unavailable for a bound repair.",
+                    409,
+                )
+            await connection.execute(
+                """
+                DELETE FROM business_checkpoints
+                WHERE run_id = ? AND stage IN ('accepting_l0', 'accepting_l4')
+                """,
+                (str(run_id),),
+            )
+            await connection.execute(
+                """
+                UPDATE series_reviews SET status = 'stale'
+                WHERE run_id = ? AND status = 'active'
+                """,
+                (str(run_id),),
+            )
+            repair_cursor = await connection.execute(
+                """
+                UPDATE quality_gate_repairs
+                SET status = 'applied', repaired_batch_id = ?, completed_at = ?
+                WHERE run_id = ? AND stage = ? AND rejection_attempt = ?
+                  AND status IN ('queued', 'repairing')
+                """,
+                (
+                    new_batch.batch_id,
+                    timestamp,
+                    str(run_id),
+                    stage.value,
+                    rejection_attempt,
+                ),
+            )
+            if repair_cursor.rowcount != 1:
+                raise DomainError(
+                    "quality_repair_stale",
+                    "The queued quality repair changed before the new batch committed.",
+                    409,
+                )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = 'accepting_l0', current_episode = NULL,
+                    execution_state = 'running', updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, str(run_id)),
+            )
+            stored = await self._fetch_script_batch_lineage(connection, run_id)
+        return self._script_batch_lineage_from_row(stored)
+
     async def _supersede_active_batch(
         self,
         connection: aiosqlite.Connection,
@@ -6279,6 +6690,7 @@ class Repository:
         *,
         stage: InternalStage,
         evidence: str | None,
+        repair_plan: QualityRepairPlan | None = None,
         now: datetime | None = None,
     ) -> QualityGateRejection:
         if stage not in {InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4}:
@@ -6351,6 +6763,34 @@ class Repository:
                     (str(run_id), stage.value, attempt_count, evidence, timestamp),
                 )
 
+            if attempt_count < MAX_STAGE_ATTEMPTS:
+                repair_status = (
+                    "available"
+                    if repair_plan is None or repair_plan.scope == "episode_content"
+                    else "blocked"
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO quality_gate_repairs(
+                        run_id, stage, rejection_attempt, plan_json, status
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, stage, rejection_attempt) DO UPDATE SET
+                        plan_json = COALESCE(quality_gate_repairs.plan_json, excluded.plan_json),
+                        status = CASE
+                            WHEN quality_gate_repairs.status IN ('queued', 'repairing', 'applied')
+                                THEN quality_gate_repairs.status
+                            ELSE excluded.status
+                        END
+                    """,
+                    (
+                        str(run_id),
+                        stage.value,
+                        attempt_count,
+                        _json(repair_plan) if repair_plan is not None else None,
+                        repair_status,
+                    ),
+                )
+
             elapsed_seconds = self._elapsed_seconds(progress, current)
             await connection.execute(
                 """
@@ -6384,6 +6824,8 @@ class Repository:
                 evidence=evidence,
                 attempt_count=attempt_count,
                 can_retry=attempt_count < MAX_STAGE_ATTEMPTS,
+                repair_plan=repair_plan,
+                repair_state=(repair_status if attempt_count < MAX_STAGE_ATTEMPTS else None),
             )
 
     async def retry_final_review(
@@ -6432,6 +6874,54 @@ class Repository:
                     "The quality gate has reached its retry limit.",
                     409,
                 )
+            rejection_attempt = int(attempt_row[0])
+            repair = await self._fetchone(
+                connection,
+                """
+                SELECT plan_json, status
+                FROM quality_gate_repairs
+                WHERE run_id = ? AND stage = ? AND rejection_attempt = ?
+                """,
+                (run["id"], run["current_stage"], rejection_attempt),
+            )
+            if repair is not None and repair["status"] == "blocked":
+                raise DomainError(
+                    "run_not_controllable",
+                    "The quality rejection is not safely repairable as an episode patch.",
+                    409,
+                )
+            repair_cursor = await connection.execute(
+                """
+                INSERT INTO quality_gate_repairs(
+                    run_id, stage, rejection_attempt, plan_json, status,
+                    original_batch_id, requested_at
+                )
+                VALUES (
+                    ?, ?, ?, ?, 'queued',
+                    (SELECT batch_id FROM script_batches
+                     WHERE run_id = ? AND status = 'active'),
+                    ?
+                )
+                ON CONFLICT(run_id, stage, rejection_attempt) DO UPDATE SET
+                    status = 'queued',
+                    original_batch_id = excluded.original_batch_id,
+                    requested_at = excluded.requested_at
+                """,
+                (
+                    run["id"],
+                    run["current_stage"],
+                    rejection_attempt,
+                    repair["plan_json"] if repair is not None else None,
+                    run["id"],
+                    timestamp,
+                ),
+            )
+            if repair_cursor.rowcount != 1:
+                raise DomainError(
+                    "quality_repair_stale",
+                    "The active script batch is unavailable for a bound quality repair.",
+                    409,
+                )
             await connection.execute(
                 """
                 UPDATE run_progress
@@ -6473,6 +6963,120 @@ class Repository:
                 timestamp,
             )
             return response
+
+    async def get_queued_quality_repair(self, run_id: UUID) -> Mapping[str, Any] | None:
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT repairs.*, rejections.evidence
+                FROM quality_gate_repairs AS repairs
+                JOIN quality_gate_rejections AS rejections
+                  ON rejections.run_id = repairs.run_id
+                 AND rejections.stage = repairs.stage
+                 AND rejections.attempt_number = repairs.rejection_attempt
+                WHERE repairs.run_id = ? AND repairs.status IN ('queued', 'repairing')
+                ORDER BY repairs.rejection_attempt DESC
+                LIMIT 1
+                """,
+                (str(run_id),),
+            )
+        if row is None:
+            return None
+        return {
+            "run_id": row["run_id"],
+            "stage": row["stage"],
+            "rejection_attempt": int(row["rejection_attempt"]),
+            "plan": (
+                QualityRepairPlan.model_validate_json(row["plan_json"])
+                if row["plan_json"] is not None
+                else None
+            ),
+            "status": row["status"],
+            "original_batch_id": row["original_batch_id"],
+            "evidence": row["evidence"],
+        }
+
+    async def set_quality_repair_plan(
+        self,
+        run_id: UUID,
+        *,
+        stage: InternalStage,
+        rejection_attempt: int,
+        plan: QualityRepairPlan,
+    ) -> None:
+        status = "repairing" if plan.scope == "episode_content" else "blocked"
+        async with self._transaction() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE quality_gate_repairs
+                SET plan_json = ?, status = ?
+                WHERE run_id = ? AND stage = ? AND rejection_attempt = ?
+                  AND status IN ('queued', 'repairing')
+                """,
+                (_json(plan), status, str(run_id), stage.value, rejection_attempt),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError(
+                    "quality_repair_stale",
+                    "The quality repair request is no longer active.",
+                    409,
+                )
+            if status == "blocked":
+                timestamp = _timestamp(_utc_now())
+                await connection.execute(
+                    """
+                    UPDATE run_progress
+                    SET execution_state = 'quality_rejected', active_started_at = NULL,
+                        updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (timestamp, str(run_id)),
+                )
+                await connection.execute(
+                    """
+                    UPDATE jobs SET state = 'failed', lease_owner = NULL,
+                        lease_expires_at = NULL, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (timestamp, str(run_id)),
+                )
+
+    async def block_quality_repair(
+        self,
+        run_id: UUID,
+        *,
+        stage: InternalStage,
+        rejection_attempt: int,
+        evidence: str,
+    ) -> None:
+        timestamp = _timestamp(_utc_now())
+        async with self._transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE quality_gate_repairs
+                SET status = 'blocked', completed_at = ?, result_evidence = ?
+                WHERE run_id = ? AND stage = ? AND rejection_attempt = ?
+                """,
+                (timestamp, evidence, str(run_id), stage.value, rejection_attempt),
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?, execution_state = 'quality_rejected',
+                    active_started_at = NULL, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (stage.value, timestamp, str(run_id)),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs SET state = 'failed', lease_owner = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, str(run_id)),
+            )
 
     async def continue_run(
         self,
@@ -7937,11 +8541,30 @@ class Repository:
         )
         if rejection is None:
             raise RuntimeError("Quality-rejected run is missing rejection evidence")
+        repair = await self._fetchone(
+            connection,
+            """
+            SELECT plan_json, status
+            FROM quality_gate_repairs
+            WHERE run_id = ? AND stage = ? AND rejection_attempt = ?
+            """,
+            (str(run_id), stage.value, int(rejection["attempt_number"])),
+        )
+        can_repair = int(rejection["attempt_number"]) < MAX_STAGE_ATTEMPTS
+        plan = (
+            QualityRepairPlan.model_validate_json(repair["plan_json"])
+            if repair is not None and repair["plan_json"] is not None
+            else None
+        )
         return QualityGateRejection(
             stage=rejection["stage"],
             evidence=rejection["evidence"],
             attempt_count=int(rejection["attempt_number"]),
-            can_retry=int(rejection["attempt_number"]) < MAX_STAGE_ATTEMPTS,
+            can_retry=can_repair,
+            repair_plan=plan,
+            repair_state=(repair["status"] if repair is not None else "available")
+            if can_repair
+            else None,
         )
 
     async def _repair_authorization_snapshot(

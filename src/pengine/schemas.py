@@ -345,12 +345,46 @@ class RunFailure(StrictModel):
     attempt_count: int = Field(ge=1, le=3)
 
 
+class QualityRepairIssue(StrictModel):
+    issue_id: NonEmptyText
+    rule_source: NonEmptyText
+    episode_number: int = Field(ge=1)
+    exact_excerpt: NonEmptyText
+    repair_instruction: NonEmptyText
+
+
+class QualityRepairPlan(StrictModel):
+    scope: Literal["episode_content", "design_rebuild", "unresolved"]
+    rationale: NonEmptyText
+    issues: list[QualityRepairIssue] = Field(default_factory=list, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "QualityRepairPlan":
+        if self.scope == "episode_content" and not self.issues:
+            raise ValueError("Episode-content repair requires at least one bound issue")
+        if self.scope != "episode_content" and self.issues:
+            raise ValueError("Only episode-content repair may name episode issues")
+        return self
+
+
 class QualityGateRejection(StrictModel):
     code: Literal["quality_gate_rejected"] = "quality_gate_rejected"
     stage: Literal["accepting_l0", "accepting_l4"]
     evidence: NonEmptyText | None = None
     attempt_count: int = Field(ge=1, le=3)
     can_retry: bool
+    repair_plan: QualityRepairPlan | None = None
+    repair_state: Literal["available", "queued", "repairing", "applied", "blocked"] | None = None
+
+    @model_validator(mode="after")
+    def validate_repair_state(self) -> "QualityGateRejection":
+        if (
+            self.repair_state in {"available", "queued", "repairing", "applied"}
+            and self.repair_plan is not None
+            and self.repair_plan.scope != "episode_content"
+        ):
+            raise ValueError("Only episode-content plans may enter the repair cycle")
+        return self
 
 
 class FinalReviewProgress(StrictModel):

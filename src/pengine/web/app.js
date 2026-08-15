@@ -220,6 +220,7 @@ function cacheElements() {
     "quality-rejection-details",
     "quality-rejection-stage",
     "quality-rejection-evidence",
+    "quality-rejection-repair",
     "quality-rejection-attempt",
     "failure-code",
     "failure-actions",
@@ -594,7 +595,7 @@ async function handleRunControl(action, options = {}) {
     if (action === "continue") {
       actionMessage = "正在恢复当前阶段……";
     } else if (action === "retry-final-review") {
-      actionMessage = "正在重新提交成品审核……";
+      actionMessage = "正在按审核证据执行受限修复并重新审核……";
     } else if (action === "authorize-repair") {
       actionMessage = "正在授权一次修复循环……";
     }
@@ -1141,11 +1142,24 @@ function showQualityRejection(rejected, options = {}) {
   const evidence =
     typeof rejection.evidence === "string" && rejection.evidence.trim()
       ? rejection.evidence.trim()
-      : "旧版本任务未保存审核证据；请查看保留工作区后再决定是否重新审核。";
+      : "旧版本任务未保存审核证据；系统会先尝试把证据绑定到具体剧集与原文。";
   const attempt = Number.isInteger(rejection.attempt_count)
     ? `审核尝试：第 ${rejection.attempt_count} 次`
     : "审核尝试：服务端未提供次数。";
   const canRetry = canRetryQualityReview(rejected);
+  const repairPlan = rejection.repair_plan;
+  const repairScope = repairPlan?.scope;
+  const repairText =
+    repairScope === "episode_content"
+      ? `修复范围：仅修改审核证据绑定的 ${repairPlan.issues
+          .map((issue) => `第 ${issue.episode_number} 集`)
+          .filter((value, index, values) => values.indexOf(value) === index)
+          .join("、")}原文。`
+      : repairScope === "design_rebuild"
+        ? "修复范围：证据涉及设计重建，不能执行局部剧本修复。"
+        : repairScope === "unresolved"
+          ? "修复范围：证据尚不能安全绑定到具体剧集原文。"
+          : "修复范围：提交后先将旧审核证据绑定到具体剧集原文。";
 
   elements["task-waiting"].hidden = true;
   elements["failure-panel"].hidden = false;
@@ -1157,11 +1171,12 @@ function showQualityRejection(rejected, options = {}) {
   elements["failure-guidance"].hidden = false;
   elements["failure-guidance"].textContent =
     canRetry
-      ? "请根据审核证据选择重新审核，或明确结束本次任务。"
+      ? "可选择执行一次受限修复；系统会验证只改了证据相关内容，再重新审核。"
       : "该审核关已达到三次上限；工作区仍保留，请结束本次任务并据此处理。";
   elements["quality-rejection-details"].hidden = false;
   elements["quality-rejection-stage"].textContent = `审核关卡：${stageLabel}`;
   elements["quality-rejection-evidence"].textContent = `审核证据：${evidence}`;
+  elements["quality-rejection-repair"].textContent = repairText;
   elements["quality-rejection-attempt"].textContent = attempt;
   elements["failure-code"].textContent = "状态：quality_rejected";
   elements["failure-actions"].hidden = true;
@@ -1199,7 +1214,12 @@ function renderQualityRejectionControls() {
 }
 
 function canRetryQualityReview(rejected) {
-  return rejected?.run?.quality_rejection?.can_retry === true;
+  const rejection = rejected?.run?.quality_rejection;
+  return (
+    rejection?.can_retry === true &&
+    rejection?.repair_state !== "blocked" &&
+    !["design_rebuild", "unresolved"].includes(rejection?.repair_plan?.scope)
+  );
 }
 
 function resetQualityRejectionPresentation() {

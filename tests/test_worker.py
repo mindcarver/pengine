@@ -13,11 +13,18 @@ import openai
 import pytest
 from langgraph.errors import GraphRecursionError
 from persona_factory import NON_PRODUCTION_CONTENT, create_persona_package
+from test_repository import persist_succeeded_model_call
+from test_script_batch import seed_batch_with_episodes
 
-from pengine.agents import AgentProtocolError, EpisodeTimeoutError, QualityGateRejectedError
+from pengine.agents import (
+    AgentProtocolError,
+    EpisodeTimeoutError,
+    QualityGateRejectedError,
+    QualityReviewerResult,
+)
 from pengine.config import Settings
 from pengine.errors import DomainError
-from pengine.model_calls import ModelCallState
+from pengine.model_calls import ModelCallContext, ModelCallState
 from pengine.personas import PersonaCatalog
 from pengine.relay import PreflightBlockedError, RelayError, RelayIdentityError
 from pengine.repository import Repository
@@ -28,6 +35,8 @@ from pengine.schemas import (
     FeedbackHandlingItem,
     GateResult,
     InternalStage,
+    QualityRepairIssue,
+    QualityRepairPlan,
     RevisionRequest,
     WorkflowResult,
 )
@@ -36,6 +45,8 @@ from pengine.worker import (
     _episode_error_message,
     _validate_persona_checkpoint_payload,
 )
+
+NOW = datetime.now(UTC)
 
 
 class DeterministicWorkflow:
@@ -1512,7 +1523,7 @@ def test_episode_upstream_stream_decode_error_uses_relay_connection_prompt() -> 
 
 
 @pytest.mark.asyncio
-async def test_quality_rejection_retries_only_missing_final_gates_on_the_same_run(
+async def test_quality_rejection_never_re_reviews_unchanged_legacy_drafts(
     tmp_path: Path,
 ) -> None:
     settings, catalog, repository, snapshot = await _services(tmp_path)
@@ -1544,6 +1555,8 @@ async def test_quality_rejection_retries_only_missing_final_gates_on_the_same_ru
         "evidence": "L0 审核发现核心冲突。",
         "attempt_count": 1,
         "can_retry": True,
+        "repair_plan": None,
+        "repair_state": "available",
     }
     first_retry = await repository.retry_final_review(
         creation_id=accepted.creation_id,
@@ -1566,18 +1579,144 @@ async def test_quality_rejection_retries_only_missing_final_gates_on_the_same_ru
     assert duplicate_retry.value.code == "run_not_controllable"
 
     assert await worker.run_once() is True
-    completed = await repository.get_creation(accepted.creation_id)
-    assert completed is not None
-    assert completed.initial.state == "succeeded"
-    assert workflow.retry_approved == {
-        InternalStage.LOADING_PERSONA,
-        InternalStage.SELECTING_L0_VARIANT,
-        InternalStage.GENERATING_STORY_OUTLINE,
-        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
-        InternalStage.GENERATING_EPISODE_OUTLINE,
+    still_rejected = await repository.get_creation(accepted.creation_id)
+    assert still_rejected is not None
+    assert still_rejected.initial.state == "quality_rejected"
+    assert still_rejected.initial.quality_rejection.repair_state == "blocked"
+    assert workflow.retry_stages == []
+
+
+@pytest.mark.asyncio
+async def test_worker_applies_bound_quality_repair_before_re_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class FakeRepairWorkflow:
+        async def generate_quality_episode_patch(self, **kwargs):
+            content = kwargs["content"]
+            excerpt = kwargs["plan"].issues[0].exact_excerpt
+            return (
+                content.replace(
+                    excerpt,
+                    f"{excerpt}\n她把纸折好，压在空碗下面。",
+                    1,
+                ),
+                None,
+            )
+
+        async def review_quality_repaired_series(self, **kwargs):
+            return SimpleNamespace(passed=True, evidence="完整剧集结构复核通过。")
+
+        async def review_quality_gate(self, **kwargs):
+            return QualityReviewerResult(
+                stage=kwargs["stage"].value,
+                passed=True,
+                evidence=(
+                    "母题兑现：人物用行动承担代价。\n"
+                    "选定侧面：照料之名的冲突贯穿全剧。\n"
+                    "雷区：解释性判断已改为可拍动作。\n"
+                    "温度：峰后由饭桌动作收束。"
+                ),
+            )
+
+    monkeypatch.setattr("pengine.worker.DeepAgentWorkflow", FakeRepairWorkflow)
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "quality-bound-repair-create",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成三集短剧。",
+        ),
+        snapshot.summary,
+    )
+    lease = await repository.lease_next_job("quality-seed-worker", 30)
+    assert lease is not None
+    _, _, committed = await seed_batch_with_episodes(repository, lease.run_id, up_to=3)
+    aggregate = dict(await repository.episode_aggregate_checkpoint_payload(lease.run_id))
+    await repository.approve_business_checkpoint(
+        lease.run_id,
         InternalStage.GENERATING_EPISODE_SCRIPTS,
-    }
-    assert workflow.retry_stages == [InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4]
+        {"stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value, **aggregate},
+        now=NOW,
+    )
+    excerpt = committed[1].content.splitlines()[0]
+    plan = QualityRepairPlan(
+        scope="episode_content",
+        rationale="解释性判断可在第二集局部落成动作。",
+        issues=[
+            QualityRepairIssue(
+                issue_id="l0-episode-2",
+                rule_source="L0 雷区",
+                episode_number=2,
+                exact_excerpt=excerpt,
+                repair_instruction="保留事实，只补可拍动作。",
+            )
+        ],
+    )
+    await repository.record_stage_attempt(lease.run_id, InternalStage.ACCEPTING_L0, now=NOW)
+    await repository.reject_quality_gate(
+        lease.run_id,
+        stage=InternalStage.ACCEPTING_L0,
+        evidence="第二集存在解释性判断。",
+        repair_plan=plan,
+        now=NOW,
+    )
+    await repository.retry_final_review(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="quality-bound-repair",
+        now=NOW,
+    )
+    old_batch = await repository.get_script_batch_lineage(lease.run_id)
+    assert old_batch is not None
+    workflow = FakeRepairWorkflow()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="quality-repair-worker",
+    )
+
+    async def succeeded_call_id(**kwargs):
+        call_id = f"quality-{uuid4()}"
+        persist_succeeded_model_call(
+            repository,
+            call_id=call_id,
+            role=kwargs["role"],
+            context=ModelCallContext(
+                run_id=str(kwargs["run_id"]),
+                stage=kwargs["stage"].value,
+                episode_number=kwargs["episode_number"],
+                operation_id=kwargs["operation_id"] or f"operation-{uuid4()}",
+            ),
+        )
+        return call_id
+
+    worker._require_physical_call_id = succeeded_call_id
+    assert await worker.run_once() is True
+
+    new_batch = await repository.get_script_batch_lineage(lease.run_id)
+    assert new_batch is not None
+    assert new_batch.batch_id != old_batch.batch_id
+    repaired = await repository.get_active_episode_candidates(lease.run_id)
+    assert "她把纸折好，压在空碗下面。" in repaired[1].content
+    assert repaired[0].content == committed[0].content
+    assert repaired[2].content == committed[2].content
+    checkpoints = await repository.get_business_checkpoints(lease.run_id)
+    assert checkpoints[InternalStage.ACCEPTING_L0]["passed"] is True
+    queued = await repository.get_creation(accepted.creation_id)
+    assert queued is not None
+    assert queued.initial.state == "running"
+    async with repository._connection() as connection:
+        job = await (
+            await connection.execute(
+                "SELECT state FROM jobs WHERE run_id = ?",
+                (str(lease.run_id),),
+            )
+        ).fetchone()
+    assert job["state"] == "queued"
 
 
 @pytest.mark.asyncio
