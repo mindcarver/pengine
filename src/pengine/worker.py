@@ -816,6 +816,97 @@ class Worker:
                         plan.episode_number,
                     )
 
+                async def load_outline_season_map() -> Mapping[str, Any] | None:
+                    return await self.repository.get_outline_season_map(work.run_id)
+
+                async def commit_outline_season_map(payload: Mapping[str, Any]) -> None:
+                    operation_id = (
+                        model_call_state.context.operation_id
+                        if model_call_state is not None
+                        else None
+                    )
+                    call_id = await self._require_physical_call_id(
+                        run_id=work.run_id,
+                        role="generation",
+                        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                        episode_number=None,
+                        operation_id=operation_id,
+                    )
+                    await self.repository.commit_outline_season_map(
+                        work.run_id,
+                        payload,
+                        call_id=call_id,
+                    )
+
+                async def load_outline_groups() -> list[Mapping[str, Any]]:
+                    return await self.repository.get_committed_outline_groups(work.run_id)
+
+                outline_group_context: dict[str, tuple[str, int]] = {}
+
+                async def begin_outline_group(
+                    *,
+                    group_id: str,
+                    position: int,
+                    start_episode: int,
+                    end_episode: int,
+                ) -> str:
+                    operation_id = new_operation_id()
+                    if model_call_state is not None:
+                        model_call_state.context.stage = (
+                            InternalStage.GENERATING_EPISODE_OUTLINE.value
+                        )
+                        model_call_state.context.episode_number = start_episode
+                        model_call_state.context.operation_id = operation_id
+                        model_call_state.context.batch = group_id
+                    await self.repository.begin_outline_group(
+                        work.run_id,
+                        group_id=group_id,
+                        position=position,
+                        start_episode=start_episode,
+                        end_episode=end_episode,
+                        operation_id=operation_id,
+                    )
+                    outline_group_context[group_id] = (operation_id, start_episode)
+                    return operation_id
+
+                async def complete_outline_group(
+                    *,
+                    group_id: str,
+                    operation_id: str,
+                    payload: Mapping[str, Any],
+                ) -> None:
+                    expected_operation, start_episode = outline_group_context[group_id]
+                    if expected_operation != operation_id:
+                        raise AgentProtocolError(
+                            "Outline group operation no longer matches its active attempt",
+                            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                        )
+                    call_id = await self._require_physical_call_id(
+                        run_id=work.run_id,
+                        role="generation",
+                        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                        episode_number=start_episode,
+                        operation_id=operation_id,
+                    )
+                    await self.repository.complete_outline_group(
+                        work.run_id,
+                        group_id=group_id,
+                        operation_id=operation_id,
+                        payload=payload,
+                        call_id=call_id,
+                    )
+
+                async def fail_outline_group(
+                    *,
+                    group_id: str,
+                    operation_id: str,
+                ) -> None:
+                    await self.repository.fail_outline_group(
+                        work.run_id,
+                        group_id=group_id,
+                        operation_id=operation_id,
+                    )
+
                 generation_window_context: dict[str, tuple[str, int]] = {}
 
                 async def begin_generation_group(
@@ -1086,6 +1177,12 @@ class Worker:
                                 "begin_generation_group": begin_generation_group,
                                 "complete_generation_group": complete_generation_group,
                                 "fail_generation_group": fail_generation_group,
+                                "load_outline_season_map": load_outline_season_map,
+                                "commit_outline_season_map": commit_outline_season_map,
+                                "load_outline_groups": load_outline_groups,
+                                "begin_outline_group": begin_outline_group,
+                                "complete_outline_group": complete_outline_group,
+                                "fail_outline_group": fail_outline_group,
                             }
                         )
                     suffix_rewrite_feedback = await self._suffix_rewrite_feedback_for_writer(

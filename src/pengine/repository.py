@@ -98,7 +98,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -1045,6 +1045,53 @@ INSERT OR IGNORE INTO pengine_schema(version) VALUES (25);
 
 _SCHEMA_V26_SCRIPT_CONTEXT_AUDIT_SQL = """
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (26);
+"""
+
+_SCHEMA_V27_GROUPED_OUTLINE_SQL = """
+CREATE TABLE IF NOT EXISTS outline_season_maps (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    content_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    call_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS outline_generation_groups (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL,
+    position INTEGER NOT NULL CHECK (position >= 1),
+    start_episode INTEGER NOT NULL CHECK (start_episode >= 1),
+    end_episode INTEGER NOT NULL CHECK (end_episode >= start_episode),
+    operation_id TEXT NOT NULL,
+    call_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('generating', 'committed', 'failed')),
+    attempt_count INTEGER NOT NULL CHECK (attempt_count >= 1),
+    content_json TEXT,
+    content_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, group_id),
+    UNIQUE (run_id, position),
+    CHECK (
+        (
+            status = 'committed'
+            AND call_id IS NOT NULL
+            AND content_json IS NOT NULL
+            AND content_sha256 IS NOT NULL
+        )
+        OR (
+            status != 'committed'
+            AND call_id IS NULL
+            AND content_json IS NULL
+            AND content_sha256 IS NULL
+        )
+    )
+);
+CREATE INDEX IF NOT EXISTS outline_generation_groups_run
+ON outline_generation_groups(run_id, position);
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (27);
 """
 
 _SCHEMA_V12_SERIES_BIBLE_SQL = """
@@ -2225,9 +2272,237 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 26
+            if schema_version == 26:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.executescript(_SCHEMA_V27_GROUPED_OUTLINE_SQL)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 27
 
     async def setup(self) -> None:
         await self.initialize()
+
+    async def get_outline_season_map(self, run_id: UUID) -> dict[str, Any] | None:
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT content_json, content_sha256, call_id
+                FROM outline_season_maps
+                WHERE run_id = ?
+                """,
+                (str(run_id),),
+            )
+        if row is None:
+            return None
+        return {
+            "content": json.loads(row["content_json"]),
+            "content_sha256": row["content_sha256"],
+            "call_id": row["call_id"],
+        }
+
+    async def commit_outline_season_map(
+        self,
+        run_id: UUID,
+        payload: Mapping[str, Any],
+        *,
+        call_id: str,
+    ) -> None:
+        content_json = _json(payload)
+        content_sha256 = _text_hash(content_json)
+        timestamp = _timestamp(_utc_now())
+        async with self._transaction() as connection:
+            existing = await self._fetchone(
+                connection,
+                """
+                SELECT content_sha256, call_id
+                FROM outline_season_maps
+                WHERE run_id = ?
+                """,
+                (str(run_id),),
+            )
+            if existing is not None:
+                if existing["content_sha256"] != content_sha256 or existing["call_id"] != call_id:
+                    raise DomainError(
+                        "outline_season_map_conflict",
+                        "The committed outline season map cannot be replaced.",
+                        409,
+                    )
+                return
+            await connection.execute(
+                """
+                INSERT INTO outline_season_maps(
+                    run_id, content_json, content_sha256, call_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(run_id),
+                    content_json,
+                    content_sha256,
+                    call_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    async def get_committed_outline_groups(self, run_id: UUID) -> list[dict[str, Any]]:
+        async with self._connection() as connection:
+            rows = await (
+                await connection.execute(
+                    """
+                SELECT group_id, position, start_episode, end_episode, content_json,
+                       content_sha256, call_id, attempt_count
+                FROM outline_generation_groups
+                WHERE run_id = ? AND status = 'committed'
+                ORDER BY position
+                """,
+                    (str(run_id),),
+                )
+            ).fetchall()
+        return [
+            {
+                "group_id": row["group_id"],
+                "position": int(row["position"]),
+                "start_episode": int(row["start_episode"]),
+                "end_episode": int(row["end_episode"]),
+                "content": json.loads(row["content_json"]),
+                "content_sha256": row["content_sha256"],
+                "call_id": row["call_id"],
+                "attempt_count": int(row["attempt_count"]),
+            }
+            for row in rows
+        ]
+
+    async def begin_outline_group(
+        self,
+        run_id: UUID,
+        *,
+        group_id: str,
+        position: int,
+        start_episode: int,
+        end_episode: int,
+        operation_id: str,
+    ) -> int:
+        timestamp = _timestamp(_utc_now())
+        async with self._transaction() as connection:
+            existing = await self._fetchone(
+                connection,
+                """
+                SELECT position, start_episode, end_episode, status, attempt_count
+                FROM outline_generation_groups
+                WHERE run_id = ? AND group_id = ?
+                """,
+                (str(run_id), group_id),
+            )
+            if existing is None:
+                attempt_count = 1
+                await connection.execute(
+                    """
+                    INSERT INTO outline_generation_groups(
+                        run_id, group_id, position, start_episode, end_episode,
+                        operation_id, status, attempt_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'generating', ?, ?, ?)
+                    """,
+                    (
+                        str(run_id),
+                        group_id,
+                        position,
+                        start_episode,
+                        end_episode,
+                        operation_id,
+                        attempt_count,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                return attempt_count
+            if (
+                int(existing["position"]) != position
+                or int(existing["start_episode"]) != start_episode
+                or int(existing["end_episode"]) != end_episode
+            ):
+                raise DomainError(
+                    "outline_group_binding_conflict",
+                    "The outline group no longer matches the committed season map.",
+                    409,
+                )
+            if existing["status"] == "committed":
+                raise DomainError(
+                    "outline_group_already_committed",
+                    "The outline group is already committed.",
+                    409,
+                )
+            attempt_count = int(existing["attempt_count"]) + 1
+            await connection.execute(
+                """
+                UPDATE outline_generation_groups
+                SET operation_id = ?, call_id = NULL, status = 'generating',
+                    attempt_count = ?, updated_at = ?
+                WHERE run_id = ? AND group_id = ?
+                """,
+                (operation_id, attempt_count, timestamp, str(run_id), group_id),
+            )
+            return attempt_count
+
+    async def complete_outline_group(
+        self,
+        run_id: UUID,
+        *,
+        group_id: str,
+        operation_id: str,
+        payload: Mapping[str, Any],
+        call_id: str,
+    ) -> None:
+        content_json = _json(payload)
+        content_sha256 = _text_hash(content_json)
+        timestamp = _timestamp(_utc_now())
+        async with self._transaction() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE outline_generation_groups
+                SET call_id = ?, status = 'committed', content_json = ?,
+                    content_sha256 = ?, updated_at = ?
+                WHERE run_id = ? AND group_id = ? AND operation_id = ?
+                  AND status = 'generating'
+                """,
+                (
+                    call_id,
+                    content_json,
+                    content_sha256,
+                    timestamp,
+                    str(run_id),
+                    group_id,
+                    operation_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError(
+                    "outline_group_not_generating",
+                    "The outline group generation operation is not active.",
+                    409,
+                )
+
+    async def fail_outline_group(
+        self,
+        run_id: UUID,
+        *,
+        group_id: str,
+        operation_id: str,
+    ) -> None:
+        async with self._transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE outline_generation_groups
+                SET status = 'failed', updated_at = ?
+                WHERE run_id = ? AND group_id = ? AND operation_id = ?
+                  AND status = 'generating'
+                """,
+                (_timestamp(_utc_now()), str(run_id), group_id, operation_id),
+            )
 
     async def replay_create_creation(
         self,

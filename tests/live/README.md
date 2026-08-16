@@ -103,7 +103,8 @@ ordinary failed, paused, ended, or quality-rejected run keeps its evidence and
 fails the test; credential-bearing evidence is the deliberate exception and is
 deleted as described above.
 
-The harness accepts arbitrary user requirements, but it does not certify the
-current single-call episode-outline planner for 60–100 episode production. A
-long-series run must be evaluated separately for structured-output size,
-call-budget headroom, recovery behavior, and whole-series consistency.
+The harness accepts arbitrary user requirements, but one successful default run
+does not certify 60–100 episode production. The episode outline is generated as
+immutable natural groups, yet each long-series size must still be evaluated for
+compiled-context growth, call-budget headroom, recovery behavior, total runtime,
+and whole-series consistency.

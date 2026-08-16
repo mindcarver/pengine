@@ -102,6 +102,7 @@ from pengine.agents import (
 from pengine.config import Settings
 from pengine.continuity import (
     EpisodeStateDelta,
+    SemanticReview,
     SeriesState,
     StoryContract,
     canonical_model_hash,
@@ -246,6 +247,7 @@ def _fake_workflow(
         recursion_limit=recursion_limit,
         generation_provider_profile_key=provider_profile_key,
         review_provider_profile_key=provider_profile_key,
+        grouped_outline_enabled=False,
     )
     if model_call_state is not None:
         return workflow_type(**kwargs, model_call_state=model_call_state)
@@ -2949,6 +2951,56 @@ async def test_structured_result_allows_failed_non_required_read() -> None:
         response_format=ToolStrategy(Result),
     )
     expected = Result(value="done")
+
+    async def handler(_: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[])],
+            structured_response=expected,
+        )
+
+    response = await StructuredResultMiddleware().awrap_model_call(request, handler)
+
+    assert response.structured_response == expected
+
+
+@pytest.mark.asyncio
+async def test_failed_pagination_after_successful_required_read_does_not_block_result() -> None:
+    class Result(BaseModel):
+        value: str
+
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[]),
+        messages=[
+            HumanMessage(
+                content=(
+                    "Review the input.\n"
+                    "<pengine-required-read-paths>\n"
+                    "/workspace/one-line.json\n"
+                    "</pengine-required-read-paths>"
+                )
+            ),
+            _tool_call("read_file", {"file_path": "/workspace/one-line.json"}, 1),
+            ToolMessage(
+                content='{"complete": true}',
+                name="read_file",
+                tool_call_id="call-1",
+            ),
+            _tool_call(
+                "read_file",
+                {"file_path": "/workspace/one-line.json", "offset": 100},
+                2,
+            ),
+            ToolMessage(
+                content="Error: Line offset 100 exceeds file length (1 lines)",
+                name="read_file",
+                tool_call_id="call-2",
+                status="error",
+            ),
+        ],
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+        response_format=ToolStrategy(Result),
+    )
+    expected = Result(value="reviewed")
 
     async def handler(_: ModelRequest) -> ModelResponse:
         return ModelResponse(
@@ -6712,6 +6764,242 @@ async def test_outline_review_target_mismatch_fails_closed_after_fresh_review() 
     assert error.value.safe_message == "分集大纲审查目标未能绑定当前合同。"
     assert review_calls == 2
     assert patch_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> None:
+    season_payload = {
+        "episode_count": 3,
+        "characters": [
+            {
+                "character_id": "lin_lan",
+                "name": "林岚",
+                "role": "调查者",
+                "initial_known_fact_ids": [],
+            }
+        ],
+        "relationships": [],
+        "prohibitions": [],
+        "review_milestones": [],
+        "script_generation_groups": [
+            {
+                "group_id": "opening",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "发现旧信",
+                "boundary_reason": "线索改变目标",
+            },
+            {
+                "group_id": "pursuit",
+                "start_episode": 2,
+                "end_episode": 3,
+                "dramatic_unit": "追查寄信人",
+                "boundary_reason": "行动获得结果",
+            },
+        ],
+    }
+
+    def group_payload(group_id: str, start: int, end: int) -> dict[str, Any]:
+        return {
+            "group_id": group_id,
+            "start_episode": start,
+            "end_episode": end,
+            "content": f"{group_id}大纲",
+            "episodes": [
+                {"episode_number": number, "plan": f"推进第{number}集"}
+                for number in range(start, end + 1)
+            ],
+            "facts": [
+                {
+                    "fact_id": f"fact_{number}",
+                    "subject": "林岚",
+                    "predicate": "确认线索",
+                    "kind": "text",
+                    "value": f"线索{number}",
+                    "first_revealed_episode": number,
+                }
+                for number in range(start, end + 1)
+            ],
+            "timeline": [
+                {
+                    "event_id": f"event_{number}",
+                    "when": f"第{number}天",
+                    "participant_ids": ["lin_lan"],
+                    "fact_ids": [f"fact_{number}"],
+                }
+                for number in range(start, end + 1)
+            ],
+            "knowledge_states": [],
+            "clues": [],
+            "episode_obligations": [
+                {
+                    "obligation_id": f"obligation_{number}",
+                    "episode_number": number,
+                    "new_information_fact_ids": [f"fact_{number}"],
+                    "end_hook": f"第{number}集钩子",
+                    "required_clue_ids": [],
+                }
+                for number in range(start, end + 1)
+            ],
+        }
+
+    stored_map: dict[str, Any] | None = None
+    committed: list[dict[str, Any]] = []
+    generated: list[str] = []
+    repair_feedbacks: list[str] = []
+    failed: list[str] = []
+    fail_second_once = True
+    reject_first_group_once = True
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(_: InternalStage, __: Mapping[str, Any]) -> None:
+        return None
+
+    async def generate_season_map(_: Any) -> Mapping[str, Any]:
+        generated.append("season_map")
+        return season_payload
+
+    async def load_season_map() -> Mapping[str, Any] | None:
+        return stored_map
+
+    async def commit_season_map(payload: Mapping[str, Any]) -> None:
+        nonlocal stored_map
+        stored_map = {"content": dict(payload)}
+
+    async def load_groups() -> list[Mapping[str, Any]]:
+        return list(committed)
+
+    async def begin_group(**kwargs: Any) -> str:
+        return f"operation-{kwargs['group_id']}"
+
+    async def generate_group(
+        compiled: Any,
+        repair_feedback: str | None,
+    ) -> Mapping[str, Any]:
+        nonlocal fail_second_once
+        group_id = compiled.manifest["group_id"]
+        generated.append(group_id)
+        if repair_feedback is not None:
+            repair_feedbacks.append(repair_feedback)
+        if group_id == "pursuit" and fail_second_once:
+            fail_second_once = False
+            raise TimeoutError("simulated current-group interruption")
+        if group_id == "opening":
+            return group_payload("opening", 1, 1)
+        return group_payload("pursuit", 2, 3)
+
+    async def review_group(_: Any, __: Any) -> SemanticReview:
+        nonlocal reject_first_group_once
+        if reject_first_group_once:
+            reject_first_group_once = False
+            return SemanticReview.model_validate(
+                {
+                    "passed": False,
+                    "evidence": "L4硬规则：当前组把照片来源写成了未获授权的新人物。",
+                    "issues": [
+                        {
+                            "code": "new_unapproved_character",
+                            "message": "仅在当前组内改回已批准人物。",
+                        }
+                    ],
+                }
+            )
+        return SemanticReview.model_validate(
+            {
+                "passed": True,
+                "evidence": "L4硬规则：当前组与已提交连续性一致",
+                "issues": [],
+            }
+        )
+
+    async def complete_group(**kwargs: Any) -> None:
+        payload = dict(kwargs["payload"])
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        committed.append(
+            {
+                "content": payload,
+                "content_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+            }
+        )
+
+    async def fail_group(**kwargs: Any) -> None:
+        failed.append(kwargs["group_id"])
+
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] generate outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-grouped-outline",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={
+            "files": {
+                "/workspace/creation-request.md": {"content": "故事需求"},
+                "/workspace/story_outline.md": {"content": "故事梗概"},
+                "/workspace/character_biographies.md": {"content": "人物小传"},
+                "/workspace/relationship_logic.md": {"content": "人物关系"},
+            }
+        },
+        runtime=None,
+    )
+
+    def middleware() -> StageGuardMiddleware:
+        return StageGuardMiddleware(
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+            approved_stages=set(),
+            output_language=SIMPLIFIED_CHINESE,
+            generate_outline_season_map=generate_season_map,
+            generate_outline_group=generate_group,
+            review_outline_group=review_group,
+            load_outline_season_map=load_season_map,
+            commit_outline_season_map=commit_season_map,
+            load_outline_groups=load_groups,
+            begin_outline_group=begin_group,
+            complete_outline_group=complete_group,
+            fail_outline_group=fail_group,
+        )
+
+    async def handler(_: ToolCallRequest) -> ToolMessage:
+        payload = {
+            "passed": True,
+            "evidence": "L4硬规则：完整合同一致",
+            "issues": [],
+        }
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-grouped-outline",
+        )
+
+    with pytest.raises(TimeoutError, match="current-group"):
+        await middleware()._generate_grouped_outline(request, handler, request.tool_call["args"])
+
+    first_group_hash = committed[0]["content_sha256"]
+    returned, locked = await middleware()._generate_grouped_outline(
+        request,
+        handler,
+        request.tool_call["args"],
+    )
+
+    assert generated == ["season_map", "opening", "opening", "pursuit", "pursuit"]
+    assert len(repair_feedbacks) == 1
+    assert "new_unapproved_character" in repair_feedbacks[0]
+    assert failed == ["pursuit"]
+    assert committed[0]["content_sha256"] == first_group_hash
+    assert isinstance(returned, ToolMessage)
+    assert [item["episode_number"] for item in locked["episodes"]] == [1, 2, 3]
+    assert locked["contract_review"]["passed"] is True
 
 
 @pytest.mark.asyncio
