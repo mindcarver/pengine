@@ -98,7 +98,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -994,6 +994,27 @@ CREATE TABLE IF NOT EXISTS quality_gate_repairs (
 );
 CREATE INDEX IF NOT EXISTS quality_gate_repairs_status
 ON quality_gate_repairs(status, requested_at);
+"""
+
+_SCHEMA_V24_SERIES_BIBLE_PROJECTION_REPAIR_SQL = """
+CREATE TABLE IF NOT EXISTS series_bible_projection_repairs (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    original_candidate_id TEXT NOT NULL REFERENCES series_bible_candidates(candidate_id),
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'applied', 'failed')),
+    target_character_ids_json TEXT NOT NULL,
+    validation_json TEXT NOT NULL,
+    original_checkpoint_sha256 TEXT NOT NULL,
+    repaired_checkpoint_sha256 TEXT,
+    repaired_content_hash TEXT,
+    generation_call_id TEXT,
+    review_call_id TEXT,
+    failure_message TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS series_bible_projection_repairs_status
+ON series_bible_projection_repairs(status, created_at);
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (24);
 """
 
 _SCHEMA_V12_SERIES_BIBLE_SQL = """
@@ -2125,6 +2146,16 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 23
+            if schema_version == 23:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.executescript(_SCHEMA_V24_SERIES_BIBLE_PROJECTION_REPAIR_SQL)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 24
 
     async def setup(self) -> None:
         await self.initialize()
@@ -4073,6 +4104,302 @@ class Repository:
             )
             rows = await cursor.fetchall()
         return {InternalStage(row["stage"]): json.loads(row["payload_json"]) for row in rows}
+
+    async def reserve_series_bible_projection_repair(
+        self,
+        run_id: UUID,
+        *,
+        original_candidate_id: str,
+        target_character_ids: list[str],
+        validation: ValidationEvidence,
+        now: datetime | None = None,
+    ) -> None:
+        """Persist the one-shot budget before invoking a projection repair model."""
+        timestamp = _timestamp(now or _utc_now())
+        stage = InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
+        async with self._transaction() as connection:
+            run = await self._fetchone(
+                connection,
+                "SELECT state FROM runs WHERE id = ?",
+                (str(run_id),),
+            )
+            if run is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if run["state"] != "running":
+                raise DomainError("run_not_running", "Workflow run is not running.", 409)
+            existing = await self._fetchone(
+                connection,
+                "SELECT status FROM series_bible_projection_repairs WHERE run_id = ?",
+                (str(run_id),),
+            )
+            if existing is not None:
+                raise DomainError(
+                    "series_bible_projection_repair_exhausted",
+                    "This run already consumed its SeriesBible projection repair budget.",
+                    409,
+                )
+            candidate = await self._fetchone(
+                connection,
+                """
+                SELECT 1 FROM series_bible_candidates
+                WHERE run_id = ? AND candidate_id = ? AND status = 'unvalidated'
+                """,
+                (str(run_id), original_candidate_id),
+            )
+            if candidate is None:
+                raise DomainError(
+                    "series_bible_projection_repair_stale",
+                    "The invalid SeriesBible candidate is unavailable for repair.",
+                    409,
+                )
+            checkpoint = await self._fetchone(
+                connection,
+                """
+                SELECT payload_sha256 FROM business_checkpoints
+                WHERE run_id = ? AND stage = ?
+                """,
+                (str(run_id), stage.value),
+            )
+            if checkpoint is None:
+                raise DomainError(
+                    "series_bible_projection_repair_stale",
+                    "The approved character checkpoint is unavailable for repair.",
+                    409,
+                )
+            await connection.execute(
+                """
+                INSERT INTO series_bible_projection_repairs(
+                    run_id, original_candidate_id, status, target_character_ids_json,
+                    validation_json, original_checkpoint_sha256, created_at
+                ) VALUES (?, ?, 'reserved', ?, ?, ?, ?)
+                """,
+                (
+                    str(run_id),
+                    original_candidate_id,
+                    _json(target_character_ids),
+                    _json(validation),
+                    checkpoint["payload_sha256"],
+                    timestamp,
+                ),
+            )
+
+    async def apply_series_bible_projection_repair(
+        self,
+        run_id: UUID,
+        *,
+        character_checkpoint: Mapping[str, Any],
+        outline_checkpoint: Mapping[str, Any],
+        repaired_content_hash: str,
+        generation_call_id: str,
+        review_call_id: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Atomically replace only the repaired biography and its final review evidence."""
+        timestamp = _timestamp(now or _utc_now())
+        character_stage = InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
+        outline_stage = InternalStage.GENERATING_EPISODE_OUTLINE
+        async with self._transaction() as connection:
+            repair = await self._fetchone(
+                connection,
+                "SELECT * FROM series_bible_projection_repairs WHERE run_id = ?",
+                (str(run_id),),
+            )
+            if repair is None or repair["status"] != "reserved":
+                raise DomainError(
+                    "series_bible_projection_repair_stale",
+                    "The SeriesBible projection repair is not reserved.",
+                    409,
+                )
+            if (
+                await self._fetchone(
+                    connection,
+                    """
+                SELECT 1 FROM business_checkpoints
+                WHERE run_id = ? AND stage = 'generating_episode_scripts'
+                """,
+                    (str(run_id),),
+                )
+                is not None
+            ):
+                raise DomainError(
+                    "series_bible_projection_repair_stale",
+                    "Episode generation already started before the design repair.",
+                    409,
+                )
+            old_character = await self._fetchone(
+                connection,
+                """
+                SELECT payload_json, payload_sha256 FROM business_checkpoints
+                WHERE run_id = ? AND stage = ?
+                """,
+                (str(run_id), character_stage.value),
+            )
+            old_outline = await self._fetchone(
+                connection,
+                """
+                SELECT payload_json FROM business_checkpoints
+                WHERE run_id = ? AND stage = ?
+                """,
+                (str(run_id), outline_stage.value),
+            )
+            if (
+                old_character is None
+                or old_outline is None
+                or old_character["payload_sha256"] != repair["original_checkpoint_sha256"]
+            ):
+                raise DomainError(
+                    "series_bible_projection_repair_stale",
+                    "The approved design checkpoints changed before repair commit.",
+                    409,
+                )
+            previous_character = json.loads(old_character["payload_json"])
+            proposed_character = dict(character_checkpoint)
+            previous_biographies = previous_character.get("character_biographies")
+            proposed_biographies = proposed_character.get("character_biographies")
+            if (
+                not isinstance(previous_biographies, str)
+                or not isinstance(proposed_biographies, str)
+                or not proposed_biographies.startswith(f"{previous_biographies}\n\n")
+                or {
+                    key: value
+                    for key, value in proposed_character.items()
+                    if key != "character_biographies"
+                }
+                != {
+                    key: value
+                    for key, value in previous_character.items()
+                    if key != "character_biographies"
+                }
+            ):
+                raise DomainError(
+                    "series_bible_projection_repair_scope_violation",
+                    "The character repair changed content outside the appended biographies.",
+                    409,
+                )
+            previous_outline = json.loads(old_outline["payload_json"])
+            proposed_outline = dict(outline_checkpoint)
+            allowed_outline_changes = {"contract_review", "projection_repair"}
+            projection_metadata = proposed_outline.get("projection_repair") or {}
+            if (
+                {
+                    key: value
+                    for key, value in proposed_outline.items()
+                    if key not in allowed_outline_changes
+                }
+                != {
+                    key: value
+                    for key, value in previous_outline.items()
+                    if key not in allowed_outline_changes
+                }
+                or not bool((proposed_outline.get("contract_review") or {}).get("passed"))
+                or projection_metadata.get("kind") != "missing_character_biographies"
+                or projection_metadata.get("original_candidate_id")
+                != repair["original_candidate_id"]
+                or projection_metadata.get("target_character_ids")
+                != json.loads(repair["target_character_ids_json"])
+                or projection_metadata.get("generation_call_id") != generation_call_id
+                or projection_metadata.get("repaired_content_hash") != repaired_content_hash
+            ):
+                raise DomainError(
+                    "series_bible_projection_repair_scope_violation",
+                    "The outline repair changed content outside final review provenance.",
+                    409,
+                )
+            for call_id, role in (
+                (generation_call_id, "generation"),
+                (review_call_id, "review"),
+            ):
+                call = await self._fetchone(
+                    connection,
+                    """
+                    SELECT 1 FROM model_calls
+                    WHERE call_id = ? AND run_id = ? AND role = ?
+                      AND stage = ? AND episode_number IS NULL AND status = 'succeeded'
+                    """,
+                    (call_id, str(run_id), role, outline_stage.value),
+                )
+                if call is None:
+                    raise DomainError(
+                        "series_bible_projection_repair_provenance_missing",
+                        "The projection repair lacks successful physical model-call provenance.",
+                        409,
+                    )
+            character_json = _json(proposed_character)
+            outline_json = _json(proposed_outline)
+            await connection.execute(
+                """
+                UPDATE business_checkpoints
+                SET payload_json = ?, payload_sha256 = ?, approved_at = ?
+                WHERE run_id = ? AND stage = ?
+                """,
+                (
+                    character_json,
+                    hashlib.sha256(character_json.encode()).hexdigest(),
+                    timestamp,
+                    str(run_id),
+                    character_stage.value,
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE business_checkpoints
+                SET payload_json = ?, payload_sha256 = ?, review_call_id = ?, approved_at = ?
+                WHERE run_id = ? AND stage = ?
+                """,
+                (
+                    outline_json,
+                    hashlib.sha256(outline_json.encode()).hexdigest(),
+                    review_call_id,
+                    timestamp,
+                    str(run_id),
+                    outline_stage.value,
+                ),
+            )
+            repaired_checkpoint_sha256 = hashlib.sha256(character_json.encode()).hexdigest()
+            await connection.execute(
+                """
+                UPDATE series_bible_projection_repairs
+                SET status = 'applied', repaired_checkpoint_sha256 = ?,
+                    repaired_content_hash = ?, generation_call_id = ?, review_call_id = ?,
+                    completed_at = ?
+                WHERE run_id = ? AND status = 'reserved'
+                """,
+                (
+                    repaired_checkpoint_sha256,
+                    repaired_content_hash,
+                    generation_call_id,
+                    review_call_id,
+                    timestamp,
+                    str(run_id),
+                ),
+            )
+
+    async def fail_series_bible_projection_repair(
+        self,
+        run_id: UUID,
+        *,
+        failure_message: str,
+        now: datetime | None = None,
+    ) -> None:
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE series_bible_projection_repairs
+                SET status = 'failed', failure_message = ?, completed_at = ?
+                WHERE run_id = ? AND status = 'reserved'
+                """,
+                (failure_message, timestamp, str(run_id)),
+            )
+
+    async def get_series_bible_projection_repair(self, run_id: UUID) -> Mapping[str, Any] | None:
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                "SELECT * FROM series_bible_projection_repairs WHERE run_id = ?",
+                (str(run_id),),
+            )
+        return dict(row) if row is not None else None
 
     async def get_stage_attempt_counts(
         self,

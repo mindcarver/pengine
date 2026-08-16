@@ -64,7 +64,7 @@ LangGraph checkpoint = 可恢复、但仍可能未批准的执行上下文
 | 命令幂等 | `idempotency_records` | key、scope、payload hash 和已接受响应 |
 | 质量/内容 | `quality_gate_rejections`、`content_rejections` | L0/L4 拒绝、合同/连续性拒绝、证据和修复计数 |
 | 模型审计 | `model_calls` | 每次模型尝试、预检、实际用量、provider 证据和血缘 |
-| 设计版本 | `series_bible_candidates`、`series_bible_lineage` | SeriesBible 候选、active/stale/superseded、重建预算 |
+| 设计版本 | `series_bible_candidates`、`series_bible_lineage`、`series_bible_projection_repairs` | SeriesBible 候选、active/stale/superseded、重建预算，以及一次性人物投影修复证据 |
 | 剧本版本 | `script_batches`、`episode_candidates` | 设计绑定的 batch、逐集不可变候选、active pointer 和前序 hash |
 | 结构审查 | `series_reviews`、`repair_authorizations` | 绑定 design/batch/prefix 的里程碑审查与一次性授权 |
 | Agent 执行 | LangGraph checkpointer 表 | thread checkpoint，表结构由依赖库管理 |

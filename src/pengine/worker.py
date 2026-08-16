@@ -18,12 +18,15 @@ from pengine.agents import (
     L4_STAGE_EVIDENCE_LABEL,
     AgentExecutionLimitError,
     AgentProtocolError,
+    BiographyProjectionRepair,
+    CanonReviewerResult,
     CheckpointUnavailableError,
     ContentReviewRejectedError,
     DeepAgentWorkflow,
     EpisodeTimeoutError,
     MilestoneRejectedError,
     QualityGateRejectedError,
+    apply_biography_projection_repair,
 )
 from pengine.config import Settings
 from pengine.continuity import EpisodeLock
@@ -1346,7 +1349,7 @@ class Worker:
     async def _sync_series_bible(
         self,
         work: RunWorkItem,
-        approved: Mapping[InternalStage, Any],
+        approved: dict[InternalStage, Any],
     ) -> None:
         """Assemble, validate, bind the review, and atomically promote one design candidate.
 
@@ -1414,25 +1417,74 @@ class Worker:
                 candidate_id=persisted_rebuild_id,
             )
         evidence = validate_series_bible(candidate)
-        if is_rebuild:
-            # Returns the persisted candidate for this epoch: after a crash
-            # between INSERT and promotion, the same authorized one-cycle rebuild
-            # resumes the identical candidate instead of building a duplicate.
-            candidate = await self.repository.rebuild_series_bible(
+        repair_targets = self._repairable_biography_projection_targets(candidate, evidence)
+        if not evidence.passed and repair_targets:
+            original = await self.repository.register_series_bible_candidate(
                 str(work.creation_id),
                 work.run_id,
                 candidate,
                 evidence,
-                authorized=authorized_rebuild,
             )
+            try:
+                candidate, evidence, outline = await self._repair_biography_projection(
+                    work,
+                    approved,
+                    original_candidate=original,
+                    repair_targets=repair_targets,
+                    persona_files=self._persona_files(work),
+                )
+            except Exception as exc:
+                await self.repository.fail_series_bible_projection_repair(
+                    work.run_id,
+                    failure_message=f"{type(exc).__name__}: {exc}",
+                )
+                logger.warning(
+                    "series bible projection repair failed run_id=%s candidate=%s error_type=%s",
+                    work.run_id,
+                    candidate.candidate_id,
+                    type(exc).__name__,
+                )
+                raise StageValidationError(
+                    "SeriesBible biography projection repair did not pass",
+                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                    safe_message="系列设计未通过确定性校验，未进入分集剧本生成。",
+                ) from exc
+
+        if evidence.passed:
+            if is_rebuild:
+                # Returns the persisted candidate for this epoch: after a crash
+                # between INSERT and promotion, the same authorized one-cycle rebuild
+                # resumes the identical candidate instead of building a duplicate.
+                candidate = await self.repository.rebuild_series_bible(
+                    str(work.creation_id),
+                    work.run_id,
+                    candidate,
+                    evidence,
+                    authorized=authorized_rebuild,
+                )
+            else:
+                candidate = await self.repository.register_series_bible_candidate(
+                    str(work.creation_id),
+                    work.run_id,
+                    candidate,
+                    evidence,
+                )
         else:
-            await self.repository.register_series_bible_candidate(
-                str(work.creation_id),
-                work.run_id,
-                candidate,
-                evidence,
-            )
-        if not evidence.passed:
+            if is_rebuild:
+                candidate = await self.repository.rebuild_series_bible(
+                    str(work.creation_id),
+                    work.run_id,
+                    candidate,
+                    evidence,
+                    authorized=authorized_rebuild,
+                )
+            else:
+                candidate = await self.repository.register_series_bible_candidate(
+                    str(work.creation_id),
+                    work.run_id,
+                    candidate,
+                    evidence,
+                )
             # A deterministically invalid candidate is retained as immutable
             # evidence but is never reviewed or promoted, so no active pointer
             # can change (SDP-A3). Episode writing requires an active design, so
@@ -1461,6 +1513,227 @@ class Worker:
             active_candidate_id=candidate.candidate_id,
         )
 
+    @staticmethod
+    def _repairable_biography_projection_targets(
+        candidate: SeriesBible,
+        evidence: Any,
+    ) -> list[dict[str, Any]]:
+        if (
+            evidence.passed
+            or not evidence.issues
+            or any(issue.code != "projection_missing_biography" for issue in evidence.issues)
+        ):
+            return []
+        requested_ids = {reference for issue in evidence.issues for reference in issue.refs}
+        targets = [
+            character.model_dump(mode="json")
+            for character in candidate.content.story_contract.characters
+            if character.character_id in requested_ids
+        ]
+        if {target["character_id"] for target in targets} != requested_ids:
+            return []
+        return targets
+
+    @staticmethod
+    def _biography_projection_contract_context(
+        candidate: SeriesBible,
+        target_character_ids: set[str],
+    ) -> dict[str, Any]:
+        contract = candidate.content.story_contract
+        target_names = {
+            character.name
+            for character in contract.characters
+            if character.character_id in target_character_ids
+        }
+        return {
+            "characters": [
+                character.model_dump(mode="json")
+                for character in contract.characters
+                if character.character_id in target_character_ids
+            ],
+            "relationships": [
+                relationship.model_dump(mode="json")
+                for relationship in contract.relationships
+                if relationship.source_character_id in target_character_ids
+                or relationship.target_character_id in target_character_ids
+            ],
+            "facts": [
+                fact.model_dump(mode="json")
+                for fact in contract.facts
+                if fact.subject in target_names
+            ],
+            "timeline": [
+                event.model_dump(mode="json")
+                for event in contract.timeline
+                if target_character_ids.intersection(event.participant_ids)
+            ],
+            "knowledge_states": [
+                state.model_dump(mode="json")
+                for state in contract.knowledge_states
+                if state.character_id in target_character_ids
+            ],
+        }
+
+    async def _repair_biography_projection(
+        self,
+        work: RunWorkItem,
+        approved: dict[InternalStage, Any],
+        *,
+        original_candidate: SeriesBible,
+        repair_targets: list[dict[str, Any]],
+        persona_files: Mapping[str, str],
+    ) -> tuple[SeriesBible, Any, Mapping[str, Any]]:
+        repair_method = getattr(self.workflow, "repair_missing_biographies", None)
+        review_method = getattr(self.workflow, "review_repaired_series_bible", None)
+        if not callable(repair_method) or not callable(review_method):
+            raise AgentProtocolError(
+                "SeriesBible biography projection repair is unavailable",
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            )
+        if original_candidate.validation is None:
+            raise AgentProtocolError(
+                "SeriesBible projection repair lacks deterministic validation evidence",
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            )
+        target_ids = [str(target["character_id"]) for target in repair_targets]
+        await self.repository.reserve_series_bible_projection_repair(
+            work.run_id,
+            original_candidate_id=original_candidate.candidate_id,
+            target_character_ids=target_ids,
+            validation=original_candidate.validation,
+        )
+        character_stage = InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
+        outline_stage = InternalStage.GENERATING_EPISODE_OUTLINE
+        current_character_checkpoint = dict(approved[character_stage])
+        current_outline_checkpoint = dict(approved[outline_stage])
+        current_biographies = str(current_character_checkpoint["character_biographies"])
+
+        generation_operation_id = new_operation_id()
+        if self._model_call_state is not None:
+            self._model_call_state.context.stage = outline_stage.value
+            self._model_call_state.context.episode_number = None
+            self._model_call_state.context.operation_id = generation_operation_id
+        repair = BiographyProjectionRepair.model_validate(
+            await repair_method(
+                current_biographies=current_biographies,
+                relationship_logic=str(current_character_checkpoint["relationship_logic"]),
+                story_outline=original_candidate.content.story_outline,
+                missing_characters=repair_targets,
+                contract_context=self._biography_projection_contract_context(
+                    original_candidate,
+                    set(target_ids),
+                ),
+                persona_files=persona_files,
+                output_language=work.output_language,
+            )
+        )
+        generation_call_id = await self._require_physical_call_id(
+            run_id=work.run_id,
+            role="generation",
+            stage=outline_stage,
+            episode_number=None,
+            operation_id=generation_operation_id,
+        )
+        repaired_biographies = apply_biography_projection_repair(
+            current_biographies,
+            repair,
+            missing_characters=repair_targets,
+            output_language=work.output_language,
+        )
+        repaired_character_checkpoint = {
+            **current_character_checkpoint,
+            "character_biographies": repaired_biographies,
+        }
+        repaired_candidate = build_series_bible(
+            run_id=str(work.run_id),
+            run_kind=work.run_kind,
+            l0_variant=original_candidate.l0_variant,
+            genre=original_candidate.genre,
+            story_outline=original_candidate.content.story_outline,
+            character_biographies=repaired_biographies,
+            relationship_logic=original_candidate.content.relationship_logic,
+            episode_outline=original_candidate.content.episode_outline,
+            story_contract_payload=original_candidate.content.story_contract.model_dump(
+                mode="json"
+            ),
+            parent_candidate_id=original_candidate.lineage.parent_candidate_id,
+            rebuild_count=original_candidate.lineage.rebuild_count,
+            design_epoch=original_candidate.design_epoch,
+            review_milestones=original_candidate.content.review_milestones,
+        )
+        repaired_evidence = validate_series_bible(repaired_candidate)
+        if not repaired_evidence.passed:
+            raise StageValidationError(
+                "Repaired SeriesBible candidate still failed deterministic validation",
+                stage=outline_stage,
+                safe_message="系列设计自动修复后仍未通过校验，未进入分集剧本生成。",
+            )
+
+        review_operation_id = new_operation_id()
+        if self._model_call_state is not None:
+            self._model_call_state.context.operation_id = review_operation_id
+        final_review = CanonReviewerResult.model_validate(
+            await review_method(
+                original_biographies=current_biographies,
+                repaired_biographies=repaired_biographies,
+                target_character_ids=target_ids,
+                candidate=repaired_candidate.content.model_dump(mode="json"),
+                output_language=work.output_language,
+            )
+        )
+        review_call_id = await self._require_physical_call_id(
+            run_id=work.run_id,
+            role="review",
+            stage=outline_stage,
+            episode_number=None,
+            operation_id=review_operation_id,
+        )
+        if not final_review.passed or final_review.issues:
+            raise StageValidationError(
+                "Repaired SeriesBible candidate did not pass final Canon review: "
+                f"{final_review.evidence}",
+                stage=outline_stage,
+                safe_message="系列设计自动修复后仍未通过审核，未进入分集剧本生成。",
+            )
+
+        projection_repair = {
+            "kind": "missing_character_biographies",
+            "original_candidate_id": original_candidate.candidate_id,
+            "target_character_ids": target_ids,
+            "repaired_content_hash": repaired_candidate.content_hash,
+            "generation_call_id": generation_call_id,
+        }
+        repaired_outline_checkpoint = {
+            **current_outline_checkpoint,
+            "contract_review": final_review.model_dump(
+                mode="json",
+                exclude={"prior_issue_closures"},
+            ),
+            "projection_repair": projection_repair,
+        }
+        await self.repository.apply_series_bible_projection_repair(
+            work.run_id,
+            character_checkpoint=repaired_character_checkpoint,
+            outline_checkpoint=repaired_outline_checkpoint,
+            repaired_content_hash=repaired_candidate.content_hash,
+            generation_call_id=generation_call_id,
+            review_call_id=review_call_id,
+        )
+        approved[character_stage] = repaired_character_checkpoint
+        approved[outline_stage] = repaired_outline_checkpoint
+        record_langfuse_event(
+            "pengine.repair.result",
+            input={
+                "run_id": str(work.run_id),
+                "stage": outline_stage.value,
+                "repair_kind": "missing_character_biographies",
+                "target_character_ids": target_ids,
+                "succeeded": True,
+            },
+            metadata={"trace_version": "pengine-1"},
+        )
+        return repaired_candidate, repaired_evidence, repaired_outline_checkpoint
+
     async def _bind_global_design_review(
         self,
         work: RunWorkItem,
@@ -1472,6 +1745,16 @@ class Worker:
         if not isinstance(contract_review, Mapping):
             raise AgentProtocolError(
                 "A unified outline requires bound global design review evidence",
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            )
+        projection_repair = outline.get("projection_repair")
+        if projection_repair is not None and (
+            not isinstance(projection_repair, Mapping)
+            or projection_repair.get("kind") != "missing_character_biographies"
+            or projection_repair.get("repaired_content_hash") != candidate.content_hash
+        ):
+            raise AgentProtocolError(
+                "SeriesBible projection repair does not bind the current candidate",
                 stage=InternalStage.GENERATING_EPISODE_OUTLINE,
             )
         call_id = await self.repository.get_checkpoint_review_call_id(
