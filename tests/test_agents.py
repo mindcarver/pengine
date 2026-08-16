@@ -272,6 +272,16 @@ def _prompt_mentions_tool(prompt: str, tool_name: str) -> bool:
     )
 
 
+def _script_context_from_description(description: str) -> dict[str, Any]:
+    match = re.search(
+        r"<PENGINE_SCRIPT_CONTEXT sha256=[a-f0-9]{64}>\n(.+)\n</PENGINE_SCRIPT_CONTEXT>",
+        description,
+        re.DOTALL,
+    )
+    assert match is not None
+    return json.loads(match.group(1))
+
+
 def _assert_task_lists_exact_workspace_paths(request: ToolCallRequest) -> None:
     description = request.tool_call["args"]["description"]
     files = request.state.get("files", {})
@@ -4724,17 +4734,17 @@ def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> 
     assert "Surface speaker labels may use names, aliases, roles" in _SCRIPT_WRITER_PROMPT
     assert "/workspace/speaker_contract.json" not in _SCRIPT_WRITER_PROMPT
     assert "allowed_speaker_labels" not in _SCRIPT_WRITER_PROMPT
-    assert "/workspace/evidence_contract.json" in _SCRIPT_WRITER_PROMPT
+    assert "evidence_contract component" in _SCRIPT_WRITER_PROMPT
     assert "exact-set self-check" in _SCRIPT_WRITER_PROMPT
     assert "required_evidence_target_ids" in _SCRIPT_WRITER_PROMPT
     assert "required_verbatim_facts" in _SCRIPT_WRITER_PROMPT
     assert "all other facts require semantic consistency only" in _SCRIPT_WRITER_PROMPT
     assert "call participants" in _SCRIPT_WRITER_PROMPT
     assert "complete non-null state_delta" in _SCRIPT_WRITER_PROMPT
-    assert "/workspace/suffix_rewrite_review.json" in _SCRIPT_WRITER_PROMPT
+    assert "suffix_rewrite_review component" in _SCRIPT_WRITER_PROMPT
     assert "read-only bound" in _SCRIPT_WRITER_PROMPT
     assert "do not reproduce the named defect" in _SCRIPT_WRITER_PROMPT
-    assert "/workspace/established_facts.json" in _SCRIPT_WRITER_PROMPT
+    assert "established_facts component" in _SCRIPT_WRITER_PROMPT
     assert "must exactly match fact.value" in _SCRIPT_WRITER_PROMPT
     assert "grandfathered pre-contract run" not in _SCRIPT_WRITER_PROMPT
     assert "/workspace/speaker_contract.json" not in _EPISODE_REPAIR_PROMPT
@@ -5155,13 +5165,16 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
     for name in (
         "story_architect",
         "episode_planner",
-        "script_writer",
         "episode_repair",
         "story_repair",
     ):
         system_prompt = subagents_by_name[name]["system_prompt"]
         assert system_prompt.count(project) == 1
         assert _PROJECT_CREATIVE_POLICY in system_prompt
+    assert project not in subagents_by_name["script_writer"]["system_prompt"]
+    assert "PENGINE_SCRIPT_CONTEXT" in subagents_by_name["script_writer"]["system_prompt"]
+    script_writer_allowlist = subagents_by_name["script_writer"]["middleware"][1]
+    assert script_writer_allowlist.allowed_tools == {"calculate_arithmetic"}
     for name in (
         "quality_reviewer",
         "canon_reviewer",
@@ -5273,14 +5286,16 @@ async def test_episode_writer_treats_speaker_labels_as_format_not_a_whitelist(
     assert "Screenplay labels and dialogue notation are format choices" in description
     assert "without normalizing aliases, roles, generic labels" in description
     assert "Allowed exact speaker labels" not in description
-    assert "/workspace/evidence_contracts/epN.json" in description
+    compiled = _script_context_from_description(description)
+    compiled_names = {item["name"] for item in compiled["components"]}
+    assert "evidence_contract.ep1" in compiled_names
     group_contract = json.loads(files["/workspace/evidence_contracts/ep1.json"]["content"])
     assert group_contract["required_evidence_target_ids"] == [
         "fact_ep1",
         "obligation_ep1",
     ]
     assert "exact-set self-check" in description
-    assert "/workspace/established_facts.json" in description
+    assert "established_facts component" in description
     assert "must exactly match" in description
 
 
@@ -5546,7 +5561,10 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             strict=True,
         ):
             tool_names = set(offered_tools)
-            if tool_names & creative_result_tools:
+            if "ScriptGenerationGroupResult" in tool_names:
+                assert project not in system_prompt
+                assert "PENGINE_SCRIPT_CONTEXT" in system_prompt
+            elif tool_names & creative_result_tools:
                 assert system_prompt.count(project) == 1
             if tool_names & reviewer_result_tools:
                 assert project not in system_prompt
@@ -5594,7 +5612,6 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         for result_tool in (
             "StoryArchitectResult",
             "EpisodePlannerResult",
-            "ScriptGenerationGroupResult",
             "CanonReviewerResult",
             "EpisodeReviewerResult",
         ):
@@ -5612,6 +5629,14 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
                 }
                 for names in result_bindings
             ), result_tool
+        script_bindings = bindings_for("ScriptGenerationGroupResult")
+        assert script_bindings
+        assert all("read_file" not in names for names in script_bindings)
+        assert all("calculate_arithmetic" in names for names in script_bindings)
+        assert all(
+            names <= {"ScriptGenerationGroupResult", "calculate_arithmetic"}
+            for names in script_bindings
+        )
 
         task_descriptions = [
             description
@@ -7423,6 +7448,10 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
     }
     first_input = writer_inputs[0]
     second_input = writer_inputs[1]
+    first_context = _script_context_from_description(writer_descriptions[0])
+    second_context = _script_context_from_description(writer_descriptions[1])
+    first_components = {item["name"]: item for item in first_context["components"]}
+    second_components = {item["name"]: item for item in second_context["components"]}
 
     # Every episode request carries the complete active SeriesBible projections.
     for key in (
@@ -7440,14 +7469,31 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
 
     # Episode 2 receives script 1 verbatim (never a summary).
     assert second_input["/workspace/episodes/ep1.md"]["content"] == "事实1\n钩子1"
+    compiled_prefix = second_components["committed_prefix"]["content"]
+    assert compiled_prefix["episodes"] == [
+        {
+            "episode_number": 1,
+            "content_sha256": hashlib.sha256("事实1\n钩子1".encode()).hexdigest(),
+            "content": "事实1\n钩子1",
+        }
+    ]
+    assert first_components["committed_prefix"]["authority"] == "committed"
+    assert second_components["story_contract"]["authority"] == "canonical"
+    assert sum(name == "story_contract" for name in second_components) == 1
+    assert second_components["series_bible.story_outline"]["content"] == "故事大纲"
+    assert second_components["series_bible.episode_outline"]["content"] == "两集分集大纲"
 
     # Episode 2 receives the folded SeriesState after episode 1.
     series_state = json.loads(second_input["/workspace/series_state.json"]["content"])
     assert series_state["locked_through_episode"] == 1
     assert series_state["established_fact_ids"] == ["fact_ep1"]
+    assert second_components["series_state"]["content"][
+        "locked_through_episode"
+    ] == 1
 
     # Bounded advisory WriterNotes from episode 1 flow forward.
     assert second_input["/workspace/writer_notes.md"]["content"] == "第1集备忘"
+    assert second_components["writer_notes"]["content"] == "第1集备忘"
 
     # The final episode fired the bound final structural review (RPR-A2).
     assert registered_reviews == [

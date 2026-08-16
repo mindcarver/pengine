@@ -73,6 +73,35 @@ def test_token_estimator_is_deterministic_and_sized() -> None:
     assert estimate_text_tokens("中" * 1000) == 1000
 
 
+def test_model_call_store_persists_content_free_script_context_manifest(tmp_path: Path) -> None:
+    store = ModelCallStore(tmp_path / "manifest.sqlite3")
+    manifest = {"bundle_sha256": "a" * 64, "components": [{"name": "story_contract"}]}
+    record = build_started_record(
+        role="generation",
+        adapter="anthropic",
+        provider="anthropic",
+        model="claude-opus-5",
+        context=ModelCallContext(
+            run_id="run-context",
+            stage="generating_episode_scripts",
+            context_bundle_sha256="a" * 64,
+            context_manifest_json=json.dumps(manifest),
+        ),
+        estimated_input_tokens=100,
+        estimated_output_tokens=20_480,
+        verified_limit_tokens=200_000,
+    )
+
+    store.upsert(record)
+    with sqlite3.connect(tmp_path / "manifest.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT context_bundle_sha256, context_manifest_json FROM model_calls"
+        ).fetchone()
+
+    assert row == ("a" * 64, json.dumps(manifest))
+    store.close()
+
+
 def test_preflight_blocks_oversized_request_with_zero_outbound_calls(
     tmp_path: Path,
 ) -> None:
@@ -113,6 +142,57 @@ def test_preflight_blocks_oversized_request_with_zero_outbound_calls(
     assert rows[0]["run_id"] == "run-overflow"
     assert rows[0]["estimated_total_tokens"] > 1
     assert rows[0]["verified_limit_tokens"] == 1
+    store.close()
+
+
+def test_script_context_preflight_reports_component_breakdown_and_call_budget(
+    tmp_path: Path,
+) -> None:
+    store = ModelCallStore(tmp_path / "script-preflight.sqlite3")
+    manifest = {
+        "components": [
+            {
+                "name": "committed_prefix",
+                "estimated_tokens": 70_000,
+                "included": True,
+            },
+            {
+                "name": "story_contract",
+                "estimated_tokens": 20_000,
+                "included": True,
+            },
+        ]
+    }
+    state = ModelCallState(store=store)
+    state.context.run_id = "run-script-overflow"
+    state.context.stage = "generating_episode_scripts"
+    state.context.requested_output_tokens = 20_480
+    state.context.context_bundle_sha256 = "b" * 64
+    state.context.context_manifest_json = json.dumps(manifest)
+    adapter = build_relay_adapter(
+        _settings(generation_context_limit=1),
+        role="generation",
+        model_call_state=state,
+    )
+
+    with pytest.raises(PreflightBlockedError) as excinfo:
+        adapter.model.invoke(_messages())
+
+    assert excinfo.value.context_breakdown == (
+        "committed_prefix=70000, story_contract=20000"
+    )
+    row = store._connection.execute(
+        """
+        SELECT estimated_output_tokens, context_bundle_sha256,
+               context_manifest_json, safe_message
+        FROM model_calls
+        WHERE run_id = 'run-script-overflow'
+        """
+    ).fetchone()
+    assert row[0] == 20_480
+    assert row[1] == "b" * 64
+    assert json.loads(row[2]) == manifest
+    assert "committed_prefix=70000" in row[3]
     store.close()
 
 

@@ -187,6 +187,7 @@ hash 和生成 `call_id` 必须原子提交。生成 `call_id` 必须来自同�
 | usage | provider 实际 input/output/cache，或 partial/unavailable |
 | 诊断 | finish reason、error code/type、HTTP status、provider code、脱敏 response、安全消息 |
 | 人格挂载 | persona/snapshot 身份、Soul 与 L3 的 hash、字符数、挂载路径和完整挂载状态 |
+| 剧本上下文 | 无损上下文包 hash，以及不含剧本正文的组件来源、权威级别、字符数与 Token 清单 |
 | 时间 | requested/finished/duration |
 
 实际用量缺失时不从估算值回填。估算是“是否允许发出请求”的安全预检证据，provider usage 才是实际使用证据。`l3_full_text_mounted` 只证明运行时装配了完整文本，不声称模型已在语义上采用；审计元数据不保存 L3 正文或摘录。
@@ -199,6 +200,8 @@ Schema 18 同时引入两组迁移：旧 `episode_attempts` 进入 `attempt_cycl
 `episode_attempt_cycles`/`episode_attempt_current`；`model_calls` 增加 `operation_id`，
 `business_checkpoints` 增加 `review_call_id` 以及相应索引。迁移在一个前向事务中完成。
 Schema 21 以加法迁移为 `model_calls` 增加四个 L3 挂载审计字段，旧行保持原样并使用安全默认值。
+Schema 26 为剧本生成调用增加 `context_bundle_sha256` 与 `context_manifest_json`；清单只保存
+组件元数据，不复制 StoryContract、SeriesBible 或分集剧本正文。
 
 L3 的正文不进入这些审计列，L4 的完整正文也不复制进 `DeliveryReport`：creation 通过
 `persona_snapshot_sha256` 绑定精确人格资产，L3 只记录安全挂载元数据，最终 L4 只保存

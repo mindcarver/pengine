@@ -248,12 +248,18 @@ DeepSeek 路径关闭 thinking，所有审核客户端都串行调用工具。�
 ### 模型上下文预算与用量观测
 
 每次真实模型请求发出前，Pengine 都会把**实际序列化**的 system prompt、messages、
-tools/schema 与完整规范上下文，加上该路由的**保留输出**，估算为 token 数并与该路由
+tools/schema 与完整规范上下文，加上该调用的**保留输出**，估算为 token 数并与该路由
 **已验证的上下文上限**（`PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS` /
 `PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS`）比较。超出上限、或该路由没有可信的已验证上限时，
 请求**不会发出**，任务会安全暂停（`context_budget`），已批准内容与已提交草稿保持不变。
 估计值与 provider 实际用量是两个独立字段：provider 报告 input/output/cache 用量时按原值
 持久化；缺失时显示为 `unavailable`，绝不从估计值回填。
+
+分组剧本写作先由无损上下文编译器把白名单内的 Persona、SeriesBible、StoryContract、
+完整已提交前缀、SeriesState 与当前剧情组装成一个模型可见输入；相同内容按 SHA-256
+去重，历史剧本无需模型自行调用 `read_file`。输出预留按当前剧情组的集数计算，不再为
+每个写作调用固定预留角色级最大输出。上下文清单会记录组件大小与来源，但不复制正文；
+无损内容仍无法装入窗口时保持 `context_budget` 失败闭合，不自动摘要或检索降级。
 
 每次尝试的物理调用（生成、审核、修复、被预检拦截的尝试）都会以唯一的 `call_id`
 记录角色，并以 `operation_id` 把一次业务产物操作与其真实 provider 调用关联；

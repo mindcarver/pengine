@@ -21,6 +21,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.outputs import LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
+from pydantic import PrivateAttr
 
 try:
     # Optional agent observability. The import is guarded so pengine still runs
@@ -119,14 +120,39 @@ def _persona_event_fields(record: ModelCallRecord) -> dict[str, Any]:
 
 
 class _SerialChatAnthropic(ChatAnthropic):
+    _pengine_model_call_state: ModelCallState | None = PrivateAttr(default=None)
+
+    def __init__(
+        self,
+        *args: Any,
+        pengine_model_call_state: ModelCallState | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._pengine_model_call_state = pengine_model_call_state
+
+    def _with_call_output_budget(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        state = self._pengine_model_call_state
+        if state is None:
+            return kwargs
+        context = state.context
+        if (
+            context.stage != "generating_episode_scripts"
+            or context.requested_output_tokens is None
+        ):
+            return kwargs
+        configured = self.max_tokens
+        requested = context.requested_output_tokens
+        return {**kwargs, "max_tokens": min(configured, requested) if configured else requested}
+
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
         seen_model_ids: dict[str, str] = {}
-        for chunk in super()._stream(*args, **kwargs):
+        for chunk in super()._stream(*args, **self._with_call_output_budget(kwargs)):
             yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
 
     async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         seen_model_ids: dict[str, str] = {}
-        async for chunk in super()._astream(*args, **kwargs):
+        async for chunk in super()._astream(*args, **self._with_call_output_budget(kwargs)):
             yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
@@ -253,7 +279,14 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         context = self.state.context if self.state is not None else ModelCallContext()
         estimated_input = estimate_messages_tokens(message_batch)
         estimated_input += estimate_tools_tokens(_extract_tools(serialized, kwargs))
-        estimated_total = estimated_input + self.reserved_output_tokens
+        reserved_output_tokens = (
+            context.requested_output_tokens
+            if self.role == "generation"
+            and context.stage == "generating_episode_scripts"
+            and context.requested_output_tokens is not None
+            else self.reserved_output_tokens
+        )
+        estimated_total = estimated_input + reserved_output_tokens
         record = build_started_record(
             call_id=physical_call_id,
             role=self.role,
@@ -262,7 +295,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             model=self.model_id,
             context=context,
             estimated_input_tokens=estimated_input,
-            estimated_output_tokens=self.reserved_output_tokens,
+            estimated_output_tokens=reserved_output_tokens,
             verified_limit_tokens=self.context_limit_tokens,
         )
         role_limit = (
@@ -323,10 +356,20 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             raise
         blocked = self.context_limit_tokens is None or estimated_total > self.context_limit_tokens
         if blocked:
+            preflight_error = PreflightBlockedError(
+                role=self.role,
+                model_id=self.model_id,
+                stage=context.stage,
+                episode_number=context.episode_number,
+                required_tokens=estimated_total,
+                verified_limit_tokens=self.context_limit_tokens,
+                context_breakdown=_compiled_context_breakdown(context),
+            )
             record.preflight = "blocked"
             record.status = "preflight_blocked"
             record.outcome = "blocked"
             record.error_code = "preflight_blocked"
+            record.safe_message = preflight_error.safe_message
             record.finished_at = _utc_now().isoformat()
             record.duration_seconds = 0.0
             self._persist(record)
@@ -353,14 +396,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 estimated_total,
                 self.context_limit_tokens,
             )
-            raise PreflightBlockedError(
-                role=self.role,
-                model_id=self.model_id,
-                stage=context.stage,
-                episode_number=context.episode_number,
-                required_tokens=estimated_total,
-                verified_limit_tokens=self.context_limit_tokens,
-            )
+            raise preflight_error
         self._pending[run_id] = record
         self._pending_lineage[run_id] = (stage_sequence, context.repair_round)
         # Supersede any prior still-started call for this run/role BEFORE persisting
@@ -393,7 +429,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             context.stage,
             context.episode_number,
             estimated_input,
-            self.reserved_output_tokens,
+            reserved_output_tokens,
         )
 
     def on_llm_end(self, response: LLMResult, *, run_id: UUID, **kwargs: Any) -> None:
@@ -964,16 +1000,23 @@ class PreflightBlockedError(RelayError):
         episode_number: int | None,
         required_tokens: int,
         verified_limit_tokens: int | None,
+        context_breakdown: str | None = None,
     ) -> None:
         self.stage = stage
         self.episode_number = episode_number
         self.required_tokens = required_tokens
         self.verified_limit_tokens = verified_limit_tokens
         self.model_id = model_id
+        self.context_breakdown = context_breakdown
         limit_text = (
             str(verified_limit_tokens)
             if verified_limit_tokens is not None
             else "unverified (no trustworthy verified limit)"
+        )
+        breakdown_clause = (
+            f" Largest compiled components: {context_breakdown}."
+            if context_breakdown
+            else ""
         )
         super().__init__(
             code="preflight_blocked",
@@ -981,9 +1024,34 @@ class PreflightBlockedError(RelayError):
                 f"The {role} model request needs about {required_tokens} tokens "
                 f"(input plus reserved output), but the verified context limit for "
                 f"{model_id} is {limit_text}. No request was sent; the current run "
-                "paused without changing approved work."
+                f"paused without changing approved work.{breakdown_clause}"
             ),
         )
+
+
+def _compiled_context_breakdown(context: ModelCallContext) -> str | None:
+    if not context.context_manifest_json:
+        return None
+    try:
+        manifest = json.loads(context.context_manifest_json)
+    except (TypeError, ValueError):
+        return None
+    components = manifest.get("components") if isinstance(manifest, dict) else None
+    if not isinstance(components, list):
+        return None
+    ranked = sorted(
+        (
+            (item.get("name"), item.get("estimated_tokens"))
+            for item in components
+            if isinstance(item, dict)
+            and item.get("included") is True
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("estimated_tokens"), int)
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:5]
+    return ", ".join(f"{name}={tokens}" for name, tokens in ranked) or None
 
 
 MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -1121,6 +1189,7 @@ def build_relay_adapter(
         model=_SerialChatAnthropic(
             **common,
             max_tokens=max_output_tokens,
+            pengine_model_call_state=model_call_state,
             # The relay 408s non-streaming requests at ~300s; long generation
             # calls (episode outlines/scripts) legitimately exceed that, so
             # stream and aggregate. model_timeout_seconds then bounds the gap

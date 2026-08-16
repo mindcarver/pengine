@@ -427,6 +427,7 @@ class Worker:
                     generation_provider_profile_key=routes.generation.provider_profile_key,
                     review_provider_profile_key=routes.review.provider_profile_key,
                     model_call_state=state,
+                    generation_max_output_tokens=self.settings.generation_max_output_tokens,
                 )
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop(), name="pengine-worker")
