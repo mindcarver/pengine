@@ -1,7 +1,7 @@
 import hashlib
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import (
@@ -424,6 +424,8 @@ class ModelCallSummary(StrictModel):
     estimated_input_tokens: int = Field(ge=0)
     estimated_output_tokens: int = Field(ge=0)
     estimated_total_tokens: int = Field(ge=0)
+    context_bundle_sha256: str | None = None
+    context_manifest: dict[str, Any] | None = None
     verified_limit_tokens: int | None = Field(default=None, ge=1)
     preflight: Literal["ok", "blocked"]
     status: Literal[

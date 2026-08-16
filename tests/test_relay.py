@@ -73,6 +73,33 @@ def test_build_relay_adapter_preserves_anthropic_defaults() -> None:
     assert adapter.model.max_tokens == 128_000
 
 
+def test_script_generation_uses_call_specific_output_budget_for_preflight_and_provider() -> None:
+    state = ModelCallState()
+    state.context.stage = "generating_episode_scripts"
+    state.context.requested_output_tokens = 20_480
+    adapter = build_relay_adapter(
+        _role_settings(),
+        role="generation",
+        model_call_state=state,
+    )
+    handler = next(
+        callback
+        for callback in adapter.model.callbacks
+        if isinstance(callback, _ModelCallAuditHandler)
+    )
+    handler.context_limit_tokens = 200_000
+    run_id = uuid4()
+
+    handler.on_chat_model_start(
+        {},
+        [[HumanMessage(content="当前剧情组")]],
+        run_id=run_id,
+    )
+
+    assert handler._pending[run_id].estimated_output_tokens == 20_480
+    assert adapter.model._with_call_output_budget({})["max_tokens"] == 20_480
+
+
 def test_build_relay_routes_keeps_generation_and_review_models_separate() -> None:
     routes = build_relay_routes(_role_settings())
 

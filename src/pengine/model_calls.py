@@ -99,7 +99,9 @@ CREATE TABLE IF NOT EXISTS model_calls (
     l3_sha256 TEXT,
     l3_char_count INTEGER,
     l3_mount_path TEXT,
-    l3_full_text_mounted INTEGER NOT NULL DEFAULT 0
+    l3_full_text_mounted INTEGER NOT NULL DEFAULT 0,
+    context_bundle_sha256 TEXT,
+    context_manifest_json TEXT
 );
 """
 
@@ -202,6 +204,9 @@ class ModelCallContext:
     l3_char_count: int | None = None
     l3_mount_path: str | None = None
     l3_full_text_mounted: bool = False
+    requested_output_tokens: int | None = None
+    context_bundle_sha256: str | None = None
+    context_manifest_json: str | None = None
 
     def reset(self) -> None:
         self.run_id = None
@@ -226,6 +231,9 @@ class ModelCallContext:
         self.l3_char_count = None
         self.l3_mount_path = None
         self.l3_full_text_mounted = False
+        self.requested_output_tokens = None
+        self.context_bundle_sha256 = None
+        self.context_manifest_json = None
 
 
 class StageCallBudgetExceeded(RuntimeError):
@@ -310,6 +318,8 @@ class ModelCallRecord:
     l3_char_count: int | None = None
     l3_mount_path: str | None = None
     l3_full_text_mounted: bool = False
+    context_bundle_sha256: str | None = None
+    context_manifest_json: str | None = None
 
 
 def new_call_id() -> str:
@@ -337,6 +347,7 @@ def build_started_record(
     verified_limit_tokens: int | None,
 ) -> ModelCallRecord:
     now = _utc_now()
+    carries_script_context = role == "generation" and context.stage == "generating_episode_scripts"
     return ModelCallRecord(
         call_id=call_id or new_call_id(),
         role=role,
@@ -371,6 +382,8 @@ def build_started_record(
         l3_char_count=context.l3_char_count,
         l3_mount_path=context.l3_mount_path,
         l3_full_text_mounted=context.l3_full_text_mounted,
+        context_bundle_sha256=(context.context_bundle_sha256 if carries_script_context else None),
+        context_manifest_json=(context.context_manifest_json if carries_script_context else None),
     )
 
 
@@ -547,6 +560,8 @@ _COLUMNS = (
     "l3_char_count",
     "l3_mount_path",
     "l3_full_text_mounted",
+    "context_bundle_sha256",
+    "context_manifest_json",
 )
 
 _UPSERT_SQL = f"""
@@ -598,6 +613,8 @@ _MODEL_CALL_ALTERS = (
     "ALTER TABLE model_calls ADD COLUMN l3_char_count INTEGER",
     "ALTER TABLE model_calls ADD COLUMN l3_mount_path TEXT",
     "ALTER TABLE model_calls ADD COLUMN l3_full_text_mounted INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE model_calls ADD COLUMN context_bundle_sha256 TEXT",
+    "ALTER TABLE model_calls ADD COLUMN context_manifest_json TEXT",
 )
 
 

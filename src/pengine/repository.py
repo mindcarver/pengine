@@ -98,7 +98,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -1041,6 +1041,10 @@ CREATE INDEX IF NOT EXISTS episode_generation_windows_run
 ON episode_generation_windows(run_id, created_at);
 
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (25);
+"""
+
+_SCHEMA_V26_SCRIPT_CONTEXT_AUDIT_SQL = """
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (26);
 """
 
 _SCHEMA_V12_SERIES_BIBLE_SQL = """
@@ -2199,6 +2203,28 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 25
+            if schema_version == 25:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    model_call_columns = await (
+                        await connection.execute("PRAGMA table_info(model_calls)")
+                    ).fetchall()
+                    existing_model_call_columns = {column[1] for column in model_call_columns}
+                    if "context_bundle_sha256" not in existing_model_call_columns:
+                        await connection.execute(
+                            "ALTER TABLE model_calls ADD COLUMN context_bundle_sha256 TEXT"
+                        )
+                    if "context_manifest_json" not in existing_model_call_columns:
+                        await connection.execute(
+                            "ALTER TABLE model_calls ADD COLUMN context_manifest_json TEXT"
+                        )
+                    await connection.executescript(_SCHEMA_V26_SCRIPT_CONTEXT_AUDIT_SQL)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 26
 
     async def setup(self) -> None:
         await self.initialize()
@@ -8816,6 +8842,7 @@ class Repository:
     @staticmethod
     def _model_call_summary(row: aiosqlite.Row) -> ModelCallSummary:
         response_model_ids: list[str] | None = None
+        context_manifest: dict[str, Any] | None = None
         raw_response_model_ids = row["response_model_ids_json"]
         if raw_response_model_ids:
             try:
@@ -8826,6 +8853,14 @@ class Repository:
                 response_model_ids = [
                     value for value in parsed_response_model_ids if isinstance(value, str) and value
                 ]
+        raw_context_manifest = row["context_manifest_json"]
+        if raw_context_manifest:
+            try:
+                parsed_context_manifest = json.loads(raw_context_manifest)
+            except (TypeError, ValueError):
+                parsed_context_manifest = None
+            if isinstance(parsed_context_manifest, dict):
+                context_manifest = parsed_context_manifest
         return ModelCallSummary(
             call_id=row["call_id"],
             operation_id=row["operation_id"],
@@ -8860,6 +8895,8 @@ class Repository:
             error_type=row["error_type"],
             safe_message=row["safe_message"],
             supersedes_call_id=row["supersedes_call_id"],
+            context_bundle_sha256=row["context_bundle_sha256"],
+            context_manifest=context_manifest,
         )
 
     async def _run_progress(
