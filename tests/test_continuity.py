@@ -1012,6 +1012,185 @@ def test_episode_validation_rejects_wrong_value_in_locked_numeric_evidence() -> 
     assert "locked_numeric_evidence_mismatch" in {issue.code for issue in issues}
 
 
+def make_cross_episode_numeric_case() -> tuple[StoryContract, str, SeriesState, EpisodeStateDelta]:
+    """第 1 集锁定苏慧年龄 59，第 2 集写作时检查对已确立值的复述。"""
+    contract = StoryContract.model_validate(
+        {
+            "version": 1,
+            "episode_count": 2,
+            "characters": [
+                {
+                    "character_id": "su_hui",
+                    "name": "苏慧",
+                    "role": "母亲",
+                    "initial_known_fact_ids": [],
+                }
+            ],
+            "relationships": [],
+            "facts": [
+                {
+                    "fact_id": "su_hui_age",
+                    "subject": "苏慧",
+                    "predicate": "现年年龄",
+                    "kind": "count",
+                    "value": "59",
+                    "unit": "岁",
+                    "first_revealed_episode": 1,
+                },
+                {
+                    "fact_id": "ep_two_fact",
+                    "subject": "苏慧",
+                    "predicate": "第二集事实",
+                    "kind": "text",
+                    "value": "第二集事实原文",
+                    "first_revealed_episode": 2,
+                },
+            ],
+            "timeline": [
+                {
+                    "event_id": "event_ep1",
+                    "order": 1,
+                    "when": "episode-1",
+                    "participant_ids": ["su_hui"],
+                    "fact_ids": ["su_hui_age"],
+                },
+                {
+                    "event_id": "event_ep2",
+                    "order": 2,
+                    "when": "episode-2",
+                    "participant_ids": ["su_hui"],
+                    "fact_ids": ["ep_two_fact"],
+                },
+            ],
+            "knowledge_states": [
+                {"episode_number": 1, "character_id": "su_hui", "known_fact_ids": ["su_hui_age"]}
+            ],
+            "clues": [],
+            "prohibitions": [],
+            "episode_obligations": [
+                {
+                    "obligation_id": "obligation_ep1",
+                    "episode_number": 1,
+                    "new_information_fact_ids": ["su_hui_age"],
+                    "end_hook": "第一集钩子",
+                    "required_clue_ids": [],
+                },
+                {
+                    "obligation_id": "obligation_ep2",
+                    "episode_number": 2,
+                    "new_information_fact_ids": ["ep_two_fact"],
+                    "end_hook": "第二集钩子",
+                    "required_clue_ids": [],
+                },
+            ],
+        }
+    )
+    contract_hash = story_contract_sha256(contract)
+    prior = SeriesState.model_validate(
+        {
+            "contract_sha256": contract_hash,
+            "locked_through_episode": 1,
+            "established_fact_ids": ["su_hui_age"],
+            "character_knowledge": [{"character_id": "su_hui", "known_fact_ids": ["su_hui_age"]}],
+            "introduced_clue_ids": [],
+            "resolved_clue_ids": [],
+            "handoff": "第一集结束。",
+        }
+    )
+    delta = EpisodeStateDelta(
+        episode_number=2,
+        contract_sha256=contract_hash,
+        established_fact_ids=["ep_two_fact"],
+        knowledge_gains=[],
+        introduced_clue_ids=[],
+        resolved_clue_ids=[],
+        satisfied_obligation_ids=["obligation_ep2"],
+        evidence=[
+            {"target_id": "ep_two_fact", "excerpt": "第二集事实原文"},
+            {"target_id": "obligation_ep2", "excerpt": "第二集钩子"},
+        ],
+        handoff="第二集结束。",
+    )
+    return contract, contract_hash, prior, delta
+
+
+@pytest.mark.parametrize(
+    "drift_content",
+    [
+        "苏慧（六十岁）从祠堂里出来，手里端着一个搪瓷盆。",
+        "苏慧今年六十岁了。",
+        "苏慧（60岁）坐在门槛上。",
+    ],
+)
+def test_episode_validation_flags_drifting_restated_locked_numeric_fact(
+    drift_content: str,
+) -> None:
+    contract, contract_hash, prior, delta = make_cross_episode_numeric_case()
+    content = f"{drift_content}\n第二集事实原文\n第二集钩子"
+
+    issues = validate_episode_candidate(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=prior,
+        content=content,
+        delta=delta,
+    )
+
+    mismatch = next(issue for issue in issues if issue.code == "locked_numeric_fact_mismatch")
+    assert mismatch.contract_refs == ["su_hui_age"]
+    assert "59" in mismatch.message
+
+
+def test_episode_validation_accepts_matching_restated_locked_numeric_fact() -> None:
+    contract, contract_hash, prior, delta = make_cross_episode_numeric_case()
+    content = "苏慧（五十九岁）从祠堂里出来。\n第二集事实原文\n第二集钩子"
+
+    issues = validate_episode_candidate(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=prior,
+        content=content,
+        delta=delta,
+    )
+
+    assert "locked_numeric_fact_mismatch" not in {issue.code for issue in issues}
+
+
+@pytest.mark.parametrize(
+    "neighbour_content",
+    [
+        # 年龄属于旁边的角色，不属于锁定主体苏慧。
+        "六十二岁的林淑芬对苏慧说了一句话。",
+        "林淑芬六十二岁，苏慧没说话。",
+        # 与锁定事实无关的数字。
+        "苏慧走进三号楼，没说话。",
+        # 无单位复述按边界留给语义审查。
+        "你妈六十了。",
+    ],
+)
+def test_episode_validation_numeric_gate_is_subject_anchored(neighbour_content: str) -> None:
+    contract, contract_hash, prior, delta = make_cross_episode_numeric_case()
+    content = f"{neighbour_content}\n第二集事实原文\n第二集钩子"
+
+    issues = validate_episode_candidate(
+        contract=contract,
+        contract_sha256=contract_hash,
+        prior_state=prior,
+        content=content,
+        delta=delta,
+    )
+
+    assert "locked_numeric_fact_mismatch" not in {issue.code for issue in issues}
+
+
+def test_episode_validation_numeric_gate_exempts_reveal_episode() -> None:
+    from pengine.continuity import _locked_numeric_content_mismatches
+
+    contract, _, _, _ = make_cross_episode_numeric_case()
+
+    assert _locked_numeric_content_mismatches(contract, 1, "苏慧（六十岁）推门进来。") == []
+
+
 def test_episode_validation_rejects_wrong_cross_unit_locked_numeric_evidence() -> None:
     contract = make_contract()
     contract_hash = story_contract_sha256(contract)
