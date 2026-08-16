@@ -280,9 +280,7 @@ async def test_schema_v25_to_v26_adds_script_context_audit_columns(repository) -
     restarted = Repository(repository.database_path)
     await restarted.initialize()
     async with restarted._connection() as connection:
-        columns = await (
-            await connection.execute("PRAGMA table_info(model_calls)")
-        ).fetchall()
+        columns = await (await connection.execute("PRAGMA table_info(model_calls)")).fetchall()
         version = await (
             await connection.execute("SELECT MAX(version) FROM pengine_schema")
         ).fetchone()

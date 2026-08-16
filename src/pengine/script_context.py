@@ -374,9 +374,7 @@ def compile_script_context(
         maximum_output_tokens=maximum_output_tokens,
     )
     included_token_total = sum(
-        component["estimated_tokens"]
-        for component in manifest_components
-        if component["included"]
+        component["estimated_tokens"] for component in manifest_components if component["included"]
     )
     for component in manifest_components:
         component["estimated_token_share"] = (

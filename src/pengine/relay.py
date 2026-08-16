@@ -136,10 +136,7 @@ class _SerialChatAnthropic(ChatAnthropic):
         if state is None:
             return kwargs
         context = state.context
-        if (
-            context.stage != "generating_episode_scripts"
-            or context.requested_output_tokens is None
-        ):
+        if context.stage != "generating_episode_scripts" or context.requested_output_tokens is None:
             return kwargs
         configured = self.max_tokens
         requested = context.requested_output_tokens
@@ -1014,9 +1011,7 @@ class PreflightBlockedError(RelayError):
             else "unverified (no trustworthy verified limit)"
         )
         breakdown_clause = (
-            f" Largest compiled components: {context_breakdown}."
-            if context_breakdown
-            else ""
+            f" Largest compiled components: {context_breakdown}." if context_breakdown else ""
         )
         super().__init__(
             code="preflight_blocked",

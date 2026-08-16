@@ -178,9 +178,7 @@ def test_script_context_preflight_reports_component_breakdown_and_call_budget(
     with pytest.raises(PreflightBlockedError) as excinfo:
         adapter.model.invoke(_messages())
 
-    assert excinfo.value.context_breakdown == (
-        "committed_prefix=70000, story_contract=20000"
-    )
+    assert excinfo.value.context_breakdown == ("committed_prefix=70000, story_contract=20000")
     row = store._connection.execute(
         """
         SELECT estimated_output_tokens, context_bundle_sha256,

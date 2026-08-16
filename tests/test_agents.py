@@ -7487,9 +7487,7 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
     series_state = json.loads(second_input["/workspace/series_state.json"]["content"])
     assert series_state["locked_through_episode"] == 1
     assert series_state["established_fact_ids"] == ["fact_ep1"]
-    assert second_components["series_state"]["content"][
-        "locked_through_episode"
-    ] == 1
+    assert second_components["series_state"]["content"]["locked_through_episode"] == 1
 
     # Bounded advisory WriterNotes from episode 1 flow forward.
     assert second_input["/workspace/writer_notes.md"]["content"] == "第1集备忘"

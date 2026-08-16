@@ -5957,9 +5957,7 @@ class StageGuardMiddleware(AgentMiddleware):
                     series_bible_components=series_bible_components,
                     story_contract_json=contract_json,
                     story_contract_sha256=contract_hash,
-                    committed_prefix=[
-                        draft for _, draft in sorted(self.episode_drafts.items())
-                    ],
+                    committed_prefix=[draft for _, draft in sorted(self.episode_drafts.items())],
                     series_state_json=prior_state.model_dump_json(),
                     generation_group_json=generation_group_json,
                     evidence_contracts=evidence_contracts,
@@ -6406,35 +6404,35 @@ class StageGuardMiddleware(AgentMiddleware):
                             subagent_type="episode_repair",
                             description=repair_description,
                             files={
-                            "/workspace/story_contract.json": contract_json,
-                            "/workspace/evidence_contract.json": _evidence_contract_json(
-                                contract,
-                                plan.episode_number,
-                                rejected_issues=evidence_repair_issues,
-                                phase="episode_repair",
-                            ),
-                            "/workspace/established_facts.json": established_facts_json,
-                            "/workspace/series_state.json": prior_state.model_dump_json(),
-                            "/workspace/current_episode_plan.md": plan.plan,
-                            "/workspace/current_episode_obligation.json": (
-                                current_obligation.model_dump_json()
-                            ),
-                            "/workspace/candidate_episode.md": parsed.content,
-                            "/workspace/candidate_state_delta.json": (
-                                parsed.state_delta.model_dump_json()
-                            ),
-                            "/workspace/episode_review.json": review.model_dump_json(),
-                            **(
-                                {
-                                    "/workspace/suffix_rewrite_review.json": json.dumps(
-                                        suffix_feedback,
-                                        ensure_ascii=False,
-                                        sort_keys=True,
-                                    )
-                                }
-                                if suffix_feedback is not None
-                                else {}
-                            ),
+                                "/workspace/story_contract.json": contract_json,
+                                "/workspace/evidence_contract.json": _evidence_contract_json(
+                                    contract,
+                                    plan.episode_number,
+                                    rejected_issues=evidence_repair_issues,
+                                    phase="episode_repair",
+                                ),
+                                "/workspace/established_facts.json": established_facts_json,
+                                "/workspace/series_state.json": prior_state.model_dump_json(),
+                                "/workspace/current_episode_plan.md": plan.plan,
+                                "/workspace/current_episode_obligation.json": (
+                                    current_obligation.model_dump_json()
+                                ),
+                                "/workspace/candidate_episode.md": parsed.content,
+                                "/workspace/candidate_state_delta.json": (
+                                    parsed.state_delta.model_dump_json()
+                                ),
+                                "/workspace/episode_review.json": review.model_dump_json(),
+                                **(
+                                    {
+                                        "/workspace/suffix_rewrite_review.json": json.dumps(
+                                            suffix_feedback,
+                                            ensure_ascii=False,
+                                            sort_keys=True,
+                                        )
+                                    }
+                                    if suffix_feedback is not None
+                                    else {}
+                                ),
                             },
                             schema=ScriptWriterResult,
                             stage=InternalStage.GENERATING_EPISODE_SCRIPTS,

@@ -69,9 +69,7 @@ def _compile(
         story_contract_json=contract_json,
         story_contract_sha256=_sha256(canonical_contract),
         committed_prefix=(
-            drafts
-            if drafts is not None
-            else [_draft(number) for number in range(1, start_episode)]
+            drafts if drafts is not None else [_draft(number) for number in range(1, start_episode)]
         ),
         series_state_json='{"locked_through_episode":2}',
         generation_group_json='{"episodes":[3,4]}',
@@ -121,9 +119,7 @@ def test_compiler_deduplicates_identical_content_and_rejects_unknown_persona_inp
 
     assert payload["aliases"] == {"persona.l4": "persona.l0"}
     identical = [
-        item
-        for item in compiled.manifest["components"]
-        if item["sha256"] == _sha256("相同规则")
+        item for item in compiled.manifest["components"] if item["sha256"] == _sha256("相同规则")
     ]
     assert [item["included"] for item in identical] == [True, False]
 
@@ -177,13 +173,19 @@ def test_compiler_preserves_complete_long_series_prefix_at_last_group(
 
 
 def test_group_output_budget_is_call_specific_and_capped() -> None:
-    assert script_group_output_tokens(
-        start_episode=1,
-        end_episode=1,
-        maximum_output_tokens=128_000,
-    ) == SCRIPT_OUTPUT_BASE_TOKENS + SCRIPT_OUTPUT_TOKENS_PER_EPISODE
-    assert script_group_output_tokens(
-        start_episode=1,
-        end_episode=4,
-        maximum_output_tokens=20_000,
-    ) == 20_000
+    assert (
+        script_group_output_tokens(
+            start_episode=1,
+            end_episode=1,
+            maximum_output_tokens=128_000,
+        )
+        == SCRIPT_OUTPUT_BASE_TOKENS + SCRIPT_OUTPUT_TOKENS_PER_EPISODE
+    )
+    assert (
+        script_group_output_tokens(
+            start_episode=1,
+            end_episode=4,
+            maximum_output_tokens=20_000,
+        )
+        == 20_000
+    )
