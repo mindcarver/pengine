@@ -1046,6 +1046,65 @@ class StoryArtifactRepairPatch(StrictModel):
         return self
 
 
+class MissingBiographyAddition(StrictModel):
+    character_id: StableId
+    character_name: NonEmptyText
+    markdown: NonEmptyText = Field(
+        max_length=4_000,
+        description=(
+            "One complete Markdown biography section for exactly one missing contract "
+            "character. Do not repeat or rewrite existing biographies."
+        ),
+    )
+
+
+class BiographyProjectionRepair(StrictModel):
+    stage: Literal["generating_character_relationships"]
+    additions: list[MissingBiographyAddition] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_unique_targets(self) -> "BiographyProjectionRepair":
+        ids = [addition.character_id for addition in self.additions]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Biography repair character IDs must be unique")
+        return self
+
+
+def apply_biography_projection_repair(
+    biographies: str,
+    repair: BiographyProjectionRepair,
+    *,
+    missing_characters: Sequence[Mapping[str, Any]],
+    output_language: OutputLanguage | None = None,
+) -> str:
+    """Append only the exact missing contract biographies authorized by validation."""
+    expected = {
+        str(character["character_id"]): str(character["name"]) for character in missing_characters
+    }
+    received = {addition.character_id: addition.character_name for addition in repair.additions}
+    if received != expected:
+        raise ValueError("biography_projection_repair_target_mismatch")
+
+    additions_by_id = {addition.character_id: addition for addition in repair.additions}
+    rendered: list[str] = []
+    for character in missing_characters:
+        character_id = str(character["character_id"])
+        addition = additions_by_id[character_id]
+        section = addition.markdown.strip()
+        if addition.character_name not in section:
+            raise ValueError("biography_projection_repair_name_missing")
+        if addition.character_name in biographies:
+            raise ValueError("biography_projection_repair_target_already_present")
+        if has_obvious_language_mismatch(
+            section,
+            output_language,
+            english_dominance_ratio=4.0,
+        ):
+            raise ValueError("biography_projection_repair_language_mismatch")
+        rendered.append(section)
+    return f"{biographies}\n\n" + "\n\n".join(rendered)
+
+
 class OutlineJsonEdit(StrictModel):
     op: Literal["replace"]
     path: NonEmptyText = Field(
@@ -4188,7 +4247,6 @@ class StageGuardMiddleware(AgentMiddleware):
                 args,
             )
             await self.approve_stage(stage, payload)
-            self.approved_payloads[stage] = dict(payload)
             self.approved_stages.add(stage)
             return result
         result, payload = await self._call_structured_stage(
@@ -5928,6 +5986,102 @@ class DeepAgentWorkflow:
         checkpoint = await self.checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
         return checkpoint is not None
 
+    async def repair_missing_biographies(
+        self,
+        *,
+        current_biographies: str,
+        relationship_logic: str,
+        story_outline: str,
+        missing_characters: Sequence[Mapping[str, Any]],
+        contract_context: Mapping[str, Any],
+        persona_files: Mapping[str, str],
+        output_language: OutputLanguage | None,
+    ) -> BiographyProjectionRepair:
+        prompt = (
+            "Repair one deterministic SeriesBible projection failure. Return exactly one "
+            "BiographyProjectionRepair tool call. Produce one concise Markdown biography "
+            "section for every supplied missing character and no other character. Use the exact "
+            "character_id and character_name. Derive content only from the approved story "
+            "outline, current relationship logic, supplied contract context, and persona rules. "
+            "Do not invent ages, dates, amounts, motives, secrets, actions, or relationships. "
+            "Do not repeat, summarize, or rewrite any existing biography."
+        )
+        if output_language == "zh-CN":
+            prompt += " Write every biography section in Simplified Chinese."
+        response = await self.generation_model.with_structured_output(
+            BiographyProjectionRepair,
+            method="function_calling",
+        ).ainvoke(
+            [
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "current_biographies": current_biographies,
+                            "relationship_logic": relationship_logic,
+                            "story_outline": story_outline,
+                            "missing_characters": list(missing_characters),
+                            "contract_context": contract_context,
+                            "persona": {
+                                path: value
+                                for path, value in persona_files.items()
+                                if path == "/persona/l0.md"
+                                or path.endswith("/generating_character_relationships.md")
+                            },
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                },
+            ]
+        )
+        return BiographyProjectionRepair.model_validate(response)
+
+    async def review_repaired_series_bible(
+        self,
+        *,
+        original_biographies: str,
+        repaired_biographies: str,
+        target_character_ids: Sequence[str],
+        candidate: Mapping[str, Any],
+        output_language: OutputLanguage | None,
+    ) -> CanonReviewerResult:
+        prompt = (
+            "Perform the final Canon review of one deterministically repaired SeriesBible. "
+            "The only authorized delta is appending biographies for the supplied target "
+            "character IDs. Verify that the original biography prefix is byte-for-byte "
+            "unchanged, every target now has exactly one biography, no non-target character was "
+            "added, and the added text introduces no contradiction with the complete final "
+            "SeriesBible. Review the complete candidate, not merely the patch. Fail on any hard "
+            "Canon, schema, projection, relationship, fact, timeline, knowledge-state, clue, or "
+            "episode-obligation contradiction. Return structured data only."
+        )
+        if output_language == "zh-CN":
+            prompt += " Return evidence in Simplified Chinese."
+        response = await self.review_model.with_structured_output(
+            CanonReviewerResult,
+            method="function_calling",
+        ).ainvoke(
+            [
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "authorized_target_character_ids": list(target_character_ids),
+                            "original_biographies": original_biographies,
+                            "repaired_biographies": repaired_biographies,
+                            "final_series_bible": candidate,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                },
+            ]
+        )
+        return CanonReviewerResult.model_validate(response)
+
     async def plan_quality_repair(
         self,
         *,
@@ -6189,8 +6343,9 @@ class DeepAgentWorkflow:
         get_series_bible: SeriesBibleRetriever | None = None,
         suffix_rewrite_feedback: Mapping[str, Any] | None = None,
     ) -> WorkflowResult:
+        approved_source = approved_checkpoints if approved_checkpoints is not None else {}
         approved_payloads: dict[InternalStage, Any] = {
-            stage: payload for stage, payload in (approved_checkpoints or {}).items()
+            stage: payload for stage, payload in approved_source.items()
         }
         resolved_output_language = (
             infer_output_language(story, requirements)
@@ -6204,7 +6359,11 @@ class DeepAgentWorkflow:
             payload: Mapping[str, Any],
         ) -> None:
             await approve_stage(stage, payload)
-            approved_payloads[stage] = dict(payload)
+            if stage in approved_source:
+                approved_payloads.clear()
+                approved_payloads.update(approved_source)
+            else:
+                approved_payloads[stage] = dict(payload)
 
         files = {
             path: {"content": content, "encoding": "utf-8"}
