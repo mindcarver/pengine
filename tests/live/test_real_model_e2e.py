@@ -328,7 +328,12 @@ def _poll_initial(
     raise AssertionError(f"Initial run did not stop within {timeout_seconds:g} seconds")
 
 
-def _assert_success(resource: dict[str, Any], *, evidence_dir: Path) -> None:
+def _assert_success(
+    resource: dict[str, Any],
+    *,
+    evidence_dir: Path,
+    unified_delivery_facts: dict[str, Any] | None = None,
+) -> None:
     initial = resource.get("initial", {})
     state = initial.get("state")
     if state != "succeeded":
@@ -360,12 +365,19 @@ def _assert_success(resource: dict[str, Any], *, evidence_dir: Path) -> None:
     )
 
     report = result.get("delivery_report", {})
-    assert report.get("l0_gate", {}).get("passed") is True, (
-        f"L0 gate did not pass; evidence: {evidence_dir}"
-    )
-    assert report.get("l4_gate", {}).get("passed") is True, (
-        f"L4 gate did not pass; evidence: {evidence_dir}"
-    )
+    legacy_gates = (report.get("l0_gate"), report.get("l4_gate"))
+    if any(gate is not None for gate in legacy_gates):
+        assert all(gate is not None and gate.get("passed") is True for gate in legacy_gates), (
+            f"Legacy L0/L4 gates did not both pass; evidence: {evidence_dir}"
+        )
+    else:
+        assert unified_delivery_facts is not None, (
+            f"Delivery lacks both legacy gates and unified final-review evidence; "
+            f"evidence: {evidence_dir}"
+        )
+        assert unified_delivery_facts.get("status") == "passed"
+        assert unified_delivery_facts.get("active_final_review_id")
+        assert unified_delivery_facts.get("formal_delivery") == 1
     assert resource.get("revision", {}).get("state") == "available", (
         f"Revision did not become available; evidence: {evidence_dir}"
     )
@@ -516,7 +528,7 @@ def _assert_unified_delivery_facts(
         candidates = connection.execute(
             """
             SELECT candidate_id, episode_number, version, content_sha256,
-                   predecessor_candidate_id, call_id, status
+                   predecessor_candidate_id, call_id, status, generation_window_id
             FROM episode_candidates
             WHERE run_id = ? AND batch_id = ? AND status = 'active'
             ORDER BY episode_number
@@ -541,11 +553,34 @@ def _assert_unified_delivery_facts(
             assert producing_call is not None, (
                 f"Episode {episode_number} candidate lacks a durable producing call"
             )
+            call_episode = episode_number
+            if candidate[7] is not None:
+                generation_window = connection.execute(
+                    "SELECT start_episode, end_episode, call_id, operation_id, status, "
+                    "committed_through_episode FROM episode_generation_windows "
+                    "WHERE window_id = ? AND run_id = ?",
+                    (candidate[7], run_id),
+                ).fetchone()
+                assert generation_window is not None, (
+                    f"Episode {episode_number} candidate lacks a generation window"
+                )
+                assert generation_window[0] <= episode_number <= generation_window[1], (
+                    f"Episode {episode_number} falls outside its generation window"
+                )
+                assert generation_window[2:4] == (candidate[5], producing_call[5]), (
+                    f"Episode {episode_number} generation window lost call provenance"
+                )
+                assert generation_window[4] == "committed" or (
+                    generation_window[4] == "failed"
+                    and generation_window[5] is not None
+                    and generation_window[5] >= episode_number
+                ), f"Episode {episode_number} generation window was not durably committed"
+                call_episode = generation_window[0]
             assert producing_call[:5] == (
                 "generation",
                 generation_model_id,
                 "generating_episode_scripts",
-                episode_number,
+                call_episode,
                 "succeeded",
             ), f"Episode {episode_number} candidate binds the wrong physical call"
             candidate_calls[episode_number] = producing_call
@@ -962,6 +997,22 @@ def test_live_e2e_evidence_helpers_are_safe_and_validate_delivery(tmp_path: Path
         "revision": {"state": "available"},
     }
     _assert_success(resource, evidence_dir=tmp_path)
+
+    unified_resource = copy.deepcopy(resource)
+    unified_resource["initial"]["result"]["delivery_report"].update(
+        {"l0_gate": None, "l4_gate": None}
+    )
+    with pytest.raises(AssertionError, match="lacks both legacy gates"):
+        _assert_success(unified_resource, evidence_dir=tmp_path)
+    _assert_success(
+        unified_resource,
+        evidence_dir=tmp_path,
+        unified_delivery_facts={
+            "status": "passed",
+            "active_final_review_id": "series_review_1",
+            "formal_delivery": 1,
+        },
+    )
 
     english_resource = copy.deepcopy(resource)
     english_resource["initial"]["result"]["content_package"]["episode_outline"] = (
@@ -1664,17 +1715,21 @@ def test_real_model_initial_creation_black_box() -> None:
                 timeline_path=timeline_path,
                 final_resource_path=evidence_dir / "final-resource.json",
             )
-            _assert_success(final_resource, evidence_dir=evidence_dir)
-            _assert_story_consistency_checkpoints(
-                data_dir / "pengine.sqlite3",
-                creation_id=str(creation_body["creation_id"]),
-                evidence_dir=evidence_dir,
-            )
             unified_facts = _assert_unified_delivery_facts(
                 data_dir / "pengine.sqlite3",
                 creation_id=str(creation_body["creation_id"]),
                 generation_model_id=settings.generation_model_id,
                 review_model_id=settings.review_model_id,
+                evidence_dir=evidence_dir,
+            )
+            _assert_success(
+                final_resource,
+                evidence_dir=evidence_dir,
+                unified_delivery_facts=unified_facts,
+            )
+            _assert_story_consistency_checkpoints(
+                data_dir / "pengine.sqlite3",
+                creation_id=str(creation_body["creation_id"]),
                 evidence_dir=evidence_dir,
             )
             metadata["unified_delivery_facts"] = unified_facts

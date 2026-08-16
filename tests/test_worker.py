@@ -61,11 +61,15 @@ class DeterministicWorkflow:
             "雷区：未发现解释性表达。\n"
             "温度：情绪克制且峰后有收拍。"
         ),
+        grouped_episode_callbacks: bool = False,
+        episode_context_observer: Any = None,
     ) -> None:
         self.episode_count = episode_count
         self.selected_l0_variant = selected_l0_variant
         self.result_l0_variant = result_l0_variant or selected_l0_variant
         self.l0_evidence = l0_evidence
+        self.grouped_episode_callbacks = grouped_episode_callbacks
+        self.episode_context_observer = episode_context_observer
 
     async def execute(
         self,
@@ -162,7 +166,13 @@ class DeterministicWorkflow:
                     continue
                 if reset_episode_deadline is not None:
                     await reset_episode_deadline()
-                await before_episode(EpisodePlan(episode_number=episode_number, plan="测试计划"))
+                plan = EpisodePlan(episode_number=episode_number, plan="测试计划")
+                if self.grouped_episode_callbacks:
+                    await before_episode(plan, new_operation=episode_number == 1)
+                else:
+                    await before_episode(plan)
+                if self.episode_context_observer is not None:
+                    self.episode_context_observer()
                 await commit_episode(episode_number, f"第{episode_number}集剧本")
             aggregate = await assemble_episode_scripts()
             payload = {
@@ -1013,7 +1023,7 @@ async def test_worker_auto_resumes_first_wall_clock_timeout_from_approved_checkp
     tmp_path: Path,
 ) -> None:
     settings, catalog, repository, snapshot = await _services(tmp_path)
-    settings = settings.model_copy(update={"run_timeout_seconds": 0.02})
+    settings = settings.model_copy(update={"run_timeout_seconds": 0.05})
     accepted = await repository.create_creation(
         "timeout-recovery",
         CreateCreationRequest(
@@ -1876,6 +1886,44 @@ async def test_worker_requires_exact_successful_physical_provenance(
             episode_number=3,
             operation_id="different-operation",
         )
+
+
+@pytest.mark.asyncio
+async def test_grouped_episode_context_advances_episode_without_rotating_operation(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    await repository.create_creation(
+        "grouped-episode-context",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="两集连续短剧。",
+            requirements="生成两集。",
+        ),
+        snapshot.summary,
+    )
+    observed: list[tuple[int | None, str | None]] = []
+    state = ModelCallState()
+
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=DeterministicWorkflow(
+            episode_count=2,
+            grouped_episode_callbacks=True,
+            episode_context_observer=lambda: observed.append(
+                (state.context.episode_number, state.context.operation_id)
+            ),
+        ),
+    )
+    worker._model_call_state = state
+
+    assert await worker.run_once() is True
+    assert observed[0][0] == 1
+    assert observed[1][0] == 2
+    assert observed[0][1] is not None
+    assert observed[1][1] == observed[0][1]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import itertools
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -56,6 +57,7 @@ from pengine.agents import (
     OutlineRepairPatch,
     QualityGateRejectedError,
     QualityReviewerResult,
+    ScriptGenerationGroupResult,
     ScriptWriterResult,
     StageGuardMiddleware,
     StoryArchitectResult,
@@ -191,6 +193,7 @@ class _ProvenanceFakeWorkflow(DeepAgentWorkflow):
         approve_stage = kwargs["approve_stage"]
         commit_episode = kwargs.get("commit_episode")
         register_series_review = kwargs.get("register_series_review")
+        complete_generation_group = kwargs.get("complete_generation_group")
 
         async def approve_with_provenance(stage, payload):
             if stage is InternalStage.GENERATING_EPISODE_OUTLINE and "story_contract" in payload:
@@ -199,22 +202,31 @@ class _ProvenanceFakeWorkflow(DeepAgentWorkflow):
 
         async def commit_with_provenance(*args, **commit_kwargs):
             assert commit_episode is not None
-            self._record_succeeded_call("generation")
+            if complete_generation_group is None:
+                self._record_succeeded_call("generation")
             return await commit_episode(*args, **commit_kwargs)
+
+        async def complete_group_with_provenance(*args, **complete_kwargs):
+            assert complete_generation_group is not None
+            self._record_succeeded_call("generation")
+            return await complete_generation_group(*args, **complete_kwargs)
 
         async def review_with_provenance(**review_kwargs):
             assert register_series_review is not None
             self._record_succeeded_call("review")
             return await register_series_review(**review_kwargs)
 
+        forwarded = {
+            **kwargs,
+            "approve_stage": approve_with_provenance,
+            "commit_episode": commit_with_provenance,
+            "register_series_review": review_with_provenance,
+        }
+        if complete_generation_group is not None:
+            forwarded["complete_generation_group"] = complete_group_with_provenance
         return await DeepAgentWorkflow.execute(
             self,
-            **{
-                **kwargs,
-                "approve_stage": approve_with_provenance,
-                "commit_episode": commit_with_provenance,
-                "register_series_review": review_with_provenance,
-            },
+            **forwarded,
         )
 
 
@@ -429,17 +441,34 @@ def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMe
                 "episode_count": 1,
                 "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
                 "story_contract": contract.model_dump(mode="json"),
+                "script_generation_groups": [
+                    {
+                        "group_id": "opening_unit",
+                        "start_episode": 1,
+                        "end_episode": 1,
+                        "dramatic_unit": "建立冲突",
+                        "boundary_reason": "单集测试在本集结束",
+                    }
+                ],
             },
         ),
         (
             "generating_episode_scripts",
             "script_writer",
-            "ScriptWriterResult",
+            "ScriptGenerationGroupResult",
             {
                 "stage": "generating_episode_scripts",
-                "episode_number": 1,
-                "content": "事实1\n钩子1",
-                "state_delta": _state_delta(contract, 1),
+                "group_id": "opening_unit",
+                "start_episode": 1,
+                "end_episode": 1,
+                "episodes": [
+                    {
+                        "stage": "generating_episode_scripts",
+                        "episode_number": 1,
+                        "content": "事实1\n钩子1",
+                        "state_delta": _state_delta(contract, 1),
+                    }
+                ],
             },
         ),
     ]
@@ -566,7 +595,7 @@ def _episode_hook_kwargs(
     committed = {draft.episode_number: draft for draft in episode_drafts or []}
     attempts: list[int] = []
 
-    async def before_episode(plan: EpisodePlan) -> int:
+    async def before_episode(plan: EpisodePlan, **_: Any) -> int:
         attempts.append(plan.episode_number)
         return 1
 
@@ -706,6 +735,78 @@ def test_script_writer_tool_binding_accepts_json_encoded_state_delta_without_ret
 
     assert isinstance(result, ScriptWriterResult)
     assert result.state_delta.model_dump(mode="json") == state_delta
+
+
+def test_generation_group_result_requires_exact_contiguous_episode_range() -> None:
+    contract = _story_contract(episode_count=2)
+    valid = {
+        "stage": "generating_episode_scripts",
+        "group_id": "opening_unit",
+        "start_episode": 1,
+        "end_episode": 2,
+        "episodes": [
+            {
+                "stage": "generating_episode_scripts",
+                "episode_number": episode,
+                "content": f"事实{episode}\n钩子{episode}",
+                "state_delta": _state_delta(contract, episode),
+            }
+            for episode in (1, 2)
+        ],
+    }
+
+    assert ScriptGenerationGroupResult.model_validate(valid).end_episode == 2
+    invalid = copy.deepcopy(valid)
+    invalid["episodes"].reverse()
+    with pytest.raises(ValidationError, match="contiguous range"):
+        ScriptGenerationGroupResult.model_validate(invalid)
+
+
+def test_episode_outline_accepts_eighty_episodes_with_outline_authored_group_sizes() -> None:
+    contract = _story_contract(episode_count=80)
+    groups: list[dict[str, Any]] = []
+    start = 1
+    lengths = (2, 3, 1, 4)
+    index = 0
+    while start <= 80:
+        end = min(80, start + lengths[index % len(lengths)] - 1)
+        groups.append(
+            {
+                "group_id": f"dramatic_unit_{index + 1}",
+                "start_episode": start,
+                "end_episode": end,
+                "dramatic_unit": f"推进第{start}至{end}集行动链",
+                "boundary_reason": f"第{end}集完成阶段目标",
+            }
+        )
+        start = end + 1
+        index += 1
+
+    result = EpisodePlannerResult.model_validate(
+        {
+            "stage": "generating_episode_outline",
+            "content": "八十集分集大纲",
+            "episode_count": 80,
+            "episodes": [
+                {"episode_number": episode, "plan": f"第{episode}集计划"}
+                for episode in range(1, 81)
+            ],
+            "story_contract": contract.model_dump(mode="json"),
+            "script_generation_groups": groups,
+        }
+    )
+
+    assert result.script_generation_groups[0].start_episode == 1
+    assert result.script_generation_groups[-1].end_episode == 80
+    group_sizes = {
+        group.end_episode - group.start_episode + 1 for group in result.script_generation_groups
+    }
+    assert group_sizes == {
+        1,
+        2,
+        3,
+        4,
+    }
 
 
 @pytest.mark.parametrize(
@@ -4132,6 +4233,81 @@ def test_outline_repair_patch_supports_guarded_episode_structure_edits() -> None
     ]
 
 
+def test_outline_repair_patch_supports_guarded_generation_group_edits() -> None:
+    contract = _story_contract(episode_count=3)
+    original_groups = [
+        {
+            "group_id": "opening",
+            "start_episode": 1,
+            "end_episode": 2,
+            "dramatic_unit": "发现并追查纸条",
+            "boundary_reason": "第二集发生关系转折",
+        },
+        {
+            "group_id": "payoff",
+            "start_episode": 3,
+            "end_episode": 3,
+            "dramatic_unit": "面对真相",
+            "boundary_reason": "全剧结束",
+        },
+    ]
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "三集分集大纲。" + "每集均有独立主事件。" * 100,
+        "episode_count": 3,
+        "episodes": [
+            {"episode_number": number, "plan": f"第{number}集计划"} for number in range(1, 4)
+        ],
+        "story_contract": contract.model_dump(mode="json"),
+        "script_generation_groups": original_groups,
+    }
+    repaired_groups = [
+        {**original_groups[0], "end_episode": 1, "boundary_reason": "第一集发生重大揭示"},
+        {
+            **original_groups[1],
+            "start_episode": 2,
+            "dramatic_unit": "追查纸条并面对真相",
+        },
+    ]
+    patch = OutlineRepairPatch.model_validate(
+        {
+            "stage": "generating_episode_outline",
+            "json_edits": [
+                {
+                    "op": "replace",
+                    "path": f"/script_generation_groups/{index}",
+                    "expected": original,
+                    "value": repaired,
+                }
+                for index, (original, repaired) in enumerate(
+                    zip(original_groups, repaired_groups, strict=True)
+                )
+            ],
+        }
+    )
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="第二集应与第三集构成连续戏剧动作。",
+        issues=[
+            {
+                "code": "generation_group_boundary",
+                "message": "调整第二集边界。",
+                "contract_refs": [],
+                "contract_mutation_required": False,
+            }
+        ],
+    )
+    context = _outline_repair_context(candidate, review)
+
+    _validate_outline_repair_patch_targets(patch, context)
+    repaired = _apply_outline_repair_patch(candidate, patch)
+
+    assert [group.model_dump(mode="json") for group in repaired.script_generation_groups] == (
+        repaired_groups
+    )
+    assert candidate["script_generation_groups"] == original_groups
+
+
 def test_outline_repair_patch_rejects_non_replace_operations() -> None:
     with pytest.raises(ValidationError, match="replace"):
         OutlineRepairPatch.model_validate(
@@ -5097,8 +5273,12 @@ async def test_episode_writer_treats_speaker_labels_as_format_not_a_whitelist(
     assert "Screenplay labels and dialogue notation are format choices" in description
     assert "without normalizing aliases, roles, generic labels" in description
     assert "Allowed exact speaker labels" not in description
-    assert 'required_evidence_target_ids=["fact_ep1", "obligation_ep1"]' in description
-    assert 'required_verbatim_facts=[{"fact_id": "fact_ep1", "value": "事实1"}]' in description
+    assert "/workspace/evidence_contracts/epN.json" in description
+    group_contract = json.loads(files["/workspace/evidence_contracts/ep1.json"]["content"])
+    assert group_contract["required_evidence_target_ids"] == [
+        "fact_ep1",
+        "obligation_ep1",
+    ]
     assert "exact-set self-check" in description
     assert "/workspace/established_facts.json" in description
     assert "must exactly match" in description
@@ -5354,7 +5534,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         creative_result_tools = {
             "StoryArchitectResult",
             "EpisodePlannerResult",
-            "ScriptWriterResult",
+            "ScriptGenerationGroupResult",
         }
         reviewer_result_tools = {
             "CanonReviewerResult",
@@ -5414,7 +5594,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         for result_tool in (
             "StoryArchitectResult",
             "EpisodePlannerResult",
-            "ScriptWriterResult",
+            "ScriptGenerationGroupResult",
             "CanonReviewerResult",
             "EpisodeReviewerResult",
         ):
@@ -6151,6 +6331,15 @@ async def test_outline_canon_review_receives_structured_episode_plans() -> None:
         "episode_count": 1,
         "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
         "story_contract": contract.model_dump(mode="json"),
+        "script_generation_groups": [
+            {
+                "group_id": "opening_unit",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "建立冲突",
+                "boundary_reason": "单集测试结束",
+            }
+        ],
     }
     reviewed_plans: list[list[dict[str, Any]]] = []
 
@@ -6264,6 +6453,15 @@ async def test_outline_review_target_mismatch_gets_one_fresh_review_before_repai
         "episode_count": 1,
         "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
         "story_contract": contract.model_dump(mode="json"),
+        "script_generation_groups": [
+            {
+                "group_id": "opening_unit",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "建立冲突",
+                "boundary_reason": "单集测试结束",
+            }
+        ],
     }
     review_calls = 0
     patch_calls = 0
@@ -6389,6 +6587,15 @@ async def test_outline_review_target_mismatch_fails_closed_after_fresh_review() 
         "episode_count": 1,
         "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
         "story_contract": contract.model_dump(mode="json"),
+        "script_generation_groups": [
+            {
+                "group_id": "opening_unit",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "建立冲突",
+                "boundary_reason": "单集测试结束",
+            }
+        ],
     }
     review_calls = 0
     patch_calls = 0
@@ -6486,15 +6693,18 @@ async def test_outline_review_target_mismatch_fails_closed_after_fresh_review() 
 async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    writer_index = _index_of_tool_call(responses, "ScriptWriterResult", occurrence=1)
+    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupResult", occurrence=1)
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
     writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
-    writer_payload["state_delta"]["evidence"] = [
+    writer_episode = writer_payload["episodes"][0]
+    writer_episode["state_delta"]["evidence"] = [
         item
-        for item in writer_payload["state_delta"]["evidence"]
+        for item in writer_episode["state_delta"]["evidence"]
         if item["target_id"] != "fact_ep1"
     ]
-    responses[writer_index] = _tool_call("ScriptWriterResult", writer_payload, writer_index)
+    responses[writer_index] = _tool_call(
+        "ScriptGenerationGroupResult", writer_payload, writer_index
+    )
     failed_review = {
         "passed": False,
         "evidence": "人物身份与上游小传不一致",
@@ -6508,9 +6718,9 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
         ],
     }
     responses[review_index] = _tool_call("EpisodeReviewerResult", failed_review, review_index)
-    responses.insert(review_index + 1, _tool_call("ScriptWriterResult", writer_payload, 201))
+    responses.insert(review_index + 1, _tool_call("ScriptWriterResult", writer_episode, 201))
     responses.insert(review_index + 2, _tool_call("EpisodeReviewerResult", failed_review, 202))
-    responses.insert(review_index + 3, _tool_call("ScriptWriterResult", writer_payload, 203))
+    responses.insert(review_index + 3, _tool_call("ScriptWriterResult", writer_episode, 203))
     responses.insert(review_index + 4, _tool_call("EpisodeReviewerResult", failed_review, 204))
     approved: list[InternalStage] = []
     episode_hooks, episode_attempts = _episode_hook_kwargs()
@@ -6571,9 +6781,10 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     database = tmp_path / "checkpoints.sqlite3"
     contract = _story_contract(verbatim_episodes={1})
     responses = _successful_responses(contract=contract)
-    writer_index = _index_of_tool_call(responses, "ScriptWriterResult", occurrence=1)
+    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupResult", occurrence=1)
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
     repaired_writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
+    repaired_writer_payload = repaired_writer_payload["episodes"][0]
     invalid_writer_payload = copy.deepcopy(repaired_writer_payload)
     invalid_writer_payload["content"] = "钩子1"
     invalid_writer_payload["state_delta"]["evidence"] = [
@@ -6584,7 +6795,16 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     invalid_writer_payload["state_delta"]["evidence"].append(
         {"target_id": "stale_target", "excerpt": "钩子1"}
     )
-    responses[writer_index] = _tool_call("ScriptWriterResult", invalid_writer_payload, writer_index)
+    invalid_group_payload = {
+        "stage": "generating_episode_scripts",
+        "group_id": "opening_unit",
+        "start_episode": 1,
+        "end_episode": 1,
+        "episodes": [invalid_writer_payload],
+    }
+    responses[writer_index] = _tool_call(
+        "ScriptGenerationGroupResult", invalid_group_payload, writer_index
+    )
     responses[review_index] = _tool_call(
         "EpisodeReviewerResult",
         {
@@ -6809,16 +7029,35 @@ async def test_numeric_fact_drift_triggers_deterministic_repair_with_established
         {"episode_number": 2, "plan": "第二集计划"},
     ]
     planner_args["story_contract"] = contract.model_dump(mode="json")
+    planner_args["script_generation_groups"] = [
+        {
+            "group_id": "episode_one",
+            "start_episode": 1,
+            "end_episode": 1,
+            "dramatic_unit": "第一集",
+            "boundary_reason": "第一集结束",
+        },
+        {
+            "group_id": "episode_two",
+            "start_episode": 2,
+            "end_episode": 2,
+            "dramatic_unit": "第二集",
+            "boundary_reason": "全剧结束",
+        },
+    ]
 
-    writer_index = _index_of_tool_call(responses, "ScriptWriterResult", occurrence=1)
+    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupResult", occurrence=1)
     writer_args = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
-    writer_args["episode_number"] = 2
-    writer_args["content"] = "测试人物（六十岁）推门进来。\n事实2\n钩子2"
-    writer_args["state_delta"] = _state_delta(contract, 2)
-    responses[writer_index] = _tool_call("ScriptWriterResult", writer_args, writer_index)
+    writer_args["group_id"] = "episode_two"
+    writer_args["start_episode"] = 2
+    writer_args["end_episode"] = 2
+    writer_args["episodes"][0]["episode_number"] = 2
+    writer_args["episodes"][0]["content"] = "测试人物（六十岁）推门进来。\n事实2\n钩子2"
+    writer_args["episodes"][0]["state_delta"] = _state_delta(contract, 2)
+    responses[writer_index] = _tool_call("ScriptGenerationGroupResult", writer_args, writer_index)
 
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
-    repaired_args = copy.deepcopy(writer_args)
+    repaired_args = copy.deepcopy(writer_args["episodes"][0])
     repaired_args["content"] = "测试人物（五十九岁）推门进来。\n事实2\n钩子2"
     responses.insert(
         review_index + 1,
@@ -7196,7 +7435,8 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
     assert second_input["/workspace/series_bible/story_outline.md"]["content"] == "故事大纲"
     assert second_input["/workspace/series_bible/episode_outline.md"]["content"] == "两集分集大纲"
     assert "/workspace/story_contract.json" in second_input
-    assert "第二集计划" in writer_descriptions[1]
+    second_group = json.loads(second_input["/workspace/generation_group.json"]["content"])
+    assert second_group["episodes"][0]["plan"] == "第二集计划"
 
     # Episode 2 receives script 1 verbatim (never a summary).
     assert second_input["/workspace/episodes/ep1.md"]["content"] == "事实1\n钩子1"
@@ -7220,6 +7460,133 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
             "earliest_affected_episode": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_episode_writer_generates_eighty_episode_outline_groups_once() -> None:
+    episode_count = 80
+    contract = _story_contract(episode_count=episode_count)
+    contract_hash = story_contract_sha256(contract)
+    groups: list[dict[str, Any]] = []
+    expected_ranges: list[tuple[int, int]] = []
+    start = 1
+    for index, length in enumerate(itertools.cycle((2, 3, 1, 4)), start=1):
+        if start > episode_count:
+            break
+        end = min(episode_count, start + length - 1)
+        groups.append(
+            {
+                "group_id": f"dramatic_unit_{index}",
+                "start_episode": start,
+                "end_episode": end,
+                "dramatic_unit": f"推进第{start}至{end}集行动链",
+                "boundary_reason": f"第{end}集完成阶段目标",
+            }
+        )
+        expected_ranges.append((start, end))
+        start = end + 1
+    summary = project_series_bible(
+        build_series_bible(
+            run_id="group-run",
+            run_kind="initial",
+            l0_variant="主动选择",
+            genre="general",
+            story_outline="故事大纲",
+            character_biographies="人物小传",
+            relationship_logic="关系逻辑",
+            episode_outline="八十集分集大纲",
+            story_contract_payload=contract.model_dump(mode="json"),
+            script_generation_groups=groups,
+        ),
+        is_active=True,
+    )
+    approved_payloads = {
+        InternalStage.GENERATING_EPISODE_OUTLINE: {
+            "stage": "generating_episode_outline",
+            "content": "八十集分集大纲",
+            "episode_count": episode_count,
+            "episodes": [
+                {"episode_number": episode, "plan": f"第{episode}集计划"}
+                for episode in range(1, episode_count + 1)
+            ],
+            "story_contract": contract.model_dump(mode="json"),
+            "script_generation_groups": groups,
+            "story_contract_sha256": contract_hash,
+            "story_contract_markdown": render_story_contract_markdown(contract, contract_hash),
+            "contract_review": {"passed": True, "evidence": "合同一致", "issues": []},
+            "contract_repair_rounds": 0,
+        }
+    }
+    episode_hooks, attempts = _episode_hook_kwargs()
+    writer_ranges: list[tuple[int, int]] = []
+
+    async def register_series_review(**_: Any) -> str:
+        return "final-review"
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _stage: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(approved_payloads),
+        approved_payloads=approved_payloads,
+        series_bible=summary,
+        register_series_review=register_series_review,
+        **episode_hooks,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] write grouped scripts",
+                "subagent_type": "script_writer",
+            },
+            "id": "call-grouped-writer",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+
+    async def handler(subagent_request: ToolCallRequest) -> ToolMessage:
+        subagent_type = subagent_request.tool_call["args"]["subagent_type"]
+        if subagent_type == "series_reviewer":
+            payload: dict[str, Any] = {
+                "passed": True,
+                "category": "pass",
+                "evidence": "L4硬规则：全系列一致",
+            }
+        else:
+            assert subagent_type == "script_writer"
+            group_payload = json.loads(
+                subagent_request.state["files"]["/workspace/generation_group.json"]["content"]
+            )
+            start = group_payload["runtime_start_episode"]
+            end = group_payload["runtime_end_episode"]
+            writer_ranges.append((start, end))
+            payload = {
+                "stage": "generating_episode_scripts",
+                "group_id": group_payload["group"]["group_id"],
+                "start_episode": start,
+                "end_episode": end,
+                "episodes": [
+                    {
+                        "stage": "generating_episode_scripts",
+                        "episode_number": episode,
+                        "content": f"事实{episode}\n钩子{episode}",
+                        "state_delta": _state_delta(contract, episode),
+                    }
+                    for episode in range(start, end + 1)
+                ],
+            }
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id="call-grouped-writer",
+        )
+
+    await middleware._write_episodes(request, handler, request.tool_call["args"])
+
+    assert writer_ranges == expected_ranges
+    assert attempts == list(range(1, episode_count + 1))
 
 
 async def _async_one() -> int:
@@ -7294,17 +7661,25 @@ async def test_contract_episode_missing_state_delta_is_corrected_within_stage(
     script_result_index = next(
         index
         for index, message in enumerate(responses)
-        if message.tool_calls and message.tool_calls[0]["name"] == "ScriptWriterResult"
+        if message.tool_calls and message.tool_calls[0]["name"] == "ScriptGenerationGroupResult"
     )
     responses.insert(
         script_result_index,
         _tool_call(
-            "ScriptWriterResult",
+            "ScriptGenerationGroupResult",
             {
                 "stage": "generating_episode_scripts",
-                "episode_number": 1,
-                "content": "事实1\n钩子1",
-                "state_delta": None,
+                "group_id": "opening_unit",
+                "start_episode": 1,
+                "end_episode": 1,
+                "episodes": [
+                    {
+                        "stage": "generating_episode_scripts",
+                        "episode_number": 1,
+                        "content": "事实1\n钩子1",
+                        "state_delta": None,
+                    }
+                ],
             },
             99,
         ),
@@ -8344,7 +8719,9 @@ async def test_outline_repair_correction_reports_a_safe_target_error() -> None:
     )
 
     assert len(corrections) == 2
-    assert "Outline repair paths must target episode plans" in (corrections[1] or "")
+    assert "Outline repair paths must target episode plans or generation groups" in (
+        corrections[1] or ""
+    )
     assert repaired["content"] == "修复后的分集大纲"
 
 
@@ -9273,6 +9650,12 @@ async def test_restarted_worker_resumes_same_run_and_thread(
     assert resource.initial.state == "succeeded"
     assert attempts[first_stage] == 1
     assert all(count == 1 for count in attempts.values())
+    windows = await repository.get_episode_generation_windows(lease.run_id)
+    assert len(windows) == 1
+    assert windows[0]["status"] == "committed"
+    assert windows[0]["start_episode"] == windows[0]["end_episode"] == 1
+    candidates = await repository.get_active_episode_candidates(lease.run_id)
+    assert candidates[0].generation_window_id == windows[0]["window_id"]
     model_call_store.close()
 
 

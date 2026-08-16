@@ -75,7 +75,11 @@ from pengine.schemas import (
     StrictModel,
     WorkflowResult,
 )
-from pengine.series_bible import SeriesBibleSummary
+from pengine.series_bible import (
+    ScriptGenerationGroup,
+    SeriesBibleSummary,
+    validate_script_generation_groups,
+)
 from pengine.series_review import StructuralReviewResult, effective_milestones
 from pengine.skill_assets import load_agent_skill_files
 
@@ -84,7 +88,7 @@ logger = logging.getLogger(__name__)
 StageHook = Callable[[InternalStage], Awaitable[int]]
 CheckpointHook = Callable[[InternalStage, Mapping[str, Any]], Awaitable[None]]
 ReferenceRetriever = Callable[[str], Awaitable[str]]
-EpisodeAttemptHook = Callable[[EpisodePlan], Awaitable[int]]
+EpisodeAttemptHook = Callable[..., Awaitable[int]]
 # ``commit_episode`` may carry ``call_id`` / ``writer_notes`` keyword arguments
 # used to bind each generation to its immutable episode candidate (FSW-A3).
 EpisodeCommitHook = Callable[..., Awaitable[EpisodeDraft]]
@@ -96,6 +100,9 @@ SeriesReviewRegistration = Callable[..., Awaitable[str]]
 # ``get_series_bible`` returns the active SeriesBible projection so the writer can
 # refresh the design after the outline stage promotes it (mid-execution).
 SeriesBibleRetriever = Callable[[], Awaitable[SeriesBibleSummary | None]]
+GenerationGroupStart = Callable[..., Awaitable[str]]
+GenerationGroupComplete = Callable[..., Awaitable[str]]
+GenerationGroupFail = Callable[[str], Awaitable[None]]
 
 
 def _trusted_series_prefix_json(episodes: Iterable[tuple[int, str]]) -> str:
@@ -167,7 +174,7 @@ _RESULT_TOOL = {
     InternalStage.GENERATING_STORY_OUTLINE: "StoryArchitectResult",
     InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: "StoryArchitectResult",
     InternalStage.GENERATING_EPISODE_OUTLINE: "EpisodePlannerResult",
-    InternalStage.GENERATING_EPISODE_SCRIPTS: "ScriptWriterResult",
+    InternalStage.GENERATING_EPISODE_SCRIPTS: "ScriptGenerationGroupResult",
     InternalStage.ACCEPTING_L0: "QualityReviewerResult",
     InternalStage.ACCEPTING_L4: "QualityReviewerResult",
 }
@@ -448,7 +455,17 @@ _EPISODE_PLANNER_PROMPT = (
     "upstream artifact explicitly requires its text value to appear contiguously word-for-word "
     "in the screenplay. Do not infer verbatim=true from quotation marks, kind=text, the value "
     "field, or words such as 原文 in subject or predicate. Non-text facts must never have "
-    "verbatim=true; leave verbatim=false otherwise."
+    "verbatim=true; leave verbatim=false otherwise. Also declare script_generation_groups "
+    "as the authoritative screenplay-generation units. Group episodes by one coherent "
+    "dramatic action, setup-development-payoff chain, continuous time/place, or shared "
+    "suspense objective; cut a group before or after a major reveal, time jump, relationship "
+    "turn, or phase ending. Every group must contain 1 to 4 contiguous episodes, all groups "
+    "must cover the complete season exactly once, and no group may cross a declared review "
+    "milestone. Give each group a stable lowercase snake_case group_id plus a concrete "
+    "dramatic_unit and boundary_reason. Do not mechanically group by a fixed episode count. "
+    "Keep content as the readable per-episode dramatic outline only: do not add a separate "
+    "generation-batch table, generation-group heading, or competing boundary declaration "
+    "there. script_generation_groups is the sole authoritative execution-group projection."
 )
 
 _SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
@@ -458,7 +475,8 @@ _SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
     "the requested episode in every state_delta list; never copy cumulative prior state into a "
     "delta. Follow the approved selected L0 facet and enforce the current persona's exact red "
     "lines and emotional-temperature instructions without adding rules from another persona. "
-    "Follow the single episode plan and persona rules without changing any "
+    "Follow every supplied episode plan in the one requested generation group and persona "
+    "rules without changing any "
     "locked episode count, cast, facts, units, timeline, knowledge states, or clue plan. Before "
     "returning, reread every approved upstream artifact and audit this episode "
     "against them. Treat contract characters as continuity-bearing identities, not as a "
@@ -493,9 +511,11 @@ _SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
     "them (for example, 22:50 becomes 1370 and 22:20 becomes 1340). Never round a "
     "non-integral division unless the script states the rounding rule. Every required "
     "fact, clue event, and episode obligation must cite a verbatim "
-    "excerpt that exists in the script. Return only the structured episode-script "
-    "result for the requested episode number, with the complete verbatim screenplay in "
-    "content rather than a completion summary, status report, or file path. When "
+    "excerpt that exists in its own script. Generate the group in episode order: each later "
+    "episode must continue from the earlier episode and state_delta returned in this same "
+    "result. Return only the structured ScriptGenerationGroupResult for the requested group, "
+    "with every complete verbatim screenplay in its episode content rather than a completion "
+    "summary, status report, or file path. When "
     "/workspace/suffix_rewrite_review.json is present, read it as the read-only bound "
     "rewrite cause, fix every conflict named in every review evidence entry, give the locked "
     "story contract priority, and do not reproduce the named defect."
@@ -966,6 +986,7 @@ class EpisodePlannerResult(StrictModel):
             "completion review; the final episode is always reviewed."
         ),
     )
+    script_generation_groups: list[ScriptGenerationGroup] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_episode_sequence(self) -> "EpisodePlannerResult":
@@ -982,6 +1003,12 @@ class EpisodePlannerResult(StrictModel):
             if milestone < 1 or milestone > self.episode_count:
                 raise ValueError("Review milestones must lie within the episode count")
         self.review_milestones = sorted(milestones)
+        validate_script_generation_groups(
+            self.script_generation_groups,
+            episode_count=self.episode_count,
+            review_milestones=self.review_milestones,
+            allow_empty=True,
+        )
         return self
 
 
@@ -1110,8 +1137,9 @@ class OutlineJsonEdit(StrictModel):
     path: NonEmptyText = Field(
         max_length=500,
         description=(
-            "RFC 6901 JSON pointer targeting an item under /episodes. Story-contract "
-            "mutations are applied atomically by the runtime."
+            "RFC 6901 JSON pointer targeting an item under /episodes or "
+            "/script_generation_groups. Story-contract mutations are applied atomically "
+            "by the runtime."
         ),
     )
     expected: JsonValue = Field(
@@ -1121,8 +1149,8 @@ class OutlineJsonEdit(StrictModel):
 
     @model_validator(mode="after")
     def validate_edit(self) -> "OutlineJsonEdit":
-        if not self.path.startswith("/episodes/"):
-            raise ValueError("Outline repair paths must target episode plans")
+        if not self.path.startswith(("/episodes/", "/script_generation_groups/")):
+            raise ValueError("Outline repair paths must target episode plans or generation groups")
         return self
 
 
@@ -1139,8 +1167,9 @@ class OutlineRepairPatch(StrictModel):
         default_factory=list,
         max_length=64,
         description=(
-            "Minimal guarded edits to episode plans. Story-contract mutations are applied "
-            "atomically by the runtime and must not be repeated here."
+            "Minimal guarded edits to episode plans or script generation groups. "
+            "Story-contract mutations are applied atomically by the runtime and must not "
+            "be repeated here."
         ),
     )
 
@@ -1191,6 +1220,26 @@ class ScriptWriterResult(StrictModel):
     def validate_delta_episode(self) -> "ScriptWriterResult":
         if self.state_delta.episode_number != self.episode_number:
             raise ValueError("Episode state delta must match the script episode")
+        return self
+
+
+class ScriptGenerationGroupResult(StrictModel):
+    """Complete ordered screenplay candidates for one outline-authored group."""
+
+    stage: Literal["generating_episode_scripts"]
+    group_id: StableId
+    start_episode: int = Field(ge=1)
+    end_episode: int = Field(ge=1)
+    episodes: list[ScriptWriterResult] = Field(min_length=1, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_episode_sequence(self) -> "ScriptGenerationGroupResult":
+        if self.end_episode < self.start_episode:
+            raise ValueError("Script generation group end must not precede its start")
+        expected = list(range(self.start_episode, self.end_episode + 1))
+        actual = [episode.episode_number for episode in self.episodes]
+        if actual != expected:
+            raise ValueError("Script generation group episodes must match its contiguous range")
         return self
 
 
@@ -1649,7 +1698,7 @@ _SAFE_VALIDATION_MESSAGES = frozenset(
         "L0 selection requires only variant and rationale",
         "Story artifact stages require only content",
         "Episode plans must be ordered and contiguous from 1",
-        "Outline repair paths must target episode plans",
+        "Outline repair paths must target episode plans or generation groups",
         "Story contract episode count must match the episode plan",
         "Episode state delta must match the script episode",
     }
@@ -1667,6 +1716,7 @@ _SAFE_VALIDATION_LOCATIONS = frozenset(
         "selection_rationale",
         "episode_count",
         "episodes",
+        "script_generation_groups",
         "episode_number",
         "plan",
         "story_contract",
@@ -1757,8 +1807,9 @@ def _structured_output_retry_message(error: Exception) -> str:
 
 _OUTLINE_PATCH_ERROR_GUIDANCE = {
     "outline_repair_patch_target_not_exposed": (
-        "Use only an exact episode_plans path. Story-contract mutations are already applied "
-        "atomically by the runtime and must not be repeated in the patch."
+        "Use only an exact episode_plans or script_generation_groups path. Story-contract "
+        "mutations are already applied atomically by the runtime and must not be repeated in "
+        "the patch."
     ),
     "outline_repair_patch_did_not_change": (
         "Change the readable outline or an exposed episode plan to resolve the confirmed issue."
@@ -1774,7 +1825,7 @@ _OUTLINE_PATCH_ERROR_GUIDANCE = {
     "missing_patch_target": "Choose an existing path supplied in the repair context.",
     "invalid_json_pointer": "Use a valid RFC 6901 path supplied in the repair context.",
     "invalid_list_index": "Use an existing decimal episode-plan list index.",
-    "disallowed_patch_root": "Use only an exposed /episodes path.",
+    "disallowed_patch_root": ("Use only an exposed /episodes or /script_generation_groups path."),
 }
 _OUTLINE_REVIEW_TARGET_ERRORS = frozenset(
     {
@@ -2055,7 +2106,11 @@ def _user_facing_texts(result: Any) -> list[str]:
             *(clue.description for clue in contract.clues),
             *contract.prohibitions,
             *(obligation.end_hook for obligation in contract.episode_obligations),
+            *(group.dramatic_unit for group in result.script_generation_groups),
+            *(group.boundary_reason for group in result.script_generation_groups),
         ]
+    if isinstance(result, ScriptGenerationGroupResult):
+        return [text for episode in result.episodes for text in _user_facing_texts(episode)]
     if isinstance(result, ScriptWriterResult):
         return [
             result.content,
@@ -2182,6 +2237,24 @@ def _language_retry_fingerprint(result: Any) -> tuple[Any, ...]:
                 )
                 for obligation in contract.episode_obligations
             ),
+            tuple(
+                (
+                    group.group_id,
+                    group.start_episode,
+                    group.end_episode,
+                    _language_text_fingerprint(group.dramatic_unit),
+                    _language_text_fingerprint(group.boundary_reason),
+                )
+                for group in result.script_generation_groups
+            ),
+        )
+    if isinstance(result, ScriptGenerationGroupResult):
+        return (
+            result.stage,
+            result.group_id,
+            result.start_episode,
+            result.end_episode,
+            tuple(_language_retry_fingerprint(episode) for episode in result.episodes),
         )
     if isinstance(result, ScriptWriterResult):
         delta = result.state_delta
@@ -2848,7 +2921,20 @@ def _parse_stage_result(stage: InternalStage, raw: Any) -> StrictModel:
     if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
         return EpisodePlannerResult.model_validate(raw)
     if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
-        return ScriptWriterResult.model_validate(raw)
+        try:
+            return ScriptGenerationGroupResult.model_validate(raw)
+        except ValidationError:
+            # Old checkpoints and narrow test harnesses may still return the former
+            # one-episode envelope. The real writer tool only exposes the group schema;
+            # this adapter exists solely so already-started legacy work can resume.
+            episode = ScriptWriterResult.model_validate(raw)
+            return ScriptGenerationGroupResult(
+                stage=stage.value,
+                group_id="legacy_single_episode",
+                start_episode=episode.episode_number,
+                end_episode=episode.episode_number,
+                episodes=[episode],
+            )
     if stage in (InternalStage.ACCEPTING_L0, InternalStage.ACCEPTING_L4):
         return QualityReviewerResult.model_validate(raw)
     raise AgentProtocolError("Task tool declared a non-specialist stage", stage=stage)
@@ -3124,7 +3210,7 @@ def _json_pointer_parts(path: str) -> list[str]:
     parts = [part.replace("~1", "/").replace("~0", "~") for part in path[1:].split("/")]
     if any(not part for part in parts):
         raise ValueError("invalid_json_pointer")
-    if len(parts) < 2 or parts[0] != "episodes":
+    if len(parts) < 2 or parts[0] not in {"episodes", "script_generation_groups"}:
         raise ValueError("disallowed_patch_root")
     return parts
 
@@ -3360,6 +3446,10 @@ def _outline_repair_context(
             {"path": f"/episodes/{index}", "value": episode}
             for index, episode in enumerate(episodes)
         ],
+        "script_generation_groups": [
+            {"path": f"/script_generation_groups/{index}", "value": group}
+            for index, group in enumerate(candidate.get("script_generation_groups", []))
+        ],
         "story_contract_header": {
             "version": contract.get("version"),
             "episode_count": contract.get("episode_count"),
@@ -3413,9 +3503,16 @@ def _validate_outline_repair_patch_targets(
         for item in context.get("episode_plans", [])
         if isinstance(item, Mapping) and isinstance(item.get("path"), str)
     }
+    generation_group_paths = {
+        item["path"]
+        for item in context.get("script_generation_groups", [])
+        if isinstance(item, Mapping) and isinstance(item.get("path"), str)
+    }
     for edit in patch.json_edits:
         allowed = any(
             edit.path == base or edit.path.startswith(f"{base}/") for base in episode_paths
+        ) or any(
+            edit.path == base or edit.path.startswith(f"{base}/") for base in generation_group_paths
         )
         if not allowed:
             raise ValueError("outline_repair_patch_target_not_exposed")
@@ -3494,10 +3591,22 @@ def _validated_stage_payload(
     )
     if parsed.stage != stage.value:
         raise AgentProtocolError("Subagent returned a different stage", stage=stage)
-    if isinstance(parsed, ScriptWriterResult) and (
-        expected_episode_number is None or parsed.episode_number != expected_episode_number
+    if isinstance(parsed, EpisodePlannerResult) and not parsed.script_generation_groups:
+        raise AgentProtocolError(
+            "Episode outline omitted script generation groups",
+            stage=stage,
+            repair_instruction=(
+                "Declare complete script_generation_groups based on dramatic units; each group "
+                "must contain 1 to 4 contiguous episodes and may not cross a review milestone."
+            ),
+            safe_message="分集大纲没有声明完整的剧本生成组。",
+        )
+    if (
+        isinstance(parsed, ScriptGenerationGroupResult)
+        and expected_episode_number is not None
+        and parsed.start_episode != expected_episode_number
     ):
-        raise AgentProtocolError("Subagent returned a different episode", stage=stage)
+        raise AgentProtocolError("Subagent returned a different generation group", stage=stage)
     if enforce_quality_gate and isinstance(parsed, QualityReviewerResult) and not parsed.passed:
         raise QualityGateRejectedError(
             stage=stage,
@@ -4101,6 +4210,9 @@ class StageGuardMiddleware(AgentMiddleware):
         get_series_bible: SeriesBibleRetriever | None = None,
         model_call_state: ModelCallState | None = None,
         suffix_rewrite_feedback: Mapping[str, Any] | None = None,
+        begin_generation_group: GenerationGroupStart | None = None,
+        complete_generation_group: GenerationGroupComplete | None = None,
+        fail_generation_group: GenerationGroupFail | None = None,
     ) -> None:
         self.before_stage = before_stage
         self.approve_stage = approve_stage
@@ -4121,6 +4233,9 @@ class StageGuardMiddleware(AgentMiddleware):
         self.get_series_bible = get_series_bible
         self.model_call_state = model_call_state
         self.suffix_rewrite_feedback = suffix_rewrite_feedback
+        self.begin_generation_group = begin_generation_group
+        self.complete_generation_group = complete_generation_group
+        self.fail_generation_group = fail_generation_group
 
     @contextmanager
     def _repair_round_context(self, repair_round: int | None):
@@ -4750,7 +4865,14 @@ class StageGuardMiddleware(AgentMiddleware):
             review_description = (
                 "Review the proposed minimum continuity ledger against every approved "
                 "upstream artifact. Check that the structured episode plans agree with the "
-                "readable episode outline and story contract. Fail only on a contradiction in "
+                "readable episode outline and story contract. Also check that each declared "
+                "script generation group is a coherent dramatic unit and that its stated "
+                "boundary follows a real reveal, action, time/place, relationship, suspense, "
+                "or phase boundary rather than a mechanical fixed count. "
+                "script_generation_groups.json is the sole authoritative execution-group "
+                "projection: readable phase headings or narrative sections are not generation "
+                "groups and must not be compared as a second boundary source. Fail only on a "
+                "contradiction in "
                 "explicitly locked or formally committed identity, relationship, alias, "
                 "pronoun, age, duration, call-participant, clue or causal facts, ambiguous "
                 "typed numbers, unfair knowledge withholding, or incomplete required clue "
@@ -4775,6 +4897,11 @@ class StageGuardMiddleware(AgentMiddleware):
                 "/workspace/episode_outline.md": payload["content"],
                 "/workspace/episode_plans.json": json.dumps(
                     payload["episodes"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "/workspace/script_generation_groups.json": json.dumps(
+                    payload["script_generation_groups"],
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
@@ -5537,9 +5664,50 @@ class StageGuardMiddleware(AgentMiddleware):
             if self.series_bible is not None
             else frozenset()
         )
+        declared_groups = (
+            list(self.series_bible.script_generation_groups)
+            if self.series_bible is not None and self.series_bible.script_generation_groups
+            else list(parsed_outline.script_generation_groups)
+            if parsed_outline.script_generation_groups
+            else [
+                ScriptGenerationGroup(
+                    group_id=f"legacy_episode_{item.episode_number}",
+                    start_episode=item.episode_number,
+                    end_episode=item.episode_number,
+                    dramatic_unit=f"Legacy episode {item.episode_number}",
+                    boundary_reason="Legacy checkpoint without outline-authored generation groups",
+                )
+                for item in plans
+            ]
+        )
+        group_by_episode = {
+            episode_number: group
+            for group in declared_groups
+            for episode_number in range(group.start_episode, group.end_episode + 1)
+        }
+        pending_group_results: dict[int, ScriptWriterResult] = {}
+        pending_group_calls: dict[int, ToolMessage | Command[Any]] = {}
+        pending_group_provenance: dict[int, int] = {}
+        pending_group_window_ids: dict[int, str | None] = {}
+        pending_group_call_ids: dict[int, str | None] = {}
         for plan in plans:
             if plan.episode_number in self.episode_drafts:
                 continue
+            declared_group = group_by_episode.get(plan.episode_number)
+            if declared_group is None:
+                raise AgentProtocolError(
+                    "Approved outline does not bind this episode to a generation group",
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                )
+            starts_group_call = plan.episode_number not in pending_group_results
+            runtime_group_start = plan.episode_number
+            runtime_group_end = declared_group.end_episode
+            group_plans = [
+                item
+                for item in plans
+                if runtime_group_start <= item.episode_number <= runtime_group_end
+                and item.episode_number not in self.episode_drafts
+            ]
             current_obligation = next(
                 obligation
                 for obligation in contract.episode_obligations
@@ -5547,7 +5715,7 @@ class StageGuardMiddleware(AgentMiddleware):
             )
             if self.reset_episode_deadline is not None:
                 await self.reset_episode_deadline()
-            await self.before_episode(plan)
+            await self.before_episode(plan, new_operation=starts_group_call)
             evidence_contract = _evidence_contract(
                 contract,
                 plan.episode_number,
@@ -5557,14 +5725,6 @@ class StageGuardMiddleware(AgentMiddleware):
                 evidence_contract,
                 ensure_ascii=False,
                 sort_keys=True,
-            )
-            required_evidence_target_ids = json.dumps(
-                evidence_contract["required_evidence_target_ids"],
-                ensure_ascii=False,
-            )
-            required_verbatim_facts = json.dumps(
-                evidence_contract["required_verbatim_facts"],
-                ensure_ascii=False,
             )
             established_facts_payload = _established_facts_payload(
                 contract, prior_state, self.episode_drafts
@@ -5591,18 +5751,23 @@ class StageGuardMiddleware(AgentMiddleware):
             episode_args = {
                 **args,
                 "description": (
-                    f"[stage=generating_episode_scripts][episode={plan.episode_number}] "
-                    f"Write only episode {plan.episode_number}.\n"
-                    f"Approved episode plan:\n{plan.plan}"
+                    f"[stage=generating_episode_scripts][episode={runtime_group_start}] "
+                    f"Write generation group {declared_group.group_id} from episode "
+                    f"{runtime_group_start} through episode {runtime_group_end}. Return every "
+                    "episode in exact order in one ScriptGenerationGroupResult. Read "
+                    "/workspace/generation_group.json and every matching "
+                    "/workspace/evidence_contracts/epN.json; apply each evidence contract only "
+                    "to its own episode.\n"
+                    f"Dramatic unit: {declared_group.dramatic_unit}\n"
+                    f"Boundary reason: {declared_group.boundary_reason}"
                     f"\nLocked contract SHA-256: {contract_hash}"
                     "\nScreenplay labels and dialogue notation are format choices, not a cast "
                     "whitelist. Preserve hard-Canon character identities without normalizing "
                     "aliases, roles, generic labels, or colon-form lines. Read "
-                    "/workspace/evidence_contract.json and perform an exact-set self-check "
-                    f"against required_evidence_target_ids={required_evidence_target_ids}: "
+                    "each episode evidence contract and perform an exact-set self-check: "
                     "no extra or duplicate target IDs and every excerpt verbatim in content. "
-                    "Only required_verbatim_facts require fact.value to appear contiguously "
-                    f"verbatim in content: required_verbatim_facts={required_verbatim_facts}. "
+                    "Only that episode's required_verbatim_facts require fact.value to appear "
+                    "contiguously verbatim in content. "
                     "All other facts are semantic-only. Read "
                     "/workspace/established_facts.json: every entry was committed in an "
                     "earlier episode and must stay consistent with its locked value in this "
@@ -5638,6 +5803,39 @@ class StageGuardMiddleware(AgentMiddleware):
                     "/workspace/series_state.json": prior_state.model_dump_json(),
                     "/workspace/previous_episode_handoff.md": prior_state.handoff or "None",
                     "/workspace/writer_notes.md": writer_notes or "None",
+                    "/workspace/generation_group.json": json.dumps(
+                        {
+                            "group": declared_group.model_dump(mode="json"),
+                            "runtime_start_episode": runtime_group_start,
+                            "runtime_end_episode": runtime_group_end,
+                            "episodes": [
+                                {
+                                    "episode_number": item.episode_number,
+                                    "plan": item.plan,
+                                    "obligation": next(
+                                        obligation.model_dump(mode="json")
+                                        for obligation in contract.episode_obligations
+                                        if obligation.episode_number == item.episode_number
+                                    ),
+                                }
+                                for item in group_plans
+                            ],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                }
+            )
+            episode_files.update(
+                {
+                    f"/workspace/evidence_contracts/ep{item.episode_number}.json": (
+                        _evidence_contract_json(
+                            contract,
+                            item.episode_number,
+                            phase="initial_episode_write",
+                        )
+                    )
+                    for item in group_plans
                 }
             )
             if suffix_feedback is not None:
@@ -5652,28 +5850,121 @@ class StageGuardMiddleware(AgentMiddleware):
                 ),
                 episode_files,
             )
-            try:
-                if self.episode_timeout_seconds is None:
-                    result, payload = await self._call_structured_stage(
-                        InternalStage.GENERATING_EPISODE_SCRIPTS,
-                        episode_request,
-                        handler,
-                        episode_args,
-                        expected_episode_number=plan.episode_number,
+            if starts_group_call:
+                window_id = (
+                    await self.begin_generation_group(
+                        group_id=declared_group.group_id,
+                        start_episode=runtime_group_start,
+                        end_episode=runtime_group_end,
                     )
-                else:
-                    async with asyncio.timeout(self.episode_timeout_seconds):
+                    if self.begin_generation_group is not None
+                    else None
+                )
+                record_langfuse_event(
+                    "pengine.script_generation_group.started",
+                    input={
+                        "group_id": declared_group.group_id,
+                        "start_episode": runtime_group_start,
+                        "end_episode": runtime_group_end,
+                    },
+                    metadata={"window_id": window_id, "trace_version": "pengine-1"},
+                )
+                try:
+                    if self.episode_timeout_seconds is None:
                         result, payload = await self._call_structured_stage(
                             InternalStage.GENERATING_EPISODE_SCRIPTS,
                             episode_request,
                             handler,
                             episode_args,
-                            expected_episode_number=plan.episode_number,
+                            expected_episode_number=runtime_group_start,
                         )
-            except TimeoutError as exc:
-                raise EpisodeTimeoutError(plan.episode_number) from exc
+                    else:
+                        async with asyncio.timeout(self.episode_timeout_seconds):
+                            result, payload = await self._call_structured_stage(
+                                InternalStage.GENERATING_EPISODE_SCRIPTS,
+                                episode_request,
+                                handler,
+                                episode_args,
+                                expected_episode_number=runtime_group_start,
+                            )
+                except TimeoutError as exc:
+                    if window_id is not None and self.fail_generation_group is not None:
+                        await self.fail_generation_group(window_id)
+                    record_langfuse_event(
+                        "pengine.script_generation_group.failed",
+                        input={"group_id": declared_group.group_id, "reason": "timeout"},
+                        metadata={"window_id": window_id, "trace_version": "pengine-1"},
+                    )
+                    raise EpisodeTimeoutError(plan.episode_number) from exc
+                except Exception:
+                    if window_id is not None and self.fail_generation_group is not None:
+                        await self.fail_generation_group(window_id)
+                    record_langfuse_event(
+                        "pengine.script_generation_group.failed",
+                        input={"group_id": declared_group.group_id, "reason": "generation_error"},
+                        metadata={"window_id": window_id, "trace_version": "pengine-1"},
+                    )
+                    raise
+                parsed_group = ScriptGenerationGroupResult.model_validate(payload)
+                legacy_single = (
+                    parsed_group.group_id == "legacy_single_episode"
+                    and runtime_group_start == runtime_group_end
+                )
+                if (
+                    (parsed_group.group_id != declared_group.group_id and not legacy_single)
+                    or parsed_group.start_episode != runtime_group_start
+                    or parsed_group.end_episode != runtime_group_end
+                ):
+                    if window_id is not None and self.fail_generation_group is not None:
+                        await self.fail_generation_group(window_id)
+                    raise AgentProtocolError(
+                        "Script writer returned a different generation group",
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    )
+                try:
+                    group_call_id = (
+                        await self.complete_generation_group(
+                            window_id,
+                            provenance_episode_number=runtime_group_start,
+                        )
+                        if window_id is not None and self.complete_generation_group is not None
+                        else None
+                    )
+                except Exception:
+                    if window_id is not None and self.fail_generation_group is not None:
+                        await self.fail_generation_group(window_id)
+                    record_langfuse_event(
+                        "pengine.script_generation_group.failed",
+                        input={"group_id": declared_group.group_id, "reason": "provenance"},
+                        metadata={"window_id": window_id, "trace_version": "pengine-1"},
+                    )
+                    raise
+                for group_episode in parsed_group.episodes:
+                    pending_group_results[group_episode.episode_number] = group_episode
+                    pending_group_calls[group_episode.episode_number] = result
+                    pending_group_provenance[group_episode.episode_number] = runtime_group_start
+                    pending_group_window_ids[group_episode.episode_number] = window_id
+                    pending_group_call_ids[group_episode.episode_number] = group_call_id
+                record_langfuse_event(
+                    "pengine.script_generation_group.completed",
+                    input={
+                        "group_id": declared_group.group_id,
+                        "start_episode": runtime_group_start,
+                        "end_episode": runtime_group_end,
+                        "episode_count": len(parsed_group.episodes),
+                    },
+                    metadata={
+                        "window_id": window_id,
+                        "call_id": group_call_id,
+                        "trace_version": "pengine-1",
+                    },
+                )
 
-            parsed = ScriptWriterResult.model_validate(payload)
+            parsed = pending_group_results.pop(plan.episode_number)
+            result = pending_group_calls.pop(plan.episode_number)
+            provenance_episode_number = pending_group_provenance.pop(plan.episode_number)
+            generation_window_id = pending_group_window_ids.pop(plan.episode_number)
+            generation_call_id = pending_group_call_ids.pop(plan.episode_number)
             repair_rounds = 0
             while True:
                 parsed = parsed.model_copy(
@@ -5769,6 +6060,9 @@ class StageGuardMiddleware(AgentMiddleware):
                         parsed.content,
                         episode_lock,
                         writer_notes=parsed.writer_notes,
+                        provenance_episode_number=provenance_episode_number,
+                        call_id=generation_call_id,
+                        generation_window_id=generation_window_id,
                     )
                     self.episode_drafts[plan.episode_number] = committed
                     prior_state = episode_lock.series_state
@@ -5798,6 +6092,29 @@ class StageGuardMiddleware(AgentMiddleware):
                         repair_rounds=repair_rounds,
                     )
                 repair_rounds += 1
+                # Later uncommitted candidates were authored against the rejected state.
+                # Discard them so the next episode regenerates the remaining group suffix
+                # from the repaired, committed SeriesState.
+                for pending_episode in range(plan.episode_number + 1, runtime_group_end + 1):
+                    pending_group_results.pop(pending_episode, None)
+                    pending_group_calls.pop(pending_episode, None)
+                    pending_group_provenance.pop(pending_episode, None)
+                    pending_group_window_ids.pop(pending_episode, None)
+                    pending_group_call_ids.pop(pending_episode, None)
+                if generation_window_id is not None and self.fail_generation_group is not None:
+                    await self.fail_generation_group(generation_window_id)
+                record_langfuse_event(
+                    "pengine.script_generation_group.failed",
+                    input={
+                        "group_id": declared_group.group_id,
+                        "reason": "episode_validation",
+                        "episode_number": plan.episode_number,
+                    },
+                    metadata={
+                        "window_id": generation_window_id,
+                        "trace_version": "pengine-1",
+                    },
+                )
                 unknown_speaker_issues = [
                     issue for issue in review.issues if issue.code == "unknown_speaker"
                 ]
@@ -5897,47 +6214,68 @@ class StageGuardMiddleware(AgentMiddleware):
                         "(59 is 五十九/59, never 六十/60) and keep every other established "
                         "fact unchanged."
                     )
-                result, payload = await self._invoke_repair_subagent(
-                    request=episode_request,
-                    handler=handler,
-                    subagent_type="episode_repair",
-                    description=repair_description,
-                    files={
-                        "/workspace/story_contract.json": contract_json,
-                        "/workspace/evidence_contract.json": _evidence_contract_json(
-                            contract,
-                            plan.episode_number,
-                            rejected_issues=evidence_repair_issues,
-                            phase="episode_repair",
-                        ),
-                        "/workspace/established_facts.json": established_facts_json,
-                        "/workspace/series_state.json": prior_state.model_dump_json(),
-                        "/workspace/current_episode_plan.md": plan.plan,
-                        "/workspace/current_episode_obligation.json": (
-                            current_obligation.model_dump_json()
-                        ),
-                        "/workspace/candidate_episode.md": parsed.content,
-                        "/workspace/candidate_state_delta.json": (
-                            parsed.state_delta.model_dump_json()
-                        ),
-                        "/workspace/episode_review.json": review.model_dump_json(),
-                        **(
-                            {
-                                "/workspace/suffix_rewrite_review.json": json.dumps(
-                                    suffix_feedback,
-                                    ensure_ascii=False,
-                                    sort_keys=True,
-                                )
-                            }
-                            if suffix_feedback is not None
-                            else {}
-                        ),
-                    },
-                    schema=ScriptWriterResult,
-                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
-                    expected_episode_number=plan.episode_number,
-                    repair_round=repair_rounds,
+                repair_window_id = (
+                    await self.begin_generation_group(
+                        group_id=declared_group.group_id,
+                        start_episode=plan.episode_number,
+                        end_episode=plan.episode_number,
+                    )
+                    if self.begin_generation_group is not None
+                    else None
                 )
+                try:
+                    result, payload = await self._invoke_repair_subagent(
+                        request=episode_request,
+                        handler=handler,
+                        subagent_type="episode_repair",
+                        description=repair_description,
+                        files={
+                            "/workspace/story_contract.json": contract_json,
+                            "/workspace/evidence_contract.json": _evidence_contract_json(
+                                contract,
+                                plan.episode_number,
+                                rejected_issues=evidence_repair_issues,
+                                phase="episode_repair",
+                            ),
+                            "/workspace/established_facts.json": established_facts_json,
+                            "/workspace/series_state.json": prior_state.model_dump_json(),
+                            "/workspace/current_episode_plan.md": plan.plan,
+                            "/workspace/current_episode_obligation.json": (
+                                current_obligation.model_dump_json()
+                            ),
+                            "/workspace/candidate_episode.md": parsed.content,
+                            "/workspace/candidate_state_delta.json": (
+                                parsed.state_delta.model_dump_json()
+                            ),
+                            "/workspace/episode_review.json": review.model_dump_json(),
+                            **(
+                                {
+                                    "/workspace/suffix_rewrite_review.json": json.dumps(
+                                        suffix_feedback,
+                                        ensure_ascii=False,
+                                        sort_keys=True,
+                                    )
+                                }
+                                if suffix_feedback is not None
+                                else {}
+                            ),
+                        },
+                        schema=ScriptWriterResult,
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        expected_episode_number=plan.episode_number,
+                        repair_round=repair_rounds,
+                    )
+                except Exception:
+                    if repair_window_id is not None and self.fail_generation_group is not None:
+                        await self.fail_generation_group(repair_window_id)
+                    raise
+                if repair_window_id is not None and self.complete_generation_group is not None:
+                    generation_call_id = await self.complete_generation_group(
+                        repair_window_id,
+                        provenance_episode_number=plan.episode_number,
+                    )
+                    generation_window_id = repair_window_id
+                    provenance_episode_number = plan.episode_number
                 parsed = ScriptWriterResult.model_validate(payload)
 
         aggregate = await self.assemble_episode_scripts()
@@ -6342,6 +6680,9 @@ class DeepAgentWorkflow:
         register_series_review: SeriesReviewRegistration | None = None,
         get_series_bible: SeriesBibleRetriever | None = None,
         suffix_rewrite_feedback: Mapping[str, Any] | None = None,
+        begin_generation_group: GenerationGroupStart | None = None,
+        complete_generation_group: GenerationGroupComplete | None = None,
+        fail_generation_group: GenerationGroupFail | None = None,
     ) -> WorkflowResult:
         approved_source = approved_checkpoints if approved_checkpoints is not None else {}
         approved_payloads: dict[InternalStage, Any] = {
@@ -6523,8 +6864,12 @@ class DeepAgentWorkflow:
                 "readable outline and episode plans, but only contract nodes referenced by the "
                 "confirmed review. For content replacements, copy an exact unique substring from "
                 "readable_outline.value; a review script_excerpt is evidence and may not be an "
-                "exact substring. JSON edits may target only the shown episode-plan paths; never "
-                "story-contract paths. The runtime has already applied every exact item in "
+                "exact substring. JSON edits may target only the shown episode-plan or "
+                "script-generation-group paths; never story-contract paths. Treat the structured "
+                "script_generation_groups as authoritative over any competing prose batch label. "
+                "Edit a structured group only when its own dramatic unit is incoherent with the "
+                "episode plans; otherwise repair or remove the competing prose label. The runtime "
+                "has already applied every exact item in "
                 "contract_mutations_applied_by_runtime as one validated atomic contract change; "
                 "do not repeat, reinterpret, or broaden those mutations. Use their resulting "
                 "values only to synchronize the readable outline and exposed episode plans. An "
@@ -6630,7 +6975,7 @@ class DeepAgentWorkflow:
                     system_prompt=script_writer_prompt,
                 ),
                 "response_format": ToolStrategy(
-                    schema=ScriptWriterResult,
+                    schema=ScriptGenerationGroupResult,
                     handle_errors=structured_output_retry,
                 ),
             },
@@ -6772,6 +7117,9 @@ class DeepAgentWorkflow:
                     get_series_bible=get_series_bible,
                     model_call_state=self.model_call_state,
                     suffix_rewrite_feedback=suffix_rewrite_feedback,
+                    begin_generation_group=begin_generation_group,
+                    complete_generation_group=complete_generation_group,
+                    fail_generation_group=fail_generation_group,
                 ),
                 ToolAllowlistMiddleware(
                     _SUPERVISOR_TOOL_ALLOWLIST,

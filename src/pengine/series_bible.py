@@ -40,6 +40,7 @@ from pengine.continuity import (
 
 SeriesBibleGenre = Literal["mystery", "general"]
 SeriesBibleStatus = Literal["unvalidated", "validated", "active", "superseded", "stale"]
+MAX_SCRIPT_GENERATION_GROUP_EPISODES = 4
 
 _MYSTERY_TERMS = (
     "悬疑",
@@ -128,6 +129,56 @@ class DesignLineage(ContinuityModel):
         return self
 
 
+class ScriptGenerationGroup(ContinuityModel):
+    """One outline-authored dramatic unit generated in a single writer operation."""
+
+    group_id: StableId
+    start_episode: int = Field(ge=1)
+    end_episode: int = Field(ge=1)
+    dramatic_unit: NonEmptyText
+    boundary_reason: NonEmptyText
+
+    @model_validator(mode="after")
+    def validate_range(self) -> ScriptGenerationGroup:
+        if self.end_episode < self.start_episode:
+            raise ValueError("Script generation group end must not precede its start")
+        if self.end_episode - self.start_episode + 1 > MAX_SCRIPT_GENERATION_GROUP_EPISODES:
+            raise ValueError(
+                "Script generation groups may contain at most "
+                f"{MAX_SCRIPT_GENERATION_GROUP_EPISODES} episodes"
+            )
+        return self
+
+
+def validate_script_generation_groups(
+    groups: list[ScriptGenerationGroup],
+    *,
+    episode_count: int,
+    review_milestones: list[int],
+    allow_empty: bool,
+) -> None:
+    """Validate complete ordered coverage and hard structural-review boundaries."""
+    if not groups:
+        if allow_empty:
+            return
+        raise ValueError("Episode outline must declare script generation groups")
+    group_ids = [group.group_id for group in groups]
+    if len(group_ids) != len(set(group_ids)):
+        raise ValueError("Script generation group IDs must be unique")
+    expected_start = 1
+    milestones = set(review_milestones)
+    for group in groups:
+        if group.start_episode != expected_start:
+            raise ValueError("Script generation groups must continuously cover episodes from 1")
+        if group.end_episode > episode_count:
+            raise ValueError("Script generation group exceeds the episode count")
+        if any(group.start_episode <= milestone < group.end_episode for milestone in milestones):
+            raise ValueError("Script generation group cannot cross a review milestone")
+        expected_start = group.end_episode + 1
+    if expected_start != episode_count + 1:
+        raise ValueError("Script generation groups must cover every episode exactly once")
+
+
 class SeriesBibleContent(ContinuityModel):
     """The complete creative content of one design candidate."""
 
@@ -143,6 +194,7 @@ class SeriesBibleContent(ContinuityModel):
             "only structural review is the final completion review."
         ),
     )
+    script_generation_groups: list[ScriptGenerationGroup] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_milestones(self) -> SeriesBibleContent:
@@ -153,6 +205,12 @@ class SeriesBibleContent(ContinuityModel):
             if milestone < 1 or milestone > self.story_contract.episode_count:
                 raise ValueError("Review milestones must lie within the episode count")
         self.review_milestones = sorted(milestones)
+        validate_script_generation_groups(
+            self.script_generation_groups,
+            episode_count=self.story_contract.episode_count,
+            review_milestones=self.review_milestones,
+            allow_empty=True,
+        )
         return self
 
 
@@ -229,6 +287,7 @@ class SeriesBibleProjections(ContinuityModel):
     episode_outline: NonEmptyText
     story_contract_markdown: NonEmptyText
     review_milestones: list[int] = Field(default_factory=list)
+    script_generation_groups: list[ScriptGenerationGroup] = Field(default_factory=list)
 
 
 class SeriesBibleSummary(ContinuityModel):
@@ -246,6 +305,7 @@ class SeriesBibleSummary(ContinuityModel):
     lineage: DesignLineage
     projections: SeriesBibleProjections
     review_milestones: list[int] = Field(default_factory=list)
+    script_generation_groups: list[ScriptGenerationGroup] = Field(default_factory=list)
     validation: ValidationEvidence | None = None
     global_review: GlobalDesignReview | None = None
     created_at: datetime
@@ -255,6 +315,10 @@ def canonical_series_bible_content_hash(content: SeriesBibleContent) -> str:
     """SHA-256 of the canonical serialized design content (immutable identity)."""
     payload = content.model_dump(mode="json")
     payload["story_contract"] = canonical_story_contract_payload(content.story_contract)
+    if not payload["script_generation_groups"]:
+        # Historical candidates predate outline-authored generation groups. Keep
+        # their immutable content hashes readable while new designs hash the field.
+        payload.pop("script_generation_groups")
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -294,6 +358,7 @@ def build_series_bible(
     design_epoch: int | None = None,
     candidate_id: StableId | None = None,
     review_milestones: list[int] | None = None,
+    script_generation_groups: list[Mapping[str, Any]] | None = None,
     now: datetime | None = None,
 ) -> SeriesBible:
     """Build one immutable SeriesBible candidate from complete content.
@@ -313,6 +378,7 @@ def build_series_bible(
         episode_outline=episode_outline,
         story_contract=contract,
         review_milestones=review_milestones or [],
+        script_generation_groups=script_generation_groups or [],
     )
     return SeriesBible(
         candidate_id=candidate_id or new_candidate_id(),
@@ -481,8 +547,10 @@ def project_series_bible(bible: SeriesBible, *, is_active: bool) -> SeriesBibleS
             episode_outline=bible.content.episode_outline,
             story_contract_markdown=render_story_contract_markdown(contract, contract_hash),
             review_milestones=bible.content.review_milestones,
+            script_generation_groups=bible.content.script_generation_groups,
         ),
         review_milestones=bible.content.review_milestones,
+        script_generation_groups=bible.content.script_generation_groups,
         validation=bible.validation,
         global_review=bible.global_review,
         created_at=bible.created_at,
