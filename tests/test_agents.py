@@ -71,6 +71,7 @@ from pengine.agents import (
     _canon_issue_ledger,
     _compact_supervisor_messages,
     _drop_dangling_tool_call_messages,
+    _established_facts_payload,
     _evidence_contract,
     _language_retry_fingerprint,
     _language_retry_matches,
@@ -99,7 +100,9 @@ from pengine.agents import (
 from pengine.config import Settings
 from pengine.continuity import (
     EpisodeStateDelta,
+    SeriesState,
     StoryContract,
+    canonical_model_hash,
     render_story_contract_markdown,
     story_contract_sha256,
 )
@@ -4555,6 +4558,8 @@ def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> 
     assert "/workspace/suffix_rewrite_review.json" in _SCRIPT_WRITER_PROMPT
     assert "read-only bound" in _SCRIPT_WRITER_PROMPT
     assert "do not reproduce the named defect" in _SCRIPT_WRITER_PROMPT
+    assert "/workspace/established_facts.json" in _SCRIPT_WRITER_PROMPT
+    assert "must exactly match fact.value" in _SCRIPT_WRITER_PROMPT
     assert "grandfathered pre-contract run" not in _SCRIPT_WRITER_PROMPT
     assert "/workspace/speaker_contract.json" not in _EPISODE_REPAIR_PROMPT
     assert "/workspace/evidence_contract.json" in _EPISODE_REPAIR_PROMPT
@@ -4572,6 +4577,8 @@ def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> 
     assert "locked story contract priority" in _EPISODE_REPAIR_PROMPT
     assert "verbatim_fact_missing" in _EPISODE_REPAIR_PROMPT
     assert "required_verbatim_facts" in _EPISODE_REPAIR_PROMPT
+    assert "locked_numeric_fact_mismatch" in _EPISODE_REPAIR_PROMPT
+    assert "/workspace/established_facts.json" in _EPISODE_REPAIR_PROMPT
 
 
 def test_specialist_prompts_apply_l0_by_stage_without_copying_source_content() -> None:
@@ -5084,6 +5091,8 @@ async def test_episode_writer_treats_speaker_labels_as_format_not_a_whitelist(
     ]
     assert evidence_contract["rejected_issues"] == []
     assert "/workspace/suffix_rewrite_review.json" not in files
+    established = json.loads(files["/workspace/established_facts.json"]["content"])
+    assert established["established_facts"] == []
     description = request.tool_call["args"]["description"]
     assert "Screenplay labels and dialogue notation are format choices" in description
     assert "without normalizing aliases, roles, generic labels" in description
@@ -5091,6 +5100,8 @@ async def test_episode_writer_treats_speaker_labels_as_format_not_a_whitelist(
     assert 'required_evidence_target_ids=["fact_ep1", "obligation_ep1"]' in description
     assert 'required_verbatim_facts=[{"fact_id": "fact_ep1", "value": "事实1"}]' in description
     assert "exact-set self-check" in description
+    assert "/workspace/established_facts.json" in description
+    assert "must exactly match" in description
 
 
 @pytest.mark.asyncio
@@ -5177,11 +5188,13 @@ async def test_suffix_rewrite_feedback_is_injected_only_from_effective_episode(
     )
     assert injected_feedback == _suffix_rewrite_feedback_for_episode(feedback, 1)
     assert [item["review_id"] for item in injected_feedback["reviews"]] == ["review-2"]
+    assert "/workspace/established_facts.json" in request.state["files"]
     description = request.tool_call["args"]["description"]
     assert "suffix rewrite" in description
     assert "fix every named conflict" in description
     assert "locked story contract has priority" in description
     assert "do not reproduce the named defect" in description
+    assert "cross-check every /workspace/established_facts.json entry" in description
     assert _suffix_rewrite_feedback_for_episode(feedback, 0) is None
     assert _suffix_rewrite_feedback_for_episode(feedback, 1)["reviews"] == [feedback["reviews"][0]]
     assert _suffix_rewrite_feedback_for_episode(feedback, 2) == feedback
@@ -5209,6 +5222,67 @@ def test_suffix_rewrite_feedback_filters_future_reviews_per_episode() -> None:
         "review-2",
         "review-3",
     ]
+
+
+def test_established_facts_payload_projects_locked_values_and_committed_evidence() -> None:
+    contract = _story_contract(episode_count=2)
+    contract_hash = story_contract_sha256(contract)
+    prior = SeriesState.model_validate(
+        {
+            "contract_sha256": contract_hash,
+            "locked_through_episode": 1,
+            "established_fact_ids": ["fact_ep1"],
+            "character_knowledge": [
+                {"character_id": "test_character", "known_fact_ids": ["fact_ep1"]}
+            ],
+            "handoff": "第1集结束",
+        }
+    )
+    ep1_delta = EpisodeStateDelta.model_validate(_state_delta(contract, 1))
+    ep1_draft = EpisodeDraft(
+        episode_number=1,
+        content="事实1\n钩子1",
+        content_sha256=hashlib.sha256("事实1\n钩子1".encode()).hexdigest(),
+        completed_at=datetime(2026, 7, 31, tzinfo=UTC),
+        contract_sha256=contract_hash,
+        state_delta=ep1_delta,
+    )
+
+    payload = _established_facts_payload(contract, prior, {1: ep1_draft})
+
+    assert payload["rules"] == {
+        "fact_values": "must_remain_consistent_in_every_episode",
+        "numeric_restatement": "numeric_values_must_exactly_match_locked_value",
+    }
+    assert payload["rule_text"]
+    assert payload["established_facts"] == [
+        {
+            "fact_id": "fact_ep1",
+            "subject": "测试人物",
+            "predicate": "确认事实",
+            "value": "事实1",
+            "unit": None,
+            "kind": "text",
+            "verbatim": False,
+            "first_revealed_episode": 1,
+            "committed_evidence": "事实1",
+        }
+    ]
+
+    empty_prior = SeriesState.model_validate(
+        {
+            "contract_sha256": contract_hash,
+            "locked_through_episode": 0,
+            "handoff": "",
+        }
+    )
+    assert (
+        _established_facts_payload(contract, empty_prior, {1: ep1_draft})["established_facts"] == []
+    )
+
+    draft_without_delta = ep1_draft.model_copy(update={"state_delta": None})
+    degraded = _established_facts_payload(contract, prior, {1: draft_without_delta})
+    assert degraded["established_facts"][0]["committed_evidence"] is None
 
 
 @pytest.mark.asyncio
@@ -6663,6 +6737,187 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     assert "every required target exactly once" in repair_description
     assert "Verbatim fact repair is mandatory" in repair_description
     assert "fact.value" in repair_description
+    assert "/workspace/established_facts.json" in captured_files[0]
+    assert InternalStage.GENERATING_EPISODE_SCRIPTS in approved
+
+
+@pytest.mark.asyncio
+async def test_numeric_fact_drift_triggers_deterministic_repair_with_established_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第 1 集已确立年龄 59；第 2 集复述为六十岁必须被确定性拦截并进入局部修复。"""
+    database = tmp_path / "numeric-fact-drift.sqlite3"
+    contract_payload = _story_contract(episode_count=2).model_dump(mode="json")
+    contract_payload["facts"].insert(
+        0,
+        {
+            "fact_id": "su_hui_age",
+            "subject": "测试人物",
+            "predicate": "现年年龄",
+            "kind": "count",
+            "value": "59",
+            "unit": "岁",
+            "first_revealed_episode": 1,
+        },
+    )
+    contract_payload["episode_obligations"][0]["new_information_fact_ids"].append("su_hui_age")
+    contract_payload["timeline"][0]["fact_ids"].append("su_hui_age")
+    contract_payload["knowledge_states"][0]["known_fact_ids"].append("su_hui_age")
+    contract_payload["knowledge_states"][1]["known_fact_ids"].append("su_hui_age")
+    contract = StoryContract.model_validate(contract_payload)
+    contract_hash = story_contract_sha256(contract)
+
+    ep1_content = "测试人物今年五十九岁。\n事实1\n钩子1"
+    ep1_delta_payload = _state_delta(contract, 1)
+    ep1_delta_payload["established_fact_ids"] = ["fact_ep1", "su_hui_age"]
+    ep1_delta_payload["evidence"].append(
+        {"target_id": "su_hui_age", "excerpt": "测试人物今年五十九岁"}
+    )
+    ep1_delta = EpisodeStateDelta.model_validate(ep1_delta_payload)
+    ep1_state = SeriesState.model_validate(
+        {
+            "contract_sha256": contract_hash,
+            "locked_through_episode": 1,
+            "established_fact_ids": ["fact_ep1", "su_hui_age"],
+            "character_knowledge": [
+                {
+                    "character_id": "test_character",
+                    "known_fact_ids": ["fact_ep1", "su_hui_age"],
+                }
+            ],
+            "handoff": "第1集结束",
+        }
+    )
+    ep1_draft = EpisodeDraft(
+        episode_number=1,
+        content=ep1_content,
+        content_sha256=hashlib.sha256(ep1_content.encode()).hexdigest(),
+        completed_at=datetime(2026, 7, 31, tzinfo=UTC),
+        contract_sha256=contract_hash,
+        state_delta=ep1_delta,
+        series_state=ep1_state,
+        series_state_sha256=canonical_model_hash(ep1_state),
+    )
+
+    responses = _successful_responses(contract=contract)
+    planner_index = _index_of_tool_call(responses, "EpisodePlannerResult")
+    planner_args = responses[planner_index].tool_calls[0]["args"]
+    planner_args["episode_count"] = 2
+    planner_args["episodes"] = [
+        {"episode_number": 1, "plan": "第一集计划"},
+        {"episode_number": 2, "plan": "第二集计划"},
+    ]
+    planner_args["story_contract"] = contract.model_dump(mode="json")
+
+    writer_index = _index_of_tool_call(responses, "ScriptWriterResult", occurrence=1)
+    writer_args = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
+    writer_args["episode_number"] = 2
+    writer_args["content"] = "测试人物（六十岁）推门进来。\n事实2\n钩子2"
+    writer_args["state_delta"] = _state_delta(contract, 2)
+    responses[writer_index] = _tool_call("ScriptWriterResult", writer_args, writer_index)
+
+    review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
+    repaired_args = copy.deepcopy(writer_args)
+    repaired_args["content"] = "测试人物（五十九岁）推门进来。\n事实2\n钩子2"
+    responses.insert(
+        review_index + 1,
+        _tool_call("ScriptWriterResult", repaired_args, 201),
+    )
+    responses.insert(
+        review_index + 2,
+        _tool_call(
+            "EpisodeReviewerResult",
+            {"passed": True, "evidence": "修复后分集一致", "issues": []},
+            202,
+        ),
+    )
+
+    captured_writer_files: list[Mapping[str, str]] = []
+    captured_repair_files: list[Mapping[str, str]] = []
+    captured_repair_descriptions: list[str] = []
+    original_call = StageGuardMiddleware._call_structured_stage
+    original_repair = StageGuardMiddleware._invoke_repair_subagent
+
+    async def capture_call(
+        middleware: StageGuardMiddleware,
+        stage: InternalStage,
+        request: ToolCallRequest,
+        handler: Any,
+        args: Mapping[str, Any],
+        *,
+        expected_episode_number: int | None = None,
+    ) -> tuple[Any, Mapping[str, Any]]:
+        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
+            captured_writer_files.append(request.state["files"])
+        return await original_call(
+            middleware,
+            stage,
+            request,
+            handler,
+            args,
+            expected_episode_number=expected_episode_number,
+        )
+
+    async def capture_repair(
+        middleware: StageGuardMiddleware,
+        **kwargs: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        captured_repair_files.append(kwargs["files"])
+        captured_repair_descriptions.append(kwargs["description"])
+        return await original_repair(middleware, **kwargs)
+
+    monkeypatch.setattr(StageGuardMiddleware, "_call_structured_stage", capture_call)
+    monkeypatch.setattr(StageGuardMiddleware, "_invoke_repair_subagent", capture_repair)
+
+    approved: list[InternalStage] = []
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = _fake_workflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+        await workflow.execute(
+            thread_id="numeric-fact-drift-writer-thread",
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+            **_episode_hook_kwargs(episode_drafts=[ep1_draft])[0],
+        )
+
+    writer_established = json.loads(
+        captured_writer_files[0]["/workspace/established_facts.json"]["content"]
+    )
+    age_entries = [
+        entry
+        for entry in writer_established["established_facts"]
+        if entry["fact_id"] == "su_hui_age"
+    ]
+    assert len(age_entries) == 1
+    assert age_entries[0]["value"] == "59"
+    assert age_entries[0]["committed_evidence"] == "测试人物今年五十九岁"
+
+    review = json.loads(captured_repair_files[0]["/workspace/episode_review.json"])
+    numeric_issue = next(
+        issue for issue in review["issues"] if issue["code"] == "locked_numeric_fact_mismatch"
+    )
+    assert numeric_issue["contract_refs"] == ["su_hui_age"]
+
+    repair_established = json.loads(captured_repair_files[0]["/workspace/established_facts.json"])
+    assert repair_established == writer_established
+    assert "Numeric fact repair is mandatory" in captured_repair_descriptions[0]
+    assert '["su_hui_age"]' in captured_repair_descriptions[0]
+    assert "五十九/59" in captured_repair_descriptions[0]
     assert InternalStage.GENERATING_EPISODE_SCRIPTS in approved
 
 

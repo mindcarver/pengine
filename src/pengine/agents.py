@@ -475,6 +475,9 @@ _SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
     "contiguous verbatim substring in content; all other facts require semantic consistency "
     "only. Do not infer a verbatim requirement from kind=text, quotation marks, the value "
     "field, or wording such as 原文 in subject or predicate. "
+    "Read /workspace/established_facts.json: every entry was committed in an earlier "
+    "episode and must stay consistent with its locked value in this episode; when restating "
+    "a numeric fact the number must exactly match fact.value. "
     "Treat explicitly locked or formally "
     "committed aliases, pronouns, ages, elapsed durations, call participants, identity and "
     "relationship facts, and clue meanings as binding. "
@@ -515,6 +518,9 @@ _EPISODE_REPAIR_PROMPT = (
     "the review contains verbatim_fact_missing issues, use each issue.contract_refs entry to "
     "find the matching required_verbatim_facts item and restore its exact fact.value as a "
     "contiguous substring in content. Do not impose exact wording on facts not listed there. "
+    "When the review contains locked_numeric_fact_mismatch issues, use each "
+    "issue.contract_refs entry to find the matching /workspace/established_facts.json item "
+    "and restore the locked value exactly wherever the screenplay restates the number. "
     "When /workspace/suffix_rewrite_review.json is present, read it as the read-only bound "
     "rewrite "
     "cause, fix every conflict named in every review evidence entry, give the locked story "
@@ -673,6 +679,58 @@ def _suffix_rewrite_feedback_for_episode(
         **feedback,
         "effective_earliest_affected_episode": effective,
         "reviews": current_reviews,
+    }
+
+
+def _established_facts_payload(
+    contract: StoryContract,
+    prior_state: SeriesState,
+    prefix_drafts: Mapping[int, EpisodeDraft],
+) -> dict[str, Any]:
+    """Project every fact established in the committed prefix with its locked value.
+
+    The story contract JSON already carries fact values, but they are buried in a
+    large document; this projection surfaces each earlier-established fact (and
+    its committed evidence excerpt) so the writer cannot silently drift on ages,
+    counts, and other hard values during a fresh generation or a suffix rewrite.
+    """
+    committed_evidence: dict[str, str] = {}
+    for _episode_number, draft in sorted(prefix_drafts.items()):
+        if draft.state_delta is None:
+            continue
+        for item in draft.state_delta.evidence:
+            committed_evidence.setdefault(item.target_id, item.excerpt)
+    established_ids = set(prior_state.established_fact_ids)
+    entries = [
+        {
+            "fact_id": fact.fact_id,
+            "subject": fact.subject,
+            "predicate": fact.predicate,
+            "value": fact.value,
+            "unit": fact.unit,
+            "kind": fact.kind,
+            "verbatim": fact.verbatim,
+            "first_revealed_episode": fact.first_revealed_episode,
+            "committed_evidence": committed_evidence.get(fact.fact_id),
+        }
+        for fact in sorted(
+            contract.facts, key=lambda item: (item.first_revealed_episode, item.fact_id)
+        )
+        if fact.fact_id in established_ids
+    ]
+    return {
+        "version": 1,
+        "rules": {
+            "fact_values": "must_remain_consistent_in_every_episode",
+            "numeric_restatement": "numeric_values_must_exactly_match_locked_value",
+        },
+        "rule_text": [
+            "Every established_facts entry was formally committed in an earlier episode.",
+            "Keep each entry consistent with its locked value in this episode; when "
+            "the screenplay restates a numeric fact, the number must exactly match "
+            "fact.value (59 stays 五十九/59, never 六十/60).",
+        ],
+        "established_facts": entries,
     }
 
 
@@ -5450,6 +5508,14 @@ class StageGuardMiddleware(AgentMiddleware):
                 evidence_contract["required_verbatim_facts"],
                 ensure_ascii=False,
             )
+            established_facts_payload = _established_facts_payload(
+                contract, prior_state, self.episode_drafts
+            )
+            established_facts_json = json.dumps(
+                established_facts_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
             suffix_feedback = _suffix_rewrite_feedback_for_episode(
                 self.suffix_rewrite_feedback,
                 plan.episode_number,
@@ -5460,7 +5526,9 @@ class StageGuardMiddleware(AgentMiddleware):
                     " This is a suffix rewrite caused by the unresolved bound structural "
                     "reviews in the read-only /workspace/suffix_rewrite_review.json. Read "
                     "every review evidence entry and fix every named conflict; the locked "
-                    "story contract has priority, and do not reproduce the named defect."
+                    "story contract has priority, and do not reproduce the named defect. "
+                    "Before returning, cross-check every "
+                    "/workspace/established_facts.json entry against the new content."
                 )
             episode_args = {
                 **args,
@@ -5477,7 +5545,11 @@ class StageGuardMiddleware(AgentMiddleware):
                     "no extra or duplicate target IDs and every excerpt verbatim in content. "
                     "Only required_verbatim_facts require fact.value to appear contiguously "
                     f"verbatim in content: required_verbatim_facts={required_verbatim_facts}. "
-                    "All other facts are semantic-only."
+                    "All other facts are semantic-only. Read "
+                    "/workspace/established_facts.json: every entry was committed in an "
+                    "earlier episode and must stay consistent with its locked value in this "
+                    "episode; when restating a numeric fact the number must exactly match "
+                    "fact.value."
                     f"{suffix_rewrite_instruction}"
                 ),
             }
@@ -5504,6 +5576,7 @@ class StageGuardMiddleware(AgentMiddleware):
                     "/workspace/story_contract.json": contract_json,
                     "/workspace/story_contract.md": outline["story_contract_markdown"],
                     "/workspace/evidence_contract.json": evidence_contract_json,
+                    "/workspace/established_facts.json": established_facts_json,
                     "/workspace/series_state.json": prior_state.model_dump_json(),
                     "/workspace/previous_episode_handoff.md": prior_state.handoff or "None",
                     "/workspace/writer_notes.md": writer_notes or "None",
@@ -5746,6 +5819,26 @@ class StageGuardMiddleware(AgentMiddleware):
                         "fact.value as one contiguous substring in content; facts not listed "
                         "there remain semantic-only."
                     )
+                numeric_fact_issues = [
+                    issue for issue in review.issues if issue.code == "locked_numeric_fact_mismatch"
+                ]
+                if numeric_fact_issues:
+                    numeric_fact_references = sorted(
+                        {
+                            reference
+                            for issue in numeric_fact_issues
+                            for reference in issue.contract_refs
+                        }
+                    )
+                    repair_description += (
+                        " Numeric fact repair is mandatory. Use the exact fact IDs from "
+                        "issue.contract_refs: "
+                        f"{json.dumps(numeric_fact_references, ensure_ascii=False)}. "
+                        "For each matching /workspace/established_facts.json entry, restore "
+                        "the locked value exactly when the screenplay restates the number "
+                        "(59 is 五十九/59, never 六十/60) and keep every other established "
+                        "fact unchanged."
+                    )
                 result, payload = await self._invoke_repair_subagent(
                     request=episode_request,
                     handler=handler,
@@ -5759,6 +5852,7 @@ class StageGuardMiddleware(AgentMiddleware):
                             rejected_issues=evidence_repair_issues,
                             phase="episode_repair",
                         ),
+                        "/workspace/established_facts.json": established_facts_json,
                         "/workspace/series_state.json": prior_state.model_dump_json(),
                         "/workspace/current_episode_plan.md": plan.plan,
                         "/workspace/current_episode_obligation.json": (

@@ -47,6 +47,13 @@ _CONVERTIBLE_MEASURED_UNITS = {
     "米": ("length_millimeters", Decimal("1000")),
 }
 _CHARACTER_LABEL_QUALIFIER = re.compile(r"\s*[（(][^）)\r\n]{1,40}[）)]\s*$")
+# A locked numeric fact is only checked where the screenplay restates it right
+# next to the fact subject, so a neighbouring character's number is never
+# mistaken for this fact's value.
+_NUMERIC_FACT_GAP_AFTER = " \t，。、；：！？（）()年今已刚满整整的了近约有\n"
+_NUMERIC_FACT_GAP_BEFORE = " \t的年了近满\n"
+_NUMERIC_FACT_MAX_GAP_AFTER = 4
+_NUMERIC_FACT_MAX_GAP_BEFORE = 3
 
 
 def character_label_base(label: str) -> str:
@@ -860,6 +867,8 @@ def validate_episode_candidate(
                 )
             )
 
+    issues.extend(_locked_numeric_content_mismatches(contract, episode, content))
+
     return issues
 
 
@@ -950,6 +959,76 @@ def _converted_measurement(value: str, unit: str) -> tuple[str, str] | None:
         return None
     dimension, multiplier = conversion
     return dimension, _normalized_decimal(str(Decimal(value) * multiplier))
+
+
+def _locked_numeric_content_mismatches(
+    contract: StoryContract,
+    episode: int,
+    content: str,
+) -> list[ReviewIssue]:
+    """Flag restatements of earlier-locked numeric facts that contradict the value.
+
+    Only numerals immediately adjacent to the fact subject (subject 苏慧, gap of
+    allowed filler, then 六十岁) are checked, so numbers that belong to a
+    neighbouring character or an unrelated sentence never produce an issue.
+    """
+    issues: list[ReviewIssue] = []
+    temporal_spans = [span for _, _, span in _temporal_tokens(content)]
+    for fact in contract.facts:
+        if fact.kind not in _NUMERIC_KINDS or fact.first_revealed_episode >= episode:
+            continue
+        locked_unit = fact.unit or ""
+        locked_value = _normalized_number(fact.value)
+        if not locked_unit or locked_value is None or fact.subject not in content:
+            continue
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_.{_CHINESE_NUMBER_CHARS}])({_NUMBER_TEXT})"
+            rf"[\s，。、]{{0,2}}{re.escape(locked_unit)}"
+        )
+        mismatches: set[str] = set()
+        for match in pattern.finditer(content):
+            if any(_spans_overlap(match.span(), span) for span in temporal_spans):
+                continue
+            raw_value = match.group(1)
+            if locked_unit == "年" and re.fullmatch(r"\d{3,4}", raw_value):
+                # A calendar year like 2026 年 is not a restatement of a
+                # locked year-count fact.
+                continue
+            after_subject = content.rfind(fact.subject, 0, match.start())
+            adjacent = (
+                after_subject != -1
+                and match.start() - (after_subject + len(fact.subject))
+                <= _NUMERIC_FACT_MAX_GAP_AFTER
+                and all(
+                    character in _NUMERIC_FACT_GAP_AFTER
+                    for character in content[after_subject + len(fact.subject) : match.start()]
+                )
+            )
+            if not adjacent:
+                before_subject = content.find(fact.subject, match.end())
+                adjacent = (
+                    before_subject != -1
+                    and before_subject - match.end() <= _NUMERIC_FACT_MAX_GAP_BEFORE
+                    and all(
+                        character in _NUMERIC_FACT_GAP_BEFORE
+                        for character in content[match.end() : before_subject]
+                    )
+                )
+            if not adjacent:
+                continue
+            value = _normalized_number(raw_value)
+            if value is not None and value != locked_value:
+                mismatches.add(f"{raw_value}{locked_unit}")
+        if mismatches:
+            issues.append(
+                _issue(
+                    "locked_numeric_fact_mismatch",
+                    f"已确立事实 {fact.fact_id} 的锁定值 {fact.value}{locked_unit} "
+                    f"与正文邻近复述 {sorted(mismatches)} 不一致",
+                    [fact.fact_id],
+                )
+            )
+    return issues
 
 
 _CHINESE_DIGITS = {
