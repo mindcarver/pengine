@@ -98,7 +98,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -1015,6 +1015,32 @@ CREATE TABLE IF NOT EXISTS series_bible_projection_repairs (
 CREATE INDEX IF NOT EXISTS series_bible_projection_repairs_status
 ON series_bible_projection_repairs(status, created_at);
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (24);
+"""
+
+_SCHEMA_V25_EPISODE_GENERATION_WINDOWS_SQL = """
+CREATE TABLE IF NOT EXISTS episode_generation_windows (
+    window_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    design_candidate_id TEXT NOT NULL,
+    design_content_hash TEXT NOT NULL,
+    design_epoch INTEGER NOT NULL CHECK (design_epoch >= 1),
+    group_id TEXT NOT NULL,
+    start_episode INTEGER NOT NULL CHECK (start_episode >= 1),
+    end_episode INTEGER NOT NULL CHECK (end_episode >= start_episode),
+    operation_id TEXT NOT NULL,
+    call_id TEXT,
+    status TEXT NOT NULL CHECK (
+        status IN ('generating', 'generated', 'partially_committed', 'committed', 'failed', 'stale')
+    ),
+    committed_through_episode INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (run_id, operation_id)
+);
+CREATE INDEX IF NOT EXISTS episode_generation_windows_run
+ON episode_generation_windows(run_id, created_at);
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (25);
 """
 
 _SCHEMA_V12_SERIES_BIBLE_SQL = """
@@ -2156,6 +2182,23 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 24
+            if schema_version == 24:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    candidate_columns = await (
+                        await connection.execute("PRAGMA table_info(episode_candidates)")
+                    ).fetchall()
+                    if "generation_window_id" not in {column[1] for column in candidate_columns}:
+                        await connection.execute(
+                            "ALTER TABLE episode_candidates ADD COLUMN generation_window_id TEXT"
+                        )
+                    await connection.executescript(_SCHEMA_V25_EPISODE_GENERATION_WINDOWS_SQL)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 25
 
     async def setup(self) -> None:
         await self.initialize()
@@ -4974,6 +5017,106 @@ class Repository:
             None,
         )
 
+    async def begin_episode_generation_window(
+        self,
+        run_id: UUID,
+        *,
+        design_candidate_id: str,
+        design_content_hash: str,
+        design_epoch: int,
+        group_id: str,
+        start_episode: int,
+        end_episode: int,
+        operation_id: str,
+    ) -> str:
+        """Persist one exact model-generation attempt before provider dispatch."""
+        window_id = f"episode_generation_window_{uuid4().hex}"
+        now = _utc_now().isoformat()
+        async with self._transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE episode_generation_windows
+                SET status = 'stale', updated_at = ?
+                WHERE run_id = ? AND status IN ('generating', 'generated', 'partially_committed')
+                      AND start_episode >= ?
+                """,
+                (now, str(run_id), start_episode),
+            )
+            await connection.execute(
+                """
+                INSERT INTO episode_generation_windows(
+                    window_id, run_id, design_candidate_id, design_content_hash,
+                    design_epoch, group_id, start_episode, end_episode, operation_id,
+                    call_id, status, committed_through_episode, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'generating', NULL, ?, ?)
+                """,
+                (
+                    window_id,
+                    str(run_id),
+                    design_candidate_id,
+                    design_content_hash,
+                    design_epoch,
+                    group_id,
+                    start_episode,
+                    end_episode,
+                    operation_id,
+                    now,
+                    now,
+                ),
+            )
+        return window_id
+
+    async def bind_episode_generation_window_call(
+        self,
+        run_id: UUID,
+        window_id: str,
+        *,
+        call_id: str,
+    ) -> None:
+        now = _utc_now().isoformat()
+        async with self._transaction() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE episode_generation_windows
+                SET call_id = ?, status = 'generated', updated_at = ?
+                WHERE window_id = ? AND run_id = ? AND status = 'generating'
+                """,
+                (call_id, now, window_id, str(run_id)),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError(
+                    "generation_window_conflict",
+                    "The episode generation window is no longer active.",
+                    409,
+                )
+
+    async def fail_episode_generation_window(
+        self,
+        run_id: UUID,
+        window_id: str,
+    ) -> None:
+        async with self._transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE episode_generation_windows
+                SET status = 'failed', updated_at = ?
+                WHERE window_id = ? AND run_id = ?
+                      AND status IN ('generating', 'generated', 'partially_committed')
+                """,
+                (_utc_now().isoformat(), window_id, str(run_id)),
+            )
+
+    async def get_episode_generation_windows(self, run_id: UUID) -> list[dict[str, Any]]:
+        async with self._connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT * FROM episode_generation_windows
+                WHERE run_id = ? ORDER BY created_at, window_id
+                """,
+                (str(run_id),),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
     async def create_script_batch(
         self,
         run_id: UUID,
@@ -5059,6 +5202,7 @@ class Repository:
         episode_lock: EpisodeLock,
         call_id: str,
         writer_notes: str,
+        generation_window_id: str | None = None,
         now: datetime | None = None,
     ) -> EpisodeCandidate:
         """Transactional/CAS commit of one immutable episode candidate.
@@ -5094,6 +5238,43 @@ class Repository:
                     409,
                 )
             batch = self._script_batch_lineage_from_row(batch_row)
+            generation_window = None
+            if generation_window_id is not None:
+                generation_window = await self._fetchone(
+                    connection,
+                    """
+                    SELECT * FROM episode_generation_windows
+                    WHERE window_id = ? AND run_id = ?
+                    """,
+                    (generation_window_id, str(run_id)),
+                )
+                if (
+                    generation_window is None
+                    or generation_window["status"] not in {"generated", "partially_committed"}
+                    or generation_window["call_id"] != call_id
+                    or generation_window["design_candidate_id"] != batch.design_candidate_id
+                    or generation_window["design_content_hash"] != batch.design_content_hash
+                    or int(generation_window["design_epoch"]) != batch.design_epoch
+                    or not int(generation_window["start_episode"])
+                    <= episode_number
+                    <= int(generation_window["end_episode"])
+                ):
+                    raise DomainError(
+                        "generation_window_conflict",
+                        "The episode candidate does not bind the active generation window.",
+                        409,
+                    )
+                expected_window_episode = (
+                    int(generation_window["committed_through_episode"]) + 1
+                    if generation_window["committed_through_episode"] is not None
+                    else int(generation_window["start_episode"])
+                )
+                if episode_number != expected_window_episode:
+                    raise DomainError(
+                        "generation_window_sequence_conflict",
+                        "Episode generation window commits must be contiguous.",
+                        409,
+                    )
             active_pointers = json.loads(batch_row["active_pointers_json"])
             committed = {int(key): value for key, value in active_pointers.items()}
             plans = await self._episode_plans(connection, run_id)
@@ -5156,6 +5337,7 @@ class Repository:
                     semantic_review=episode_lock.semantic_review,
                     repair_rounds=episode_lock.repair_rounds,
                     call_id=call_id,
+                    generation_window_id=generation_window_id,
                     writer_notes=writer_notes,
                     now=_datetime(timestamp),
                 )
@@ -5183,6 +5365,26 @@ class Repository:
                 """,
                 (timestamp, candidate.candidate_id),
             )
+            if generation_window is not None:
+                window_status = (
+                    "committed"
+                    if episode_number == int(generation_window["end_episode"])
+                    else "partially_committed"
+                )
+                await connection.execute(
+                    """
+                    UPDATE episode_generation_windows
+                    SET committed_through_episode = ?, status = ?, updated_at = ?
+                    WHERE window_id = ? AND run_id = ?
+                    """,
+                    (
+                        episode_number,
+                        window_status,
+                        timestamp,
+                        generation_window_id,
+                        str(run_id),
+                    ),
+                )
             await self._upsert_active_draft_projection(
                 connection,
                 run_id,
@@ -5782,11 +5984,12 @@ class Repository:
                 candidate_id, batch_id, batch_epoch, run_id,
                 design_candidate_id, design_content_hash, design_epoch,
                 episode_number, version, content, content_sha256,
-                predecessor_candidate_id, predecessor_sha256, call_id, writer_notes,
+                predecessor_candidate_id, predecessor_sha256, call_id, generation_window_id,
+                writer_notes,
                 state_delta_json, series_state_json, series_state_sha256,
                 semantic_review_json, repair_rounds, status, created_at,
                 activated_at, superseded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 candidate.candidate_id,
@@ -5803,6 +6006,7 @@ class Repository:
                 candidate.predecessor_candidate_id,
                 candidate.predecessor_sha256,
                 candidate.call_id,
+                candidate.generation_window_id,
                 candidate.writer_notes,
                 _json(candidate.state_delta),
                 _json(candidate.series_state),
@@ -5960,6 +6164,7 @@ class Repository:
             predecessor_candidate_id=row["predecessor_candidate_id"],
             predecessor_sha256=row["predecessor_sha256"],
             call_id=row["call_id"],
+            generation_window_id=row["generation_window_id"],
             writer_notes=row["writer_notes"] or "",
             state_delta=EpisodeStateDelta.model_validate_json(row["state_delta_json"]),
             series_state=SeriesState.model_validate_json(row["series_state_json"]),

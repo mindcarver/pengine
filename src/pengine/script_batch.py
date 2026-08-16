@@ -104,6 +104,7 @@ class EpisodeCandidate(ContinuityModel):
     predecessor_candidate_id: StableId | None = None
     predecessor_sha256: Sha256 | None = None
     call_id: NonEmptyText
+    generation_window_id: StableId | None = None
     writer_notes: str = ""
     state_delta: EpisodeStateDelta
     series_state: SeriesState
@@ -149,6 +150,7 @@ def build_episode_candidate(
     semantic_review: SemanticReview,
     repair_rounds: int,
     call_id: str,
+    generation_window_id: StableId | None = None,
     writer_notes: str,
     now: datetime | None = None,
 ) -> EpisodeCandidate:
@@ -186,6 +188,7 @@ def build_episode_candidate(
         predecessor_candidate_id=predecessor_candidate_id,
         predecessor_sha256=predecessor_sha256,
         call_id=call_id,
+        generation_window_id=generation_window_id,
         writer_notes=writer_notes,
         state_delta=lock.state_delta,
         series_state=lock.series_state,

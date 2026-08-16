@@ -796,7 +796,11 @@ class Worker:
                                 active.candidate_id if active is not None else None
                             )
 
-                async def before_episode(plan: EpisodePlan) -> int:
+                async def before_episode(
+                    plan: EpisodePlan,
+                    *,
+                    new_operation: bool = True,
+                ) -> int:
                     nonlocal current_stage
                     current_stage = InternalStage.GENERATING_EPISODE_SCRIPTS
                     if model_call_state is not None:
@@ -804,10 +808,85 @@ class Worker:
                             InternalStage.GENERATING_EPISODE_SCRIPTS.value
                         )
                         model_call_state.context.episode_number = plan.episode_number
-                        model_call_state.context.operation_id = new_operation_id()
+                        if new_operation:
+                            model_call_state.context.operation_id = new_operation_id()
                     return await self.repository.record_episode_attempt(
                         work.run_id,
                         plan.episode_number,
+                    )
+
+                generation_window_context: dict[str, tuple[str, int]] = {}
+
+                async def begin_generation_group(
+                    *,
+                    group_id: str,
+                    start_episode: int,
+                    end_episode: int,
+                ) -> str:
+                    active = await self.repository.get_run_series_bible(work.run_id)
+                    if active is None:
+                        raise AgentProtocolError(
+                            "Episode generation requires an active SeriesBible design",
+                            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        )
+                    operation_id = (
+                        model_call_state.context.operation_id
+                        if model_call_state is not None
+                        else None
+                    )
+                    if operation_id is None or operation_id in {
+                        stored_operation_id
+                        for stored_operation_id, _ in generation_window_context.values()
+                    }:
+                        operation_id = new_operation_id()
+                    if model_call_state is not None:
+                        model_call_state.context.stage = (
+                            InternalStage.GENERATING_EPISODE_SCRIPTS.value
+                        )
+                        model_call_state.context.episode_number = start_episode
+                        model_call_state.context.operation_id = operation_id
+                    window_id = await self.repository.begin_episode_generation_window(
+                        work.run_id,
+                        design_candidate_id=active.candidate_id,
+                        design_content_hash=active.content_hash,
+                        design_epoch=active.design_epoch,
+                        group_id=group_id,
+                        start_episode=start_episode,
+                        end_episode=end_episode,
+                        operation_id=operation_id,
+                    )
+                    generation_window_context[window_id] = (operation_id, start_episode)
+                    return window_id
+
+                async def complete_generation_group(
+                    window_id: str,
+                    *,
+                    provenance_episode_number: int,
+                ) -> str:
+                    operation_id, start_episode = generation_window_context[window_id]
+                    if start_episode != provenance_episode_number:
+                        raise AgentProtocolError(
+                            "Generation window provenance episode does not match its range",
+                            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        )
+                    call_id = await self._require_physical_call_id(
+                        run_id=work.run_id,
+                        role="generation",
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        episode_number=start_episode,
+                        operation_id=operation_id,
+                    )
+                    await self.repository.bind_episode_generation_window_call(
+                        work.run_id,
+                        window_id,
+                        call_id=call_id,
+                    )
+                    return call_id
+
+                async def fail_generation_group(window_id: str) -> None:
+                    await self.repository.fail_episode_generation_window(
+                        work.run_id,
+                        window_id,
                     )
 
                 async def commit_episode(
@@ -817,6 +896,8 @@ class Worker:
                     *,
                     call_id: str | None = None,
                     writer_notes: str = "",
+                    provenance_episode_number: int | None = None,
+                    generation_window_id: str | None = None,
                 ) -> EpisodeDraft:
                     if episode_lock is None:
                         # Legacy outline path without a locked story contract keeps the
@@ -848,7 +929,7 @@ class Worker:
                         run_id=work.run_id,
                         role="generation",
                         stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
-                        episode_number=episode_number,
+                        episode_number=(provenance_episode_number or episode_number),
                         operation_id=operation_id,
                     )
                     if call_id is not None and call_id != resolved_call_id:
@@ -864,6 +945,7 @@ class Worker:
                         episode_lock=episode_lock,
                         call_id=resolved_call_id,
                         writer_notes=writer_notes,
+                        generation_window_id=generation_window_id,
                     )
                     return EpisodeDraft(
                         episode_number=candidate.episode_number,
@@ -997,6 +1079,14 @@ class Worker:
                             work.run_id
                         ),
                     }
+                    if isinstance(self.workflow, DeepAgentWorkflow):
+                        workflow_kwargs.update(
+                            {
+                                "begin_generation_group": begin_generation_group,
+                                "complete_generation_group": complete_generation_group,
+                                "fail_generation_group": fail_generation_group,
+                            }
+                        )
                     suffix_rewrite_feedback = await self._suffix_rewrite_feedback_for_writer(
                         work.run_id
                     )
@@ -1297,11 +1387,14 @@ class Worker:
             safe_message=safe_message,
         )
         logger.warning(
-            "episode execution paused run_id=%s creation_id=%s episode=%s error_type=%s",
+            "episode execution paused run_id=%s creation_id=%s episode=%s "
+            "error_type=%s error=%s safe_message=%s",
             work.run_id,
             work.creation_id,
             episode_number,
             type(exc).__name__,
+            str(exc),
+            safe_message,
         )
         return True
 
@@ -1382,6 +1475,9 @@ class Worker:
             story_contract_payload=outline["story_contract"],
             review_milestones=(
                 outline.get("review_milestones") if isinstance(outline, Mapping) else None
+            ),
+            script_generation_groups=(
+                outline.get("script_generation_groups") if isinstance(outline, Mapping) else None
             ),
         )
         candidate = build_series_bible(**base)
@@ -1660,6 +1756,10 @@ class Worker:
             rebuild_count=original_candidate.lineage.rebuild_count,
             design_epoch=original_candidate.design_epoch,
             review_milestones=original_candidate.content.review_milestones,
+            script_generation_groups=[
+                group.model_dump(mode="json")
+                for group in original_candidate.content.script_generation_groups
+            ],
         )
         repaired_evidence = validate_series_bible(repaired_candidate)
         if not repaired_evidence.passed:
