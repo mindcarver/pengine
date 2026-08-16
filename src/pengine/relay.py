@@ -136,7 +136,7 @@ class _SerialChatAnthropic(ChatAnthropic):
         if state is None:
             return kwargs
         context = state.context
-        if context.stage != "generating_episode_scripts" or context.requested_output_tokens is None:
+        if context.requested_output_tokens is None:
             return kwargs
         configured = self.max_tokens
         requested = context.requested_output_tokens
@@ -278,9 +278,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         estimated_input += estimate_tools_tokens(_extract_tools(serialized, kwargs))
         reserved_output_tokens = (
             context.requested_output_tokens
-            if self.role == "generation"
-            and context.stage == "generating_episode_scripts"
-            and context.requested_output_tokens is not None
+            if self.role == "generation" and context.requested_output_tokens is not None
             else self.reserved_output_tokens
         )
         estimated_total = estimated_input + reserved_output_tokens
@@ -1382,6 +1380,8 @@ def _is_upstream_stream_error(exc: BaseException) -> bool:
         payload = json.loads(raw_body)
     except (TypeError, ValueError):
         return False
+    if payload == {"error": "upstream_timeout"}:
+        return True
     if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
         return False
     error = payload["error"]

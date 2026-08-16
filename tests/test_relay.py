@@ -73,9 +73,15 @@ def test_build_relay_adapter_preserves_anthropic_defaults() -> None:
     assert adapter.model.max_tokens == 128_000
 
 
-def test_script_generation_uses_call_specific_output_budget_for_preflight_and_provider() -> None:
+@pytest.mark.parametrize(
+    "stage",
+    ["generating_episode_outline", "generating_episode_scripts"],
+)
+def test_generation_uses_call_specific_output_budget_for_preflight_and_provider(
+    stage: str,
+) -> None:
     state = ModelCallState()
-    state.context.stage = "generating_episode_scripts"
+    state.context.stage = stage
     state.context.requested_output_tokens = 20_480
     adapter = build_relay_adapter(
         _role_settings(),
@@ -768,6 +774,36 @@ def test_http_200_upstream_stream_error_is_a_relay_interruption(provider_error) 
     assert mapped.redacted_body is not None
     assert "upstream_stream_error" in mapped.redacted_body
     assert "decoding response body" in mapped.safe_message
+
+
+@pytest.mark.parametrize("provider_error", [anthropic.APIStatusError, openai.APIStatusError])
+def test_http_200_exact_upstream_timeout_is_a_relay_interruption(provider_error) -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    body = {"error": "upstream_timeout"}
+    response = httpx.Response(200, request=request, json=body)
+    error = provider_error("upstream timeout", response=response, body=body)
+
+    assert is_relay_connection_error(error)
+    assert retryable_relay_interruption(error) is not None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "timeout"},
+        {"error": "upstream_timeout", "extra": True},
+        {"error": {"type": "upstream_timeout"}},
+    ],
+)
+def test_http_200_similar_upstream_timeout_shapes_are_not_retryable(
+    body: dict[str, object],
+) -> None:
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    response = httpx.Response(200, request=request, json=body)
+    error = anthropic.APIStatusError("upstream timeout", response=response, body=body)
+
+    assert retryable_relay_interruption(error) is None
+    assert not is_relay_connection_error(error)
 
 
 @pytest.mark.parametrize(

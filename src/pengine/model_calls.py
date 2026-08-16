@@ -347,7 +347,7 @@ def build_started_record(
     verified_limit_tokens: int | None,
 ) -> ModelCallRecord:
     now = _utc_now()
-    carries_script_context = role == "generation" and context.stage == "generating_episode_scripts"
+    carries_compiled_context = role == "generation" and context.context_bundle_sha256 is not None
     return ModelCallRecord(
         call_id=call_id or new_call_id(),
         role=role,
@@ -382,8 +382,8 @@ def build_started_record(
         l3_char_count=context.l3_char_count,
         l3_mount_path=context.l3_mount_path,
         l3_full_text_mounted=context.l3_full_text_mounted,
-        context_bundle_sha256=(context.context_bundle_sha256 if carries_script_context else None),
-        context_manifest_json=(context.context_manifest_json if carries_script_context else None),
+        context_bundle_sha256=(context.context_bundle_sha256 if carries_compiled_context else None),
+        context_manifest_json=(context.context_manifest_json if carries_compiled_context else None),
     )
 
 
