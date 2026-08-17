@@ -4180,21 +4180,30 @@ class Repository:
             )
             row = await cursor.fetchone()
             current_count = int(row[0]) if row is not None else 0
-            if current_count >= MAX_STAGE_ATTEMPTS:
+            grouped_outline_resume = False
+            if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+                season_map = await self._fetchone(
+                    connection,
+                    "SELECT 1 FROM outline_season_maps WHERE run_id = ?",
+                    (str(run_id),),
+                )
+                grouped_outline_resume = season_map is not None and current_count > 0
+            if current_count >= MAX_STAGE_ATTEMPTS and not grouped_outline_resume:
                 raise DomainError(
                     "attempts_exhausted",
                     "The stage attempt limit has been exhausted.",
                     409,
                 )
 
-            attempt_number = current_count + 1
-            await connection.execute(
-                """
-                INSERT INTO stage_attempts(run_id, stage, attempt_number, recorded_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (str(run_id), stage.value, attempt_number, timestamp),
-            )
+            attempt_number = current_count if grouped_outline_resume else current_count + 1
+            if not grouped_outline_resume:
+                await connection.execute(
+                    """
+                    INSERT INTO stage_attempts(run_id, stage, attempt_number, recorded_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (str(run_id), stage.value, attempt_number, timestamp),
+                )
             await connection.execute(
                 """
                 UPDATE run_progress
@@ -7447,9 +7456,17 @@ class Repository:
             if attempt is None:
                 raise RuntimeError("Stage attempt count is unavailable")
             attempt_count = int(attempt["attempt_count"])
+            grouped_outline_resume = False
+            if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+                season_map = await self._fetchone(
+                    connection,
+                    "SELECT 1 FROM outline_season_maps WHERE run_id = ?",
+                    (str(run_id),),
+                )
+                grouped_outline_resume = season_map is not None
             next_state: RecoveryState = (
                 "failed"
-                if attempt_count >= MAX_STAGE_ATTEMPTS
+                if attempt_count >= MAX_STAGE_ATTEMPTS and not grouped_outline_resume
                 else "auto_resuming"
                 if timeout_count == 1
                 else "paused"
@@ -9655,6 +9672,14 @@ class Repository:
             )
             row = await cursor.fetchone()
             return int(row[0]) < MAX_EPISODE_ATTEMPTS
+        if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
+            season_map = await Repository._fetchone(
+                connection,
+                "SELECT 1 FROM outline_season_maps WHERE run_id = ?",
+                (run_id,),
+            )
+            if season_map is not None:
+                return True
         cursor = await connection.execute(
             "SELECT COUNT(*) FROM stage_attempts WHERE run_id = ? AND stage = ?",
             (run_id, stage.value),
