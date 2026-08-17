@@ -61,7 +61,7 @@ from pengine.language import (
     infer_output_language,
     language_instruction,
 )
-from pengine.model_calls import ModelCallState, new_operation_id
+from pengine.model_calls import ModelCallState, estimate_text_tokens, new_operation_id
 from pengine.observability import content_fingerprint, record_langfuse_event
 from pengine.outline_context import (
     CompiledOutlineContext,
@@ -128,6 +128,7 @@ OutlineGroupLoader = Callable[[], Awaitable[list[Mapping[str, Any]]]]
 OutlineGroupStart = Callable[..., Awaitable[str]]
 OutlineGroupComplete = Callable[..., Awaitable[None]]
 OutlineGroupFail = Callable[..., Awaitable[None]]
+ScriptGroupGenerator = Callable[[str], Awaitable["ScriptGenerationGroupResult"]]
 
 
 def _trusted_series_prefix_json(episodes: Iterable[tuple[int, str]]) -> str:
@@ -241,7 +242,6 @@ _SUPERVISOR_TOOL_ALLOWLIST = frozenset({"task"})
 _GENERATION_TOOL_ALLOWLIST = frozenset(
     {"read_file", "calculate_arithmetic", "retrieve_persona_references"}
 )
-_SCRIPT_WRITER_TOOL_ALLOWLIST = frozenset({"calculate_arithmetic"})
 _REVIEW_TOOL_ALLOWLIST = frozenset({"read_file"})
 _REPAIR_TOOL_ALLOWLIST = frozenset({"read_file", "calculate_arithmetic"})
 L0_GATE_EVIDENCE_LABELS = ("母题兑现：", "选定侧面：", "雷区：", "温度：")
@@ -532,14 +532,11 @@ _SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
     "Correct contradictions in dates or countdowns, amounts or arithmetic, "
     "exact dialogue-count claims, and episode-specific promised actions. Every "
     "explicitly locked upstream commitment must appear in the scripts. Unspecified "
-    "creative details remain the writer's choice. Use calculate_arithmetic to verify every "
-    "derived numeric claim. The tool interaction stays private, but it does not constrain "
-    "dramatic presentation: the screenplay may show operands, equations, mental calculation, "
-    "checking, and reasoning when the story needs them. Never copy a tool-call envelope or "
-    "private validation log into the screenplay. The tool accepts "
-    "decimal operands only: convert clock times to elapsed minutes before subtracting "
-    "them (for example, 22:50 becomes 1370 and 22:20 becomes 1340). Never round a "
-    "non-integral division unless the script states the rounding rule. Every required "
+    "creative details remain the writer's choice. Preserve every locked numeric value and "
+    "do not invent a derived numeric claim that is absent from the compiled context. The "
+    "screenplay may show operands, equations, mental calculation, checking, and reasoning "
+    "when the story needs them. Never copy a tool-call envelope or private validation log "
+    "into the screenplay. Every required "
     "fact, clue event, and episode obligation must cite a verbatim "
     "excerpt that exists in its own script. Generate the group in episode order: each later "
     "episode must continue from the earlier episode and state_delta returned in this same "
@@ -1895,6 +1892,296 @@ async def _invoke_direct_structured_with_retry(
     if isinstance(corrected_error, Exception):
         raise corrected_error
     raise AgentProtocolError("Subagent returned invalid structured output")
+
+
+def _resolve_json_schema(schema: Mapping[str, Any], root: Mapping[str, Any]) -> Mapping[str, Any]:
+    reference = schema.get("$ref")
+    if not isinstance(reference, str) or not reference.startswith("#/$defs/"):
+        return schema
+    resolved = root.get("$defs", {}).get(reference.removeprefix("#/$defs/"))
+    return resolved if isinstance(resolved, Mapping) else schema
+
+
+def _normalize_structured_transport(
+    value: Any,
+    schema: Mapping[str, Any],
+    root: Mapping[str, Any],
+) -> Any:
+    schema = _resolve_json_schema(schema, root)
+    variants = schema.get("anyOf")
+    if isinstance(variants, list):
+        non_null = [item for item in variants if item.get("type") != "null"]
+        if len(non_null) == 1:
+            return _normalize_structured_transport(value, non_null[0], root)
+    expected_type = schema.get("type")
+    if isinstance(value, str) and expected_type in {"object", "array"}:
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = value
+        if (expected_type == "object" and isinstance(decoded, Mapping)) or (
+            expected_type == "array" and isinstance(decoded, list)
+        ):
+            value = decoded
+    if expected_type == "object" and isinstance(value, Mapping):
+        properties = schema.get("properties")
+        if not isinstance(properties, Mapping):
+            return dict(value)
+        return {
+            key: _normalize_structured_transport(item, properties[key], root)
+            for key, item in value.items()
+            if key in properties
+        }
+    if expected_type == "array" and isinstance(value, list):
+        item_schema = schema.get("items")
+        if not isinstance(item_schema, Mapping):
+            return list(value)
+        return [_normalize_structured_transport(item, item_schema, root) for item in value]
+    return value
+
+
+def _script_group_tool_args(raw: Any) -> Mapping[str, Any] | None:
+    matching_call = next(
+        (
+            call
+            for call in getattr(raw, "tool_calls", [])
+            if call.get("name") == ScriptGenerationGroupResult.__name__
+        ),
+        None,
+    )
+    if matching_call is None:
+        return None
+    args = matching_call.get("args")
+    if not isinstance(args, Mapping):
+        return None
+    if set(args) == {"$PARAMETER_NAME"} and isinstance(args["$PARAMETER_NAME"], str):
+        try:
+            unwrapped = json.loads(args["$PARAMETER_NAME"])
+        except json.JSONDecodeError:
+            unwrapped = None
+        if isinstance(unwrapped, Mapping):
+            return unwrapped
+    return args
+
+
+def _candidate_episode_mappings(value: Any) -> list[Mapping[str, Any]]:
+    candidates: list[Mapping[str, Any]] = []
+    if isinstance(value, Mapping):
+        if "episode_number" in value and "content" in value:
+            candidates.append(value)
+        else:
+            for item in value.values():
+                candidates.extend(_candidate_episode_mappings(item))
+    elif isinstance(value, list):
+        for item in value:
+            candidates.extend(_candidate_episode_mappings(item))
+    return candidates
+
+
+def _is_partial_structural_match(expected: Any, actual: Any) -> bool:
+    if expected is None:
+        return True
+    if isinstance(expected, Mapping):
+        return isinstance(actual, Mapping) and all(
+            key in actual and _is_partial_structural_match(value, actual[key])
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(expected) == len(actual)
+            and all(
+                _is_partial_structural_match(left, right)
+                for left, right in zip(expected, actual, strict=True)
+            )
+        )
+    return expected == actual
+
+
+def _assert_protocol_repair_preserved_candidate(
+    original: Mapping[str, Any],
+    repaired: ScriptGenerationGroupResult,
+) -> None:
+    for field in ("group_id", "start_episode", "end_episode"):
+        if field in original and original[field] != getattr(repaired, field):
+            raise AgentProtocolError("Protocol repair changed generation group identity")
+    episode_schema = ScriptWriterResult.model_json_schema()
+    repaired_by_episode = {
+        episode.episode_number: episode.model_dump(mode="json") for episode in repaired.episodes
+    }
+    original_episodes = _candidate_episode_mappings(original)
+    if not original_episodes:
+        raise AgentProtocolError("Protocol repair has no screenplay candidate to preserve")
+    for candidate in original_episodes:
+        episode_number = candidate.get("episode_number")
+        if not isinstance(episode_number, int) or episode_number not in repaired_by_episode:
+            raise AgentProtocolError("Protocol repair changed screenplay episode identity")
+        projected = _normalize_structured_transport(candidate, episode_schema, episode_schema)
+        if not _is_partial_structural_match(projected, repaired_by_episode[episode_number]):
+            raise AgentProtocolError("Protocol repair changed screenplay content")
+
+
+async def _invoke_script_group_structured(
+    model: BaseChatModel,
+    messages: list[dict[str, str]],
+    *,
+    model_call_state: ModelCallState | None = None,
+) -> ScriptGenerationGroupResult:
+    """Generate one group and repair only transport/schema shape without story context."""
+
+    structured_model = model.with_structured_output(
+        ScriptGenerationGroupResult,
+        method="function_calling",
+        include_raw=True,
+    )
+    response = await structured_model.ainvoke(messages)
+    parsed = response.get("parsed") if isinstance(response, Mapping) else None
+    if parsed is not None:
+        return ScriptGenerationGroupResult.model_validate(parsed)
+    raw = response.get("raw") if isinstance(response, Mapping) else None
+    args = _script_group_tool_args(raw)
+    if args is None:
+        raise AgentProtocolError("Script writer omitted its structured result")
+    schema = ScriptGenerationGroupResult.model_json_schema()
+    normalized = _normalize_structured_transport(args, schema, schema)
+    try:
+        normalized_result = ScriptGenerationGroupResult.model_validate(normalized)
+    except ValidationError as error:
+        correction = _structured_output_retry_message(error)
+    else:
+        record_langfuse_event(
+            "pengine.script_protocol_repair.completed",
+            input={
+                "mode": "deterministic_transport_normalization",
+                "candidate_sha256": content_fingerprint(
+                    json.dumps(args, ensure_ascii=False, sort_keys=True)
+                ),
+                "model_retry_required": False,
+            },
+            metadata={"trace_version": "pengine-1"},
+        )
+        return normalized_result
+
+    repair_input = json.dumps(
+        {"invalid_candidate": args, "validation_feedback": correction},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    original_episodes = _candidate_episode_mappings(args)
+    requires_semantic_completion = any(
+        not isinstance(episode.get("content"), str)
+        or not isinstance(episode.get("state_delta"), Mapping)
+        for episode in original_episodes
+    )
+    repair_manifest = json.dumps(
+        {
+            "mode": (
+                "script_candidate_completion"
+                if requires_semantic_completion
+                else "script_protocol_repair"
+            ),
+            "candidate_sha256": hashlib.sha256(repair_input.encode()).hexdigest(),
+            "candidate_characters": len(repair_input),
+            "candidate_estimated_tokens": estimate_text_tokens(repair_input),
+            "full_story_context_included": requires_semantic_completion,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    previous_context: tuple[int | None, str | None, str | None] | None = None
+    if model_call_state is not None and not requires_semantic_completion:
+        context = model_call_state.context
+        previous_context = (
+            context.requested_output_tokens,
+            context.context_bundle_sha256,
+            context.context_manifest_json,
+        )
+        maximum = context.requested_output_tokens or 128_000
+        context.requested_output_tokens = min(
+            maximum,
+            max(4_096, estimate_text_tokens(repair_input) + 2_048),
+        )
+        context.context_bundle_sha256 = None
+        context.context_manifest_json = repair_manifest
+    record_langfuse_event(
+        "pengine.script_protocol_repair.started",
+        input=json.loads(repair_manifest),
+        metadata={"trace_version": "pengine-1"},
+    )
+    try:
+        repair_messages: list[dict[str, str]] = [
+            *(
+                messages
+                if requires_semantic_completion
+                else [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Repair only the JSON protocol shape of the supplied screenplay "
+                            "candidate. Return exactly one ScriptGenerationGroupResult tool "
+                            "call. Preserve every existing screenplay character, state-delta "
+                            "value, group identity, episode number, and episode order exactly. "
+                            "Remove unknown fields, decode JSON containers, and add only "
+                            "missing structural fields. Do not use or request the story context "
+                            "and do not rewrite any creative content."
+                        ),
+                    }
+                ]
+            ),
+            {
+                "role": "user",
+                "content": (
+                    repair_input
+                    if not requires_semantic_completion
+                    else (
+                        "Complete only the missing required structured fields in this prior "
+                        "candidate using the same compiled context. Preserve every existing "
+                        f"screenplay character exactly.\n{repair_input}"
+                    )
+                ),
+            },
+        ]
+        repair_response = await structured_model.ainvoke(repair_messages)
+    finally:
+        if model_call_state is not None and previous_context is not None:
+            (
+                model_call_state.context.requested_output_tokens,
+                model_call_state.context.context_bundle_sha256,
+                model_call_state.context.context_manifest_json,
+            ) = previous_context
+    repaired = repair_response.get("parsed") if isinstance(repair_response, Mapping) else None
+    if repaired is None:
+        repaired_raw = repair_response.get("raw") if isinstance(repair_response, Mapping) else None
+        repaired_args = _script_group_tool_args(repaired_raw)
+        if repaired_args is not None:
+            repaired_normalized = _normalize_structured_transport(
+                repaired_args,
+                schema,
+                schema,
+            )
+            try:
+                repaired = ScriptGenerationGroupResult.model_validate(repaired_normalized)
+            except ValidationError:
+                repaired = None
+    if repaired is None:
+        raise AgentProtocolError("Script writer protocol repair failed")
+    result = ScriptGenerationGroupResult.model_validate(repaired)
+    _assert_protocol_repair_preserved_candidate(args, result)
+    record_langfuse_event(
+        "pengine.script_protocol_repair.completed",
+        input={
+            "mode": (
+                "script_candidate_completion"
+                if requires_semantic_completion
+                else "script_protocol_repair"
+            ),
+            "candidate_sha256": content_fingerprint(repair_input),
+            "model_retry_required": True,
+        },
+        metadata={"trace_version": "pengine-1"},
+    )
+    return result
 
 
 _OUTLINE_PATCH_ERROR_GUIDANCE = {
@@ -4353,6 +4640,7 @@ class StageGuardMiddleware(AgentMiddleware):
         begin_outline_group: OutlineGroupStart | None = None,
         complete_outline_group: OutlineGroupComplete | None = None,
         fail_outline_group: OutlineGroupFail | None = None,
+        generate_script_group: ScriptGroupGenerator | None = None,
     ) -> None:
         self.before_stage = before_stage
         self.approve_stage = approve_stage
@@ -4386,6 +4674,7 @@ class StageGuardMiddleware(AgentMiddleware):
         self.begin_outline_group = begin_outline_group
         self.complete_outline_group = complete_outline_group
         self.fail_outline_group = fail_outline_group
+        self.generate_script_group = generate_script_group
 
     @contextmanager
     def _repair_round_context(self, repair_round: int | None):
@@ -6040,6 +6329,33 @@ class StageGuardMiddleware(AgentMiddleware):
             )
         return result
 
+    async def _generate_script_group_candidate(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        args: Mapping[str, Any],
+        *,
+        expected_episode_number: int,
+    ) -> tuple[ToolMessage | Command[Any], Mapping[str, Any]]:
+        if self.generate_script_group is None:
+            return await self._call_structured_stage(
+                InternalStage.GENERATING_EPISODE_SCRIPTS,
+                request,
+                handler,
+                args,
+                expected_episode_number=expected_episode_number,
+            )
+        generated = await self.generate_script_group(str(args["description"]))
+        payload = generated.model_dump(mode="json")
+        return (
+            ToolMessage(
+                content=json.dumps(payload, ensure_ascii=False),
+                tool_call_id=request.tool_call["id"],
+                name="task",
+            ),
+            payload,
+        )
+
     async def _write_episodes(
         self,
         request: ToolCallRequest,
@@ -6422,8 +6738,7 @@ class StageGuardMiddleware(AgentMiddleware):
                         manifest_json=compiled_context.manifest_json,
                     ):
                         if self.episode_timeout_seconds is None:
-                            result, payload = await self._call_structured_stage(
-                                InternalStage.GENERATING_EPISODE_SCRIPTS,
+                            result, payload = await self._generate_script_group_candidate(
                                 episode_request,
                                 handler,
                                 episode_args,
@@ -6431,8 +6746,7 @@ class StageGuardMiddleware(AgentMiddleware):
                             )
                         else:
                             async with asyncio.timeout(self.episode_timeout_seconds):
-                                result, payload = await self._call_structured_stage(
-                                    InternalStage.GENERATING_EPISODE_SCRIPTS,
+                                result, payload = await self._generate_script_group_candidate(
                                     episode_request,
                                     handler,
                                     episode_args,
@@ -7613,6 +7927,16 @@ class DeepAgentWorkflow:
             language_contract=output_language_contract,
         )
 
+        async def generate_script_group(description: str) -> ScriptGenerationGroupResult:
+            return await _invoke_script_group_structured(
+                self.generation_model,
+                [
+                    {"role": "system", "content": script_writer_prompt},
+                    {"role": "user", "content": description},
+                ],
+                model_call_state=self.model_call_state,
+            )
+
         subagents = [
             {
                 "name": "story_architect",
@@ -7654,10 +7978,10 @@ class DeepAgentWorkflow:
                 "description": "Creates the complete episode scripts.",
                 "system_prompt": script_writer_prompt,
                 "model": self.generation_model,
-                "tools": generation_tools,
+                "tools": [],
                 "permissions": VIRTUAL_FILE_PERMISSIONS,
                 "middleware": stage_middleware(
-                    _SCRIPT_WRITER_TOOL_ALLOWLIST,
+                    frozenset(),
                     system_prompt=script_writer_prompt,
                 ),
                 "response_format": ToolStrategy(
@@ -7822,6 +8146,7 @@ class DeepAgentWorkflow:
                     begin_outline_group=begin_outline_group,
                     complete_outline_group=complete_outline_group,
                     fail_outline_group=fail_outline_group,
+                    generate_script_group=generate_script_group,
                 ),
                 ToolAllowlistMiddleware(
                     _SUPERVISOR_TOOL_ALLOWLIST,
