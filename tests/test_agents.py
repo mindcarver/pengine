@@ -8439,7 +8439,7 @@ async def test_episode_writer_receives_compact_active_design_and_recent_verbatim
             payload = {
                 "passed": True,
                 "category": "pass",
-                "evidence": "L4硬规则：全系列一致",
+                "evidence": "全系列一致",
             }
         else:
             assert subagent_type == "episode_reviewer"

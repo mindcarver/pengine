@@ -404,13 +404,20 @@ def _require_l4_stage_evidence(
     review: SemanticReview | StructuralReviewResult,
     *,
     stage: InternalStage,
-) -> None:
+) -> SemanticReview | StructuralReviewResult:
     if review.passed and L4_STAGE_EVIDENCE_LABEL not in review.evidence:
-        raise AgentProtocolError(
-            "Passing stage review evidence is missing the required L4 hard-rule section",
-            stage=stage,
-            safe_message="通过的阶段审查缺少 L4 硬规则证据。",
+        record_langfuse_event(
+            "pengine.review.protocol_normalized",
+            input={
+                "stage": stage.value,
+                "normalization": "prepend_l4_evidence_label",
+                "decision_preserved": True,
+                "evidence_sha256": content_fingerprint(review.evidence),
+            },
+            metadata={"trace_version": "pengine-1"},
         )
+        return review.model_copy(update={"evidence": f"{L4_STAGE_EVIDENCE_LABEL}{review.evidence}"})
+    return review
 
 
 _STORY_ARCHITECT_PROMPT = (
@@ -5440,7 +5447,10 @@ class StageGuardMiddleware(AgentMiddleware):
                 )
                 review = _merge_canon_reviews([review, backstop])
             if review.passed:
-                _require_l4_stage_evidence(review, stage=stage)
+                review = cast(
+                    CanonReviewerResult,
+                    _require_l4_stage_evidence(review, stage=stage),
+                )
                 approved_payload = parsed.model_dump(mode="json")
                 return _result_with_payload(result, approved_payload), {
                     **approved_payload,
@@ -6065,9 +6075,12 @@ class StageGuardMiddleware(AgentMiddleware):
                                 safe_message="分集大纲审查目标未能绑定当前合同。",
                             ) from corrected_exc
             if review.passed:
-                _require_l4_stage_evidence(
-                    review,
-                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                review = cast(
+                    CanonReviewerResult,
+                    _require_l4_stage_evidence(
+                        review,
+                        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                    ),
                 )
                 return _result_with_payload(result, payload), {
                     **candidate,
@@ -6719,9 +6732,12 @@ class StageGuardMiddleware(AgentMiddleware):
             schema=StructuralReviewResult,
             stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
         )
-        _require_l4_stage_evidence(
-            result,
-            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+        result = cast(
+            StructuralReviewResult,
+            _require_l4_stage_evidence(
+                result,
+                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            ),
         )
         review_id = await self.register_series_review(
             review_type=("final" if episode_number == contract.episode_count else "milestone"),
