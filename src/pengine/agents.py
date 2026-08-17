@@ -3631,6 +3631,22 @@ def _validate_outline_repair_patch_targets(
             raise ValueError("outline_repair_patch_target_not_exposed")
 
 
+def _validate_group_projection_repair_patch(
+    patch: OutlineRepairPatch,
+    *,
+    contract_mutations: Sequence[Mapping[str, Any]],
+) -> None:
+    if contract_mutations or patch.content_replacements:
+        raise ValueError("group_projection_repair_scope_violation")
+    allowed_path = re.compile(
+        r"^/script_generation_groups/[0-9]+/(?:dramatic_unit|boundary_reason)$"
+    )
+    if not patch.json_edits or any(
+        allowed_path.fullmatch(edit.path) is None for edit in patch.json_edits
+    ):
+        raise ValueError("group_projection_repair_scope_violation")
+
+
 def _apply_outline_repair_patch(
     candidate: Mapping[str, Any],
     patch: OutlineRepairPatch,
@@ -5235,7 +5251,7 @@ class StageGuardMiddleware(AgentMiddleware):
             args,
             initial_result=synthetic,
             initial_payload=payload,
-            allow_repair=False,
+            group_projection_only=True,
         )
 
     async def _generate_locked_outline(
@@ -5247,6 +5263,7 @@ class StageGuardMiddleware(AgentMiddleware):
         initial_result: ToolMessage | Command[Any] | None = None,
         initial_payload: Mapping[str, Any] | None = None,
         allow_repair: bool = True,
+        group_projection_only: bool = False,
     ) -> tuple[ToolMessage | Command[Any], Mapping[str, Any]]:
         if initial_result is None or initial_payload is None:
             result, payload = await self._call_structured_stage(
@@ -5381,6 +5398,7 @@ class StageGuardMiddleware(AgentMiddleware):
                 candidate=payload,
                 review=review,
                 repair_round=repair_rounds,
+                group_projection_only=group_projection_only,
             )
 
     async def _invoke_outline_repair(
@@ -5389,6 +5407,7 @@ class StageGuardMiddleware(AgentMiddleware):
         candidate: Mapping[str, Any],
         review: CanonReviewerResult,
         repair_round: int,
+        group_projection_only: bool = False,
     ) -> Mapping[str, Any]:
         stage = InternalStage.GENERATING_EPISODE_OUTLINE
         if self.generate_outline_patch is None:
@@ -5421,6 +5440,11 @@ class StageGuardMiddleware(AgentMiddleware):
                     patch,
                     _outline_repair_context(candidate, review),
                 )
+                if group_projection_only:
+                    _validate_group_projection_repair_patch(
+                        patch,
+                        contract_mutations=contract_mutations,
+                    )
                 if (
                     not contract_mutations
                     and not patch.content_replacements
@@ -5459,14 +5483,26 @@ class StageGuardMiddleware(AgentMiddleware):
             )
             return repaired.model_dump(mode="json")
 
+        scope_instruction = None
+        if group_projection_only:
+            scope_instruction = (
+                "This candidate was assembled from committed natural outline groups. Repair "
+                "only execution-group projection wording. Return no content replacements and "
+                "no story-contract or episode-plan changes. Every JSON edit must target exactly "
+                "/script_generation_groups/<index>/dramatic_unit or "
+                "/script_generation_groups/<index>/boundary_reason. Preserve group IDs, episode "
+                "boundaries, every committed outline group, and every other field."
+            )
+
         try:
             with self._repair_round_context(repair_round):
-                return await generate_and_apply(None)
+                return await generate_and_apply(scope_instruction)
         except AgentProtocolError as first_error:
             correction = (
                 "The previous patch could not be applied or did not validate. Return exactly "
                 "one corrected OutlineRepairPatch tool call now. Do not return analysis or the "
-                f"full candidate. {first_error.repair_instruction or ''}"
+                f"full candidate. {scope_instruction or ''} "
+                f"{first_error.repair_instruction or ''}"
             )
             with self._repair_round_context(repair_round):
                 return await generate_and_apply(correction)
