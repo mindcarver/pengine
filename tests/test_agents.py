@@ -8540,7 +8540,7 @@ async def test_episode_writer_receives_compact_active_design_and_recent_verbatim
 
     await resumed.awrap_tool_call(request, handler)
 
-    assert resumed_attempts == []
+    assert resumed_attempts == [2]
     assert len(series_review_inputs) == 2
     assert len(registered_reviews) == 2
     assert registered_reviews[-1]["review_type"] == "final"
