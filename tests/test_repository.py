@@ -408,6 +408,88 @@ async def test_grouped_outline_checkpoints_are_immutable_and_resume_failed_group
         )
 
 
+async def test_grouped_outline_recovery_does_not_exhaust_whole_stage_attempts(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    stage = InternalStage.GENERATING_EPISODE_OUTLINE
+    assert await repository.record_stage_attempt(lease.run_id, stage, now=NOW) == 1
+    assert (
+        await repository.record_stage_attempt(
+            lease.run_id,
+            stage,
+            now=NOW + timedelta(seconds=1),
+        )
+        == 2
+    )
+    assert (
+        await repository.record_stage_attempt(
+            lease.run_id,
+            stage,
+            now=NOW + timedelta(seconds=2),
+        )
+        == 3
+    )
+    await repository.commit_outline_season_map(
+        lease.run_id,
+        {"episode_count": 30, "script_generation_groups": ["opening"]},
+        call_id="season-call",
+    )
+
+    assert (
+        await repository.record_stage_attempt(
+            lease.run_id,
+            stage,
+            now=NOW + timedelta(seconds=3),
+        )
+        == 3
+    )
+    assert await repository.get_stage_attempt_counts(lease.run_id) == {stage: 3}
+    assert (
+        await repository.handle_run_timeout(
+            lease.run_id,
+            stage,
+            now=NOW + timedelta(seconds=4),
+        )
+        == "auto_resuming"
+    )
+
+    resumed = await repository.lease_next_job(
+        "worker-after-outline-timeout",
+        30,
+        now=NOW + timedelta(seconds=5),
+    )
+    assert resumed is not None
+    assert resumed.run_id == lease.run_id
+    assert (
+        await repository.record_stage_attempt(
+            lease.run_id,
+            stage,
+            now=NOW + timedelta(seconds=6),
+        )
+        == 3
+    )
+    assert (
+        await repository.handle_run_timeout(
+            lease.run_id,
+            stage,
+            now=NOW + timedelta(seconds=7),
+        )
+        == "paused"
+    )
+
+    continued = await repository.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-grouped-outline",
+        now=NOW + timedelta(seconds=8),
+    )
+    assert continued.creation_id == accepted.creation_id
+    assert continued.run_state == "queued"
+
+
 async def test_schema_v18_migrates_episode_attempts_to_cycle_zero(
     repository,
     persona,

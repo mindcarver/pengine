@@ -75,6 +75,7 @@ from pengine.agents import (
     _drop_dangling_tool_call_messages,
     _established_facts_payload,
     _evidence_contract,
+    _invoke_direct_structured_with_retry,
     _language_retry_fingerprint,
     _language_retry_matches,
     _merge_story_canon_reviews,
@@ -135,6 +136,7 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
     bound_tool_names: list[list[str]] = Field(default_factory=list)
     bound_tool_descriptions: list[list[str]] = Field(default_factory=list)
     model_system_prompts: list[str] = Field(default_factory=list)
+    model_message_batches: list[list[Any]] = Field(default_factory=list)
 
     def bind_tools(
         self,
@@ -152,6 +154,7 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> Any:
+        self.model_message_batches.append(list(messages))
         self.model_system_prompts.append(
             "\n\n".join(message.text for message in messages if isinstance(message, SystemMessage))
         )
@@ -307,6 +310,36 @@ def _tool_call(name: str, args: dict[str, Any], index: int) -> AIMessage:
             }
         ],
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_structured_call_repairs_parameter_name_json_wrapper() -> None:
+    class Result(BaseModel):
+        value: str
+
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call("Result", {"$PARAMETER_NAME": '{"value":"wrong shape"}'}, 1),
+            _tool_call("Result", {"value": "corrected"}, 2),
+        ]
+    )
+
+    result = await _invoke_direct_structured_with_retry(
+        model,
+        Result,
+        [
+            {"role": "system", "content": "Return Result."},
+            {"role": "user", "content": "Produce the value."},
+        ],
+    )
+
+    assert result == Result(value="corrected")
+    assert len(model.model_system_prompts) == 2
+    feedback = next(
+        message for message in model.model_message_batches[1] if isinstance(message, ToolMessage)
+    )
+    assert "$PARAMETER_NAME" in feedback.content
+    assert "JSON string" in feedback.content
 
 
 def _story_contract(
@@ -6804,7 +6837,7 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
             "group_id": group_id,
             "start_episode": start,
             "end_episode": end,
-            "content": f"{group_id}大纲",
+            "content": "开端大纲" if group_id == "opening" else "追查大纲",
             "episodes": [
                 {"episode_number": number, "plan": f"推进第{number}集"}
                 for number in range(start, end + 1)
@@ -6850,6 +6883,8 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
     failed: list[str] = []
     fail_second_once = True
     reject_first_group_once = True
+    final_review_calls = 0
+    projection_repair_constraints: list[str | None] = []
 
     async def before_stage(_: InternalStage) -> int:
         return 1
@@ -6932,6 +6967,26 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
     async def fail_group(**kwargs: Any) -> None:
         failed.append(kwargs["group_id"])
 
+    async def generate_outline_patch(
+        _: Mapping[str, Any],
+        __: CanonReviewerResult,
+        ___: int,
+        correction: str | None,
+    ) -> Mapping[str, Any]:
+        projection_repair_constraints.append(correction)
+        return {
+            "stage": "generating_episode_outline",
+            "content_replacements": [],
+            "json_edits": [
+                {
+                    "op": "replace",
+                    "path": "/script_generation_groups/0/dramatic_unit",
+                    "expected": "发现旧信",
+                    "value": "发现旧信并确认寄信线索",
+                }
+            ],
+        }
+
     request = ToolCallRequest(
         tool_call={
             "name": "task",
@@ -6969,14 +7024,31 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
             begin_outline_group=begin_group,
             complete_outline_group=complete_group,
             fail_outline_group=fail_group,
+            generate_outline_patch=generate_outline_patch,
         )
 
     async def handler(_: ToolCallRequest) -> ToolMessage:
-        payload = {
-            "passed": True,
-            "evidence": "L4硬规则：完整合同一致",
-            "issues": [],
-        }
+        nonlocal final_review_calls
+        final_review_calls += 1
+        payload = (
+            {
+                "passed": False,
+                "evidence": "第一组投影描述遗漏已提交的寄信线索。",
+                "issues": [
+                    {
+                        "code": "opening_projection_stale",
+                        "message": "只修正 opening 组的戏剧单元描述。",
+                        "contract_mutation_required": False,
+                    }
+                ],
+            }
+            if final_review_calls == 1
+            else {
+                "passed": True,
+                "evidence": "L4硬规则：完整合同与组投影一致",
+                "issues": [],
+            }
+        )
         return ToolMessage(
             content=json.dumps(payload, ensure_ascii=False),
             tool_call_id="call-grouped-outline",
@@ -6999,7 +7071,187 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
     assert committed[0]["content_sha256"] == first_group_hash
     assert isinstance(returned, ToolMessage)
     assert [item["episode_number"] for item in locked["episodes"]] == [1, 2, 3]
+    assert locked["script_generation_groups"][0]["dramatic_unit"] == ("发现旧信并确认寄信线索")
+    assert locked["contract_repair_rounds"] == 1
     assert locked["contract_review"]["passed"] is True
+    assert len(projection_repair_constraints) == 1
+    assert "dramatic_unit" in (projection_repair_constraints[0] or "")
+
+
+@pytest.mark.asyncio
+async def test_grouped_outline_projection_repair_rejects_episode_or_contract_changes() -> None:
+    corrections: list[str | None] = []
+    contract = _story_contract()
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "第一集大纲",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "发现旧信"}],
+        "story_contract": contract.model_dump(mode="json"),
+        "script_generation_groups": [
+            {
+                "group_id": "opening",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "发现旧信",
+                "boundary_reason": "线索改变目标",
+            }
+        ],
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="组投影描述需要修复。",
+        issues=[
+            {
+                "code": "opening_projection_stale",
+                "message": "只修正组描述。",
+                "contract_mutation_required": False,
+            }
+        ],
+    )
+
+    async def generate_invalid_patch(
+        _: Mapping[str, Any],
+        __: CanonReviewerResult,
+        ___: int,
+        correction: str | None,
+    ) -> Mapping[str, Any]:
+        corrections.append(correction)
+        return {
+            "stage": "generating_episode_outline",
+            "content_replacements": [],
+            "json_edits": [
+                {
+                    "op": "replace",
+                    "path": "/episodes/0/plan",
+                    "expected": "发现旧信",
+                    "value": "改写整集计划",
+                }
+            ],
+        }
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_patch=generate_invalid_patch,
+    )
+
+    with pytest.raises(AgentProtocolError) as error:
+        await middleware._invoke_outline_repair(
+            candidate=candidate,
+            review=review,
+            repair_round=1,
+            group_projection_only=True,
+        )
+
+    assert len(corrections) == 2
+    assert all("script_generation_groups" in (item or "") for item in corrections)
+    assert error.value.safe_message == "分集大纲修复补丁未通过结构化校验。"
+
+
+@pytest.mark.asyncio
+async def test_grouped_outline_final_rejection_reports_two_real_repair_rounds() -> None:
+    contract = _story_contract()
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "第一集大纲",
+        "episode_count": 1,
+        "episodes": [{"episode_number": 1, "plan": "发现旧信"}],
+        "story_contract": contract.model_dump(mode="json"),
+        "script_generation_groups": [
+            {
+                "group_id": "opening",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "发现旧信",
+                "boundary_reason": "线索改变目标",
+            }
+        ],
+    }
+    patch_calls = 0
+
+    async def generate_patch(
+        _: Mapping[str, Any],
+        __: CanonReviewerResult,
+        ___: int,
+        ____: str | None,
+    ) -> Mapping[str, Any]:
+        nonlocal patch_calls
+        patch_calls += 1
+        field = "dramatic_unit" if patch_calls == 1 else "boundary_reason"
+        expected = "发现旧信" if patch_calls == 1 else "线索改变目标"
+        value = "发现旧信并确认来源" if patch_calls == 1 else "来源确认后改变目标"
+        return {
+            "stage": "generating_episode_outline",
+            "content_replacements": [],
+            "json_edits": [
+                {
+                    "op": "replace",
+                    "path": f"/script_generation_groups/0/{field}",
+                    "expected": expected,
+                    "value": value,
+                }
+            ],
+        }
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_patch=generate_patch,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] review grouped outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-grouped-final-rejection",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def reject(_: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "passed": False,
+                    "evidence": "组投影描述仍与分集计划冲突。",
+                    "issues": [
+                        {
+                            "code": "group_projection_stale",
+                            "message": "组投影仍不准确。",
+                            "contract_mutation_required": False,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-grouped-final-rejection",
+        )
+
+    with pytest.raises(ContentReviewRejectedError) as error:
+        await middleware._generate_locked_outline(
+            request,
+            reject,
+            request.tool_call["args"],
+            initial_result=ToolMessage(
+                content=json.dumps(candidate, ensure_ascii=False),
+                tool_call_id="call-grouped-final-rejection",
+            ),
+            initial_payload=candidate,
+            group_projection_only=True,
+        )
+
+    assert patch_calls == 2
+    assert error.value.repair_rounds == 2
 
 
 @pytest.mark.asyncio

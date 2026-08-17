@@ -1834,6 +1834,68 @@ def _structured_output_retry_message(error: Exception) -> str:
     return f"{instruction} Correct these validation errors: {'; '.join(details)}."
 
 
+async def _invoke_direct_structured_with_retry(
+    model: BaseChatModel,
+    schema: type[Any],
+    messages: list[dict[str, str]],
+) -> Any:
+    """Retry one invalid direct structured call with bounded protocol feedback."""
+
+    structured_model = model.with_structured_output(
+        schema,
+        method="function_calling",
+        include_raw=True,
+    )
+    response = await structured_model.ainvoke(messages)
+    parsed = response.get("parsed") if isinstance(response, Mapping) else None
+    if parsed is not None:
+        return parsed
+
+    parsing_error = response.get("parsing_error") if isinstance(response, Mapping) else None
+    error = (
+        parsing_error
+        if isinstance(parsing_error, Exception)
+        else ValueError("structured_result_missing")
+    )
+    correction = (
+        f"{_structured_output_retry_message(error)} Pass every schema field directly as a "
+        "tool argument. Do not wrap the result in $PARAMETER_NAME and do not encode the "
+        "result object as a JSON string."
+    )
+    raw = response.get("raw") if isinstance(response, Mapping) else None
+    retry_messages: list[Any] = list(messages)
+    matching_call = next(
+        (
+            call
+            for call in getattr(raw, "tool_calls", [])
+            if call.get("name") == schema.__name__ and call.get("id")
+        ),
+        None,
+    )
+    if isinstance(raw, AIMessage) and matching_call is not None:
+        retry_messages.extend(
+            [
+                raw,
+                ToolMessage(
+                    content=correction,
+                    tool_call_id=matching_call["id"],
+                    name=schema.__name__,
+                ),
+            ]
+        )
+    else:
+        retry_messages.append(HumanMessage(content=correction))
+
+    corrected = await structured_model.ainvoke(retry_messages)
+    corrected_parsed = corrected.get("parsed") if isinstance(corrected, Mapping) else None
+    if corrected_parsed is not None:
+        return corrected_parsed
+    corrected_error = corrected.get("parsing_error") if isinstance(corrected, Mapping) else None
+    if isinstance(corrected_error, Exception):
+        raise corrected_error
+    raise AgentProtocolError("Subagent returned invalid structured output")
+
+
 _OUTLINE_PATCH_ERROR_GUIDANCE = {
     "outline_repair_patch_target_not_exposed": (
         "Use only an exact episode_plans or script_generation_groups path. Story-contract "
@@ -3569,6 +3631,22 @@ def _validate_outline_repair_patch_targets(
             raise ValueError("outline_repair_patch_target_not_exposed")
 
 
+def _validate_group_projection_repair_patch(
+    patch: OutlineRepairPatch,
+    *,
+    contract_mutations: Sequence[Mapping[str, Any]],
+) -> None:
+    if contract_mutations or patch.content_replacements:
+        raise ValueError("group_projection_repair_scope_violation")
+    allowed_path = re.compile(
+        r"^/script_generation_groups/[0-9]+/(?:dramatic_unit|boundary_reason)$"
+    )
+    if not patch.json_edits or any(
+        allowed_path.fullmatch(edit.path) is None for edit in patch.json_edits
+    ):
+        raise ValueError("group_projection_repair_scope_violation")
+
+
 def _apply_outline_repair_patch(
     candidate: Mapping[str, Any],
     patch: OutlineRepairPatch,
@@ -5173,7 +5251,7 @@ class StageGuardMiddleware(AgentMiddleware):
             args,
             initial_result=synthetic,
             initial_payload=payload,
-            allow_repair=False,
+            group_projection_only=True,
         )
 
     async def _generate_locked_outline(
@@ -5185,6 +5263,7 @@ class StageGuardMiddleware(AgentMiddleware):
         initial_result: ToolMessage | Command[Any] | None = None,
         initial_payload: Mapping[str, Any] | None = None,
         allow_repair: bool = True,
+        group_projection_only: bool = False,
     ) -> tuple[ToolMessage | Command[Any], Mapping[str, Any]]:
         if initial_result is None or initial_payload is None:
             result, payload = await self._call_structured_stage(
@@ -5319,6 +5398,7 @@ class StageGuardMiddleware(AgentMiddleware):
                 candidate=payload,
                 review=review,
                 repair_round=repair_rounds,
+                group_projection_only=group_projection_only,
             )
 
     async def _invoke_outline_repair(
@@ -5327,6 +5407,7 @@ class StageGuardMiddleware(AgentMiddleware):
         candidate: Mapping[str, Any],
         review: CanonReviewerResult,
         repair_round: int,
+        group_projection_only: bool = False,
     ) -> Mapping[str, Any]:
         stage = InternalStage.GENERATING_EPISODE_OUTLINE
         if self.generate_outline_patch is None:
@@ -5359,6 +5440,11 @@ class StageGuardMiddleware(AgentMiddleware):
                     patch,
                     _outline_repair_context(candidate, review),
                 )
+                if group_projection_only:
+                    _validate_group_projection_repair_patch(
+                        patch,
+                        contract_mutations=contract_mutations,
+                    )
                 if (
                     not contract_mutations
                     and not patch.content_replacements
@@ -5397,14 +5483,26 @@ class StageGuardMiddleware(AgentMiddleware):
             )
             return repaired.model_dump(mode="json")
 
+        scope_instruction = None
+        if group_projection_only:
+            scope_instruction = (
+                "This candidate was assembled from committed natural outline groups. Repair "
+                "only execution-group projection wording. Return no content replacements and "
+                "no story-contract or episode-plan changes. Every JSON edit must target exactly "
+                "/script_generation_groups/<index>/dramatic_unit or "
+                "/script_generation_groups/<index>/boundary_reason. Preserve group IDs, episode "
+                "boundaries, every committed outline group, and every other field."
+            )
+
         try:
             with self._repair_round_context(repair_round):
-                return await generate_and_apply(None)
+                return await generate_and_apply(scope_instruction)
         except AgentProtocolError as first_error:
             correction = (
                 "The previous patch could not be applied or did not validate. Return exactly "
                 "one corrected OutlineRepairPatch tool call now. Do not return analysis or the "
-                f"full candidate. {first_error.repair_instruction or ''}"
+                f"full candidate. {scope_instruction or ''} "
+                f"{first_error.repair_instruction or ''}"
             )
             with self._repair_round_context(repair_round):
                 return await generate_and_apply(correction)
@@ -7303,14 +7401,13 @@ class DeepAgentWorkflow:
                     separators=(",", ":"),
                     sort_keys=True,
                 )
-            response = await self.generation_model.with_structured_output(
+            response = await _invoke_direct_structured_with_retry(
+                self.generation_model,
                 EpisodeOutlineGroupResult,
-                method="function_calling",
-            ).ainvoke(
                 [
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_content},
-                ]
+                ],
             )
             return EpisodeOutlineGroupResult.model_validate(response).model_dump(mode="json")
 

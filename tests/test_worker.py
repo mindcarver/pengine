@@ -18,6 +18,7 @@ from test_script_batch import seed_batch_with_episodes
 
 from pengine.agents import (
     AgentProtocolError,
+    ContentReviewRejectedError,
     EpisodeTimeoutError,
     QualityGateRejectedError,
     QualityReviewerResult,
@@ -1449,6 +1450,43 @@ async def test_worker_reports_graph_and_quality_failures_separately(
     else:
         assert resource.initial.quality_rejection.code == expected_code
         assert resource.initial.quality_rejection.evidence == "L0 与已批准稿件的核心冲突。"
+
+
+@pytest.mark.asyncio
+async def test_worker_persists_grouped_outline_content_rejection_after_two_repairs(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "grouped-outline-content-rejected",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人追查旧信。",
+            requirements="生成三十集短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=RaisingWorkflow(
+            ContentReviewRejectedError(
+                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                evidence="组投影在两轮有界修复后仍与分集计划冲突。",
+                repair_rounds=2,
+            )
+        ),
+        worker_id="grouped-outline-content-rejected-worker",
+    )
+
+    assert await worker.run_once() is True
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "paused"
+    assert resource.initial.pause.code == "content_rejected"
+    assert resource.initial.pause.content_repair_count == 2
+    assert resource.initial.progress.can_continue is True
 
 
 @pytest.mark.asyncio
