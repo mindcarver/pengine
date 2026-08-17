@@ -7886,7 +7886,10 @@ class StageGuardMiddleware(AgentMiddleware):
             final_plan = plans[-1]
             if self.reset_episode_deadline is not None:
                 await self.reset_episode_deadline()
-            await self.before_episode(final_plan, new_operation=True)
+            if self.model_call_state is not None:
+                self.model_call_state.context.stage = InternalStage.GENERATING_EPISODE_SCRIPTS.value
+                self.model_call_state.context.episode_number = contract.episode_count
+                self.model_call_state.context.operation_id = new_operation_id()
             await self._milestone_review(
                 episode_number=contract.episode_count,
                 prior_state=prior_state,
