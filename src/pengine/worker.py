@@ -737,12 +737,27 @@ class Worker:
                         code="relay_unavailable",
                         safe_message="The model relay is not configured.",
                     )
-                if (
-                    isinstance(self.workflow, DeepAgentWorkflow)
-                    and self._requires_langgraph_checkpoint(work)
-                    and not await self.workflow.has_checkpoint(work.thread_id)
-                ):
-                    raise CheckpointUnavailableError("The durable workflow checkpoint is missing.")
+                workflow_thread_id = work.thread_id
+                if isinstance(self.workflow, DeepAgentWorkflow):
+                    outline_approved = InternalStage.GENERATING_EPISODE_OUTLINE in approved
+                    if outline_approved:
+                        active_series_bible = await self.repository.get_run_series_bible(
+                            work.run_id
+                        )
+                        if active_series_bible is None:
+                            raise CheckpointUnavailableError(
+                                "The active SeriesBible checkpoint is missing."
+                            )
+                        workflow_thread_id = self.workflow.episode_script_thread_id(
+                            work.thread_id,
+                            active_series_bible.candidate_id,
+                        )
+                    elif self._requires_langgraph_checkpoint(
+                        work
+                    ) and not await self.workflow.has_checkpoint(work.thread_id):
+                        raise CheckpointUnavailableError(
+                            "The durable workflow checkpoint is missing."
+                        )
 
                 async def before_stage(stage: InternalStage) -> int:
                     nonlocal current_stage
@@ -1147,7 +1162,7 @@ class Worker:
                         )
 
                     workflow_kwargs: dict[str, Any] = {
-                        "thread_id": work.thread_id,
+                        "thread_id": workflow_thread_id,
                         "story": work.story,
                         "requirements": work.requirements,
                         "persona_files": persona_files,

@@ -633,6 +633,26 @@ def _successful_responses_unified() -> list[AIMessage]:
     return unified
 
 
+def _successful_checkpoint_payloads() -> dict[InternalStage, dict[str, Any]]:
+    payloads: dict[InternalStage, dict[str, Any]] = {}
+    for response in _successful_responses():
+        if not response.tool_calls:
+            continue
+        call = response.tool_calls[0]
+        stage = call["args"].get("stage")
+        if (
+            call["name"]
+            in {
+                "StoryArchitectResult",
+                "EpisodePlannerResult",
+                "ScriptGenerationGroupResult",
+            }
+            and stage is not None
+        ):
+            payloads[InternalStage(stage)] = call["args"]
+    return payloads
+
+
 def _episode_hook_kwargs(
     *,
     episode_drafts: list[EpisodeDraft] | None = None,
@@ -10126,6 +10146,64 @@ async def test_restart_reuses_thread_checkpoint_and_skips_approved_stage(
         InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
         InternalStage.GENERATING_EPISODE_OUTLINE,
     ]
+
+
+@pytest.mark.asyncio
+async def test_episode_phase_uses_segmented_checkpoint_and_bounded_supervisor_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    approved = _successful_checkpoint_payloads()
+    approved[InternalStage.GENERATING_EPISODE_SCRIPTS] = {
+        "stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+        "content": "第 1 集\n事实1\n钩子1",
+    }
+    state = ModelCallState()
+    observed_output_budgets: list[int | None] = []
+
+    class FakeSupervisor:
+        async def ainvoke(self, _: Any, config: dict[str, Any]) -> dict[str, Any]:
+            observed_output_budgets.append(state.context.requested_output_tokens)
+            assert config["configurable"]["thread_id"] == (
+                "base-thread:episode-scripts:candidate-1"
+            )
+            return {"structured_response": {"completed": True}}
+
+    monkeypatch.setattr(
+        "pengine.agents.create_deep_agent",
+        lambda **_: FakeSupervisor(),
+    )
+
+    async def before_stage(_: InternalStage) -> int:
+        raise AssertionError("No approved stage may be attempted")
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("No approved stage may be approved again")
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = _fake_workflow(
+            model=ToolCallingFakeModel(responses=[]),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+            model_call_state=state,
+        )
+        thread_id = workflow.episode_script_thread_id("base-thread", "candidate-1")
+        result = await workflow.execute(
+            thread_id=thread_id,
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+            approved_checkpoints=approved,
+            **_episode_hook_kwargs()[0],
+        )
+
+    assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
+    assert observed_output_budgets == [4_096]
+    assert state.context.requested_output_tokens is None
 
 
 @pytest.mark.asyncio

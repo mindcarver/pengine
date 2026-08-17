@@ -194,6 +194,7 @@ _ORDERED_SPECIALIST_STAGES = tuple(_STORY_STAGES) + (
     InternalStage.GENERATING_EPISODE_OUTLINE,
     InternalStage.GENERATING_EPISODE_SCRIPTS,
 )
+_SUPERVISOR_ROUTING_OUTPUT_TOKENS = 4_096
 _RESULT_TOOL = {
     InternalStage.SELECTING_L0_VARIANT: "StoryArchitectResult",
     InternalStage.GENERATING_STORY_OUTLINE: "StoryArchitectResult",
@@ -6886,6 +6887,10 @@ class DeepAgentWorkflow:
         checkpoint = await self.checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
         return checkpoint is not None
 
+    @staticmethod
+    def episode_script_thread_id(thread_id: str, series_bible_candidate_id: str) -> str:
+        return f"{thread_id}:episode-scripts:{series_bible_candidate_id}"
+
     async def repair_missing_biographies(
         self,
         *,
@@ -7834,24 +7839,38 @@ class DeepAgentWorkflow:
             checkpointer=self.checkpointer,
             store=None,
         )
-        result = await supervisor.ainvoke(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            "Execute the bounded short-drama workflow now. "
-                            "Return the complete structured result only after all gates pass."
-                        ),
-                    }
-                ],
-                "files": files,
-            },
-            {
-                "configurable": {"thread_id": thread_id},
-                "recursion_limit": self.recursion_limit,
-            },
+        bounded_supervisor_routing = (
+            self.model_call_state is not None
+            and InternalStage.GENERATING_EPISODE_OUTLINE in approved_payloads
         )
+        previous_output_tokens = None
+        if bounded_supervisor_routing and self.model_call_state is not None:
+            previous_output_tokens = self.model_call_state.context.requested_output_tokens
+            self.model_call_state.context.requested_output_tokens = (
+                _SUPERVISOR_ROUTING_OUTPUT_TOKENS
+            )
+        try:
+            result = await supervisor.ainvoke(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Execute the bounded short-drama workflow now. "
+                                "Return the complete structured result only after all gates pass."
+                            ),
+                        }
+                    ],
+                    "files": files,
+                },
+                {
+                    "configurable": {"thread_id": thread_id},
+                    "recursion_limit": self.recursion_limit,
+                },
+            )
+        finally:
+            if bounded_supervisor_routing and self.model_call_state is not None:
+                self.model_call_state.context.requested_output_tokens = previous_output_tokens
         structured = result.get("structured_response")
         if structured is None:
             try:
