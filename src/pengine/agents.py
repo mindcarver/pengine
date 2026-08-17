@@ -1834,6 +1834,68 @@ def _structured_output_retry_message(error: Exception) -> str:
     return f"{instruction} Correct these validation errors: {'; '.join(details)}."
 
 
+async def _invoke_direct_structured_with_retry(
+    model: BaseChatModel,
+    schema: type[Any],
+    messages: list[dict[str, str]],
+) -> Any:
+    """Retry one invalid direct structured call with bounded protocol feedback."""
+
+    structured_model = model.with_structured_output(
+        schema,
+        method="function_calling",
+        include_raw=True,
+    )
+    response = await structured_model.ainvoke(messages)
+    parsed = response.get("parsed") if isinstance(response, Mapping) else None
+    if parsed is not None:
+        return parsed
+
+    parsing_error = response.get("parsing_error") if isinstance(response, Mapping) else None
+    error = (
+        parsing_error
+        if isinstance(parsing_error, Exception)
+        else ValueError("structured_result_missing")
+    )
+    correction = (
+        f"{_structured_output_retry_message(error)} Pass every schema field directly as a "
+        "tool argument. Do not wrap the result in $PARAMETER_NAME and do not encode the "
+        "result object as a JSON string."
+    )
+    raw = response.get("raw") if isinstance(response, Mapping) else None
+    retry_messages: list[Any] = list(messages)
+    matching_call = next(
+        (
+            call
+            for call in getattr(raw, "tool_calls", [])
+            if call.get("name") == schema.__name__ and call.get("id")
+        ),
+        None,
+    )
+    if isinstance(raw, AIMessage) and matching_call is not None:
+        retry_messages.extend(
+            [
+                raw,
+                ToolMessage(
+                    content=correction,
+                    tool_call_id=matching_call["id"],
+                    name=schema.__name__,
+                ),
+            ]
+        )
+    else:
+        retry_messages.append(HumanMessage(content=correction))
+
+    corrected = await structured_model.ainvoke(retry_messages)
+    corrected_parsed = corrected.get("parsed") if isinstance(corrected, Mapping) else None
+    if corrected_parsed is not None:
+        return corrected_parsed
+    corrected_error = corrected.get("parsing_error") if isinstance(corrected, Mapping) else None
+    if isinstance(corrected_error, Exception):
+        raise corrected_error
+    raise AgentProtocolError("Subagent returned invalid structured output")
+
+
 _OUTLINE_PATCH_ERROR_GUIDANCE = {
     "outline_repair_patch_target_not_exposed": (
         "Use only an exact episode_plans or script_generation_groups path. Story-contract "
@@ -7303,14 +7365,13 @@ class DeepAgentWorkflow:
                     separators=(",", ":"),
                     sort_keys=True,
                 )
-            response = await self.generation_model.with_structured_output(
+            response = await _invoke_direct_structured_with_retry(
+                self.generation_model,
                 EpisodeOutlineGroupResult,
-                method="function_calling",
-            ).ainvoke(
                 [
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_content},
-                ]
+                ],
             )
             return EpisodeOutlineGroupResult.model_validate(response).model_dump(mode="json")
 

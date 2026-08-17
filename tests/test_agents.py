@@ -75,6 +75,7 @@ from pengine.agents import (
     _drop_dangling_tool_call_messages,
     _established_facts_payload,
     _evidence_contract,
+    _invoke_direct_structured_with_retry,
     _language_retry_fingerprint,
     _language_retry_matches,
     _merge_story_canon_reviews,
@@ -135,6 +136,7 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
     bound_tool_names: list[list[str]] = Field(default_factory=list)
     bound_tool_descriptions: list[list[str]] = Field(default_factory=list)
     model_system_prompts: list[str] = Field(default_factory=list)
+    model_message_batches: list[list[Any]] = Field(default_factory=list)
 
     def bind_tools(
         self,
@@ -152,6 +154,7 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> Any:
+        self.model_message_batches.append(list(messages))
         self.model_system_prompts.append(
             "\n\n".join(message.text for message in messages if isinstance(message, SystemMessage))
         )
@@ -307,6 +310,36 @@ def _tool_call(name: str, args: dict[str, Any], index: int) -> AIMessage:
             }
         ],
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_structured_call_repairs_parameter_name_json_wrapper() -> None:
+    class Result(BaseModel):
+        value: str
+
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call("Result", {"$PARAMETER_NAME": '{"value":"wrong shape"}'}, 1),
+            _tool_call("Result", {"value": "corrected"}, 2),
+        ]
+    )
+
+    result = await _invoke_direct_structured_with_retry(
+        model,
+        Result,
+        [
+            {"role": "system", "content": "Return Result."},
+            {"role": "user", "content": "Produce the value."},
+        ],
+    )
+
+    assert result == Result(value="corrected")
+    assert len(model.model_system_prompts) == 2
+    feedback = next(
+        message for message in model.model_message_batches[1] if isinstance(message, ToolMessage)
+    )
+    assert "$PARAMETER_NAME" in feedback.content
+    assert "JSON string" in feedback.content
 
 
 def _story_contract(
