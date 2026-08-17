@@ -1031,6 +1031,43 @@ def _locked_numeric_content_mismatches(
     return issues
 
 
+def requires_locked_fact_semantic_review(
+    contract: StoryContract,
+    prior_state: SeriesState,
+    content: str,
+) -> bool:
+    """Return whether a candidate ambiguously restates an established hard value.
+
+    Deterministic validation already handles values adjacent to their fact subject.
+    This risk signal covers indirect restatements such as pronouns: a measured value
+    or timestamp is sent to a bounded semantic reviewer only when the committed state
+    contains an established fact of the same unit or temporal kind.
+    """
+    established_ids = set(prior_state.established_fact_ids)
+    established = [fact for fact in contract.facts if fact.fact_id in established_ids]
+    temporal_kinds = {fact.kind for fact in established if fact.kind in _TEMPORAL_KINDS}
+    if temporal_kinds and _temporal_tokens(content):
+        return True
+    established_units = {
+        fact.unit for fact in established if fact.kind in _NUMERIC_KINDS and fact.unit
+    }
+    if not established_units:
+        return False
+    established_dimensions = {
+        converted[0]
+        for unit in established_units
+        if (converted := _converted_measurement("1", unit)) is not None
+    }
+    for match in _MEASURED_NUMBER.finditer(content):
+        unit = match.group(2)
+        if unit in established_units:
+            return True
+        converted = _converted_measurement("1", unit)
+        if converted is not None and converted[0] in established_dimensions:
+            return True
+    return False
+
+
 _CHINESE_DIGITS = {
     character: value
     for value, characters in enumerate(

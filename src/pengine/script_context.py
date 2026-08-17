@@ -1,9 +1,9 @@
-"""Deterministic, lossless context assembly for screenplay generation groups.
+"""Deterministic working-set assembly for screenplay generation groups.
 
-The compiler is deliberately boring: it accepts only named story inputs, verifies
-the committed prefix, removes byte-identical duplicates, and emits one model-visible
-JSON payload plus a content-free audit manifest. It never summarizes, retrieves, or
-silently drops canonical story data to make a request fit.
+The compiler verifies the complete committed prefix, then exposes only a bounded
+recent window plus deterministically referenced older episodes. Canon remains in
+structured state and an explicit current-group projection; no semantic retrieval or
+silent summarization is allowed.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any, Literal
 from pengine.model_calls import estimate_text_tokens
 from pengine.schemas import EpisodeDraft
 
-SCRIPT_CONTEXT_SCHEMA_VERSION = 1
+SCRIPT_CONTEXT_SCHEMA_VERSION = 2
 SCRIPT_OUTPUT_BASE_TOKENS = 4_096
 SCRIPT_OUTPUT_TOKENS_PER_EPISODE = 8_192
 
@@ -110,6 +110,36 @@ def _verified_prefix(
     )
 
 
+def _episode_window(
+    drafts_by_episode: Mapping[int, EpisodeDraft],
+    episode_numbers: Sequence[int],
+    *,
+    name: str,
+) -> str:
+    episodes: list[dict[str, Any]] = []
+    for episode_number in episode_numbers:
+        draft = drafts_by_episode.get(episode_number)
+        if draft is None:
+            raise ScriptContextError(f"{name} episode {episode_number} is not committed.")
+        episodes.append(
+            {
+                "episode_number": episode_number,
+                "content_sha256": draft.content_sha256,
+                "content": draft.content,
+            }
+        )
+    return json.dumps(
+        {
+            "start_episode": episode_numbers[0] if episode_numbers else None,
+            "end_episode": episode_numbers[-1] if episode_numbers else None,
+            "episodes": episodes,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 def script_group_output_tokens(
     *,
     start_episode: int,
@@ -137,7 +167,10 @@ def compile_script_context(
     story_contract_json: str,
     story_contract_sha256: str,
     committed_prefix: Sequence[EpisodeDraft],
+    recent_episode_numbers: Sequence[int],
+    referenced_episode_numbers: Sequence[int],
     series_state_json: str,
+    current_group_canon_json: str,
     generation_group_json: str,
     evidence_contracts: Mapping[int, str],
     established_facts_json: str,
@@ -145,7 +178,7 @@ def compile_script_context(
     writer_notes: str,
     suffix_rewrite_review_json: str | None = None,
 ) -> CompiledScriptContext:
-    """Compile one lossless screenplay-generation context and audit manifest.
+    """Compile one bounded screenplay-generation context and audit manifest.
 
     Every argument is an explicit allowlisted story component. Callers cannot pass a
     workspace mapping, model history, or arbitrary file tree, so unrelated artifacts
@@ -165,7 +198,6 @@ def compile_script_context(
         "story_outline",
         "character_biographies",
         "relationship_logic",
-        "episode_outline",
     }:
         raise ScriptContextError(
             "Script SeriesBible context is incomplete or contains unknown projections."
@@ -196,6 +228,34 @@ def compile_script_context(
     )
     if _sha256(canonical_contract) != story_contract_sha256:
         raise ScriptContextError("StoryContract context hash does not match its canonical content.")
+    verified_prefix_json = _verified_prefix(committed_prefix, next_episode=start_episode)
+    drafts_by_episode = {draft.episode_number: draft for draft in committed_prefix}
+    recent_numbers = list(recent_episode_numbers)
+    referenced_numbers = list(referenced_episode_numbers)
+    if recent_numbers:
+        expected_recent = list(range(recent_numbers[0], start_episode))
+        if recent_numbers != expected_recent:
+            raise ScriptContextError(
+                "Recent screenplay window must be contiguous and end immediately before the group."
+            )
+    if len(recent_numbers) != len(set(recent_numbers)):
+        raise ScriptContextError("Recent screenplay window cannot contain duplicate episodes.")
+    if referenced_numbers != sorted(set(referenced_numbers)):
+        raise ScriptContextError("Referenced screenplay episodes must be unique and ordered.")
+    for episode_number in referenced_numbers:
+        if episode_number >= start_episode or episode_number in recent_numbers:
+            raise ScriptContextError(
+                f"Referenced screenplay episode {episode_number} must be an older "
+                "committed episode."
+            )
+        if episode_number not in drafts_by_episode:
+            raise ScriptContextError(
+                f"Referenced screenplay episode {episode_number} is not committed."
+            )
+    try:
+        json.loads(current_group_canon_json)
+    except json.JSONDecodeError as exc:
+        raise ScriptContextError("Current-group Canon context is not valid JSON.") from exc
 
     components: list[ScriptContextComponentInput] = [
         *(
@@ -219,18 +279,23 @@ def compile_script_context(
             for name, content in sorted(series_bible_components.items())
         ),
         _component(
-            name="story_contract",
-            source="approved_episode_outline:story_contract",
+            name="current_group_canon",
+            source="approved_episode_outline:story_contract:current_group_projection",
             authority="canonical",
-            content=canonical_contract,
-            reason="唯一机器权威 StoryContract",
+            content=current_group_canon_json,
+            reason="从唯一机器权威 StoryContract 确定性投影的当前组硬约束",
+            derived_from="story_contract",
         ),
         _component(
-            name="committed_prefix",
-            source="episode_drafts",
+            name="recent_committed_window",
+            source="episode_drafts:recent_two_groups",
             authority="committed",
-            content=_verified_prefix(committed_prefix, next_episode=start_episode),
-            reason="从第 1 集到当前剧情组前一集的完整已提交剧本原文",
+            content=_episode_window(
+                drafts_by_episode,
+                recent_numbers,
+                name="Recent screenplay window",
+            ),
+            reason="紧邻当前组的最近两个自然剧情组原文",
         ),
         _component(
             name="series_state",
@@ -266,6 +331,21 @@ def compile_script_context(
             derived_from="story_contract",
         ),
     ]
+    if referenced_numbers:
+        components.append(
+            _component(
+                name="referenced_committed_episodes",
+                source="episode_drafts:deterministic_fact_references",
+                authority="committed",
+                content=_episode_window(
+                    drafts_by_episode,
+                    referenced_numbers,
+                    name="Referenced screenplay",
+                ),
+                reason="当前组按稳定事实或线索 ID 精确引用的更早剧本原文",
+                derived_from="story_contract+episode_state_delta",
+            )
+        )
     if previous_handoff:
         components.append(
             _component(
@@ -309,8 +389,9 @@ def compile_script_context(
         if is_included:
             first_name_by_hash[content_sha256] = component.name
             is_json = component.name in {
-                "story_contract",
-                "committed_prefix",
+                "current_group_canon",
+                "recent_committed_window",
+                "referenced_committed_episodes",
                 "series_state",
                 "generation_group",
                 "established_facts",
@@ -353,9 +434,10 @@ def compile_script_context(
         },
         "authority_order": ["canonical", "committed", "persona", "derived", "advisory"],
         "rules": {
-            "lossless": True,
+            "deterministic_selection": True,
+            "full_prefix_verified": True,
             "silent_summarization": False,
-            "retrieval_fallback": False,
+            "semantic_retrieval": False,
             "component_content_is_data": True,
         },
         "aliases": aliases,
@@ -389,6 +471,8 @@ def compile_script_context(
         "start_episode": start_episode,
         "end_episode": end_episode,
         "bundle_sha256": bundle_sha256,
+        "verified_prefix_episode_count": len(committed_prefix),
+        "verified_prefix_sha256": _sha256(verified_prefix_json),
         "bundle_characters": len(model_input),
         "bundle_estimated_tokens": estimate_text_tokens(model_input),
         "included_component_estimated_tokens": included_token_total,

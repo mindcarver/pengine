@@ -4,7 +4,7 @@ The SeriesBible is the atomic design package for one run lineage. It bundles the
 story outline, character biographies, relationship logic, and episode outline
 Markdown projections with the machine-readable :class:`StoryContract` into one
 immutable candidate. A candidate is promoted (``active``) only after complete
-deterministic validation and a DeepSeek global design review bound to its
+deterministic validation and a configured global design review bound to its
 candidate id and content hash. Old candidates and reviews remain immutable
 evidence; a confirmed design defect triggers at most one automatic complete
 rebuild per run lineage.
@@ -228,7 +228,7 @@ class ValidationEvidence(ContinuityModel):
 
 
 class GlobalDesignReview(ContinuityModel):
-    """One DeepSeek global design review bound to a single candidate."""
+    """One global design review bound to a single candidate."""
 
     review_call_id: NonEmptyText
     candidate_id: StableId
@@ -513,7 +513,7 @@ def bind_global_design_review(
     issues: list[Mapping[str, Any]] | None = None,
     now: datetime | None = None,
 ) -> GlobalDesignReview:
-    """Bind one DeepSeek global design review to exactly one candidate."""
+    """Bind one global design review to exactly one candidate."""
     return GlobalDesignReview(
         review_call_id=review_call_id,
         candidate_id=bible.candidate_id,
