@@ -76,6 +76,7 @@ from pengine.agents import (
     _established_facts_payload,
     _evidence_contract,
     _invoke_direct_structured_with_retry,
+    _invoke_script_group_structured,
     _language_retry_fingerprint,
     _language_retry_matches,
     _merge_story_canon_reviews,
@@ -340,6 +341,168 @@ async def test_direct_structured_call_repairs_parameter_name_json_wrapper() -> N
     )
     assert "$PARAMETER_NAME" in feedback.content
     assert "JSON string" in feedback.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("genre", "episode_count"),
+    [("都市", 1), ("悬疑", 2), ("古装", 3), ("奇幻", 4)],
+)
+async def test_script_group_normalizes_transport_shape_without_another_model_call(
+    genre: str,
+    episode_count: int,
+) -> None:
+    contract = _story_contract(episode_count=episode_count)
+    episodes = [
+        {
+            "stage": "generating_episode_scripts",
+            "episode_number": episode_number,
+            "content": f"{genre}事实{episode_number}\n钩子{episode_number}",
+            "state_delta": _state_delta(contract, episode_number),
+            "field": "provider-noise",
+        }
+        for episode_number in range(1, episode_count + 1)
+    ]
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call(
+                "ScriptGenerationGroupResult",
+                {
+                    "stage": "generating_episode_scripts",
+                    "group_id": "opening_unit",
+                    "start_episode": 1,
+                    "end_episode": episode_count,
+                    "episodes": json.dumps(episodes, ensure_ascii=False),
+                },
+                1,
+            )
+        ]
+    )
+
+    result = await _invoke_script_group_structured(
+        model,
+        [
+            {"role": "system", "content": "Return the screenplay group."},
+            {"role": "user", "content": "FULL-CONTEXT-SENTINEL"},
+        ],
+    )
+
+    assert [episode.episode_number for episode in result.episodes] == list(
+        range(1, episode_count + 1)
+    )
+    assert [episode.content for episode in result.episodes] == [
+        f"{genre}事实{episode_number}\n钩子{episode_number}"
+        for episode_number in range(1, episode_count + 1)
+    ]
+    assert len(model.model_message_batches) == 1
+    assert all("calculate_arithmetic" not in names for names in model.bound_tool_names)
+
+
+@pytest.mark.asyncio
+async def test_script_group_protocol_repair_does_not_resend_full_context() -> None:
+    contract = _story_contract()
+    state = ModelCallState()
+    state.context.requested_output_tokens = 20_480
+    state.context.context_bundle_sha256 = "a" * 64
+    state.context.context_manifest_json = '{"mode":"compiled"}'
+    episode = {
+        "stage": "generating_episode_scripts",
+        "episode_number": 1,
+        "content": "事实1\n钩子1",
+        "state_delta": _state_delta(contract, 1),
+    }
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call(
+                "ScriptGenerationGroupResult",
+                {
+                    "stage": "generating_episode_scripts",
+                    "group_id": "opening_unit",
+                    "start_episode": 1,
+                    "end_episode": 1,
+                    "episodes": {"items": [episode]},
+                },
+                1,
+            ),
+            _tool_call(
+                "ScriptGenerationGroupResult",
+                {
+                    "stage": "generating_episode_scripts",
+                    "group_id": "opening_unit",
+                    "start_episode": 1,
+                    "end_episode": 1,
+                    "episodes": [episode],
+                },
+                2,
+            ),
+        ]
+    )
+
+    result = await _invoke_script_group_structured(
+        model,
+        [
+            {"role": "system", "content": "Return the screenplay group."},
+            {"role": "user", "content": "FULL-CONTEXT-SENTINEL"},
+        ],
+        model_call_state=state,
+    )
+
+    assert result.episodes[0].content == "事实1\n钩子1"
+    assert len(model.model_message_batches) == 2
+    repair_input = "\n".join(str(message.content) for message in model.model_message_batches[1])
+    assert "FULL-CONTEXT-SENTINEL" not in repair_input
+    assert "事实1" in repair_input
+    assert state.context.requested_output_tokens == 20_480
+    assert state.context.context_bundle_sha256 == "a" * 64
+    assert state.context.context_manifest_json == '{"mode":"compiled"}'
+
+
+@pytest.mark.asyncio
+async def test_script_group_protocol_repair_cannot_rewrite_screenplay() -> None:
+    contract = _story_contract()
+    episode = {
+        "stage": "generating_episode_scripts",
+        "episode_number": 1,
+        "content": "原始事实\n原始钩子",
+        "state_delta": _state_delta(contract, 1),
+    }
+    rewritten = copy.deepcopy(episode)
+    rewritten["content"] = "改写后的剧本"
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call(
+                "ScriptGenerationGroupResult",
+                {
+                    "stage": "generating_episode_scripts",
+                    "group_id": "opening_unit",
+                    "start_episode": 1,
+                    "end_episode": 1,
+                    "episodes": {"items": [episode]},
+                },
+                1,
+            ),
+            _tool_call(
+                "ScriptGenerationGroupResult",
+                {
+                    "stage": "generating_episode_scripts",
+                    "group_id": "opening_unit",
+                    "start_episode": 1,
+                    "end_episode": 1,
+                    "episodes": [rewritten],
+                },
+                2,
+            ),
+        ]
+    )
+
+    with pytest.raises(AgentProtocolError, match="changed screenplay content"):
+        await _invoke_script_group_structured(
+            model,
+            [
+                {"role": "system", "content": "Return the screenplay group."},
+                {"role": "user", "content": "FULL-CONTEXT-SENTINEL"},
+            ],
+        )
 
 
 def _story_contract(
@@ -4797,7 +4960,8 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     assert "Every explicitly locked upstream commitment must appear" in _SCRIPT_WRITER_PROMPT
     assert "Unspecified creative details remain the writer's choice" in _SCRIPT_WRITER_PROMPT
     assert "explicitly locked or formally committed aliases" in _SCRIPT_WRITER_PROMPT
-    assert "calculate_arithmetic" in _SCRIPT_WRITER_PROMPT
+    assert "calculate_arithmetic" not in _SCRIPT_WRITER_PROMPT
+    assert "do not invent a derived numeric claim" in _SCRIPT_WRITER_PROMPT
 
 
 @pytest.mark.parametrize(
@@ -5052,9 +5216,7 @@ def test_internal_runtime_leak_policy_accepts_diverse_screenplay_forms() -> None
         assert legitimate_content in policy
     assert "Never reject or rewrite content merely because" in policy
     assert "episode_number is not provenance evidence" in policy
-    assert "the screenplay may show operands, equations, mental calculation" in (
-        _SCRIPT_WRITER_PROMPT
-    )
+    assert "screenplay may show operands, equations, mental calculation" in (_SCRIPT_WRITER_PROMPT)
     assert "Never copy a tool-call envelope or private validation log" in _SCRIPT_WRITER_PROMPT
 
 
@@ -5279,7 +5441,7 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
     assert project not in subagents_by_name["script_writer"]["system_prompt"]
     assert "PENGINE_SCRIPT_CONTEXT" in subagents_by_name["script_writer"]["system_prompt"]
     script_writer_allowlist = subagents_by_name["script_writer"]["middleware"][1]
-    assert script_writer_allowlist.allowed_tools == {"calculate_arithmetic"}
+    assert script_writer_allowlist.allowed_tools == frozenset()
     for name in (
         "quality_reviewer",
         "canon_reviewer",
@@ -5323,29 +5485,30 @@ async def test_episode_writer_treats_speaker_labels_as_format_not_a_whitelist(
     database = tmp_path / "format-agnostic-speaker-checkpoints.sqlite3"
     contract = _story_contract(verbatim_episodes={1})
     captured_requests: list[ToolCallRequest] = []
-    original_call = StageGuardMiddleware._call_structured_stage
+    original_call = StageGuardMiddleware._generate_script_group_candidate
 
     async def capture_call(
         middleware: StageGuardMiddleware,
-        stage: InternalStage,
         request: ToolCallRequest,
         handler: Any,
         args: Mapping[str, Any],
         *,
-        expected_episode_number: int | None = None,
+        expected_episode_number: int,
     ) -> tuple[Any, Mapping[str, Any]]:
-        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
-            captured_requests.append(request)
+        captured_requests.append(request)
         return await original_call(
             middleware,
-            stage,
             request,
             handler,
             args,
             expected_episode_number=expected_episode_number,
         )
 
-    monkeypatch.setattr(StageGuardMiddleware, "_call_structured_stage", capture_call)
+    monkeypatch.setattr(
+        StageGuardMiddleware,
+        "_generate_script_group_candidate",
+        capture_call,
+    )
 
     async def before_stage(_: InternalStage) -> int:
         return 1
@@ -5411,29 +5574,30 @@ async def test_suffix_rewrite_feedback_is_injected_only_from_effective_episode(
 ) -> None:
     database = tmp_path / "suffix-rewrite-checkpoints.sqlite3"
     captured_requests: list[ToolCallRequest] = []
-    original_call = StageGuardMiddleware._call_structured_stage
+    original_call = StageGuardMiddleware._generate_script_group_candidate
 
     async def capture_call(
         middleware: StageGuardMiddleware,
-        stage: InternalStage,
         request: ToolCallRequest,
         handler: Any,
         args: Mapping[str, Any],
         *,
-        expected_episode_number: int | None = None,
+        expected_episode_number: int,
     ) -> tuple[Any, Mapping[str, Any]]:
-        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
-            captured_requests.append(request)
+        captured_requests.append(request)
         return await original_call(
             middleware,
-            stage,
             request,
             handler,
             args,
             expected_episode_number=expected_episode_number,
         )
 
-    monkeypatch.setattr(StageGuardMiddleware, "_call_structured_stage", capture_call)
+    monkeypatch.setattr(
+        StageGuardMiddleware,
+        "_generate_script_group_candidate",
+        capture_call,
+    )
     feedback = {
         "version": 1,
         "effective_earliest_affected_episode": 1,
@@ -5735,13 +5899,8 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
                 for names in result_bindings
             ), result_tool
         script_bindings = bindings_for("ScriptGenerationGroupResult")
-        assert script_bindings
         assert all("read_file" not in names for names in script_bindings)
-        assert all("calculate_arithmetic" in names for names in script_bindings)
-        assert all(
-            names <= {"ScriptGenerationGroupResult", "calculate_arithmetic"}
-            for names in script_bindings
-        )
+        assert all(names == {"ScriptGenerationGroupResult"} for names in script_bindings)
 
         task_descriptions = [
             description
@@ -7660,23 +7819,20 @@ async def test_numeric_fact_drift_triggers_deterministic_repair_with_established
     captured_writer_files: list[Mapping[str, str]] = []
     captured_repair_files: list[Mapping[str, str]] = []
     captured_repair_descriptions: list[str] = []
-    original_call = StageGuardMiddleware._call_structured_stage
+    original_call = StageGuardMiddleware._generate_script_group_candidate
     original_repair = StageGuardMiddleware._invoke_repair_subagent
 
     async def capture_call(
         middleware: StageGuardMiddleware,
-        stage: InternalStage,
         request: ToolCallRequest,
         handler: Any,
         args: Mapping[str, Any],
         *,
-        expected_episode_number: int | None = None,
+        expected_episode_number: int,
     ) -> tuple[Any, Mapping[str, Any]]:
-        if stage is InternalStage.GENERATING_EPISODE_SCRIPTS:
-            captured_writer_files.append(request.state["files"])
+        captured_writer_files.append(request.state["files"])
         return await original_call(
             middleware,
-            stage,
             request,
             handler,
             args,
@@ -7691,7 +7847,11 @@ async def test_numeric_fact_drift_triggers_deterministic_repair_with_established
         captured_repair_descriptions.append(kwargs["description"])
         return await original_repair(middleware, **kwargs)
 
-    monkeypatch.setattr(StageGuardMiddleware, "_call_structured_stage", capture_call)
+    monkeypatch.setattr(
+        StageGuardMiddleware,
+        "_generate_script_group_candidate",
+        capture_call,
+    )
     monkeypatch.setattr(StageGuardMiddleware, "_invoke_repair_subagent", capture_repair)
 
     approved: list[InternalStage] = []
