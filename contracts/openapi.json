@@ -2513,6 +2513,14 @@
             "type": "array",
             "title": "Resolved Clue Ids"
           },
+          "repair_constraints": {
+            "items": {
+              "$ref": "#/components/schemas/RepairConstraint"
+            },
+            "type": "array",
+            "maxItems": 64,
+            "title": "Repair Constraints"
+          },
           "handoff": {
             "type": "string",
             "default": "",
@@ -3312,6 +3320,71 @@
           "message"
         ],
         "title": "ValidationIssue"
+      },
+      "RepairConstraint": {
+        "properties": {
+          "constraint_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$",
+            "title": "Constraint Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "date",
+              "time",
+              "datetime",
+              "amount",
+              "count",
+              "duration",
+              "direction",
+              "relationship",
+              "relative_time",
+              "continuity"
+            ],
+            "title": "Kind"
+          },
+          "statement": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Statement"
+          },
+          "source_episode": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Source Episode"
+          },
+          "applies_from_episode": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Applies From Episode"
+          },
+          "applies_through_episode": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Applies Through Episode"
+          },
+          "evidence_excerpt": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Evidence Excerpt"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "constraint_id",
+          "kind",
+          "statement",
+          "source_episode",
+          "applies_from_episode",
+          "applies_through_episode",
+          "evidence_excerpt"
+        ],
+        "title": "RepairConstraint",
+        "description": "One bounded continuity commitment created during an authorized suffix rewrite."
       },
       "RepairAuthorization": {
         "properties": {

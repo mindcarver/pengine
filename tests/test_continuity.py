@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from pengine.continuity import (
     ContinuityViolation,
     EpisodeStateDelta,
+    RepairConstraint,
     SemanticReview,
     SeriesState,
     StoryContract,
@@ -16,10 +17,57 @@ from pengine.continuity import (
     build_episode_lock,
     initial_series_state,
     render_story_contract_markdown,
+    repair_constraint_id,
     requires_locked_fact_semantic_review,
     story_contract_sha256,
     validate_episode_candidate,
+    validate_repair_constraints,
 )
+
+
+def _repair_constraint(**overrides: object) -> RepairConstraint:
+    values = {
+        "kind": "relative_time",
+        "statement": "首期从下一自然月开始",
+        "source_episode": 2,
+        "applies_from_episode": 3,
+        "applies_through_episode": 6,
+        "evidence_excerpt": "从下个月起，每月十号交付",
+        **overrides,
+    }
+    return RepairConstraint(
+        constraint_id=repair_constraint_id(**values),
+        **values,
+    )
+
+
+def test_repair_constraint_ledger_binds_stable_id_range_and_verbatim_source() -> None:
+    relative_time = _repair_constraint()
+    direction = _repair_constraint(
+        kind="direction",
+        statement="甲方向乙方交付",
+        evidence_excerpt="由甲方交给乙方",
+    )
+
+    assert (
+        validate_repair_constraints(
+            [relative_time, direction],
+            episode_count=6,
+            source_content_by_episode={2: "双方确认：从下个月起，每月十号交付；由甲方交给乙方。"},
+        )
+        == []
+    )
+
+    invalid = direction.model_copy(update={"constraint_id": "repair_wrong"})
+    issues = validate_repair_constraints(
+        [relative_time, invalid],
+        episode_count=6,
+        source_content_by_episode={2: "没有逐字证据"},
+    )
+    assert {item.code for item in issues} == {
+        "repair_constraint_id_mismatch",
+        "repair_constraint_evidence_invalid",
+    }
 
 
 def test_indirect_numeric_restatement_requires_semantic_review() -> None:

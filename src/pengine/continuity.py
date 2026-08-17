@@ -375,6 +375,37 @@ class ScriptEvidence(ContinuityModel):
     excerpt: NonEmptyText
 
 
+class RepairConstraint(ContinuityModel):
+    """One bounded continuity commitment created during an authorized suffix rewrite."""
+
+    constraint_id: StableId
+    kind: Literal[
+        "date",
+        "time",
+        "datetime",
+        "amount",
+        "count",
+        "duration",
+        "direction",
+        "relationship",
+        "relative_time",
+        "continuity",
+    ]
+    statement: NonEmptyText
+    source_episode: int = Field(ge=1)
+    applies_from_episode: int = Field(ge=1)
+    applies_through_episode: int = Field(ge=1)
+    evidence_excerpt: NonEmptyText
+
+    @model_validator(mode="after")
+    def validate_episode_range(self) -> RepairConstraint:
+        if self.applies_from_episode <= self.source_episode:
+            raise ValueError("Repair constraints must apply after their source episode")
+        if self.applies_through_episode < self.applies_from_episode:
+            raise ValueError("Repair constraint range is invalid")
+        return self
+
+
 class EpisodeStateDelta(ContinuityModel):
     episode_number: int = Field(ge=1)
     contract_sha256: Sha256
@@ -400,6 +431,78 @@ class EpisodeStateDelta(ContinuityModel):
         return self
 
 
+def repair_constraint_id(
+    *,
+    kind: str,
+    statement: str,
+    source_episode: int,
+    applies_from_episode: int,
+    applies_through_episode: int,
+    evidence_excerpt: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "kind": kind,
+            "statement": statement,
+            "source_episode": source_episode,
+            "applies_from_episode": applies_from_episode,
+            "applies_through_episode": applies_through_episode,
+            "evidence_excerpt": evidence_excerpt,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"repair_{hashlib.sha256(payload.encode()).hexdigest()[:24]}"
+
+
+def validate_repair_constraints(
+    constraints: list[RepairConstraint],
+    *,
+    episode_count: int,
+    source_content_by_episode: dict[int, str],
+) -> list[ReviewIssue]:
+    issues: list[ReviewIssue] = []
+    ids = [item.constraint_id for item in constraints]
+    if len(ids) != len(set(ids)):
+        issues.append(_issue("duplicate_repair_constraint", "修复约束 ID 重复", ids))
+    for item in constraints:
+        expected_id = repair_constraint_id(
+            kind=item.kind,
+            statement=item.statement,
+            source_episode=item.source_episode,
+            applies_from_episode=item.applies_from_episode,
+            applies_through_episode=item.applies_through_episode,
+            evidence_excerpt=item.evidence_excerpt,
+        )
+        if item.constraint_id != expected_id:
+            issues.append(
+                _issue(
+                    "repair_constraint_id_mismatch",
+                    f"修复约束 {item.constraint_id} 的稳定 ID 与内容不匹配",
+                    [item.constraint_id],
+                )
+            )
+        if item.applies_through_episode > episode_count:
+            issues.append(
+                _issue(
+                    "repair_constraint_range_invalid",
+                    f"修复约束 {item.constraint_id} 超出整季集数",
+                    [item.constraint_id],
+                )
+            )
+        source_content = source_content_by_episode.get(item.source_episode)
+        if source_content is None or item.evidence_excerpt not in source_content:
+            issues.append(
+                _issue(
+                    "repair_constraint_evidence_invalid",
+                    f"修复约束 {item.constraint_id} 的逐字证据不在来源文本中",
+                    [item.constraint_id],
+                )
+            )
+    return issues
+
+
 class CharacterKnowledge(ContinuityModel):
     character_id: StableId
     known_fact_ids: list[StableId] = Field(default_factory=list)
@@ -412,7 +515,19 @@ class SeriesState(ContinuityModel):
     character_knowledge: list[CharacterKnowledge] = Field(default_factory=list)
     introduced_clue_ids: list[StableId] = Field(default_factory=list)
     resolved_clue_ids: list[StableId] = Field(default_factory=list)
+    repair_constraints: list[RepairConstraint] = Field(
+        default_factory=list,
+        max_length=64,
+        exclude_if=lambda value: not value,
+    )
     handoff: str = ""
+
+    @model_validator(mode="after")
+    def validate_unique_repair_constraints(self) -> SeriesState:
+        constraint_ids = [item.constraint_id for item in self.repair_constraints]
+        if len(constraint_ids) != len(set(constraint_ids)):
+            raise ValueError("Repair constraint IDs must be unique")
+        return self
 
 
 class EpisodeLock(ContinuityModel):
@@ -607,6 +722,7 @@ def build_episode_lock(
     delta: EpisodeStateDelta,
     semantic_review: SemanticReview,
     repair_rounds: int,
+    repair_constraints: list[RepairConstraint] | None = None,
 ) -> EpisodeLock:
     issues = validate_episode_candidate(
         contract=contract,
@@ -640,6 +756,11 @@ def build_episode_lock(
             set(prior_state.introduced_clue_ids) | set(delta.introduced_clue_ids)
         ),
         resolved_clue_ids=sorted(set(prior_state.resolved_clue_ids) | set(delta.resolved_clue_ids)),
+        repair_constraints=(
+            list(repair_constraints)
+            if repair_constraints is not None
+            else list(prior_state.repair_constraints)
+        ),
         handoff=delta.handoff,
     )
     return EpisodeLock(

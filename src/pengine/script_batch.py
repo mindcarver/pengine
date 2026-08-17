@@ -27,6 +27,7 @@ from pengine.continuity import (
     ContinuityModel,
     EpisodeStateDelta,
     NonEmptyText,
+    RepairConstraint,
     SemanticReview,
     SeriesState,
     Sha256,
@@ -149,6 +150,7 @@ def build_episode_candidate(
     delta: EpisodeStateDelta,
     semantic_review: SemanticReview,
     repair_rounds: int,
+    repair_constraints: list[RepairConstraint] | None = None,
     call_id: str,
     generation_window_id: StableId | None = None,
     writer_notes: str,
@@ -172,6 +174,7 @@ def build_episode_candidate(
         delta=delta,
         semantic_review=semantic_review,
         repair_rounds=repair_rounds,
+        repair_constraints=repair_constraints,
     )
     return EpisodeCandidate(
         candidate_id=new_candidate_id(),

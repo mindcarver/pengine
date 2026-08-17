@@ -177,6 +177,7 @@ def compile_script_context(
     previous_handoff: str,
     writer_notes: str,
     suffix_rewrite_review_json: str | None = None,
+    repair_constraint_ledger_json: str | None = None,
 ) -> CompiledScriptContext:
     """Compile one bounded screenplay-generation context and audit manifest.
 
@@ -377,6 +378,21 @@ def compile_script_context(
                 reason="当前受限后缀修复的唯一授权证据",
             )
         )
+    if repair_constraint_ledger_json:
+        try:
+            json.loads(repair_constraint_ledger_json)
+        except json.JSONDecodeError as exc:
+            raise ScriptContextError("Repair constraint ledger is not valid JSON.") from exc
+        components.append(
+            _component(
+                name="repair_constraint_ledger",
+                source="authorized_suffix_rewrite:committed_episode_deltas",
+                authority="committed",
+                content=repair_constraint_ledger_json,
+                reason="已授权后缀重写中由逐字证据绑定的跨组连续性约束",
+                derived_from="structural_review+episode_state_delta",
+            )
+        )
 
     included: list[dict[str, Any]] = []
     aliases: dict[str, str] = {}
@@ -396,6 +412,7 @@ def compile_script_context(
                 "generation_group",
                 "established_facts",
                 "suffix_rewrite_review",
+                "repair_constraint_ledger",
             } or component.name.startswith("evidence_contract.")
             included.append(
                 {
