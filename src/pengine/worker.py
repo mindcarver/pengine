@@ -558,10 +558,20 @@ class Worker:
         await self.repository.mark_run_running(job.run_id)
         work = await self.repository.get_run_work_item(job.run_id)
         approved: dict[InternalStage, Any] = dict(work.business_checkpoints)
+        active_series_bible = await self.repository.get_run_series_bible(work.run_id)
+        final_review_ready = active_series_bible is None
+        if active_series_bible is not None:
+            try:
+                await self._resolve_final_review_id(work.run_id)
+            except AgentProtocolError:
+                final_review_ready = False
+            else:
+                final_review_ready = True
         if (
             work.episode_plans
             and len(work.episode_drafts) == len(work.episode_plans)
             and InternalStage.GENERATING_EPISODE_SCRIPTS not in approved
+            and final_review_ready
         ):
             aggregate = await self.repository.episode_aggregate_checkpoint_payload(work.run_id)
             payload = {
