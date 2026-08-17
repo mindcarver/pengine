@@ -1953,7 +1953,7 @@ class Worker:
         candidate: SeriesBible,
         outline: Mapping[str, Any],
     ) -> GlobalDesignReview:
-        """Bind the DeepSeek review evidence to this exact candidate and model call."""
+        """Bind review evidence to this exact candidate and model call."""
         contract_review = outline.get("contract_review")
         if not isinstance(contract_review, Mapping):
             raise AgentProtocolError(
@@ -2001,7 +2001,7 @@ class Worker:
         )
 
     def _review_model_id(self) -> str:
-        return self.settings.review_model_id or "gpt-5.5"
+        return self.settings.review_model_id or "claude-opus-5"
 
     @staticmethod
     def _assemble_delivery(work: RunWorkItem, result: WorkflowResult) -> Delivery:

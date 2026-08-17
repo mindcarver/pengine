@@ -52,6 +52,7 @@ from pengine.continuity import (
     initial_series_state,
     render_story_contract_markdown,
     required_episode_evidence_target_ids,
+    requires_locked_fact_semantic_review,
     story_contract_sha256,
     validate_episode_candidate,
 )
@@ -779,6 +780,142 @@ def _established_facts_payload(
         ],
         "established_facts": entries,
     }
+
+
+def _current_group_canon_payload(
+    contract: StoryContract,
+    contract_hash: str,
+    prior_state: SeriesState,
+    group: ScriptGenerationGroup,
+    group_plans: Sequence[EpisodePlan],
+) -> dict[str, Any]:
+    """Project the hard Canon relevant to one generation group.
+
+    Numeric and temporal facts already established in the committed state remain
+    visible even when the current outline uses a pronoun. Other historical facts
+    are selected by exact subject, value, or stable ID occurrence in the group.
+    """
+    group_text = json.dumps(
+        {
+            "group": group.model_dump(mode="json"),
+            "plans": [plan.model_dump(mode="json") for plan in group_plans],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    established_ids = set(prior_state.established_fact_ids)
+    group_fact_ids = {
+        fact_id
+        for obligation in contract.episode_obligations
+        if group.start_episode <= obligation.episode_number <= group.end_episode
+        for fact_id in obligation.new_information_fact_ids
+    }
+    relevant_facts = [
+        fact
+        for fact in contract.facts
+        if fact.fact_id in group_fact_ids
+        or (
+            fact.fact_id in established_ids
+            and (
+                fact.kind
+                in {"date", "time", "datetime", "duration", "count", "amount", "measurement"}
+                or fact.fact_id in group_text
+                or fact.subject in group_text
+                or fact.value in group_text
+            )
+        )
+    ]
+    relevant_fact_ids = {fact.fact_id for fact in relevant_facts}
+    required_clue_ids = {
+        clue_id
+        for obligation in contract.episode_obligations
+        if group.start_episode <= obligation.episode_number <= group.end_episode
+        for clue_id in obligation.required_clue_ids
+    }
+    relevant_clues = [
+        clue
+        for clue in contract.clues
+        if clue.clue_id in required_clue_ids
+        or group.start_episode
+        <= (clue.callback_episode or clue.explained_episode)
+        <= group.end_episode
+        or group.start_episode <= clue.introduced_episode <= group.end_episode
+    ]
+    relevant_character_ids = {
+        character.character_id for character in contract.characters if character.name in group_text
+    }
+    relevant_timeline = [
+        event
+        for event in contract.timeline
+        if relevant_fact_ids.intersection(event.fact_ids)
+        or relevant_character_ids.intersection(event.participant_ids)
+    ]
+    return {
+        "schema_version": 1,
+        "story_contract_sha256": contract_hash,
+        "group_id": group.group_id,
+        "start_episode": group.start_episode,
+        "end_episode": group.end_episode,
+        "characters": [item.model_dump(mode="json") for item in contract.characters],
+        "relationships": [item.model_dump(mode="json") for item in contract.relationships],
+        "facts": [item.model_dump(mode="json") for item in relevant_facts],
+        "timeline": [item.model_dump(mode="json") for item in relevant_timeline],
+        "clues": [item.model_dump(mode="json") for item in relevant_clues],
+        "prohibitions": list(contract.prohibitions),
+        "episode_obligations": [
+            item.model_dump(mode="json")
+            for item in contract.episode_obligations
+            if group.start_episode <= item.episode_number <= group.end_episode
+        ],
+    }
+
+
+def _recent_group_episode_numbers(
+    groups: Sequence[ScriptGenerationGroup],
+    *,
+    start_episode: int,
+    committed_episode_numbers: set[int],
+) -> list[int]:
+    if start_episode == 1:
+        return []
+    prior_groups = [group for group in groups if group.start_episode < start_episode]
+    selected = prior_groups[-2:]
+    return sorted(
+        episode_number
+        for group in selected
+        for episode_number in range(
+            group.start_episode, min(group.end_episode, start_episode - 1) + 1
+        )
+        if episode_number in committed_episode_numbers
+    )
+
+
+def _referenced_prefix_episode_numbers(
+    drafts: Mapping[int, EpisodeDraft],
+    *,
+    target_episodes: Mapping[str, int],
+    recent_episode_numbers: set[int],
+    start_episode: int,
+) -> list[int]:
+    referenced: set[int] = set()
+    for target_id, preferred_episode in sorted(target_episodes.items()):
+        candidate_numbers = [
+            preferred_episode,
+            *(
+                episode_number
+                for episode_number in sorted(drafts)
+                if episode_number != preferred_episode
+            ),
+        ]
+        for episode_number in candidate_numbers:
+            if episode_number >= start_episode or episode_number in recent_episode_numbers:
+                continue
+            draft = drafts.get(episode_number)
+            delta = draft.state_delta if draft is not None else None
+            if delta is not None and any(item.target_id == target_id for item in delta.evidence):
+                referenced.add(episode_number)
+                break
+    return sorted(referenced)
 
 
 def _evidence_contract(
@@ -3293,13 +3430,35 @@ def _subagent_request(
     description: str,
     files: Mapping[str, str],
     required_read_paths: Iterable[str] = (),
+    inherit_files: bool = True,
 ) -> ToolCallRequest:
     existing_files = request.state.get("files") if isinstance(request.state, Mapping) else None
+    if not inherit_files and isinstance(existing_files, Mapping):
+        existing_files = {
+            path: value
+            for path, value in existing_files.items()
+            if path == "/workspace/creation-request.md"
+        }
     task_files = {
         **(dict(existing_files) if isinstance(existing_files, Mapping) else {}),
         **files,
     }
-    with_files = _request_with_files(request, files)
+    if inherit_files:
+        with_files = _request_with_files(request, files)
+    else:
+        if not isinstance(request.state, Mapping):
+            raise AgentProtocolError("Task state is unavailable")
+        state_files = {
+            **(dict(existing_files) if isinstance(existing_files, Mapping) else {}),
+            **{path: {"content": content, "encoding": "utf-8"} for path, content in files.items()},
+        }
+        state = {**request.state, "files": state_files}
+        with_files = request.override(
+            state=state,
+            runtime=(
+                replace(request.runtime, state=state) if request.runtime is not None else None
+            ),
+        )
     task_description = _description_with_workspace_paths(description, task_files)
     task_description = _description_with_required_read_paths(
         task_description,
@@ -5954,6 +6113,7 @@ class StageGuardMiddleware(AgentMiddleware):
         files: Mapping[str, str],
         schema: type[SemanticReview],
         stage: InternalStage,
+        minimal_context: bool = False,
     ) -> SemanticReview:
         # Bound the number of internal handler dispatches so a runaway subagent
         # (work-tool loop, structured-output retry storm) raises instead of
@@ -5974,10 +6134,14 @@ class StageGuardMiddleware(AgentMiddleware):
                 )
             return await handler(candidate_request)
 
-        approved_review_files = {
-            path: data["content"]
-            for path, data in _review_workspace_files(self.approved_payloads).items()
-        }
+        approved_review_files = (
+            {}
+            if minimal_context
+            else {
+                path: data["content"]
+                for path, data in _review_workspace_files(self.approved_payloads).items()
+            }
+        )
         review_files = {
             **approved_review_files,
             **files,
@@ -5997,6 +6161,7 @@ class StageGuardMiddleware(AgentMiddleware):
             ),
             files=review_files,
             required_read_paths=required_read_paths,
+            inherit_files=not minimal_context,
         )
 
         async def invoke(
@@ -6520,6 +6685,46 @@ class StageGuardMiddleware(AgentMiddleware):
                 separators=(",", ":"),
                 sort_keys=True,
             )
+            current_group_canon = _current_group_canon_payload(
+                contract,
+                contract_hash,
+                prior_state,
+                declared_group,
+                group_plans,
+            )
+            current_group_canon_json = json.dumps(
+                current_group_canon,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            recent_episode_numbers = _recent_group_episode_numbers(
+                declared_groups,
+                start_episode=runtime_group_start,
+                committed_episode_numbers=set(self.episode_drafts),
+            )
+            referenced_target_episodes = {
+                item["fact_id"]: item["first_revealed_episode"]
+                for item in current_group_canon["facts"]
+                if item["fact_id"] in generation_group_json
+                and item["first_revealed_episode"] < runtime_group_start
+            }
+            referenced_target_episodes.update(
+                {
+                    item["clue_id"]: (
+                        item["explained_episode"]
+                        if item["explained_episode"] < runtime_group_start
+                        else item["introduced_episode"]
+                    )
+                    for item in current_group_canon["clues"]
+                }
+            )
+            referenced_episode_numbers = _referenced_prefix_episode_numbers(
+                self.episode_drafts,
+                target_episodes=referenced_target_episodes,
+                recent_episode_numbers=set(recent_episode_numbers),
+                start_episode=runtime_group_start,
+            )
             evidence_contracts = {
                 item.episode_number: _evidence_contract_json(
                     contract,
@@ -6570,9 +6775,11 @@ class StageGuardMiddleware(AgentMiddleware):
                     f"{suffix_rewrite_instruction}"
                 ),
             }
+            visible_episode_numbers = set(recent_episode_numbers) | set(referenced_episode_numbers)
             episode_files = {
                 f"/workspace/episodes/ep{number}.md": draft.content
                 for number, draft in sorted(self.episode_drafts.items())
+                if number in visible_episode_numbers
             }
             if self.series_bible is not None:
                 projections = self.series_bible.projections
@@ -6585,13 +6792,11 @@ class StageGuardMiddleware(AgentMiddleware):
                         "/workspace/series_bible/relationship_logic.md": (
                             projections.relationship_logic
                         ),
-                        "/workspace/series_bible/episode_outline.md": projections.episode_outline,
                     }
                 )
             episode_files.update(
                 {
-                    "/workspace/story_contract.json": contract_json,
-                    "/workspace/story_contract.md": outline["story_contract_markdown"],
+                    "/workspace/current_group_canon.json": current_group_canon_json,
                     "/workspace/evidence_contract.json": evidence_contract_json,
                     "/workspace/established_facts.json": established_facts_json,
                     "/workspace/series_state.json": prior_state.model_dump_json(),
@@ -6630,7 +6835,6 @@ class StageGuardMiddleware(AgentMiddleware):
                             self.series_bible.projections.character_biographies
                         ),
                         "relationship_logic": self.series_bible.projections.relationship_logic,
-                        "episode_outline": self.series_bible.projections.episode_outline,
                     }
                 else:
                     story_payload = self.approved_payloads.get(
@@ -6649,7 +6853,6 @@ class StageGuardMiddleware(AgentMiddleware):
                         "relationship_logic": str(
                             relationships_payload.get("relationship_logic") or ""
                         ),
-                        "episode_outline": str(outline.get("content") or ""),
                     }
                 compiled_context = compile_script_context(
                     group_id=declared_group.group_id,
@@ -6661,7 +6864,10 @@ class StageGuardMiddleware(AgentMiddleware):
                     story_contract_json=contract_json,
                     story_contract_sha256=contract_hash,
                     committed_prefix=[draft for _, draft in sorted(self.episode_drafts.items())],
+                    recent_episode_numbers=recent_episode_numbers,
+                    referenced_episode_numbers=referenced_episode_numbers,
                     series_state_json=prior_state.model_dump_json(),
+                    current_group_canon_json=current_group_canon_json,
                     generation_group_json=generation_group_json,
                     evidence_contracts=evidence_contracts,
                     established_facts_json=established_facts_json,
@@ -6848,14 +7054,55 @@ class StageGuardMiddleware(AgentMiddleware):
                     content=parsed.content,
                     delta=parsed.state_delta,
                 )
-                if self.series_bible is not None:
-                    # RPR-A1: in the unified SeriesBible flow DeepSeek is reserved for
-                    # the declared structural milestones and the final completion review;
-                    # per-episode semantic review is superseded by deterministic
-                    # per-episode validation in the writer.
+                if not deterministic_issues and requires_locked_fact_semantic_review(
+                    contract,
+                    prior_state,
+                    parsed.content,
+                ):
+                    recent_scripts = _trusted_series_prefix_json(
+                        (
+                            episode_number,
+                            self.episode_drafts[episode_number].content,
+                        )
+                        for episode_number in recent_episode_numbers
+                        if episode_number in self.episode_drafts
+                    )
+                    semantic_review = await self._invoke_semantic_reviewer(
+                        request=request,
+                        handler=handler,
+                        subagent_type="episode_reviewer",
+                        description=(
+                            f"Perform a targeted hard-Canon review of episode "
+                            f"{plan.episode_number}. A deterministic risk signal found a "
+                            "numeric or temporal restatement that may refer indirectly to "
+                            "an established fact. Read only the compact current-group Canon, "
+                            "established-fact index, recent screenplay window, current "
+                            "candidate, and candidate state delta. Resolve aliases and "
+                            "pronouns from those files. Fail only for a direct contradiction "
+                            "to a locked value; do not review style, format, pacing, or "
+                            "unlocked creative choices. Bind every issue to exact fact IDs "
+                            "and a verbatim script excerpt. Return structured evidence only."
+                        ),
+                        files={
+                            "/workspace/current_group_canon.json": current_group_canon_json,
+                            "/workspace/established_facts.json": established_facts_json,
+                            "/workspace/series_state.json": prior_state.model_dump_json(),
+                            "/workspace/recent_scripts.json": recent_scripts,
+                            "/workspace/candidate_episode.md": parsed.content,
+                            "/workspace/candidate_state_delta.json": (
+                                parsed.state_delta.model_dump_json()
+                            ),
+                        },
+                        schema=EpisodeReviewerResult,
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        minimal_context=True,
+                    )
+                elif self.series_bible is not None:
                     semantic_review = SemanticReview(
                         passed=True,
-                        evidence="确定性逐集校验通过；结构性里程碑与终审由系列级审查覆盖。",
+                        evidence=(
+                            "确定性逐集校验通过；本集未触发既有数值或时间事实的语义风险审查。"
+                        ),
                     )
                 else:
                     semantic_review = await self._invoke_semantic_reviewer(

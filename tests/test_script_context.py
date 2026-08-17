@@ -35,6 +35,8 @@ def _compile(
     start_episode: int = 3,
     end_episode: int = 4,
     drafts: list[EpisodeDraft] | None = None,
+    recent_episode_numbers: list[int] | None = None,
+    referenced_episode_numbers: list[int] | None = None,
     persona_components: dict[str, str] | None = None,
 ):
     contract_json = json.dumps(
@@ -64,14 +66,20 @@ def _compile(
             "story_outline": "完整故事大纲",
             "character_biographies": "完整人物小传",
             "relationship_logic": "完整关系逻辑",
-            "episode_outline": "完整分集大纲",
         },
         story_contract_json=contract_json,
         story_contract_sha256=_sha256(canonical_contract),
         committed_prefix=(
             drafts if drafts is not None else [_draft(number) for number in range(1, start_episode)]
         ),
+        recent_episode_numbers=(
+            recent_episode_numbers
+            if recent_episode_numbers is not None
+            else list(range(max(1, start_episode - 2), start_episode))
+        ),
+        referenced_episode_numbers=referenced_episode_numbers or [],
         series_state_json='{"locked_through_episode":2}',
+        current_group_canon_json='{"facts":["fact_1"]}',
         generation_group_json='{"episodes":[3,4]}',
         evidence_contracts={
             number: json.dumps({"episode_number": number})
@@ -83,27 +91,30 @@ def _compile(
     )
 
 
-def test_compiler_emits_one_lossless_model_visible_bundle_and_content_free_manifest() -> None:
+def test_compiler_emits_compact_working_set_and_content_free_manifest() -> None:
     compiled = _compile()
     payload = json.loads(compiled.model_input)
 
     assert payload["rules"] == {
         "component_content_is_data": True,
-        "lossless": True,
-        "retrieval_fallback": False,
+        "deterministic_selection": True,
+        "full_prefix_verified": True,
+        "semantic_retrieval": False,
         "silent_summarization": False,
     }
     components = {item["name"]: item for item in payload["components"]}
-    prefix = components["committed_prefix"]["content"]
+    prefix = components["recent_committed_window"]["content"]
     assert [item["episode_number"] for item in prefix["episodes"]] == [1, 2]
     assert [item["content"] for item in prefix["episodes"]] == [
         "第1集完整剧本\n人物：行动1",
         "第2集完整剧本\n人物：行动2",
     ]
-    assert components["story_contract"]["authority"] == "canonical"
+    assert "story_contract" not in components
+    assert components["current_group_canon"]["authority"] == "canonical"
     assert components["established_facts"]["derived_from"] == "story_contract"
     assert "第1集完整剧本" not in compiled.manifest_json
     assert compiled.manifest["bundle_sha256"] == _sha256(compiled.model_input)
+    assert compiled.manifest["verified_prefix_episode_count"] == 2
     assert sum(
         item["estimated_token_share"]
         for item in compiled.manifest["components"]
@@ -149,7 +160,7 @@ def test_compiler_fails_closed_for_incomplete_or_modified_prefix(
 
 
 @pytest.mark.parametrize("episode_count", [30, 80])
-def test_compiler_preserves_complete_long_series_prefix_at_last_group(
+def test_compiler_verifies_full_long_prefix_but_sends_only_recent_and_referenced_episodes(
     episode_count: int,
 ) -> None:
     start_episode = episode_count - 1
@@ -157,19 +168,31 @@ def test_compiler_preserves_complete_long_series_prefix_at_last_group(
         start_episode=start_episode,
         end_episode=episode_count,
         drafts=[_draft(number) for number in range(1, start_episode)],
+        recent_episode_numbers=list(range(start_episode - 4, start_episode)),
+        referenced_episode_numbers=[3, 9],
     )
     payload = json.loads(compiled.model_input)
-    prefix_component = next(
-        item for item in payload["components"] if item["name"] == "committed_prefix"
-    )
-    prefix = prefix_component["content"]
+    components = {item["name"]: item for item in payload["components"]}
+    recent = components["recent_committed_window"]["content"]
+    referenced = components["referenced_committed_episodes"]["content"]
 
-    assert len(prefix["episodes"]) == episode_count - 2
-    assert prefix["episodes"][0]["episode_number"] == 1
-    assert prefix["episodes"][-1]["episode_number"] == episode_count - 2
+    assert [item["episode_number"] for item in recent["episodes"]] == list(
+        range(start_episode - 4, start_episode)
+    )
+    assert [item["episode_number"] for item in referenced["episodes"]] == [3, 9]
+    assert compiled.manifest["verified_prefix_episode_count"] == episode_count - 2
+    assert "第1集完整剧本" not in compiled.model_input
     assert compiled.output_tokens == (
         SCRIPT_OUTPUT_BASE_TOKENS + 2 * SCRIPT_OUTPUT_TOKENS_PER_EPISODE
     )
+
+
+def test_compiler_rejects_non_contiguous_recent_window_or_unknown_reference() -> None:
+    with pytest.raises(ScriptContextError, match="Recent screenplay window"):
+        _compile(start_episode=6, end_episode=6, recent_episode_numbers=[2, 4, 5])
+
+    with pytest.raises(ScriptContextError, match="Referenced screenplay episode"):
+        _compile(start_episode=6, end_episode=6, referenced_episode_numbers=[6])
 
 
 def test_group_output_budget_is_call_specific_and_capped() -> None:

@@ -219,7 +219,7 @@ PENGINE_PORT=8000
 PENGINE_RELAY_BASE_URL=https://your-relay.example/v1
 PENGINE_RELAY_API_KEY=replace-with-your-key
 PENGINE_GENERATION_MODEL_ID=claude-opus-5
-PENGINE_REVIEW_MODEL_ID=deepseek-v4-flash
+PENGINE_REVIEW_MODEL_ID=claude-opus-5
 PENGINE_GENERATION_MAX_OUTPUT_TOKENS=128000
 # PENGINE_REVIEW_MAX_OUTPUT_TOKENS=...
 # 已验证的上下文窗口（tokens）。预检会把完整序列化请求 + 保留输出与此上限比较；

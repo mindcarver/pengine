@@ -17,7 +17,7 @@ Required model settings are:
 PENGINE_RELAY_BASE_URL=https://your-relay.example/v1
 PENGINE_RELAY_API_KEY=replace-with-your-key
 PENGINE_GENERATION_MODEL_ID=claude-opus-5
-PENGINE_REVIEW_MODEL_ID=deepseek-v4-flash
+PENGINE_REVIEW_MODEL_ID=claude-opus-5
 ```
 
 The review value above is an example matching `.env.example`, not the only

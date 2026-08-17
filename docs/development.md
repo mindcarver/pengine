@@ -39,7 +39,7 @@ PENGINE_PORT=8000
 PENGINE_RELAY_BASE_URL=https://relay.example/v1
 PENGINE_RELAY_API_KEY=replace-me
 PENGINE_GENERATION_MODEL_ID=claude-opus-5
-PENGINE_REVIEW_MODEL_ID=deepseek-v4-flash
+PENGINE_REVIEW_MODEL_ID=claude-opus-5
 PENGINE_GENERATION_MAX_OUTPUT_TOKENS=128000
 PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS=200000
 PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS=64000
@@ -52,7 +52,7 @@ PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 配置规则：
 
 - generation model 必须是 `claude-opus-5`，生成输出上限不能超过 `128000`；
-- `.env.example` 选择 `deepseek-v4-flash`；Settings 允许的审核模型完整集合是
+- `.env.example` 选择 `claude-opus-5`；Settings 允许的审核模型完整集合是
   `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra` 和 `claude-opus-5`，分别走
   DeepSeek、OpenAI 和 Anthropic 客户端；不能仅凭配置通过就声称 provider 能力已验证；
 - generation/review 上下文上限必须是实际验证过的 token window；没有可信上限时请求前阻断；

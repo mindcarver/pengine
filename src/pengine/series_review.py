@@ -1,6 +1,6 @@
 """Bound structural milestone and final reviews with repair-budget semantics.
 
-A structural review binds one DeepSeek review to the exact design candidate,
+A structural review binds one configured review-model call to the exact design candidate,
 script batch/epoch, complete active-prefix hash, and model-call id that it
 observed. It carries a deterministic category (pass / design defect / script
 defect) and, for a script defect, the earliest affected episode N. Protocol and
@@ -68,7 +68,7 @@ def active_prefix_hash(episodes: Sequence[Mapping[str, str]]) -> str:
 
 
 class StructuralReviewResult(ContinuityModel):
-    """The structured DeepSeek review decision for one milestone or final prefix."""
+    """The structured review decision for one milestone or final prefix."""
 
     passed: bool = Field(
         description=(

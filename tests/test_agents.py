@@ -82,6 +82,8 @@ from pengine.agents import (
     _merge_story_canon_reviews,
     _outline_repair_context,
     _outline_repair_result,
+    _recent_group_episode_numbers,
+    _referenced_prefix_episode_numbers,
     _request_with_canonical_workspace,
     _required_read_paths,
     _result_with_payload,
@@ -89,6 +91,7 @@ from pengine.agents import (
     _story_repair_context,
     _structured_output_retry_message,
     _structured_result_validation_correction,
+    _subagent_request,
     _successful_required_reads,
     _suffix_rewrite_feedback_for_episode,
     _supervisor_prompt,
@@ -128,9 +131,92 @@ from pengine.schemas import (
     QualityRepairIssue,
     QualityRepairPlan,
 )
-from pengine.series_bible import build_series_bible, project_series_bible
+from pengine.series_bible import (
+    ScriptGenerationGroup,
+    build_series_bible,
+    project_series_bible,
+)
 from pengine.skill_assets import load_agent_skill_files
 from pengine.worker import Worker
+
+
+def test_minimal_subagent_request_drops_unrelated_workspace_files() -> None:
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {"description": "review", "subagent_type": "episode_reviewer"},
+            "id": "minimal-review",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={
+            "files": {
+                "/workspace/creation-request.md": {
+                    "content": "用户创意",
+                    "encoding": "utf-8",
+                },
+                "/workspace/unrelated.md": {
+                    "content": "其他阶段内容",
+                    "encoding": "utf-8",
+                },
+            }
+        },
+        runtime=None,
+    )
+
+    minimal = _subagent_request(
+        request,
+        subagent_type="episode_reviewer",
+        description="targeted review",
+        files={"/workspace/current_group_canon.json": "{}"},
+        required_read_paths=["/workspace/current_group_canon.json"],
+        inherit_files=False,
+    )
+
+    assert set(minimal.state["files"]) == {
+        "/workspace/creation-request.md",
+        "/workspace/current_group_canon.json",
+    }
+
+
+def test_long_series_working_set_keeps_two_groups_and_exact_older_references() -> None:
+    groups = [
+        ScriptGenerationGroup(
+            group_id=f"group_{start}",
+            start_episode=start,
+            end_episode=start + 3,
+            dramatic_unit=f"剧情组 {start}",
+            boundary_reason="自然转折",
+        )
+        for start in range(1, 81, 4)
+    ]
+    recent = _recent_group_episode_numbers(
+        groups,
+        start_episode=77,
+        committed_episode_numbers=set(range(1, 77)),
+    )
+    contract = _story_contract(episode_count=80)
+    referenced_delta = EpisodeStateDelta.model_validate(_state_delta(contract, 3))
+    referenced_content = "第三集旧场景"
+    drafts = {
+        3: EpisodeDraft(
+            episode_number=3,
+            content=referenced_content,
+            content_sha256=hashlib.sha256(referenced_content.encode()).hexdigest(),
+            completed_at=datetime(2026, 8, 17, tzinfo=UTC),
+            state_delta=referenced_delta,
+        )
+    }
+
+    referenced = _referenced_prefix_episode_numbers(
+        drafts,
+        target_episodes={referenced_delta.evidence[0].target_id: 3},
+        recent_episode_numbers=set(recent),
+        start_episode=77,
+    )
+
+    assert recent == list(range(69, 77))
+    assert referenced == [3]
 
 
 class ToolCallingFakeModel(FakeMessagesListChatModel):
@@ -7706,11 +7792,11 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
 
 
 @pytest.mark.asyncio
-async def test_numeric_fact_drift_triggers_deterministic_repair_with_established_facts(
+async def test_pronoun_numeric_fact_drift_triggers_targeted_review_and_repair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """第 1 集已确立年龄 59；第 2 集复述为六十岁必须被确定性拦截并进入局部修复。"""
+    """代词复述年龄时，紧凑语义审查必须拦截并进入局部修复。"""
     database = tmp_path / "numeric-fact-drift.sqlite3"
     contract_payload = _story_contract(episode_count=2).model_dump(mode="json")
     contract_payload["facts"].insert(
@@ -7796,13 +7882,29 @@ async def test_numeric_fact_drift_triggers_deterministic_repair_with_established
     writer_args["start_episode"] = 2
     writer_args["end_episode"] = 2
     writer_args["episodes"][0]["episode_number"] = 2
-    writer_args["episodes"][0]["content"] = "测试人物（六十岁）推门进来。\n事实2\n钩子2"
+    writer_args["episodes"][0]["content"] = "她六十岁，推门进来。\n事实2\n钩子2"
     writer_args["episodes"][0]["state_delta"] = _state_delta(contract, 2)
     responses[writer_index] = _tool_call("ScriptGenerationGroupResult", writer_args, writer_index)
 
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
+    responses[review_index] = _tool_call(
+        "EpisodeReviewerResult",
+        {
+            "passed": False,
+            "evidence": "代词指向测试人物，年龄与锁定事实冲突",
+            "issues": [
+                {
+                    "code": "locked_numeric_fact_mismatch",
+                    "message": "测试人物锁定为59岁，正文写成六十岁",
+                    "contract_refs": ["su_hui_age"],
+                    "script_excerpt": "她六十岁",
+                }
+            ],
+        },
+        review_index,
+    )
     repaired_args = copy.deepcopy(writer_args["episodes"][0])
-    repaired_args["content"] = "测试人物（五十九岁）推门进来。\n事实2\n钩子2"
+    repaired_args["content"] = "她五十九岁，推门进来。\n事实2\n钩子2"
     responses.insert(
         review_index + 1,
         _tool_call("ScriptWriterResult", repaired_args, 201),
@@ -7819,8 +7921,10 @@ async def test_numeric_fact_drift_triggers_deterministic_repair_with_established
     captured_writer_files: list[Mapping[str, str]] = []
     captured_repair_files: list[Mapping[str, str]] = []
     captured_repair_descriptions: list[str] = []
+    captured_review_files: list[Mapping[str, str]] = []
     original_call = StageGuardMiddleware._generate_script_group_candidate
     original_repair = StageGuardMiddleware._invoke_repair_subagent
+    original_review = StageGuardMiddleware._invoke_semantic_reviewer
 
     async def capture_call(
         middleware: StageGuardMiddleware,
@@ -7847,12 +7951,21 @@ async def test_numeric_fact_drift_triggers_deterministic_repair_with_established
         captured_repair_descriptions.append(kwargs["description"])
         return await original_repair(middleware, **kwargs)
 
+    async def capture_review(
+        middleware: StageGuardMiddleware,
+        **kwargs: Any,
+    ) -> SemanticReview:
+        if kwargs.get("minimal_context"):
+            captured_review_files.append(kwargs["files"])
+        return await original_review(middleware, **kwargs)
+
     monkeypatch.setattr(
         StageGuardMiddleware,
         "_generate_script_group_candidate",
         capture_call,
     )
     monkeypatch.setattr(StageGuardMiddleware, "_invoke_repair_subagent", capture_repair)
+    monkeypatch.setattr(StageGuardMiddleware, "_invoke_semantic_reviewer", capture_review)
 
     approved: list[InternalStage] = []
 
@@ -7890,6 +8003,17 @@ async def test_numeric_fact_drift_triggers_deterministic_repair_with_established
     assert len(age_entries) == 1
     assert age_entries[0]["value"] == "59"
     assert age_entries[0]["committed_evidence"] == "测试人物今年五十九岁"
+
+    assert len(captured_review_files) == 2
+    assert set(captured_review_files[0]) == {
+        "/workspace/current_group_canon.json",
+        "/workspace/established_facts.json",
+        "/workspace/series_state.json",
+        "/workspace/recent_scripts.json",
+        "/workspace/candidate_episode.md",
+        "/workspace/candidate_state_delta.json",
+    }
+    assert "/workspace/story_contract.json" not in captured_review_files[0]
 
     review = json.loads(captured_repair_files[0]["/workspace/episode_review.json"])
     numeric_issue = next(
@@ -8035,9 +8159,8 @@ async def test_last_episode_review_receives_complete_series_prefix_before_approv
 
 
 @pytest.mark.asyncio
-async def test_episode_writer_receives_complete_active_design_and_verbatim_prefix() -> None:
-    """FSW-A2: episode N input carries the full SeriesBible, verbatim scripts 1..N-1,
-    the folded SeriesState, the exact plan/obligation, and bounded WriterNotes."""
+async def test_episode_writer_receives_compact_active_design_and_recent_verbatim_window() -> None:
+    """Episode N carries compact Canon, recent scripts, full state, and exact obligations."""
     contract = _story_contract(episode_count=2)
     contract_hash = story_contract_sha256(contract)
     summary = project_series_bible(
@@ -8173,23 +8296,24 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
     first_components = {item["name"]: item for item in first_context["components"]}
     second_components = {item["name"]: item for item in second_context["components"]}
 
-    # Every episode request carries the complete active SeriesBible projections.
+    # Every episode request carries only the stable global SeriesBible projections;
+    # the current group already carries its own episode plans.
     for key in (
         "/workspace/series_bible/story_outline.md",
         "/workspace/series_bible/character_biographies.md",
         "/workspace/series_bible/relationship_logic.md",
-        "/workspace/series_bible/episode_outline.md",
     ):
         assert key in first_input and key in second_input
     assert second_input["/workspace/series_bible/story_outline.md"]["content"] == "故事大纲"
-    assert second_input["/workspace/series_bible/episode_outline.md"]["content"] == "两集分集大纲"
-    assert "/workspace/story_contract.json" in second_input
+    assert "/workspace/series_bible/episode_outline.md" not in second_input
+    assert "/workspace/story_contract.json" not in second_input
+    assert "/workspace/current_group_canon.json" in second_input
     second_group = json.loads(second_input["/workspace/generation_group.json"]["content"])
     assert second_group["episodes"][0]["plan"] == "第二集计划"
 
     # Episode 2 receives script 1 verbatim (never a summary).
     assert second_input["/workspace/episodes/ep1.md"]["content"] == "事实1\n钩子1"
-    compiled_prefix = second_components["committed_prefix"]["content"]
+    compiled_prefix = second_components["recent_committed_window"]["content"]
     assert compiled_prefix["episodes"] == [
         {
             "episode_number": 1,
@@ -8197,11 +8321,11 @@ async def test_episode_writer_receives_complete_active_design_and_verbatim_prefi
             "content": "事实1\n钩子1",
         }
     ]
-    assert first_components["committed_prefix"]["authority"] == "committed"
-    assert second_components["story_contract"]["authority"] == "canonical"
-    assert sum(name == "story_contract" for name in second_components) == 1
+    assert first_components["recent_committed_window"]["authority"] == "committed"
+    assert second_components["current_group_canon"]["authority"] == "canonical"
+    assert "story_contract" not in second_components
     assert second_components["series_bible.story_outline"]["content"] == "故事大纲"
-    assert second_components["series_bible.episode_outline"]["content"] == "两集分集大纲"
+    assert "series_bible.episode_outline" not in second_components
 
     # Episode 2 receives the folded SeriesState after episode 1.
     series_state = json.loads(second_input["/workspace/series_state.json"]["content"])

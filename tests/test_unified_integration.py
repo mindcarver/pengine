@@ -273,7 +273,7 @@ class UnifiedWorkflow:
         self.model_call_state: ModelCallState | None = None
         self.database_path: Path | None = None
         self.generation_model_id = "claude-opus-5"
-        self.review_model_id = "gpt-5.5"
+        self.review_model_id = "claude-opus-5"
 
     def record_physical_call(self, role: str) -> str:
         """Persist one deterministic provider-call fixture with real physical lineage."""
@@ -282,7 +282,7 @@ class UnifiedWorkflow:
         model_id = self.generation_model_id if role == "generation" else self.review_model_id
         provider = (
             "anthropic"
-            if role == "generation"
+            if model_id.startswith("claude-")
             else ("openai" if model_id.startswith("gpt-") else "deepseek")
         )
         record = build_started_record(
@@ -614,7 +614,7 @@ def _audited_worker(
     workflow.model_call_state = state
     workflow.database_path = settings.database_path
     workflow.generation_model_id = settings.generation_model_id or "claude-opus-5"
-    workflow.review_model_id = settings.review_model_id or "gpt-5.5"
+    workflow.review_model_id = settings.review_model_id or "claude-opus-5"
     worker = Worker(
         settings=settings,
         repository=repository,
@@ -1488,7 +1488,7 @@ async def test_unified_delivery_facts_helper_validates_seeded_run(
 
     # Seed provider-reported usage rows for both roles on this run (as the relay
     # audit would have recorded for real calls).
-    review_model = settings.review_model_id or "gpt-5.5"
+    review_model = settings.review_model_id or "claude-opus-5"
     with sqlite3.connect(settings.database_path) as connection:
         for role, model in (("generation", "claude-opus-5"), ("review", review_model)):
             connection.execute(
@@ -1508,8 +1508,8 @@ async def test_unified_delivery_facts_helper_validates_seeded_run(
                     str(accepted.creation_id),
                     role,
                     "anthropic"
-                    if role == "generation"
-                    else ("openai" if review_model == "gpt-5.5" else "deepseek"),
+                    if model.startswith("claude-")
+                    else ("openai" if model.startswith("gpt-") else "deepseek"),
                     model.split("-")[0],
                     model,
                     "generating_episode_scripts",

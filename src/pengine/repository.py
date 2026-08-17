@@ -4849,7 +4849,7 @@ class Repository:
         *,
         now: datetime | None = None,
     ) -> SeriesBible:
-        """Bind one DeepSeek global design review to exactly one candidate."""
+        """Bind one global design review to exactly one candidate."""
         async with self._transaction() as connection:
             candidate = await self._fetch_series_bible_candidate(
                 connection,
