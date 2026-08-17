@@ -7877,6 +7877,25 @@ class StageGuardMiddleware(AgentMiddleware):
                     provenance_episode_number = plan.episode_number
                 parsed = ScriptWriterResult.model_validate(payload)
 
+        if (
+            last_result is None
+            and self.series_bible is not None
+            and contract.episode_count in milestones
+            and len(self.episode_drafts) == contract.episode_count
+        ):
+            final_plan = plans[-1]
+            await self._milestone_review(
+                episode_number=contract.episode_count,
+                prior_state=prior_state,
+                contract=contract,
+                contract_hash=contract_hash,
+                contract_json=contract_json,
+                outline=outline,
+                plan=final_plan,
+                request=request,
+                handler=handler,
+            )
+
         aggregate = await self.assemble_episode_scripts()
         payload = {"stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value, "content": aggregate}
         payload.update(

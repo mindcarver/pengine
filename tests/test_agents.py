@@ -8520,6 +8520,32 @@ async def test_episode_writer_receives_compact_active_design_and_recent_verbatim
         }
     ]
 
+    resumed_hooks, resumed_attempts = _episode_hook_kwargs(
+        episode_drafts=list(middleware.episode_drafts.values())
+    )
+    resumed_payloads = {
+        stage: payload
+        for stage, payload in middleware.approved_payloads.items()
+        if stage is not InternalStage.GENERATING_EPISODE_SCRIPTS
+    }
+    resumed = StageGuardMiddleware(
+        before_stage=lambda _stage: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(resumed_payloads),
+        approved_payloads=resumed_payloads,
+        series_bible=summary,
+        register_series_review=register_series_review,
+        **resumed_hooks,
+    )
+
+    await resumed.awrap_tool_call(request, handler)
+
+    assert resumed_attempts == []
+    assert len(series_review_inputs) == 2
+    assert len(registered_reviews) == 2
+    assert registered_reviews[-1]["review_type"] == "final"
+    assert registered_reviews[-1]["passed"] is True
+
 
 @pytest.mark.asyncio
 async def test_episode_writer_generates_eighty_episode_outline_groups_once() -> None:
