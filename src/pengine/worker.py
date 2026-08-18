@@ -972,8 +972,54 @@ class Worker:
                         end_episode=end_episode,
                         operation_id=operation_id,
                     )
+                    stored_text = await self.repository.get_episode_generation_text(
+                        work.run_id,
+                        window_id,
+                    )
+                    if stored_text is not None:
+                        operation_id = str(stored_text["operation_id"])
+                        if model_call_state is not None:
+                            model_call_state.context.operation_id = operation_id
                     generation_window_context[window_id] = (operation_id, start_episode)
                     return window_id
+
+                async def load_generation_group_text(
+                    window_id: str,
+                ) -> Mapping[str, Any] | None:
+                    return await self.repository.get_episode_generation_text(
+                        work.run_id,
+                        window_id,
+                    )
+
+                async def persist_generation_group_text(
+                    window_id: str,
+                    *,
+                    nonce: str,
+                    raw_text: str,
+                    manifest: list[Mapping[str, Any]],
+                ) -> str:
+                    operation_id, start_episode = generation_window_context[window_id]
+                    content_call_id = await self._require_physical_call_id(
+                        run_id=work.run_id,
+                        role="generation",
+                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                        episode_number=start_episode,
+                        operation_id=operation_id,
+                    )
+                    await self.repository.save_episode_generation_text(
+                        work.run_id,
+                        window_id,
+                        screenplay_text=raw_text,
+                        nonce=nonce,
+                        manifest=manifest,
+                        content_call_id=content_call_id,
+                        context_bundle_sha256=(
+                            model_call_state.context.context_bundle_sha256
+                            if model_call_state is not None
+                            else None
+                        ),
+                    )
+                    return content_call_id
 
                 async def complete_generation_group(
                     window_id: str,
@@ -993,17 +1039,30 @@ class Worker:
                         episode_number=start_episode,
                         operation_id=operation_id,
                     )
+                    stored_text = await self.repository.get_episode_generation_text(
+                        work.run_id,
+                        window_id,
+                    )
+                    content_call_id = (
+                        str(stored_text["content_call_id"]) if stored_text is not None else call_id
+                    )
                     await self.repository.bind_episode_generation_window_call(
                         work.run_id,
                         window_id,
-                        call_id=call_id,
+                        call_id=content_call_id,
+                        sidecar_call_id=(call_id if stored_text is not None else None),
                     )
-                    return call_id
+                    return content_call_id
 
-                async def fail_generation_group(window_id: str) -> None:
+                async def fail_generation_group(
+                    window_id: str,
+                    *,
+                    preserve_text: bool = False,
+                ) -> None:
                     await self.repository.fail_episode_generation_window(
                         work.run_id,
                         window_id,
+                        preserve_text=preserve_text,
                     )
 
                 async def commit_episode(
@@ -1037,18 +1096,33 @@ class Worker:
                         design_content_hash=active.content_hash,
                         design_epoch=active.design_epoch,
                     )
-                    operation_id = (
-                        model_call_state.context.operation_id
-                        if model_call_state is not None
-                        else None
-                    )
-                    resolved_call_id = await self._require_physical_call_id(
-                        run_id=work.run_id,
-                        role="generation",
-                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
-                        episode_number=(provenance_episode_number or episode_number),
-                        operation_id=operation_id,
-                    )
+                    if generation_window_id is not None and call_id is not None:
+                        stored_text = await self.repository.get_episode_generation_text(
+                            work.run_id,
+                            generation_window_id,
+                        )
+                        if (
+                            stored_text is not None
+                            and stored_text.get("content_call_id") != call_id
+                        ):
+                            raise AgentProtocolError(
+                                "Episode candidate call_id does not match its plaintext call",
+                                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                            )
+                        resolved_call_id = call_id
+                    else:
+                        operation_id = (
+                            model_call_state.context.operation_id
+                            if model_call_state is not None
+                            else None
+                        )
+                        resolved_call_id = await self._require_physical_call_id(
+                            run_id=work.run_id,
+                            role="generation",
+                            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                            episode_number=(provenance_episode_number or episode_number),
+                            operation_id=operation_id,
+                        )
                     if call_id is not None and call_id != resolved_call_id:
                         raise AgentProtocolError(
                             "Episode candidate call_id does not match its successful physical "
@@ -1202,6 +1276,8 @@ class Worker:
                                 "begin_generation_group": begin_generation_group,
                                 "complete_generation_group": complete_generation_group,
                                 "fail_generation_group": fail_generation_group,
+                                "load_generation_group_text": load_generation_group_text,
+                                "persist_generation_group_text": persist_generation_group_text,
                                 "load_outline_season_map": load_outline_season_map,
                                 "commit_outline_season_map": commit_outline_season_map,
                                 "load_outline_groups": load_outline_groups,

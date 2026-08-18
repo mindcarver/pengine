@@ -62,6 +62,7 @@ from pengine.agents import (
     RepairConstraintExtractionResult,
     RepairConstraintValidationResult,
     ScriptGenerationGroupResult,
+    ScriptGenerationGroupSidecar,
     ScriptWriterResult,
     StageGuardMiddleware,
     StoryArchitectResult,
@@ -79,14 +80,17 @@ from pengine.agents import (
     _drop_dangling_tool_call_messages,
     _established_facts_payload,
     _evidence_contract,
+    _generate_script_group_with_sidecar,
     _invoke_direct_structured_with_retry,
-    _invoke_script_group_structured,
+    _invoke_script_group_sidecar,
+    _invoke_script_group_text,
     _language_retry_fingerprint,
     _language_retry_matches,
     _materialize_repair_constraints,
     _merge_story_canon_reviews,
     _outline_repair_context,
     _outline_repair_result,
+    _parse_script_group_text,
     _recent_group_episode_numbers,
     _referenced_prefix_episode_numbers,
     _repair_constraint_check_issues,
@@ -364,12 +368,24 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         self.model_system_prompts.append(
             "\n\n".join(message.text for message in messages if isinstance(message, SystemMessage))
         )
-        return super()._generate(
+        if len(self.bound_tool_names) < len(self.model_system_prompts):
+            self.bound_tool_names.append([])
+            self.bound_tool_descriptions.append([])
+        result = super()._generate(
             messages,
             stop=stop,
             run_manager=run_manager,
             **kwargs,
         )
+        message = result.generations[0].message
+        if isinstance(message.content, str) and "{PENGINE_NONCE}" in message.content:
+            request_text = "\n".join(str(item.content) for item in messages)
+            match = re.search(r"<<<PENGINE_EPISODE_START:([0-9a-f]{32}):\d+>>>", request_text)
+            assert match is not None
+            result.generations[0].message = message.model_copy(
+                update={"content": message.content.replace("{PENGINE_NONCE}", match.group(1))}
+            )
+        return result
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -404,6 +420,7 @@ class _ProvenanceFakeWorkflow(DeepAgentWorkflow):
         commit_episode = kwargs.get("commit_episode")
         register_series_review = kwargs.get("register_series_review")
         complete_generation_group = kwargs.get("complete_generation_group")
+        persist_generation_group_text = kwargs.get("persist_generation_group_text")
 
         async def approve_with_provenance(stage, payload):
             if stage is InternalStage.GENERATING_EPISODE_OUTLINE and "story_contract" in payload:
@@ -421,6 +438,11 @@ class _ProvenanceFakeWorkflow(DeepAgentWorkflow):
             self._record_succeeded_call("generation")
             return await complete_generation_group(*args, **complete_kwargs)
 
+        async def persist_group_text_with_provenance(*args, **persist_kwargs):
+            assert persist_generation_group_text is not None
+            self._record_succeeded_call("generation")
+            return await persist_generation_group_text(*args, **persist_kwargs)
+
         async def review_with_provenance(**review_kwargs):
             assert register_series_review is not None
             self._record_succeeded_call("review")
@@ -434,6 +456,8 @@ class _ProvenanceFakeWorkflow(DeepAgentWorkflow):
         }
         if complete_generation_group is not None:
             forwarded["complete_generation_group"] = complete_group_with_provenance
+        if persist_generation_group_text is not None:
+            forwarded["persist_generation_group_text"] = persist_group_text_with_provenance
         return await DeepAgentWorkflow.execute(
             self,
             **forwarded,
@@ -553,211 +577,304 @@ async def test_direct_structured_call_repairs_parameter_name_json_wrapper() -> N
     ("genre", "episode_count"),
     [("都市", 1), ("悬疑", 2), ("古装", 3), ("奇幻", 4)],
 )
-async def test_script_group_normalizes_transport_shape_without_another_model_call(
+async def test_script_group_plaintext_accepts_varied_content_and_group_sizes(
     genre: str,
     episode_count: int,
 ) -> None:
-    contract = _story_contract(episode_count=episode_count)
-    episodes = [
-        {
-            "stage": "generating_episode_scripts",
-            "episode_number": episode_number,
-            "content": f"{genre}事实{episode_number}\n钩子{episode_number}",
-            "state_delta": _state_delta(contract, episode_number),
-            "field": "provider-noise",
-        }
+    nonce = "a" * 32
+    contents = [
+        f"{genre}事实{episode_number}\n人物：“引号 \\ Markdown ```json”\n钩子{episode_number}"
         for episode_number in range(1, episode_count + 1)
     ]
-    model = ToolCallingFakeModel(
-        responses=[
-            _tool_call(
-                "ScriptGenerationGroupResult",
-                {
-                    "stage": "generating_episode_scripts",
-                    "group_id": "opening_unit",
-                    "start_episode": 1,
-                    "end_episode": episode_count,
-                    "episodes": json.dumps(episodes, ensure_ascii=False),
-                },
-                1,
-            )
-        ]
+    plaintext = "\n\n".join(
+        f"<<<PENGINE_EPISODE_START:{nonce}:{episode_number}>>>\n"
+        f"{contents[episode_number - 1]}\n"
+        f"<<<PENGINE_EPISODE_END:{nonce}:{episode_number}>>>"
+        for episode_number in range(1, episode_count + 1)
     )
+    model = ToolCallingFakeModel(responses=[AIMessage(content=plaintext)])
 
-    result = await _invoke_script_group_structured(
+    result = await _invoke_script_group_text(
         model,
         [
-            {"role": "system", "content": "Return the screenplay group."},
+            {"role": "system", "content": "Return plaintext."},
             {"role": "user", "content": "FULL-CONTEXT-SENTINEL"},
         ],
+        group_id="opening_unit",
+        start_episode=1,
+        end_episode=episode_count,
+        nonce=nonce,
     )
 
     assert [episode.episode_number for episode in result.episodes] == list(
         range(1, episode_count + 1)
     )
-    assert [episode.content for episode in result.episodes] == [
-        f"{genre}事实{episode_number}\n钩子{episode_number}"
-        for episode_number in range(1, episode_count + 1)
-    ]
+    assert [episode.content for episode in result.episodes] == contents
     assert len(model.model_message_batches) == 1
-    assert all("calculate_arithmetic" not in names for names in model.bound_tool_names)
+    assert model.bound_tool_names == [[]]
 
 
 @pytest.mark.asyncio
-async def test_script_group_protocol_repair_does_not_resend_full_context() -> None:
+@pytest.mark.parametrize(
+    "plaintext",
+    [
+        "正文没有边界",
+        "<<<PENGINE_EPISODE_START:{nonce}:1>>>\n<<<PENGINE_EPISODE_END:{nonce}:1>>>",
+        ("<<<PENGINE_EPISODE_START:{nonce}:2>>>\n第二集\n<<<PENGINE_EPISODE_END:{nonce}:2>>>"),
+        (
+            "额外文本\n<<<PENGINE_EPISODE_START:{nonce}:1>>>\n第一集\n"
+            "<<<PENGINE_EPISODE_END:{nonce}:1>>>"
+        ),
+    ],
+)
+async def test_script_group_plaintext_rejects_invalid_boundaries(plaintext: str) -> None:
+    nonce = "b" * 32
+    model = ToolCallingFakeModel(responses=[AIMessage(content=plaintext.format(nonce=nonce))])
+
+    with pytest.raises(AgentProtocolError):
+        await _invoke_script_group_text(
+            model,
+            [{"role": "user", "content": "write"}],
+            group_id="opening_unit",
+            start_episode=1,
+            end_episode=1,
+            nonce=nonce,
+        )
+
+
+@pytest.mark.parametrize("episode_count", [60, 80])
+def test_plaintext_protocol_covers_long_series_by_natural_group(episode_count: int) -> None:
+    covered: list[int] = []
+    for start_episode in range(1, episode_count + 1, 4):
+        end_episode = min(start_episode + 3, episode_count)
+        nonce = hashlib.sha256(f"group-{start_episode}".encode()).hexdigest()[:32]
+        raw_text = "\n".join(
+            (
+                f"<<<PENGINE_EPISODE_START:{nonce}:{episode_number}>>>\n"
+                f"第{episode_number}集完整正文\n"
+                f"<<<PENGINE_EPISODE_END:{nonce}:{episode_number}>>>"
+            )
+            for episode_number in range(start_episode, end_episode + 1)
+        )
+        parsed = _parse_script_group_text(
+            raw_text,
+            group_id=f"natural_group_{start_episode}",
+            start_episode=start_episode,
+            end_episode=end_episode,
+            nonce=nonce,
+        )
+        covered.extend(episode.episode_number for episode in parsed.episodes)
+
+    assert covered == list(range(1, episode_count + 1))
+
+
+@pytest.mark.asyncio
+async def test_script_group_sidecar_binds_hash_without_repeating_screenplay_json() -> None:
     contract = _story_contract()
     state = ModelCallState()
     state.context.requested_output_tokens = 20_480
     state.context.context_bundle_sha256 = "a" * 64
     state.context.context_manifest_json = '{"mode":"compiled"}'
-    episode = {
-        "stage": "generating_episode_scripts",
-        "episode_number": 1,
-        "content": "事实1\n钩子1",
-        "state_delta": _state_delta(contract, 1),
-    }
+    nonce = "c" * 32
+    content = "事实1\n钩子1"
+    screenplay_sha256 = hashlib.sha256(content.encode()).hexdigest()
+    plaintext = (
+        f"<<<PENGINE_EPISODE_START:{nonce}:1>>>\n{content}\n<<<PENGINE_EPISODE_END:{nonce}:1>>>"
+    )
+    text_model = ToolCallingFakeModel(responses=[AIMessage(content=plaintext)])
+    text = await _invoke_script_group_text(
+        text_model,
+        [{"role": "user", "content": "write"}],
+        group_id="opening_unit",
+        start_episode=1,
+        end_episode=1,
+        nonce=nonce,
+    )
     model = ToolCallingFakeModel(
         responses=[
             _tool_call(
-                "ScriptGenerationGroupResult",
+                "ScriptGenerationGroupSidecar",
                 {
                     "stage": "generating_episode_scripts",
                     "group_id": "opening_unit",
                     "start_episode": 1,
                     "end_episode": 1,
-                    "episodes": {"items": [episode]},
+                    "episodes": [
+                        {
+                            "episode_number": 1,
+                            "screenplay_sha256": screenplay_sha256,
+                            "state_delta": _state_delta(contract, 1),
+                            "writer_notes": "下一集继续",
+                        }
+                    ],
                 },
                 1,
-            ),
-            _tool_call(
-                "ScriptGenerationGroupResult",
-                {
-                    "stage": "generating_episode_scripts",
-                    "group_id": "opening_unit",
-                    "start_episode": 1,
-                    "end_episode": 1,
-                    "episodes": [episode],
-                },
-                2,
             ),
         ]
     )
 
-    result = await _invoke_script_group_structured(
+    result = await _invoke_script_group_sidecar(
         model,
-        [
-            {"role": "system", "content": "Return the screenplay group."},
-            {"role": "user", "content": "FULL-CONTEXT-SENTINEL"},
-        ],
+        text,
+        sidecar_context={"contract_sha256": "locked", "facts": ["fact_ep1"]},
         model_call_state=state,
     )
 
-    assert result.episodes[0].content == "事实1\n钩子1"
-    assert len(model.model_message_batches) == 2
-    repair_input = "\n".join(str(message.content) for message in model.model_message_batches[1])
-    assert "FULL-CONTEXT-SENTINEL" not in repair_input
-    assert "事实1" in repair_input
+    assert result.episodes[0].content == content
+    assert result.episodes[0].writer_notes == "下一集继续"
+    schema = ScriptGenerationGroupSidecar.model_json_schema()
+    assert "content" not in json.dumps(schema, ensure_ascii=False)
+    sidecar_input = "\n".join(str(message.content) for message in model.model_message_batches[0])
+    assert screenplay_sha256 in sidecar_input
+    assert "FULL-CONTEXT-SENTINEL" not in sidecar_input
     assert state.context.requested_output_tokens == 20_480
     assert state.context.context_bundle_sha256 == "a" * 64
     assert state.context.context_manifest_json == '{"mode":"compiled"}'
 
 
 @pytest.mark.asyncio
-async def test_script_group_protocol_repair_preserves_partial_json_candidate() -> None:
+async def test_script_group_sidecar_rejects_screenplay_hash_mismatch() -> None:
     contract = _story_contract()
-    episode = {
-        "stage": "generating_episode_scripts",
-        "episode_number": 1,
-        "content": "完整事实\n完整钩子",
-        "state_delta": _state_delta(contract, 1),
-    }
-    encoded_episodes = json.dumps([episode], ensure_ascii=False, separators=(",", ":"))
-    malformed_episodes = encoded_episodes[:-2] + encoded_episodes[-1]
+    nonce = "d" * 32
+    content = "完整事实\n完整钩子"
+    text_model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content=(
+                    f"<<<PENGINE_EPISODE_START:{nonce}:1>>>\n{content}\n"
+                    f"<<<PENGINE_EPISODE_END:{nonce}:1>>>"
+                )
+            )
+        ]
+    )
+    text = await _invoke_script_group_text(
+        text_model,
+        [{"role": "user", "content": "write"}],
+        group_id="opening_unit",
+        start_episode=1,
+        end_episode=1,
+        nonce=nonce,
+    )
     model = ToolCallingFakeModel(
         responses=[
             _tool_call(
-                "ScriptGenerationGroupResult",
+                "ScriptGenerationGroupSidecar",
                 {
                     "stage": "generating_episode_scripts",
                     "group_id": "opening_unit",
                     "start_episode": 1,
                     "end_episode": 1,
-                    "episodes": malformed_episodes,
+                    "episodes": [
+                        {
+                            "episode_number": 1,
+                            "screenplay_sha256": "0" * 64,
+                            "state_delta": _state_delta(contract, 1),
+                        }
+                    ],
                 },
                 1,
-            ),
-            _tool_call(
-                "ScriptGenerationGroupResult",
-                {
-                    "stage": "generating_episode_scripts",
-                    "group_id": "opening_unit",
-                    "start_episode": 1,
-                    "end_episode": 1,
-                    "episodes": [episode],
-                },
-                2,
             ),
         ]
     )
 
-    result = await _invoke_script_group_structured(
-        model,
-        [
-            {"role": "system", "content": "Return the screenplay group."},
-            {"role": "user", "content": "FULL-CONTEXT-SENTINEL"},
-        ],
-    )
-
-    assert result.episodes[0].content == "完整事实\n完整钩子"
-    assert len(model.model_message_batches) == 2
+    with pytest.raises(AgentProtocolError, match="hash does not match"):
+        await _invoke_script_group_sidecar(
+            model,
+            text,
+            sidecar_context={"contract_sha256": "locked"},
+        )
 
 
 @pytest.mark.asyncio
-async def test_script_group_protocol_repair_cannot_rewrite_screenplay() -> None:
+async def test_script_group_sidecar_resume_reuses_persisted_plaintext() -> None:
     contract = _story_contract()
-    episode = {
+    content = "事实1\n钩子1"
+    screenplay_sha256 = hashlib.sha256(content.encode()).hexdigest()
+    stored: dict[str, Any] = {}
+
+    async def load_text(_: str) -> Mapping[str, Any] | None:
+        return stored or None
+
+    async def persist_text(
+        _: str,
+        *,
+        nonce: str,
+        raw_text: str,
+        manifest: list[Mapping[str, Any]],
+    ) -> str:
+        stored.update({"nonce": nonce, "raw_text": raw_text, "manifest": manifest})
+        return "content-call"
+
+    invalid_sidecar = {
         "stage": "generating_episode_scripts",
-        "episode_number": 1,
-        "content": "原始事实\n原始钩子",
-        "state_delta": _state_delta(contract, 1),
+        "group_id": "opening_unit",
+        "start_episode": 1,
+        "end_episode": 1,
+        "episodes": [
+            {
+                "episode_number": 1,
+                "screenplay_sha256": screenplay_sha256,
+                "state_delta": None,
+            }
+        ],
     }
-    rewritten = copy.deepcopy(episode)
-    rewritten["content"] = "改写后的剧本"
-    model = ToolCallingFakeModel(
+    first_model = ToolCallingFakeModel(
         responses=[
-            _tool_call(
-                "ScriptGenerationGroupResult",
-                {
-                    "stage": "generating_episode_scripts",
-                    "group_id": "opening_unit",
-                    "start_episode": 1,
-                    "end_episode": 1,
-                    "episodes": {"items": [episode]},
-                },
-                1,
+            AIMessage(
+                content=(
+                    "<<<PENGINE_EPISODE_START:{PENGINE_NONCE}:1>>>\n"
+                    f"{content}\n"
+                    "<<<PENGINE_EPISODE_END:{PENGINE_NONCE}:1>>>"
+                )
             ),
-            _tool_call(
-                "ScriptGenerationGroupResult",
-                {
-                    "stage": "generating_episode_scripts",
-                    "group_id": "opening_unit",
-                    "start_episode": 1,
-                    "end_episode": 1,
-                    "episodes": [rewritten],
-                },
-                2,
-            ),
+            _tool_call("ScriptGenerationGroupSidecar", invalid_sidecar, 1),
+            _tool_call("ScriptGenerationGroupSidecar", invalid_sidecar, 2),
         ]
     )
 
-    with pytest.raises(AgentProtocolError, match="changed screenplay content"):
-        await _invoke_script_group_structured(
-            model,
-            [
-                {"role": "system", "content": "Return the screenplay group."},
-                {"role": "user", "content": "FULL-CONTEXT-SENTINEL"},
-            ],
+    with pytest.raises(ValidationError):
+        await _generate_script_group_with_sidecar(
+            first_model,
+            script_writer_prompt="Return plaintext with runtime-supplied episode boundary markers.",
+            description="Write the group.",
+            group_id="opening_unit",
+            start_episode=1,
+            end_episode=1,
+            window_id="window-1",
+            sidecar_context={"contract_sha256": story_contract_sha256(contract)},
+            load_text=load_text,
+            persist_text=persist_text,
+            model_call_state=None,
         )
+
+    assert stored["manifest"] == [{"episode_number": 1, "screenplay_sha256": screenplay_sha256}]
+    valid_sidecar = copy.deepcopy(invalid_sidecar)
+    valid_sidecar["episodes"][0]["state_delta"] = _state_delta(contract, 1)
+    resumed_model = ToolCallingFakeModel(
+        responses=[_tool_call("ScriptGenerationGroupSidecar", valid_sidecar, 3)]
+    )
+
+    result = await _generate_script_group_with_sidecar(
+        resumed_model,
+        script_writer_prompt="Return plaintext with runtime-supplied episode boundary markers.",
+        description="Write the group.",
+        group_id="opening_unit",
+        start_episode=1,
+        end_episode=1,
+        window_id="window-1",
+        sidecar_context={"contract_sha256": story_contract_sha256(contract)},
+        load_text=load_text,
+        persist_text=persist_text,
+        model_call_state=None,
+    )
+
+    assert result.episodes[0].content == content
+    assert len(resumed_model.model_message_batches) == 1
+    resumed_input = "\n".join(
+        str(message.content) for message in resumed_model.model_message_batches[0]
+    )
+    assert "Return plaintext only" not in resumed_input
+    assert screenplay_sha256 in resumed_input
 
 
 def _story_contract(
@@ -948,8 +1065,42 @@ def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMe
                 index,
             )
         )
-        responses.append(_tool_call(schema, payload, index + 1))
-        index += 2
+        if stage == "generating_episode_scripts":
+            content = payload["episodes"][0]["content"]
+            screenplay_sha256 = hashlib.sha256(content.encode()).hexdigest()
+            responses.append(
+                AIMessage(
+                    content=(
+                        "<<<PENGINE_EPISODE_START:{PENGINE_NONCE}:1>>>\n"
+                        f"{content}\n"
+                        "<<<PENGINE_EPISODE_END:{PENGINE_NONCE}:1>>>"
+                    )
+                )
+            )
+            responses.append(
+                _tool_call(
+                    "ScriptGenerationGroupSidecar",
+                    {
+                        "stage": "generating_episode_scripts",
+                        "group_id": payload["group_id"],
+                        "start_episode": 1,
+                        "end_episode": 1,
+                        "episodes": [
+                            {
+                                "episode_number": 1,
+                                "screenplay_sha256": screenplay_sha256,
+                                "state_delta": payload["episodes"][0]["state_delta"],
+                                "writer_notes": "",
+                            }
+                        ],
+                    },
+                    index + 2,
+                )
+            )
+            index += 3
+        else:
+            responses.append(_tool_call(schema, payload, index + 1))
+            index += 2
         if stage == "generating_story_outline":
             # Outline stage: single-lens canon review (1 review call).
             responses.append(
@@ -1022,6 +1173,16 @@ def _index_of_tool_call(responses: list[AIMessage], name: str, *, occurrence: in
     raise AssertionError(f"No tool call named {name!r} (occurrence {occurrence}) in responses")
 
 
+def _index_of_script_plaintext(responses: list[AIMessage], *, occurrence: int = 1) -> int:
+    seen = 0
+    for index, message in enumerate(responses):
+        if isinstance(message.content, str) and "<<<PENGINE_EPISODE_START:" in message.content:
+            seen += 1
+            if seen == occurrence:
+                return index
+    raise AssertionError(f"No plaintext screenplay response (occurrence {occurrence})")
+
+
 def _successful_responses_unified() -> list[AIMessage]:
     """The unified SeriesBible flow response sequence.
 
@@ -1063,11 +1224,28 @@ def _successful_checkpoint_payloads() -> dict[InternalStage, dict[str, Any]]:
             in {
                 "StoryArchitectResult",
                 "EpisodePlannerResult",
-                "ScriptGenerationGroupResult",
             }
             and stage is not None
         ):
             payloads[InternalStage(stage)] = call["args"]
+        if call["name"] == "ScriptGenerationGroupSidecar":
+            sidecar = call["args"]
+            payloads[InternalStage.GENERATING_EPISODE_SCRIPTS] = {
+                "stage": "generating_episode_scripts",
+                "group_id": sidecar["group_id"],
+                "start_episode": sidecar["start_episode"],
+                "end_episode": sidecar["end_episode"],
+                "episodes": [
+                    {
+                        "stage": "generating_episode_scripts",
+                        "episode_number": item["episode_number"],
+                        "content": f"事实{item['episode_number']}\n钩子{item['episode_number']}",
+                        "state_delta": item["state_delta"],
+                        "writer_notes": item.get("writer_notes", ""),
+                    }
+                    for item in sidecar["episodes"]
+                ],
+            }
     return payloads
 
 
@@ -5264,7 +5442,8 @@ def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> 
     assert "required_verbatim_facts" in _SCRIPT_WRITER_PROMPT
     assert "all other facts require semantic consistency only" in _SCRIPT_WRITER_PROMPT
     assert "call participants" in _SCRIPT_WRITER_PROMPT
-    assert "complete non-null state_delta" in _SCRIPT_WRITER_PROMPT
+    assert "complete non-null state_delta" not in _SCRIPT_WRITER_PROMPT
+    assert "Do not return JSON, a tool call, state_delta" in _SCRIPT_WRITER_PROMPT
     assert "suffix_rewrite_review component" in _SCRIPT_WRITER_PROMPT
     assert "read-only bound" in _SCRIPT_WRITER_PROMPT
     assert "do not reproduce the named defect" in _SCRIPT_WRITER_PROMPT
@@ -5751,6 +5930,7 @@ async def test_episode_writer_treats_speaker_labels_as_format_not_a_whitelist(
         args: Mapping[str, Any],
         *,
         expected_episode_number: int,
+        **kwargs: Any,
     ) -> tuple[Any, Mapping[str, Any]]:
         captured_requests.append(request)
         return await original_call(
@@ -5759,6 +5939,7 @@ async def test_episode_writer_treats_speaker_labels_as_format_not_a_whitelist(
             handler,
             args,
             expected_episode_number=expected_episode_number,
+            **kwargs,
         )
 
     monkeypatch.setattr(
@@ -5840,6 +6021,7 @@ async def test_suffix_rewrite_feedback_is_injected_only_from_effective_episode(
         args: Mapping[str, Any],
         *,
         expected_episode_number: int,
+        **kwargs: Any,
     ) -> tuple[Any, Mapping[str, Any]]:
         captured_requests.append(request)
         return await original_call(
@@ -5848,6 +6030,7 @@ async def test_suffix_rewrite_feedback_is_injected_only_from_effective_episode(
             handler,
             args,
             expected_episode_number=expected_episode_number,
+            **kwargs,
         )
 
     monkeypatch.setattr(
@@ -6075,7 +6258,6 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         creative_result_tools = {
             "StoryArchitectResult",
             "EpisodePlannerResult",
-            "ScriptGenerationGroupResult",
         }
         reviewer_result_tools = {
             "CanonReviewerResult",
@@ -6087,7 +6269,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             strict=True,
         ):
             tool_names = set(offered_tools)
-            if "ScriptGenerationGroupResult" in tool_names:
+            if not tool_names and "runtime-supplied episode boundary markers" in system_prompt:
                 assert project not in system_prompt
                 assert "PENGINE_SCRIPT_CONTEXT" in system_prompt
             elif tool_names & creative_result_tools:
@@ -6155,9 +6337,17 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
                 }
                 for names in result_bindings
             ), result_tool
-        script_bindings = bindings_for("ScriptGenerationGroupResult")
-        assert all("read_file" not in names for names in script_bindings)
-        assert all(names == {"ScriptGenerationGroupResult"} for names in script_bindings)
+        script_bindings = bindings_for("ScriptGenerationGroupSidecar")
+        assert all(names == {"ScriptGenerationGroupSidecar"} for names in script_bindings)
+        assert "ScriptGenerationGroupResult" not in all_tool_names
+        assert any(
+            not names and "runtime-supplied episode boundary markers" in prompt
+            for names, prompt in zip(
+                model.bound_tool_names,
+                model.model_system_prompts,
+                strict=True,
+            )
+        )
 
         task_descriptions = [
             description
@@ -7694,18 +7884,25 @@ async def test_grouped_outline_final_rejection_reports_two_real_repair_rounds() 
 async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupResult", occurrence=1)
+    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupSidecar", occurrence=1)
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
     writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
-    writer_episode = writer_payload["episodes"][0]
-    writer_episode["state_delta"]["evidence"] = [
+    sidecar_episode = writer_payload["episodes"][0]
+    sidecar_episode["state_delta"]["evidence"] = [
         item
-        for item in writer_episode["state_delta"]["evidence"]
+        for item in sidecar_episode["state_delta"]["evidence"]
         if item["target_id"] != "fact_ep1"
     ]
     responses[writer_index] = _tool_call(
-        "ScriptGenerationGroupResult", writer_payload, writer_index
+        "ScriptGenerationGroupSidecar", writer_payload, writer_index
     )
+    writer_episode = {
+        "stage": "generating_episode_scripts",
+        "episode_number": 1,
+        "content": "事实1\n钩子1",
+        "state_delta": sidecar_episode["state_delta"],
+        "writer_notes": "",
+    }
     failed_review = {
         "passed": False,
         "evidence": "人物身份与上游小传不一致",
@@ -7782,10 +7979,17 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     database = tmp_path / "checkpoints.sqlite3"
     contract = _story_contract(verbatim_episodes={1})
     responses = _successful_responses(contract=contract)
-    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupResult", occurrence=1)
+    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupSidecar", occurrence=1)
+    plaintext_index = _index_of_script_plaintext(responses)
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
-    repaired_writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
-    repaired_writer_payload = repaired_writer_payload["episodes"][0]
+    sidecar_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
+    repaired_writer_payload = {
+        "stage": "generating_episode_scripts",
+        "episode_number": 1,
+        "content": "事实1\n钩子1",
+        "state_delta": sidecar_payload["episodes"][0]["state_delta"],
+        "writer_notes": "",
+    }
     invalid_writer_payload = copy.deepcopy(repaired_writer_payload)
     invalid_writer_payload["content"] = "钩子1"
     invalid_writer_payload["state_delta"]["evidence"] = [
@@ -7796,15 +8000,20 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
     invalid_writer_payload["state_delta"]["evidence"].append(
         {"target_id": "stale_target", "excerpt": "钩子1"}
     )
-    invalid_group_payload = {
-        "stage": "generating_episode_scripts",
-        "group_id": "opening_unit",
-        "start_episode": 1,
-        "end_episode": 1,
-        "episodes": [invalid_writer_payload],
-    }
+    invalid_content = invalid_writer_payload["content"]
+    responses[plaintext_index] = AIMessage(
+        content=(
+            "<<<PENGINE_EPISODE_START:{PENGINE_NONCE}:1>>>\n"
+            f"{invalid_content}\n"
+            "<<<PENGINE_EPISODE_END:{PENGINE_NONCE}:1>>>"
+        )
+    )
+    sidecar_payload["episodes"][0]["screenplay_sha256"] = hashlib.sha256(
+        invalid_content.encode()
+    ).hexdigest()
+    sidecar_payload["episodes"][0]["state_delta"] = invalid_writer_payload["state_delta"]
     responses[writer_index] = _tool_call(
-        "ScriptGenerationGroupResult", invalid_group_payload, writer_index
+        "ScriptGenerationGroupSidecar", sidecar_payload, writer_index
     )
     responses[review_index] = _tool_call(
         "EpisodeReviewerResult",
@@ -8047,15 +8256,26 @@ async def test_pronoun_numeric_fact_drift_triggers_targeted_review_and_repair(
         },
     ]
 
-    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupResult", occurrence=1)
+    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupSidecar", occurrence=1)
+    plaintext_index = _index_of_script_plaintext(responses)
     writer_args = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
     writer_args["group_id"] = "episode_two"
     writer_args["start_episode"] = 2
     writer_args["end_episode"] = 2
     writer_args["episodes"][0]["episode_number"] = 2
-    writer_args["episodes"][0]["content"] = "她六十岁，推门进来。\n事实2\n钩子2"
+    invalid_content = "她六十岁，推门进来。\n事实2\n钩子2"
+    responses[plaintext_index] = AIMessage(
+        content=(
+            "<<<PENGINE_EPISODE_START:{PENGINE_NONCE}:2>>>\n"
+            f"{invalid_content}\n"
+            "<<<PENGINE_EPISODE_END:{PENGINE_NONCE}:2>>>"
+        )
+    )
+    writer_args["episodes"][0]["screenplay_sha256"] = hashlib.sha256(
+        invalid_content.encode()
+    ).hexdigest()
     writer_args["episodes"][0]["state_delta"] = _state_delta(contract, 2)
-    responses[writer_index] = _tool_call("ScriptGenerationGroupResult", writer_args, writer_index)
+    responses[writer_index] = _tool_call("ScriptGenerationGroupSidecar", writer_args, writer_index)
 
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
     responses[review_index] = _tool_call(
@@ -8074,7 +8294,13 @@ async def test_pronoun_numeric_fact_drift_triggers_targeted_review_and_repair(
         },
         review_index,
     )
-    repaired_args = copy.deepcopy(writer_args["episodes"][0])
+    repaired_args = {
+        "stage": "generating_episode_scripts",
+        "episode_number": 2,
+        "content": invalid_content,
+        "state_delta": copy.deepcopy(writer_args["episodes"][0]["state_delta"]),
+        "writer_notes": "",
+    }
     repaired_args["content"] = "她五十九岁，推门进来。\n事实2\n钩子2"
     responses.insert(
         review_index + 1,
@@ -8104,6 +8330,7 @@ async def test_pronoun_numeric_fact_drift_triggers_targeted_review_and_repair(
         args: Mapping[str, Any],
         *,
         expected_episode_number: int,
+        **kwargs: Any,
     ) -> tuple[Any, Mapping[str, Any]]:
         captured_writer_files.append(request.state["files"])
         return await original_call(
@@ -8112,6 +8339,7 @@ async def test_pronoun_numeric_fact_drift_triggers_targeted_review_and_repair(
             handler,
             args,
             expected_episode_number=expected_episode_number,
+            **kwargs,
         )
 
     async def capture_repair(
@@ -8743,29 +8971,15 @@ async def test_contract_episode_missing_state_delta_is_corrected_within_stage(
 ) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    script_result_index = next(
-        index
-        for index, message in enumerate(responses)
-        if message.tool_calls and message.tool_calls[0]["name"] == "ScriptGenerationGroupResult"
-    )
+    script_result_index = _index_of_tool_call(responses, "ScriptGenerationGroupSidecar")
+    valid_sidecar = copy.deepcopy(responses[script_result_index].tool_calls[0]["args"])
+    invalid_sidecar = copy.deepcopy(valid_sidecar)
+    invalid_sidecar["episodes"][0]["state_delta"] = None
     responses.insert(
         script_result_index,
         _tool_call(
-            "ScriptGenerationGroupResult",
-            {
-                "stage": "generating_episode_scripts",
-                "group_id": "opening_unit",
-                "start_episode": 1,
-                "end_episode": 1,
-                "episodes": [
-                    {
-                        "stage": "generating_episode_scripts",
-                        "episode_number": 1,
-                        "content": "事实1\n钩子1",
-                        "state_delta": None,
-                    }
-                ],
-            },
+            "ScriptGenerationGroupSidecar",
+            invalid_sidecar,
             99,
         ),
     )
