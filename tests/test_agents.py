@@ -101,6 +101,7 @@ from pengine.agents import (
     _successful_required_reads,
     _suffix_rewrite_feedback_for_episode,
     _supervisor_prompt,
+    _validate_group_projection_repair_patch,
     _validate_outline_repair_patch_targets,
     _validate_result_language,
     _with_inline_project,
@@ -7585,6 +7586,168 @@ async def test_grouped_outline_projection_repair_rejects_episode_or_contract_cha
     assert len(corrections) == 2
     assert all("script_generation_groups" in (item or "") for item in corrections)
     assert error.value.safe_message == "分集大纲修复补丁未通过结构化校验。"
+
+
+@pytest.mark.asyncio
+async def test_grouped_outline_contract_only_repair_accepts_empty_projection_patch() -> None:
+    contract = _story_contract(episode_count=2).model_dump(mode="json")
+    contract["clues"] = [
+        {
+            "clue_id": "clue_voice",
+            "description": "录音中的第三个声音",
+            "introduced_episode": 1,
+            "introduction_is_visible_or_audible": True,
+            "explained_episode": 2,
+            "callback_episode": None,
+        }
+    ]
+    candidate = {
+        "stage": "generating_episode_outline",
+        "content": "第一集听见第三个声音，第二集继续追查。",
+        "episode_count": 2,
+        "episodes": [
+            {"episode_number": 1, "plan": "听见并认出第三个声音"},
+            {"episode_number": 2, "plan": "追查声音来源"},
+        ],
+        "story_contract": contract,
+        "script_generation_groups": [
+            {
+                "group_id": "voice_unit",
+                "start_episode": 1,
+                "end_episode": 2,
+                "dramatic_unit": "听见并追查第三个声音",
+                "boundary_reason": "声音来源改变调查方向",
+            }
+        ],
+    }
+    review = CanonReviewerResult(
+        passed=False,
+        evidence="线索的解读集应与第一集的唯一解读节点一致。",
+        issues=[
+            {
+                "code": "clue_explained_episode_mismatch",
+                "message": "把线索解读集从第二集改为第一集。",
+                "contract_refs": ["clue_voice"],
+                "contract_mutation_required": True,
+                "repair_targets": [
+                    {
+                        "target_id": "repair_clue_voice_episode",
+                        "collection": "clues",
+                        "intent": "replace_existing",
+                        "index": 0,
+                        "expected_value": contract["clues"][0],
+                        "value": {**contract["clues"][0], "explained_episode": 1},
+                    }
+                ],
+            }
+        ],
+    )
+    patch_calls = 0
+
+    async def generate_empty_patch(
+        _: Mapping[str, Any],
+        __: CanonReviewerResult,
+        ___: int,
+        ____: str | None,
+    ) -> Mapping[str, Any]:
+        nonlocal patch_calls
+        patch_calls += 1
+        return {
+            "stage": "generating_episode_outline",
+            "content_replacements": [],
+            "json_edits": [],
+        }
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_patch=generate_empty_patch,
+    )
+
+    repaired = await middleware._invoke_outline_repair(
+        candidate=candidate,
+        review=review,
+        repair_round=1,
+        group_projection_only=True,
+    )
+
+    assert patch_calls == 1
+    assert repaired["story_contract"]["clues"][0]["explained_episode"] == 1
+    assert repaired["episodes"] == candidate["episodes"]
+    assert repaired["script_generation_groups"] == candidate["script_generation_groups"]
+
+
+def test_grouped_outline_contract_repair_can_update_projection_wording() -> None:
+    patch = OutlineRepairPatch(
+        stage="generating_episode_outline",
+        json_edits=[
+            {
+                "op": "replace",
+                "path": "/script_generation_groups/0/dramatic_unit",
+                "expected": "发现事实",
+                "value": "发现并确认修复事实",
+            }
+        ],
+    )
+
+    _validate_group_projection_repair_patch(
+        patch,
+        contract_mutations=[{"path": "/story_contract/facts/0"}],
+    )
+
+
+@pytest.mark.parametrize(
+    ("patch", "contract_mutations"),
+    [
+        (OutlineRepairPatch(stage="generating_episode_outline"), []),
+        (
+            OutlineRepairPatch(
+                stage="generating_episode_outline",
+                content_replacements=[{"old": "旧大纲", "new": "新大纲"}],
+            ),
+            [{"path": "/story_contract/facts/0"}],
+        ),
+        (
+            OutlineRepairPatch(
+                stage="generating_episode_outline",
+                json_edits=[
+                    {
+                        "op": "replace",
+                        "path": "/episodes/0/plan",
+                        "expected": "旧计划",
+                        "value": "新计划",
+                    }
+                ],
+            ),
+            [{"path": "/story_contract/facts/0"}],
+        ),
+        (
+            OutlineRepairPatch(
+                stage="generating_episode_outline",
+                json_edits=[
+                    {
+                        "op": "replace",
+                        "path": "/script_generation_groups/0/end_episode",
+                        "expected": 2,
+                        "value": 3,
+                    }
+                ],
+            ),
+            [{"path": "/story_contract/facts/0"}],
+        ),
+    ],
+)
+def test_grouped_outline_projection_scope_rejects_unowned_edits(
+    patch: OutlineRepairPatch,
+    contract_mutations: list[Mapping[str, Any]],
+) -> None:
+    with pytest.raises(ValueError, match="group_projection_repair_scope_violation"):
+        _validate_group_projection_repair_patch(
+            patch,
+            contract_mutations=contract_mutations,
+        )
 
 
 @pytest.mark.asyncio
