@@ -4336,12 +4336,12 @@ def _validate_group_projection_repair_patch(
     *,
     contract_mutations: Sequence[Mapping[str, Any]],
 ) -> None:
-    if contract_mutations or patch.content_replacements:
+    if patch.content_replacements:
         raise ValueError("group_projection_repair_scope_violation")
     allowed_path = re.compile(
         r"^/script_generation_groups/[0-9]+/(?:dramatic_unit|boundary_reason)$"
     )
-    if not patch.json_edits or any(
+    if (not contract_mutations and not patch.json_edits) or any(
         allowed_path.fullmatch(edit.path) is None for edit in patch.json_edits
     ):
         raise ValueError("group_projection_repair_scope_violation")
