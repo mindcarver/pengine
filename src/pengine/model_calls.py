@@ -347,7 +347,9 @@ def build_started_record(
     verified_limit_tokens: int | None,
 ) -> ModelCallRecord:
     now = _utc_now()
-    carries_compiled_context = role == "generation" and context.context_bundle_sha256 is not None
+    carries_compiled_context = (
+        role in {"generation", "review"} and context.context_bundle_sha256 is not None
+    )
     return ModelCallRecord(
         call_id=call_id or new_call_id(),
         role=role,

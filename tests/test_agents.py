@@ -84,6 +84,7 @@ from pengine.agents import (
     _invoke_direct_structured_with_retry,
     _invoke_script_group_sidecar,
     _invoke_script_group_text,
+    _invoke_structural_review_structured,
     _language_retry_fingerprint,
     _language_retry_matches,
     _materialize_repair_constraints,
@@ -150,6 +151,7 @@ from pengine.series_bible import (
     build_series_bible,
     project_series_bible,
 )
+from pengine.series_review import StructuralReviewResult
 from pengine.skill_assets import load_agent_skill_files
 from pengine.worker import Worker
 
@@ -924,6 +926,189 @@ async def test_script_group_sidecar_resume_reuses_persisted_plaintext() -> None:
     )
     assert "Return plaintext only" not in resumed_input
     assert screenplay_sha256 in resumed_input
+
+
+@pytest.mark.asyncio
+async def test_direct_structural_review_uses_one_model_call_without_file_tools() -> None:
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call(
+                "StructuralReviewResult",
+                {
+                    "passed": True,
+                    "category": "pass",
+                    "evidence": (
+                        "L4硬规则：未发现阻断。\nL4价值观：未发现阻断。\nL4创作建议：未发现阻断。"
+                    ),
+                    "earliest_affected_episode": None,
+                },
+                1,
+            )
+        ]
+    )
+
+    result = await _invoke_structural_review_structured(
+        model,
+        [
+            {"role": "system", "content": "Return the structural decision."},
+            {"role": "user", "content": "INLINE-REVIEW-PACKET"},
+        ],
+        output_language="zh-CN",
+    )
+
+    assert result.passed is True
+    assert len(model.model_message_batches) == 1
+    assert all("read_file" not in names for names in model.bound_tool_names)
+
+
+@pytest.mark.asyncio
+async def test_direct_structural_review_protocol_repair_cannot_change_decision() -> None:
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call(
+                "StructuralReviewResult",
+                {
+                    "passed": False,
+                    "category": "script_defect",
+                    "evidence": "第2集与合同冲突。",
+                },
+                1,
+            ),
+            _tool_call(
+                "StructuralReviewResult",
+                {
+                    "passed": True,
+                    "category": "pass",
+                    "evidence": "L4硬规则：通过。",
+                    "earliest_affected_episode": None,
+                },
+                2,
+            ),
+        ]
+    )
+
+    with pytest.raises(AgentProtocolError, match="changed structural review decision"):
+        await _invoke_structural_review_structured(
+            model,
+            [
+                {"role": "system", "content": "Return the structural decision."},
+                {"role": "user", "content": "INLINE-REVIEW-PACKET"},
+            ],
+            output_language="zh-CN",
+        )
+
+    assert len(model.model_message_batches) == 2
+    retry_input = "\n".join(str(message.content) for message in model.model_message_batches[1])
+    assert "INLINE-REVIEW-PACKET" not in retry_input
+
+
+@pytest.mark.asyncio
+async def test_active_series_bible_uses_compiled_direct_final_review() -> None:
+    contract = _story_contract()
+    contract_hash = story_contract_sha256(contract)
+    summary = project_series_bible(
+        build_series_bible(
+            run_id="review_context_run",
+            run_kind="initial",
+            l0_variant="主动选择",
+            genre="general",
+            story_outline="故事大纲",
+            character_biographies="人物小传",
+            relationship_logic="关系逻辑",
+            episode_outline="第一集完成行动",
+            story_contract_payload=contract.model_dump(mode="json"),
+        ),
+        is_active=True,
+    )
+    approved_payloads = {
+        InternalStage.GENERATING_EPISODE_OUTLINE: {
+            "stage": "generating_episode_outline",
+            "content": "第一集完成行动",
+            "episode_count": 1,
+            "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+            "story_contract": contract.model_dump(mode="json"),
+            "story_contract_sha256": contract_hash,
+            "story_contract_markdown": render_story_contract_markdown(contract, contract_hash),
+            "contract_review": {"passed": True, "evidence": "合同一致", "issues": []},
+            "contract_repair_rounds": 0,
+        }
+    }
+    episode_hooks, attempts = _episode_hook_kwargs()
+    state = ModelCallState()
+    compiled_reviews: list[Any] = []
+    registered: list[dict[str, Any]] = []
+
+    async def review_series_prefix(compiled):
+        compiled_reviews.append(compiled)
+        assert state.context.context_bundle_sha256 == compiled.bundle_sha256
+        assert json.loads(state.context.context_manifest_json) == compiled.manifest
+        return StructuralReviewResult(
+            passed=True,
+            category="pass",
+            evidence=("L4硬规则：未发现阻断。\nL4价值观：未发现阻断。\nL4创作建议：未发现阻断。"),
+        )
+
+    async def register_series_review(**kwargs: Any) -> str:
+        registered.append(kwargs)
+        return "series_review_final"
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _stage: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages={
+            InternalStage.SELECTING_L0_VARIANT,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+        },
+        approved_payloads=approved_payloads,
+        series_bible=summary,
+        register_series_review=register_series_review,
+        review_series_prefix=review_series_prefix,
+        review_context_limit_tokens=100_000,
+        review_max_output_tokens=64_000,
+        model_call_state=state,
+        **episode_hooks,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] write scripts",
+                "subagent_type": "script_writer",
+            },
+            "id": "call-direct-series-review",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+
+    async def handler(subagent_request: ToolCallRequest) -> ToolMessage:
+        assert subagent_request.tool_call["args"]["subagent_type"] == "script_writer"
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "stage": "generating_episode_scripts",
+                    "episode_number": 1,
+                    "content": "事实1\n钩子1",
+                    "state_delta": _state_delta(contract, 1),
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-direct-series-review",
+        )
+
+    await middleware.awrap_tool_call(request, handler)
+
+    assert attempts == [1]
+    assert len(compiled_reviews) == 1
+    assert compiled_reviews[0].mode == "full_prefix"
+    assert "事实1\\n钩子1" in compiled_reviews[0].model_input
+    assert registered[0]["review_type"] == "final"
+    assert state.context.context_bundle_sha256 is None
+    assert state.context.context_manifest_json is None
 
 
 def _story_contract(
