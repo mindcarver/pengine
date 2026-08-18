@@ -5434,6 +5434,10 @@ class StageGuardMiddleware(AgentMiddleware):
         logger.info("story artifact loop entered stage=%s", stage.value)
         result, payload = await self._call_structured_stage(stage, request, handler, args)
         logger.info("story artifact initial generation done stage=%s", stage.value)
+        if stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS:
+            parsed = StoryArchitectResult.model_validate(payload)
+            approved_payload = parsed.model_dump(mode="json")
+            return _result_with_payload(result, approved_payload), approved_payload
         repair_rounds = 0
         previous_content: str | None = None
         previous_review: CanonReviewerResult | None = None

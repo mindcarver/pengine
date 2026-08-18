@@ -1149,21 +1149,6 @@ def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMe
                 )
             )
             index += 1
-        if stage == "generating_character_relationships":
-            # Character + relationships stage: two-lens canon review (2 review calls).
-            for _ in range(2):
-                responses.append(
-                    _tool_call(
-                        "CanonReviewerResult",
-                        {
-                            "passed": True,
-                            "evidence": "L4硬规则：人物关系适用硬规则一致。",
-                            "issues": [],
-                        },
-                        index,
-                    )
-                )
-                index += 1
         if stage == "generating_episode_outline":
             responses.append(
                 _tool_call(
@@ -6366,7 +6351,7 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval() -> None:
+async def test_character_relationships_skip_canon_review_and_repair() -> None:
     approved_payloads: dict[InternalStage, Any] = {
         InternalStage.SELECTING_L0_VARIANT: {
             "stage": "selecting_l0_variant",
@@ -6508,14 +6493,12 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
 
     returned = await middleware.awrap_tool_call(request, handler)
 
-    assert review_calls == 4
-    assert repair_calls == 1
+    assert review_calls == 0
+    assert repair_calls == 0
     assert isinstance(returned, ToolMessage)
     returned_payload = json.loads(returned.content)
-    assert "二十二岁，比程屿大两岁" in returned_payload["relationship_logic"]
-    assert "电话对象写成程屿" in returned_payload["relationship_logic"]
-    assert "二十四岁" not in returned_payload["relationship_logic"]
-    assert "电话对象写成周砚" not in returned_payload["relationship_logic"]
+    assert "二十四岁，比程屿大六岁" in returned_payload["relationship_logic"]
+    assert "电话对象写成周砚" in returned_payload["relationship_logic"]
     assert "consistency_review" not in returned_payload
     assert "consistency_repair_rounds" not in returned_payload
     assert (
@@ -6526,14 +6509,14 @@ async def test_story_artifact_is_reviewed_and_minimally_repaired_before_approval
     assert len(approvals) == 1
     stage, repaired = approvals[0]
     assert stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
-    assert repaired["consistency_review"]["passed"] is True
-    assert repaired["consistency_repair_rounds"] == 1
-    assert "二十二岁，比程屿大两岁" in repaired["relationship_logic"]
-    assert "电话对象写成程屿" in repaired["relationship_logic"]
+    assert "consistency_review" not in repaired
+    assert "consistency_repair_rounds" not in repaired
+    assert "二十四岁，比程屿大六岁" in repaired["relationship_logic"]
+    assert "电话对象写成周砚" in repaired["relationship_logic"]
 
 
 @pytest.mark.asyncio
-async def test_story_consistency_converges_at_fourth_repair_round() -> None:
+async def test_character_relationships_do_not_enter_former_repair_loop() -> None:
     approvals: list[tuple[InternalStage, dict[str, Any]]] = []
     approved_payloads: dict[InternalStage, Any] = {
         InternalStage.SELECTING_L0_VARIANT: {
@@ -6748,14 +6731,14 @@ async def test_story_consistency_converges_at_fourth_repair_round() -> None:
 
     await middleware.awrap_tool_call(request, handler)
 
-    assert review_calls == 10
-    assert repair_calls == 4
+    assert review_calls == 0
+    assert repair_calls == 0
     assert len(approvals) == 1
     stage, repaired = approvals[0]
     assert stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS
-    assert repaired["consistency_review"]["passed"] is True
-    assert repaired["consistency_repair_rounds"] == 4
-    assert "值班记录与手记" in repaired["relationship_logic"]
+    assert "consistency_review" not in repaired
+    assert "consistency_repair_rounds" not in repaired
+    assert "电话打给周砚" in repaired["relationship_logic"]
 
 
 @pytest.mark.asyncio
@@ -6765,7 +6748,7 @@ async def test_contract_review_repairs_once_before_outline_lock(
 ) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    outline_review_index = _index_of_tool_call(responses, "CanonReviewerResult", occurrence=4)
+    outline_review_index = _index_of_tool_call(responses, "CanonReviewerResult", occurrence=2)
     responses[outline_review_index] = _tool_call(
         "CanonReviewerResult",
         {
@@ -6989,7 +6972,7 @@ async def test_story_patch_direct_call_inlines_project_once(
 async def test_contract_repair_stops_after_one_invalid_patch_correction(tmp_path: Path) -> None:
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
-    outline_review_index = _index_of_tool_call(responses, "CanonReviewerResult", occurrence=4)
+    outline_review_index = _index_of_tool_call(responses, "CanonReviewerResult", occurrence=2)
     responses[outline_review_index] = _tool_call(
         "CanonReviewerResult",
         {
