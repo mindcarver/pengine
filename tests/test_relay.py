@@ -6,12 +6,14 @@ import httpx
 import openai
 import pytest
 from langchain_anthropic import ChatAnthropic
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr
 
+import pengine.relay as relay_module
 from pengine.config import Settings
 from pengine.model_calls import ModelCallState, StageCallBudgetExceeded
 from pengine.relay import (
@@ -71,6 +73,49 @@ def test_build_relay_adapter_preserves_anthropic_defaults() -> None:
     assert adapter.model_id == "claude-opus-5"
     assert adapter.provider_profile_key == "anthropic"
     assert adapter.model.max_tokens == 128_000
+
+
+def test_build_relay_adapter_configures_langfuse_without_sdk_environment(
+    monkeypatch,
+) -> None:
+    client_calls: list[dict[str, str]] = []
+    handler_calls: list[str | None] = []
+
+    class FakeLangfuseClient:
+        def __init__(self, **kwargs: str) -> None:
+            client_calls.append(kwargs)
+
+    class FakeLangfuseHandler(BaseCallbackHandler):
+        def __init__(self, *, public_key: str | None = None) -> None:
+            handler_calls.append(public_key)
+
+    for name in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(relay_module, "_LangfuseClient", FakeLangfuseClient)
+    monkeypatch.setattr(relay_module, "_LangfuseCallbackHandler", FakeLangfuseHandler)
+    settings = Settings(
+        _env_file=None,
+        relay_base_url="https://relay.example/v1",
+        relay_api_key="secret-value",
+        generation_model_id="claude-opus-5",
+        review_model_id="deepseek-v4-flash",
+        langfuse_enabled=True,
+        langfuse_host="https://langfuse.example",
+        langfuse_public_key="public-value",
+        langfuse_secret_key="private-value",
+    )
+
+    adapter = build_relay_adapter(settings, role="review")
+
+    assert client_calls == [
+        {
+            "public_key": "public-value",
+            "secret_key": "private-value",
+            "base_url": "https://langfuse.example",
+        }
+    ]
+    assert handler_calls == ["public-value"]
+    assert any(isinstance(callback, FakeLangfuseHandler) for callback in adapter.model.callbacks)
 
 
 @pytest.mark.parametrize(
