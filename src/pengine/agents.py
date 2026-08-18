@@ -37,10 +37,12 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import from_json
 
 from pengine.continuity import (
     ContinuityViolation,
     EpisodeStateDelta,
+    RepairConstraint,
     ReviewIssue,
     SemanticReview,
     SeriesState,
@@ -51,10 +53,12 @@ from pengine.continuity import (
     canonical_model_hash,
     initial_series_state,
     render_story_contract_markdown,
+    repair_constraint_id,
     required_episode_evidence_target_ids,
     requires_locked_fact_semantic_review,
     story_contract_sha256,
     validate_episode_candidate,
+    validate_repair_constraints,
 )
 from pengine.language import (
     OutputLanguage,
@@ -400,13 +404,20 @@ def _require_l4_stage_evidence(
     review: SemanticReview | StructuralReviewResult,
     *,
     stage: InternalStage,
-) -> None:
+) -> SemanticReview | StructuralReviewResult:
     if review.passed and L4_STAGE_EVIDENCE_LABEL not in review.evidence:
-        raise AgentProtocolError(
-            "Passing stage review evidence is missing the required L4 hard-rule section",
-            stage=stage,
-            safe_message="通过的阶段审查缺少 L4 硬规则证据。",
+        record_langfuse_event(
+            "pengine.review.protocol_normalized",
+            input={
+                "stage": stage.value,
+                "normalization": "prepend_l4_evidence_label",
+                "decision_preserved": True,
+                "evidence_sha256": content_fingerprint(review.evidence),
+            },
+            metadata={"trace_version": "pengine-1"},
         )
+        return review.model_copy(update={"evidence": f"{L4_STAGE_EVIDENCE_LABEL}{review.evidence}"})
+    return review
 
 
 _STORY_ARCHITECT_PROMPT = (
@@ -728,6 +739,139 @@ def _suffix_rewrite_feedback_for_episode(
         "effective_earliest_affected_episode": effective,
         "reviews": current_reviews,
     }
+
+
+def _latest_repair_constraint_ledger(
+    drafts: Mapping[int, EpisodeDraft],
+) -> list[RepairConstraint]:
+    for episode_number in sorted(drafts, reverse=True):
+        state = drafts[episode_number].series_state
+        if state is not None and state.repair_constraints:
+            return list(state.repair_constraints)
+    return []
+
+
+def _materialize_repair_constraints(
+    extracted: "RepairConstraintExtractionResult",
+    *,
+    episode_count: int,
+    source_content_by_episode: Mapping[int, str],
+) -> list[RepairConstraint]:
+    if not extracted.passed:
+        raise AgentProtocolError(
+            extracted.evidence,
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            safe_message="修复约束无法可靠提取，已停止提交剧本。",
+        )
+    constraints = [
+        RepairConstraint(
+            constraint_id=repair_constraint_id(
+                kind=item.kind,
+                statement=item.statement,
+                source_episode=item.source_episode,
+                applies_from_episode=item.applies_from_episode,
+                applies_through_episode=item.applies_through_episode,
+                evidence_excerpt=item.evidence_excerpt,
+            ),
+            **item.model_dump(mode="python"),
+        )
+        for item in extracted.constraints
+    ]
+    issues = validate_repair_constraints(
+        constraints,
+        episode_count=episode_count,
+        source_content_by_episode=dict(source_content_by_episode),
+    )
+    if issues:
+        raise AgentProtocolError(
+            "; ".join(f"{issue.code}: {issue.message}" for issue in issues),
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            safe_message="修复约束证据或作用范围无效，已停止提交剧本。",
+        )
+    return constraints
+
+
+def _merge_repair_constraint_ledger(
+    current: Sequence[RepairConstraint],
+    additions: Sequence[RepairConstraint],
+) -> list[RepairConstraint]:
+    by_id = {item.constraint_id: item for item in current}
+    for item in additions:
+        by_id[item.constraint_id] = item
+    return sorted(
+        by_id.values(),
+        key=lambda item: (
+            item.applies_from_episode,
+            item.source_episode,
+            item.constraint_id,
+        ),
+    )
+
+
+def _applicable_repair_constraints(
+    constraints: Sequence[RepairConstraint], episode_number: int
+) -> list[RepairConstraint]:
+    return [
+        item
+        for item in constraints
+        if item.applies_from_episode <= episode_number <= item.applies_through_episode
+    ]
+
+
+def _repair_constraint_check_issues(
+    result: "RepairConstraintValidationResult",
+    *,
+    constraints: Sequence[RepairConstraint],
+    candidate_content: str,
+) -> list[ReviewIssue]:
+    expected_ids = {item.constraint_id for item in constraints}
+    actual_ids = [item.constraint_id for item in result.checks]
+    issues: list[ReviewIssue] = []
+    if len(actual_ids) != len(set(actual_ids)):
+        issues.append(
+            ReviewIssue(
+                code="duplicate_repair_constraint_check",
+                message="修复约束校验返回了重复 ID",
+                contract_refs=sorted(set(actual_ids)),
+            )
+        )
+    missing = sorted(expected_ids - set(actual_ids))
+    unknown = sorted(set(actual_ids) - expected_ids)
+    if missing:
+        issues.append(
+            ReviewIssue(
+                code="missing_repair_constraint_check",
+                message="修复约束校验未覆盖全部适用约束",
+                contract_refs=missing,
+            )
+        )
+    if unknown:
+        issues.append(
+            ReviewIssue(
+                code="unknown_repair_constraint_check",
+                message="修复约束校验引用了未知约束",
+                contract_refs=unknown,
+            )
+        )
+    for check in result.checks:
+        if check.evidence_excerpt is not None and check.evidence_excerpt not in candidate_content:
+            issues.append(
+                ReviewIssue(
+                    code="repair_constraint_check_evidence_invalid",
+                    message=f"修复约束 {check.constraint_id} 的候选证据不在剧本中",
+                    contract_refs=[check.constraint_id],
+                )
+            )
+        if check.status == "contradicted":
+            issues.append(
+                ReviewIssue(
+                    code="repair_constraint_contradiction",
+                    message=check.explanation,
+                    contract_refs=[check.constraint_id],
+                    script_excerpt=check.evidence_excerpt,
+                )
+            )
+    return issues
 
 
 def _established_facts_payload(
@@ -1628,6 +1772,56 @@ class EpisodeReviewerResult(SemanticReview):
     pass
 
 
+class RepairConstraintDraft(StrictModel):
+    kind: Literal[
+        "date",
+        "time",
+        "datetime",
+        "amount",
+        "count",
+        "duration",
+        "direction",
+        "relationship",
+        "relative_time",
+        "continuity",
+    ]
+    statement: NonEmptyText
+    source_episode: int = Field(ge=1)
+    applies_from_episode: int = Field(ge=1)
+    applies_through_episode: int = Field(ge=1)
+    evidence_excerpt: NonEmptyText
+
+
+class RepairConstraintExtractionResult(SemanticReview):
+    constraints: list[RepairConstraintDraft] = Field(default_factory=list, max_length=32)
+
+
+class RepairConstraintCheck(StrictModel):
+    constraint_id: StableId
+    status: Literal["satisfied", "not_applicable", "contradicted"]
+    evidence_excerpt: NonEmptyText | None = None
+    explanation: NonEmptyText
+
+    @model_validator(mode="after")
+    def validate_evidence_shape(self) -> "RepairConstraintCheck":
+        if self.status == "not_applicable" and self.evidence_excerpt is not None:
+            raise ValueError("Not-applicable constraint checks cannot quote candidate evidence")
+        if self.status != "not_applicable" and self.evidence_excerpt is None:
+            raise ValueError("Applicable constraint checks require candidate evidence")
+        return self
+
+
+class RepairConstraintValidationResult(SemanticReview):
+    checks: list[RepairConstraintCheck] = Field(default_factory=list, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_decision_matches_checks(self) -> "RepairConstraintValidationResult":
+        contradicted = any(item.status == "contradicted" for item in self.checks)
+        if contradicted == self.passed:
+            raise ValueError("Repair constraint decision does not match its checks")
+        return self
+
+
 def _bounded_writer_notes(prior: str, current: str) -> str:
     """Accumulate bounded advisory writer notes without ever replacing canon.
 
@@ -1642,9 +1836,19 @@ def _merge_episode_reviews(
     deterministic_issues: list[Any],
     semantic_review: EpisodeReviewerResult,
 ) -> EpisodeReviewerResult:
+    return _merge_episode_review_results(deterministic_issues, [semantic_review])
+
+
+def _merge_episode_review_results(
+    deterministic_issues: list[Any],
+    semantic_reviews: Sequence[SemanticReview],
+) -> EpisodeReviewerResult:
     issues = []
     seen: set[str] = set()
-    for issue in [*deterministic_issues, *semantic_review.issues]:
+    for issue in [
+        *deterministic_issues,
+        *(issue for review in semantic_reviews for issue in review.issues),
+    ]:
         key = issue.model_dump_json()
         if key not in seen:
             seen.add(key)
@@ -1660,7 +1864,7 @@ def _merge_episode_reviews(
                 for issue in deterministic_issues
             )
         )
-    evidence.append(f"语义审核：{semantic_review.evidence}")
+    evidence.extend(f"语义审核：{review.evidence}" for review in semantic_reviews)
     referenced_targets = sorted({target for issue in issues for target in issue.contract_refs})
     if referenced_targets:
         evidence.append(f"审查目标：{', '.join(referenced_targets)}")
@@ -2112,6 +2316,13 @@ def _candidate_episode_mappings(value: Any) -> list[Mapping[str, Any]]:
     elif isinstance(value, list):
         for item in value:
             candidates.extend(_candidate_episode_mappings(item))
+    elif isinstance(value, str) and value.lstrip().startswith(("[", "{")):
+        try:
+            partial = from_json(value, allow_partial=True)
+        except ValueError:
+            partial = None
+        if partial != value:
+            candidates.extend(_candidate_episode_mappings(partial))
     return candidates
 
 
@@ -2638,6 +2849,20 @@ def _user_facing_texts(result: Any) -> list[str]:
             *(item.handling for item in result.feedback_handling),
             *(item.result for item in result.feedback_handling),
         ]
+    if isinstance(result, RepairConstraintExtractionResult):
+        return [
+            result.evidence,
+            *(issue.message for issue in result.issues),
+            *(item.statement for item in result.constraints),
+            *(item.evidence_excerpt for item in result.constraints),
+        ]
+    if isinstance(result, RepairConstraintValidationResult):
+        return [
+            result.evidence,
+            *(issue.message for issue in result.issues),
+            *(item.explanation for item in result.checks),
+            *(item.evidence_excerpt for item in result.checks if item.evidence_excerpt is not None),
+        ]
     if isinstance(result, SemanticReview):
         return [result.evidence, *(issue.message for issue in result.issues)]
     return []
@@ -2807,6 +3032,34 @@ def _language_retry_fingerprint(result: Any) -> tuple[Any, ...]:
                     _language_text_fingerprint(item.result),
                 )
                 for item in result.feedback_handling
+            ),
+        )
+    if isinstance(result, RepairConstraintExtractionResult):
+        return (
+            result.passed,
+            tuple(
+                (
+                    item.kind,
+                    _language_text_fingerprint(item.statement),
+                    item.source_episode,
+                    item.applies_from_episode,
+                    item.applies_through_episode,
+                    item.evidence_excerpt,
+                )
+                for item in result.constraints
+            ),
+        )
+    if isinstance(result, RepairConstraintValidationResult):
+        return (
+            result.passed,
+            tuple(
+                (
+                    item.constraint_id,
+                    item.status,
+                    item.evidence_excerpt,
+                    _language_text_fingerprint(item.explanation),
+                )
+                for item in result.checks
             ),
         )
     if isinstance(result, SemanticReview):
@@ -5194,7 +5447,10 @@ class StageGuardMiddleware(AgentMiddleware):
                 )
                 review = _merge_canon_reviews([review, backstop])
             if review.passed:
-                _require_l4_stage_evidence(review, stage=stage)
+                review = cast(
+                    CanonReviewerResult,
+                    _require_l4_stage_evidence(review, stage=stage),
+                )
                 approved_payload = parsed.model_dump(mode="json")
                 return _result_with_payload(result, approved_payload), {
                     **approved_payload,
@@ -5819,9 +6075,12 @@ class StageGuardMiddleware(AgentMiddleware):
                                 safe_message="分集大纲审查目标未能绑定当前合同。",
                             ) from corrected_exc
             if review.passed:
-                _require_l4_stage_evidence(
-                    review,
-                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                review = cast(
+                    CanonReviewerResult,
+                    _require_l4_stage_evidence(
+                        review,
+                        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                    ),
                 )
                 return _result_with_payload(result, payload), {
                     **candidate,
@@ -6473,9 +6732,12 @@ class StageGuardMiddleware(AgentMiddleware):
             schema=StructuralReviewResult,
             stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
         )
-        _require_l4_stage_evidence(
-            result,
-            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+        result = cast(
+            StructuralReviewResult,
+            _require_l4_stage_evidence(
+                result,
+                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            ),
         )
         review_id = await self.register_series_review(
             review_type=("final" if episode_number == contract.episode_count else "milestone"),
@@ -6519,6 +6781,106 @@ class StageGuardMiddleware(AgentMiddleware):
                 name="task",
             ),
             payload,
+        )
+
+    async def _extract_repair_constraints(
+        self,
+        *,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        source_scripts: Mapping[int, str],
+        suffix_feedback: Mapping[str, Any],
+        current_ledger: Sequence[RepairConstraint],
+        episode_count: int,
+    ) -> list[RepairConstraint]:
+        if not source_scripts:
+            return []
+        result = await self._invoke_semantic_reviewer(
+            request=request,
+            handler=handler,
+            subagent_type="repair_constraint_extractor",
+            description=(
+                "Extract only explicit continuity commitments in the supplied committed "
+                "screenplays that were created or made binding by the authorized suffix "
+                "rewrite, directly address an unresolved review defect, and can constrain a "
+                "later episode. Ignore unrelated canon merely because it appears in the "
+                "recent screenplay window. Cover dates, times, amounts, "
+                "counts, durations, payment or transfer direction, relationships, and "
+                "relative-time commitments. Do not infer style, theme, intent, or unspecified "
+                "details. Do not repeat a semantically equivalent item already in the ledger. "
+                "Every evidence_excerpt must be a verbatim substring of exactly one supplied "
+                "episode, source_episode must name that episode, and applies_from_episode must "
+                "be later than it. Return passed=false when the supplied evidence is ambiguous "
+                "or mutually inconsistent and include at least one ReviewIssue; otherwise "
+                "return passed=true, including when no new "
+                "constraint exists. Return structured evidence only."
+            ),
+            files={
+                "/workspace/suffix_rewrite_review.json": json.dumps(
+                    suffix_feedback, ensure_ascii=False, sort_keys=True
+                ),
+                "/workspace/committed_rewrite_scripts.json": _trusted_series_prefix_json(
+                    sorted(source_scripts.items())
+                ),
+                "/workspace/repair_constraint_ledger.json": json.dumps(
+                    [item.model_dump(mode="json") for item in current_ledger],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            },
+            schema=RepairConstraintExtractionResult,
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            minimal_context=True,
+        )
+        return _materialize_repair_constraints(
+            cast(RepairConstraintExtractionResult, result),
+            episode_count=episode_count,
+            source_content_by_episode=source_scripts,
+        )
+
+    async def _review_repair_constraints(
+        self,
+        *,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        constraints: Sequence[RepairConstraint],
+        episode_number: int,
+        candidate_content: str,
+        candidate_state_delta: EpisodeStateDelta,
+    ) -> tuple[RepairConstraintValidationResult, list[ReviewIssue]]:
+        result = await self._invoke_semantic_reviewer(
+            request=request,
+            handler=handler,
+            subagent_type="repair_constraint_validator",
+            description=(
+                f"Check episode {episode_number} against every supplied repair constraint. "
+                "Return exactly one check for every constraint_id and no others. Mark "
+                "satisfied when the candidate explicitly realizes it, contradicted when the "
+                "candidate conflicts with it, and not_applicable only when this episode does "
+                "not mention or enact the constrained matter. Quote a verbatim candidate "
+                "excerpt for satisfied or contradicted; never invent evidence. Fail the review "
+                "for any contradiction and include one ReviewIssue whose contract_refs names "
+                "that constraint_id. Do not review style, format, pacing, or facts absent "
+                "from the ledger. Return structured evidence only."
+            ),
+            files={
+                "/workspace/repair_constraint_ledger.json": json.dumps(
+                    [item.model_dump(mode="json") for item in constraints],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "/workspace/candidate_episode.md": candidate_content,
+                "/workspace/candidate_state_delta.json": (candidate_state_delta.model_dump_json()),
+            },
+            schema=RepairConstraintValidationResult,
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            minimal_context=True,
+        )
+        typed = cast(RepairConstraintValidationResult, result)
+        return typed, _repair_constraint_check_issues(
+            typed,
+            constraints=constraints,
+            candidate_content=candidate_content,
         )
 
     async def _write_episodes(
@@ -6619,6 +6981,22 @@ class StageGuardMiddleware(AgentMiddleware):
         pending_group_provenance: dict[int, int] = {}
         pending_group_window_ids: dict[int, str | None] = {}
         pending_group_call_ids: dict[int, str | None] = {}
+        repair_constraint_ledger = _latest_repair_constraint_ledger(self.episode_drafts)
+        if repair_constraint_ledger:
+            ledger_issues = validate_repair_constraints(
+                repair_constraint_ledger,
+                episode_count=contract.episode_count,
+                source_content_by_episode={
+                    number: draft.content for number, draft in self.episode_drafts.items()
+                },
+            )
+            if ledger_issues:
+                raise AgentProtocolError(
+                    "; ".join(f"{item.code}: {item.message}" for item in ledger_issues),
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    safe_message="已持久化的修复约束账本无效，未继续生成。",
+                )
+        repair_feedback_loaded = False
         for plan in plans:
             if plan.episode_number in self.episode_drafts:
                 continue
@@ -6737,6 +7115,39 @@ class StageGuardMiddleware(AgentMiddleware):
                 self.suffix_rewrite_feedback,
                 plan.episode_number,
             )
+            if suffix_feedback is not None and not repair_feedback_loaded:
+                source_scripts = {
+                    number: self.episode_drafts[number].content
+                    for number in recent_episode_numbers
+                    if number in self.episode_drafts and number < runtime_group_start
+                }
+                additions = await self._extract_repair_constraints(
+                    request=request,
+                    handler=handler,
+                    source_scripts=source_scripts,
+                    suffix_feedback=suffix_feedback,
+                    current_ledger=repair_constraint_ledger,
+                    episode_count=contract.episode_count,
+                )
+                repair_constraint_ledger = _merge_repair_constraint_ledger(
+                    repair_constraint_ledger, additions
+                )
+                repair_feedback_loaded = True
+            group_repair_constraints = [
+                item
+                for item in repair_constraint_ledger
+                if item.applies_from_episode <= runtime_group_end
+                and item.applies_through_episode >= runtime_group_start
+            ]
+            repair_constraint_ledger_json = (
+                json.dumps(
+                    [item.model_dump(mode="json") for item in group_repair_constraints],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if group_repair_constraints
+                else None
+            )
             suffix_rewrite_instruction = ""
             if suffix_feedback is not None:
                 suffix_rewrite_instruction = (
@@ -6748,6 +7159,12 @@ class StageGuardMiddleware(AgentMiddleware):
                     "against the "
                     "new content."
                 )
+                if group_repair_constraints:
+                    suffix_rewrite_instruction += (
+                        " The repair_constraint_ledger component is a binding cross-group "
+                        "continuity ledger. Check every constraint that applies to an episode "
+                        "before returning that episode."
+                    )
             episode_args = {
                 **args,
                 "description": (
@@ -6817,6 +7234,10 @@ class StageGuardMiddleware(AgentMiddleware):
                     ensure_ascii=False,
                     sort_keys=True,
                 )
+            if repair_constraint_ledger_json is not None:
+                episode_files["/workspace/repair_constraint_ledger.json"] = (
+                    repair_constraint_ledger_json
+                )
             try:
                 persona_components: dict[str, str] = {}
                 for name, path in (
@@ -6876,6 +7297,7 @@ class StageGuardMiddleware(AgentMiddleware):
                     suffix_rewrite_review_json=(
                         episode_files.get("/workspace/suffix_rewrite_review.json")
                     ),
+                    repair_constraint_ledger_json=repair_constraint_ledger_json,
                 )
             except ScriptContextError as exc:
                 raise AgentProtocolError(
@@ -7054,6 +7476,21 @@ class StageGuardMiddleware(AgentMiddleware):
                     content=parsed.content,
                     delta=parsed.state_delta,
                 )
+                semantic_reviews: list[SemanticReview] = []
+                applicable_repair_constraints = _applicable_repair_constraints(
+                    repair_constraint_ledger, plan.episode_number
+                )
+                if not deterministic_issues and applicable_repair_constraints:
+                    constraint_review, constraint_issues = await self._review_repair_constraints(
+                        request=request,
+                        handler=handler,
+                        constraints=applicable_repair_constraints,
+                        episode_number=plan.episode_number,
+                        candidate_content=parsed.content,
+                        candidate_state_delta=parsed.state_delta,
+                    )
+                    deterministic_issues.extend(constraint_issues)
+                    semantic_reviews.append(constraint_review)
                 if not deterministic_issues and requires_locked_fact_semantic_review(
                     contract,
                     prior_state,
@@ -7067,45 +7504,50 @@ class StageGuardMiddleware(AgentMiddleware):
                         for episode_number in recent_episode_numbers
                         if episode_number in self.episode_drafts
                     )
-                    semantic_review = await self._invoke_semantic_reviewer(
-                        request=request,
-                        handler=handler,
-                        subagent_type="episode_reviewer",
-                        description=(
-                            f"Perform a targeted hard-Canon review of episode "
-                            f"{plan.episode_number}. A deterministic risk signal found a "
-                            "numeric or temporal restatement that may refer indirectly to "
-                            "an established fact. Read only the compact current-group Canon, "
-                            "established-fact index, recent screenplay window, current "
-                            "candidate, and candidate state delta. Resolve aliases and "
-                            "pronouns from those files. Fail only for a direct contradiction "
-                            "to a locked value; do not review style, format, pacing, or "
-                            "unlocked creative choices. Bind every issue to exact fact IDs "
-                            "and a verbatim script excerpt. Return structured evidence only."
-                        ),
-                        files={
-                            "/workspace/current_group_canon.json": current_group_canon_json,
-                            "/workspace/established_facts.json": established_facts_json,
-                            "/workspace/series_state.json": prior_state.model_dump_json(),
-                            "/workspace/recent_scripts.json": recent_scripts,
-                            "/workspace/candidate_episode.md": parsed.content,
-                            "/workspace/candidate_state_delta.json": (
-                                parsed.state_delta.model_dump_json()
+                    semantic_reviews.append(
+                        await self._invoke_semantic_reviewer(
+                            request=request,
+                            handler=handler,
+                            subagent_type="episode_reviewer",
+                            description=(
+                                f"Perform a targeted hard-Canon review of episode "
+                                f"{plan.episode_number}. A deterministic risk signal found a "
+                                "numeric or temporal restatement that may refer indirectly to "
+                                "an established fact. Read only the compact current-group Canon, "
+                                "established-fact index, recent screenplay window, current "
+                                "candidate, and candidate state delta. Resolve aliases and "
+                                "pronouns from those files. Fail only for a direct contradiction "
+                                "to a locked value; do not review style, format, pacing, or "
+                                "unlocked creative choices. Bind every issue to exact fact IDs "
+                                "and a verbatim script excerpt. Return structured evidence only."
                             ),
-                        },
-                        schema=EpisodeReviewerResult,
-                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
-                        minimal_context=True,
+                            files={
+                                "/workspace/current_group_canon.json": current_group_canon_json,
+                                "/workspace/established_facts.json": established_facts_json,
+                                "/workspace/series_state.json": prior_state.model_dump_json(),
+                                "/workspace/recent_scripts.json": recent_scripts,
+                                "/workspace/candidate_episode.md": parsed.content,
+                                "/workspace/candidate_state_delta.json": (
+                                    parsed.state_delta.model_dump_json()
+                                ),
+                            },
+                            schema=EpisodeReviewerResult,
+                            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                            minimal_context=True,
+                        )
                     )
                 elif self.series_bible is not None:
-                    semantic_review = SemanticReview(
-                        passed=True,
-                        evidence=(
-                            "确定性逐集校验通过；本集未触发既有数值或时间事实的语义风险审查。"
-                        ),
-                    )
+                    if not semantic_reviews:
+                        semantic_reviews.append(
+                            SemanticReview(
+                                passed=True,
+                                evidence=(
+                                    "确定性逐集校验通过；本集未触发既有数值或时间事实的语义风险审查。"
+                                ),
+                            )
+                        )
                 else:
-                    semantic_review = await self._invoke_semantic_reviewer(
+                    full_episode_review = await self._invoke_semantic_reviewer(
                         request=episode_request,
                         handler=handler,
                         subagent_type="episode_reviewer",
@@ -7150,8 +7592,21 @@ class StageGuardMiddleware(AgentMiddleware):
                         schema=EpisodeReviewerResult,
                         stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
                     )
-                review = _merge_episode_reviews(deterministic_issues, semantic_review)
+                    semantic_reviews.append(full_episode_review)
+                review = _merge_episode_review_results(deterministic_issues, semantic_reviews)
                 if review.passed:
+                    if suffix_feedback is not None and plan.episode_number < contract.episode_count:
+                        additions = await self._extract_repair_constraints(
+                            request=request,
+                            handler=handler,
+                            source_scripts={plan.episode_number: parsed.content},
+                            suffix_feedback=suffix_feedback,
+                            current_ledger=repair_constraint_ledger,
+                            episode_count=contract.episode_count,
+                        )
+                        repair_constraint_ledger = _merge_repair_constraint_ledger(
+                            repair_constraint_ledger, additions
+                        )
                     try:
                         episode_lock = build_episode_lock(
                             contract=contract,
@@ -7161,6 +7616,7 @@ class StageGuardMiddleware(AgentMiddleware):
                             delta=parsed.state_delta,
                             semantic_review=review,
                             repair_rounds=repair_rounds,
+                            repair_constraints=repair_constraint_ledger,
                         )
                     except ContinuityViolation as exc:
                         raise AgentProtocolError(
@@ -7270,6 +7726,13 @@ class StageGuardMiddleware(AgentMiddleware):
                         "reviews in the read-only /workspace/suffix_rewrite_review.json. Read "
                         "every review evidence entry and fix every named conflict; the locked "
                         "story contract has priority, and do not reproduce the named defect."
+                    )
+                if applicable_repair_constraints:
+                    repair_description += (
+                        " Repair constraint compliance is mandatory. Read "
+                        "/workspace/repair_constraint_ledger.json and the exact constraint IDs "
+                        "in /workspace/episode_review.json; remove every contradiction while "
+                        "leaving unrelated creative choices unchanged."
                     )
                 if unknown_speaker_issues:
                     repair_description += (
@@ -7381,6 +7844,20 @@ class StageGuardMiddleware(AgentMiddleware):
                                     if suffix_feedback is not None
                                     else {}
                                 ),
+                                **(
+                                    {
+                                        "/workspace/repair_constraint_ledger.json": json.dumps(
+                                            [
+                                                item.model_dump(mode="json")
+                                                for item in applicable_repair_constraints
+                                            ],
+                                            ensure_ascii=False,
+                                            sort_keys=True,
+                                        )
+                                    }
+                                    if applicable_repair_constraints
+                                    else {}
+                                ),
                             },
                             schema=ScriptWriterResult,
                             stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
@@ -7399,6 +7876,31 @@ class StageGuardMiddleware(AgentMiddleware):
                     generation_window_id = repair_window_id
                     provenance_episode_number = plan.episode_number
                 parsed = ScriptWriterResult.model_validate(payload)
+
+        if (
+            last_result is None
+            and self.series_bible is not None
+            and contract.episode_count in milestones
+            and len(self.episode_drafts) == contract.episode_count
+        ):
+            final_plan = plans[-1]
+            if self.reset_episode_deadline is not None:
+                await self.reset_episode_deadline()
+            if self.model_call_state is not None:
+                self.model_call_state.context.stage = InternalStage.GENERATING_EPISODE_SCRIPTS.value
+                self.model_call_state.context.episode_number = contract.episode_count
+                self.model_call_state.context.operation_id = new_operation_id()
+            await self._milestone_review(
+                episode_number=contract.episode_count,
+                prior_state=prior_state,
+                contract=contract,
+                contract_hash=contract_hash,
+                contract_json=contract_json,
+                outline=outline,
+                plan=final_plan,
+                request=request,
+                handler=handler,
+            )
 
         aggregate = await self.assemble_episode_scripts()
         payload = {"stage": InternalStage.GENERATING_EPISODE_SCRIPTS.value, "content": aggregate}
@@ -8287,6 +8789,43 @@ class DeepAgentWorkflow:
                 "skills": _SPECIALIST_SKILL_SOURCES["episode_reviewer"],
                 "response_format": ToolStrategy(
                     schema=EpisodeReviewerResult,
+                    handle_errors=structured_output_retry,
+                ),
+            },
+            {
+                "name": "repair_constraint_extractor",
+                "description": (
+                    "Extracts evidence-bound cross-episode commitments during an authorized "
+                    "suffix rewrite."
+                ),
+                "system_prompt": episode_reviewer_prompt,
+                "model": self.review_model,
+                "tools": [],
+                "permissions": REVIEW_FILE_PERMISSIONS,
+                "middleware": stage_middleware(
+                    _REVIEW_TOOL_ALLOWLIST,
+                    system_prompt=episode_reviewer_prompt,
+                ),
+                "response_format": ToolStrategy(
+                    schema=RepairConstraintExtractionResult,
+                    handle_errors=structured_output_retry,
+                ),
+            },
+            {
+                "name": "repair_constraint_validator",
+                "description": (
+                    "Checks one suffix-rewrite episode against every applicable repair constraint."
+                ),
+                "system_prompt": episode_reviewer_prompt,
+                "model": self.review_model,
+                "tools": [],
+                "permissions": REVIEW_FILE_PERMISSIONS,
+                "middleware": stage_middleware(
+                    _REVIEW_TOOL_ALLOWLIST,
+                    system_prompt=episode_reviewer_prompt,
+                ),
+                "response_format": ToolStrategy(
+                    schema=RepairConstraintValidationResult,
                     handle_errors=structured_output_retry,
                 ),
             },

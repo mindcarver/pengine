@@ -38,6 +38,7 @@ def _compile(
     recent_episode_numbers: list[int] | None = None,
     referenced_episode_numbers: list[int] | None = None,
     persona_components: dict[str, str] | None = None,
+    repair_constraint_ledger_json: str | None = None,
 ):
     contract_json = json.dumps(
         {"facts": [{"fact_id": "fact_1", "verbatim": False}]},
@@ -88,6 +89,7 @@ def _compile(
         established_facts_json='{"established_facts":["fact_1"]}',
         previous_handoff="上一集停在门外",
         writer_notes="保持雨夜氛围",
+        repair_constraint_ledger_json=repair_constraint_ledger_json,
     )
 
 
@@ -120,6 +122,37 @@ def test_compiler_emits_compact_working_set_and_content_free_manifest() -> None:
         for item in compiled.manifest["components"]
         if item["included"]
     ) == pytest.approx(1.0)
+
+
+def test_compiler_mounts_repair_ledger_only_when_suffix_rewrite_supplies_it() -> None:
+    normal = json.loads(_compile().model_input)
+    assert "repair_constraint_ledger" not in {item["name"] for item in normal["components"]}
+
+    ledger = json.dumps(
+        [
+            {
+                "constraint_id": "repair_1234567890abcdef12345678",
+                "kind": "relative_time",
+                "statement": "首期从下一自然月开始",
+                "source_episode": 2,
+                "applies_from_episode": 3,
+                "applies_through_episode": 4,
+                "evidence_excerpt": "从下个月开始",
+            }
+        ],
+        ensure_ascii=False,
+    )
+    compiled = _compile(repair_constraint_ledger_json=ledger)
+    payload = json.loads(compiled.model_input)
+    component = next(
+        item for item in payload["components"] if item["name"] == "repair_constraint_ledger"
+    )
+
+    assert component["authority"] == "committed"
+    assert component["content"][0]["kind"] == "relative_time"
+    assert any(
+        item["name"] == "repair_constraint_ledger" for item in compiled.manifest["components"]
+    )
 
 
 def test_compiler_deduplicates_identical_content_and_rejects_unknown_persona_input() -> None:

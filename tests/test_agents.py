@@ -57,6 +57,10 @@ from pengine.agents import (
     OutlineRepairPatch,
     QualityGateRejectedError,
     QualityReviewerResult,
+    RepairConstraintCheck,
+    RepairConstraintDraft,
+    RepairConstraintExtractionResult,
+    RepairConstraintValidationResult,
     ScriptGenerationGroupResult,
     ScriptWriterResult,
     StageGuardMiddleware,
@@ -79,11 +83,13 @@ from pengine.agents import (
     _invoke_script_group_structured,
     _language_retry_fingerprint,
     _language_retry_matches,
+    _materialize_repair_constraints,
     _merge_story_canon_reviews,
     _outline_repair_context,
     _outline_repair_result,
     _recent_group_episode_numbers,
     _referenced_prefix_episode_numbers,
+    _repair_constraint_check_issues,
     _request_with_canonical_workspace,
     _required_read_paths,
     _result_with_payload,
@@ -107,11 +113,13 @@ from pengine.agents import (
 from pengine.config import Settings
 from pengine.continuity import (
     EpisodeStateDelta,
+    RepairConstraint,
     SemanticReview,
     SeriesState,
     StoryContract,
     canonical_model_hash,
     render_story_contract_markdown,
+    repair_constraint_id,
     story_contract_sha256,
 )
 from pengine.language import SIMPLIFIED_CHINESE, language_instruction
@@ -138,6 +146,117 @@ from pengine.series_bible import (
 )
 from pengine.skill_assets import load_agent_skill_files
 from pengine.worker import Worker
+
+
+def test_materialized_repair_constraints_are_story_agnostic_and_evidence_bound() -> None:
+    extracted = RepairConstraintExtractionResult(
+        passed=True,
+        evidence="已提取两个跨集承诺。",
+        constraints=[
+            RepairConstraintDraft(
+                kind="relative_time",
+                statement="首期从下一自然月开始",
+                source_episode=4,
+                applies_from_episode=5,
+                applies_through_episode=8,
+                evidence_excerpt="从下个月起，每月五号兑现",
+            ),
+            RepairConstraintDraft(
+                kind="direction",
+                statement="北方工作室向南方仓库交付",
+                source_episode=4,
+                applies_from_episode=5,
+                applies_through_episode=8,
+                evidence_excerpt="由北方工作室交给南方仓库",
+            ),
+        ],
+    )
+
+    constraints = _materialize_repair_constraints(
+        extracted,
+        episode_count=8,
+        source_content_by_episode={4: "约定从下个月起，每月五号兑现，由北方工作室交给南方仓库。"},
+    )
+
+    assert [item.kind for item in constraints] == ["relative_time", "direction"]
+    assert all(item.constraint_id.startswith("repair_") for item in constraints)
+
+
+def test_writer_schema_does_not_expose_runtime_repair_ledger() -> None:
+    schema = ScriptWriterResult.model_json_schema()
+
+    assert "repair_constraints" not in schema["$defs"]["EpisodeStateDelta"]["properties"]
+    assert "repair_constraints" in SeriesState.model_json_schema()["properties"]
+
+
+def test_repair_constraint_checks_fail_closed_on_missing_id_or_forged_evidence() -> None:
+    values = {
+        "kind": "relationship",
+        "statement": "甲是乙的授权代理人",
+        "source_episode": 3,
+        "applies_from_episode": 4,
+        "applies_through_episode": 7,
+        "evidence_excerpt": "甲继续担任乙的授权代理人",
+    }
+    constraint = RepairConstraint(
+        constraint_id=repair_constraint_id(**values),
+        **values,
+    )
+    result = RepairConstraintValidationResult(
+        passed=True,
+        evidence="候选未形成冲突。",
+        checks=[
+            RepairConstraintCheck(
+                constraint_id=constraint.constraint_id,
+                status="satisfied",
+                evidence_excerpt="不存在于候选的伪造句子",
+                explanation="关系保持不变。",
+            )
+        ],
+    )
+
+    forged = _repair_constraint_check_issues(
+        result,
+        constraints=[constraint],
+        candidate_content="甲继续担任乙的授权代理人。",
+    )
+    missing = _repair_constraint_check_issues(
+        RepairConstraintValidationResult(
+            passed=True,
+            evidence="没有返回任何检查。",
+            checks=[],
+        ),
+        constraints=[constraint],
+        candidate_content="本集没有涉及代理关系。",
+    )
+    contradicted = _repair_constraint_check_issues(
+        RepairConstraintValidationResult(
+            passed=False,
+            evidence="候选把代理关系改成了竞争关系。",
+            issues=[
+                {
+                    "code": "repair_constraint_contradiction",
+                    "message": "候选直接改变了已承诺关系。",
+                    "contract_refs": [constraint.constraint_id],
+                    "script_excerpt": "甲已不再代理乙",
+                }
+            ],
+            checks=[
+                RepairConstraintCheck(
+                    constraint_id=constraint.constraint_id,
+                    status="contradicted",
+                    evidence_excerpt="甲已不再代理乙",
+                    explanation="候选直接改变了已承诺关系。",
+                )
+            ],
+        ),
+        constraints=[constraint],
+        candidate_content="甲已不再代理乙。",
+    )
+
+    assert [item.code for item in forged] == ["repair_constraint_check_evidence_invalid"]
+    assert [item.code for item in missing] == ["missing_repair_constraint_check"]
+    assert [item.code for item in contradicted] == ["repair_constraint_contradiction"]
 
 
 def test_minimal_subagent_request_drops_unrelated_workspace_files() -> None:
@@ -541,6 +660,56 @@ async def test_script_group_protocol_repair_does_not_resend_full_context() -> No
     assert state.context.requested_output_tokens == 20_480
     assert state.context.context_bundle_sha256 == "a" * 64
     assert state.context.context_manifest_json == '{"mode":"compiled"}'
+
+
+@pytest.mark.asyncio
+async def test_script_group_protocol_repair_preserves_partial_json_candidate() -> None:
+    contract = _story_contract()
+    episode = {
+        "stage": "generating_episode_scripts",
+        "episode_number": 1,
+        "content": "完整事实\n完整钩子",
+        "state_delta": _state_delta(contract, 1),
+    }
+    encoded_episodes = json.dumps([episode], ensure_ascii=False, separators=(",", ":"))
+    malformed_episodes = encoded_episodes[:-2] + encoded_episodes[-1]
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call(
+                "ScriptGenerationGroupResult",
+                {
+                    "stage": "generating_episode_scripts",
+                    "group_id": "opening_unit",
+                    "start_episode": 1,
+                    "end_episode": 1,
+                    "episodes": malformed_episodes,
+                },
+                1,
+            ),
+            _tool_call(
+                "ScriptGenerationGroupResult",
+                {
+                    "stage": "generating_episode_scripts",
+                    "group_id": "opening_unit",
+                    "start_episode": 1,
+                    "end_episode": 1,
+                    "episodes": [episode],
+                },
+                2,
+            ),
+        ]
+    )
+
+    result = await _invoke_script_group_structured(
+        model,
+        [
+            {"role": "system", "content": "Return the screenplay group."},
+            {"role": "user", "content": "FULL-CONTEXT-SENTINEL"},
+        ],
+    )
+
+    assert result.episodes[0].content == "完整事实\n完整钩子"
+    assert len(model.model_message_batches) == 2
 
 
 @pytest.mark.asyncio
@@ -5512,6 +5681,8 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
         "quality_reviewer",
         "canon_reviewer",
         "episode_reviewer",
+        "repair_constraint_extractor",
+        "repair_constraint_validator",
         "series_reviewer",
     }
     subagents_by_name = {spec["name"]: spec for spec in captured["subagents"]}
@@ -8268,7 +8439,7 @@ async def test_episode_writer_receives_compact_active_design_and_recent_verbatim
             payload = {
                 "passed": True,
                 "category": "pass",
-                "evidence": "L4硬规则：全系列一致",
+                "evidence": "全系列一致",
             }
         else:
             assert subagent_type == "episode_reviewer"
@@ -8348,6 +8519,32 @@ async def test_episode_writer_receives_compact_active_design_and_recent_verbatim
             "earliest_affected_episode": None,
         }
     ]
+
+    resumed_hooks, resumed_attempts = _episode_hook_kwargs(
+        episode_drafts=list(middleware.episode_drafts.values())
+    )
+    resumed_payloads = {
+        stage: payload
+        for stage, payload in middleware.approved_payloads.items()
+        if stage is not InternalStage.GENERATING_EPISODE_SCRIPTS
+    }
+    resumed = StageGuardMiddleware(
+        before_stage=lambda _stage: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(resumed_payloads),
+        approved_payloads=resumed_payloads,
+        series_bible=summary,
+        register_series_review=register_series_review,
+        **resumed_hooks,
+    )
+
+    await resumed.awrap_tool_call(request, handler)
+
+    assert resumed_attempts == []
+    assert len(series_review_inputs) == 2
+    assert len(registered_reviews) == 2
+    assert registered_reviews[-1]["review_type"] == "final"
+    assert registered_reviews[-1]["passed"] is True
 
 
 @pytest.mark.asyncio

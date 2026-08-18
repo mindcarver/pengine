@@ -3260,6 +3260,7 @@ class Repository:
                         delta=episode_lock.state_delta,
                         semantic_review=episode_lock.semantic_review,
                         repair_rounds=episode_lock.repair_rounds,
+                        repair_constraints=episode_lock.series_state.repair_constraints,
                     )
                     if rebuilt != episode_lock:
                         raise ValueError("Episode lock is not deterministic")
@@ -4064,6 +4065,7 @@ class Repository:
                     delta=draft.state_delta,
                     semantic_review=draft.semantic_review,
                     repair_rounds=draft.repair_rounds,
+                    repair_constraints=draft.series_state.repair_constraints,
                 )
                 if (
                     rebuilt.series_state != draft.series_state
@@ -5646,6 +5648,7 @@ class Repository:
                     delta=episode_lock.state_delta,
                     semantic_review=episode_lock.semantic_review,
                     repair_rounds=episode_lock.repair_rounds,
+                    repair_constraints=episode_lock.series_state.repair_constraints,
                     call_id=call_id,
                     generation_window_id=generation_window_id,
                     writer_notes=writer_notes,
