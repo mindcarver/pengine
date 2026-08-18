@@ -27,8 +27,10 @@ try:
     # Optional agent observability. The import is guarded so pengine still runs
     # when tracing is disabled or the langfuse package is absent. The handler is
     # only constructed when settings.langfuse_configured is true.
+    from langfuse import Langfuse as _LangfuseClient
     from langfuse.langchain import CallbackHandler as _LangfuseCallbackHandler
 except ImportError:  # pragma: no cover - exercised only without langfuse installed
+    _LangfuseClient = None  # type: ignore[assignment,misc]
     _LangfuseCallbackHandler = None  # type: ignore[assignment,misc]
 
 from pengine.config import Settings
@@ -208,11 +210,22 @@ def _build_langfuse_handler(settings: Settings) -> BaseCallbackHandler | None:
     association (session_id, run_id) is stamped from the worker via
     :func:`langfuse.propagate_attributes`, not here.
     """
-    if not settings.langfuse_configured or _LangfuseCallbackHandler is None:
+    if (
+        not settings.langfuse_configured
+        or _LangfuseClient is None
+        or _LangfuseCallbackHandler is None
+    ):
         return None
-    # Credentials reach the SDK via LANGFUSE_* env vars set by the worker at
-    # startup, so the handler needs no arguments here.
-    return _LangfuseCallbackHandler()
+    assert settings.langfuse_public_key is not None  # noqa: S101 - narrowed by property
+    assert settings.langfuse_secret_key is not None  # noqa: S101 - narrowed by property
+    assert settings.langfuse_host is not None  # noqa: S101 - narrowed by property
+    public_key = settings.langfuse_public_key.get_secret_value()
+    _LangfuseClient(
+        public_key=public_key,
+        secret_key=settings.langfuse_secret_key.get_secret_value(),
+        base_url=settings.langfuse_host,
+    )
+    return _LangfuseCallbackHandler(public_key=public_key)
 
 
 class _ModelCallAuditHandler(BaseCallbackHandler):
