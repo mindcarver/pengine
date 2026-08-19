@@ -5461,6 +5461,20 @@ def test_story_outline_rejects_episode_by_episode_sections(content: str) -> None
         StoryArchitectResult(stage="generating_story_outline", content=content)
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "第一集开场，冷库因线路老化更换主控箱。",
+        "第一集先建立人物关系，终章再回到同一份记录。",
+        "Episode 1 opens on the abandoned cold store.",
+    ],
+)
+def test_story_outline_allows_episode_mentions_in_global_prose(content: str) -> None:
+    result = StoryArchitectResult(stage="generating_story_outline", content=content)
+
+    assert result.content == content
+
+
 def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> None:
     result = StoryArchitectResult(
         stage="generating_story_outline",
@@ -5517,6 +5531,37 @@ def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> 
     assert "required_verbatim_facts" in _EPISODE_REPAIR_PROMPT
     assert "locked_numeric_fact_mismatch" in _EPISODE_REPAIR_PROMPT
     assert "/workspace/established_facts.json" in _EPISODE_REPAIR_PROMPT
+
+
+def test_story_outline_episode_section_error_provides_safe_actionable_feedback() -> None:
+    content = "## 第一集｜回来\n\n知雨回到家。"
+
+    with pytest.raises(ValidationError) as captured:
+        StoryArchitectResult(stage="generating_story_outline", content=content)
+
+    feedback = _structured_output_retry_message(captured.value)
+
+    assert (
+        "Episode-by-episode content belongs in generating_episode_outline, not the story outline"
+        in feedback
+    )
+    assert content not in feedback
+
+
+def test_story_outline_rejects_bare_episode_title() -> None:
+    with pytest.raises(ValidationError, match="belongs in generating_episode_outline"):
+        StoryArchitectResult(
+            stage="generating_story_outline",
+            content="第一集：回来\n\n知雨回到家。",
+        )
+
+
+def test_story_outline_rejects_episode_sections_mixed_with_global_prose() -> None:
+    with pytest.raises(ValidationError, match="belongs in generating_episode_outline"):
+        StoryArchitectResult(
+            stage="generating_story_outline",
+            content="第一集开场，知雨回家。\n\n## 第二集｜旧照\n\n她发现旧照。",
+        )
 
 
 def test_specialist_prompts_apply_l0_by_stage_without_copying_source_content() -> None:
