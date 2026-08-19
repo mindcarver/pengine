@@ -98,7 +98,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -1045,6 +1045,10 @@ INSERT OR IGNORE INTO pengine_schema(version) VALUES (25);
 
 _SCHEMA_V26_SCRIPT_CONTEXT_AUDIT_SQL = """
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (26);
+"""
+
+_SCHEMA_V28_SCRIPT_TEXT_SIDECAR_SQL = """
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (28);
 """
 
 _SCHEMA_V27_GROUPED_OUTLINE_SQL = """
@@ -2282,6 +2286,34 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 27
+            if schema_version == 27:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    window_columns = await (
+                        await connection.execute("PRAGMA table_info(episode_generation_windows)")
+                    ).fetchall()
+                    existing_window_columns = {column[1] for column in window_columns}
+                    additions = {
+                        "screenplay_text": "TEXT",
+                        "screenplay_nonce": "TEXT",
+                        "screenplay_manifest_json": "TEXT",
+                        "content_call_id": "TEXT",
+                        "sidecar_call_id": "TEXT",
+                        "context_bundle_sha256": "TEXT",
+                    }
+                    for name, sql_type in additions.items():
+                        if name not in existing_window_columns:
+                            await connection.execute(
+                                f"ALTER TABLE episode_generation_windows "
+                                f"ADD COLUMN {name} {sql_type}"
+                            )
+                    await connection.executescript(_SCHEMA_V28_SCRIPT_TEXT_SIDECAR_SQL)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 28
 
     async def setup(self) -> None:
         await self.initialize()
@@ -5345,6 +5377,37 @@ class Repository:
         window_id = f"episode_generation_window_{uuid4().hex}"
         now = _utc_now().isoformat()
         async with self._transaction() as connection:
+            reusable = await self._fetchone(
+                connection,
+                """
+                SELECT window_id FROM episode_generation_windows
+                WHERE run_id = ?
+                  AND design_candidate_id = ?
+                  AND design_content_hash = ?
+                  AND design_epoch = ?
+                  AND group_id = ?
+                  AND start_episode = ?
+                  AND end_episode = ?
+                  AND status = 'generating'
+                  AND screenplay_text IS NOT NULL
+                  AND screenplay_nonce IS NOT NULL
+                  AND screenplay_manifest_json IS NOT NULL
+                  AND content_call_id IS NOT NULL
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (
+                    str(run_id),
+                    design_candidate_id,
+                    design_content_hash,
+                    design_epoch,
+                    group_id,
+                    start_episode,
+                    end_episode,
+                ),
+            )
+            if reusable is not None:
+                return str(reusable["window_id"])
             await connection.execute(
                 """
                 UPDATE episode_generation_windows
@@ -5378,22 +5441,126 @@ class Repository:
             )
         return window_id
 
+    async def save_episode_generation_text(
+        self,
+        run_id: UUID,
+        window_id: str,
+        *,
+        screenplay_text: str,
+        nonce: str,
+        manifest: list[Mapping[str, Any]],
+        content_call_id: str,
+        context_bundle_sha256: str | None,
+    ) -> None:
+        """Persist immutable plaintext before the compact state-sidecar call."""
+        if not screenplay_text.strip() or not nonce:
+            raise DomainError(
+                "invalid_screenplay_text",
+                "A generated screenplay text artifact must be non-empty.",
+                409,
+            )
+        now = _utc_now().isoformat()
+        manifest_json = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        async with self._transaction() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE episode_generation_windows
+                SET screenplay_text = ?, screenplay_nonce = ?,
+                    screenplay_manifest_json = ?, content_call_id = ?,
+                    context_bundle_sha256 = ?, updated_at = ?
+                WHERE window_id = ? AND run_id = ? AND status = 'generating'
+                  AND screenplay_text IS NULL
+                """,
+                (
+                    screenplay_text,
+                    nonce,
+                    manifest_json,
+                    content_call_id,
+                    context_bundle_sha256,
+                    now,
+                    window_id,
+                    str(run_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                existing = await self._fetchone(
+                    connection,
+                    """
+                    SELECT screenplay_text, screenplay_nonce, screenplay_manifest_json,
+                           content_call_id, context_bundle_sha256
+                    FROM episode_generation_windows
+                    WHERE window_id = ? AND run_id = ? AND status = 'generating'
+                    """,
+                    (window_id, str(run_id)),
+                )
+                expected = (
+                    screenplay_text,
+                    nonce,
+                    manifest_json,
+                    content_call_id,
+                    context_bundle_sha256,
+                )
+                actual = tuple(existing) if existing is not None else None
+                if actual != expected:
+                    raise DomainError(
+                        "generation_window_conflict",
+                        "The screenplay text artifact no longer matches its generation window.",
+                        409,
+                    )
+
+    async def get_episode_generation_text(
+        self,
+        run_id: UUID,
+        window_id: str,
+    ) -> dict[str, Any] | None:
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT screenplay_text, screenplay_nonce, screenplay_manifest_json,
+                       content_call_id, context_bundle_sha256, operation_id
+                FROM episode_generation_windows
+                WHERE window_id = ? AND run_id = ?
+                  AND status IN ('generating', 'generated', 'partially_committed', 'committed')
+                  AND screenplay_text IS NOT NULL
+                """,
+                (window_id, str(run_id)),
+            )
+        if row is None:
+            return None
+        return {
+            "raw_text": row["screenplay_text"],
+            "nonce": row["screenplay_nonce"],
+            "manifest": json.loads(row["screenplay_manifest_json"]),
+            "content_call_id": row["content_call_id"],
+            "context_bundle_sha256": row["context_bundle_sha256"],
+            "operation_id": row["operation_id"],
+        }
+
     async def bind_episode_generation_window_call(
         self,
         run_id: UUID,
         window_id: str,
         *,
         call_id: str,
+        sidecar_call_id: str | None = None,
     ) -> None:
         now = _utc_now().isoformat()
         async with self._transaction() as connection:
             cursor = await connection.execute(
                 """
                 UPDATE episode_generation_windows
-                SET call_id = ?, status = 'generated', updated_at = ?
+                SET call_id = COALESCE(content_call_id, ?), sidecar_call_id = ?,
+                    status = 'generated', updated_at = ?
                 WHERE window_id = ? AND run_id = ? AND status = 'generating'
+                  AND (screenplay_text IS NULL OR content_call_id IS NOT NULL)
                 """,
-                (call_id, now, window_id, str(run_id)),
+                (call_id, sidecar_call_id, now, window_id, str(run_id)),
             )
             if cursor.rowcount != 1:
                 raise DomainError(
@@ -5406,15 +5573,20 @@ class Repository:
         self,
         run_id: UUID,
         window_id: str,
+        *,
+        preserve_text: bool = False,
     ) -> None:
         async with self._transaction() as connection:
-            await connection.execute(
-                """
+            sql = """
                 UPDATE episode_generation_windows
                 SET status = 'failed', updated_at = ?
                 WHERE window_id = ? AND run_id = ?
-                      AND status IN ('generating', 'generated', 'partially_committed')
-                """,
+                  AND status IN ('generating', 'generated', 'partially_committed')
+            """
+            if preserve_text:
+                sql += " AND screenplay_text IS NULL"
+            await connection.execute(
+                sql,
                 (_utc_now().isoformat(), window_id, str(run_id)),
             )
 

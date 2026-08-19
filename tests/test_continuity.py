@@ -1237,6 +1237,58 @@ def test_episode_validation_accepts_matching_restated_locked_numeric_fact() -> N
     assert "locked_numeric_fact_mismatch" not in {issue.code for issue in issues}
 
 
+@pytest.mark.parametrize("calendar_year", ["1995", "一九九五", "二〇一五"])
+def test_episode_validation_does_not_treat_calendar_year_as_locked_year_count(
+    calendar_year: str,
+) -> None:
+    from pengine.continuity import _locked_numeric_content_mismatches
+
+    contract = make_contract(
+        numeric_facts=[
+            {
+                "fact_id": "archive_tenure",
+                "subject": "档案员",
+                "predicate": "任职年限",
+                "kind": "duration",
+                "value": "11",
+                "unit": "年",
+                "first_revealed_episode": 1,
+            }
+        ]
+    )
+
+    issues = _locked_numeric_content_mismatches(
+        contract,
+        2,
+        f"档案员：{calendar_year}年的旧档案就在这里。",
+    )
+
+    assert "locked_numeric_fact_mismatch" not in {issue.code for issue in issues}
+
+
+def test_episode_validation_still_rejects_wrong_locked_year_count() -> None:
+    from pengine.continuity import _locked_numeric_content_mismatches
+
+    contract = make_contract(
+        numeric_facts=[
+            {
+                "fact_id": "archive_tenure",
+                "subject": "档案员",
+                "predicate": "任职年限",
+                "kind": "duration",
+                "value": "11",
+                "unit": "年",
+                "first_revealed_episode": 1,
+            }
+        ]
+    )
+
+    issues = _locked_numeric_content_mismatches(contract, 2, "档案员：十二年了。")
+
+    mismatch = next(issue for issue in issues if issue.code == "locked_numeric_fact_mismatch")
+    assert mismatch.contract_refs == ["archive_tenure"]
+
+
 @pytest.mark.parametrize(
     "neighbour_content",
     [
