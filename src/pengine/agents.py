@@ -2305,6 +2305,11 @@ def _message_plaintext(response: Any) -> str:
                 and isinstance(block.get("text"), str)
             ):
                 parts.append(block["text"])
+            elif isinstance(block, Mapping) and block.get("type") in {
+                "thinking",
+                "redacted_thinking",
+            }:
+                continue
             else:
                 raise AgentProtocolError("Script writer returned a non-text content block")
         return "".join(parts)

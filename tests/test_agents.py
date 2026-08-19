@@ -88,6 +88,7 @@ from pengine.agents import (
     _language_retry_matches,
     _materialize_repair_constraints,
     _merge_story_canon_reviews,
+    _message_plaintext,
     _outline_repair_context,
     _outline_repair_result,
     _parse_script_group_text,
@@ -613,6 +614,50 @@ async def test_script_group_plaintext_accepts_varied_content_and_group_sizes(
     assert [episode.content for episode in result.episodes] == contents
     assert len(model.model_message_batches) == 1
     assert model.bound_tool_names == [[]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reasoning_block",
+    [
+        {"type": "thinking", "thinking": "", "signature": "provider-signature"},
+        {"type": "redacted_thinking", "data": "provider-redaction"},
+    ],
+)
+async def test_script_group_plaintext_ignores_provider_reasoning_metadata(
+    reasoning_block: dict[str, str],
+) -> None:
+    nonce = "f" * 32
+    plaintext = (
+        f"<<<PENGINE_EPISODE_START:{nonce}:1>>>\n第一集正文\n<<<PENGINE_EPISODE_END:{nonce}:1>>>"
+    )
+    model = ToolCallingFakeModel(responses=[AIMessage(content=["", reasoning_block, plaintext])])
+
+    result = await _invoke_script_group_text(
+        model,
+        [{"role": "user", "content": "write"}],
+        group_id="opening_unit",
+        start_episode=1,
+        end_episode=1,
+        nonce=nonce,
+    )
+
+    assert result.episodes[0].content == "第一集正文"
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "tool_use", "name": "unexpected", "input": {}},
+        {"type": "image", "source": {"type": "base64", "data": "ignored"}},
+        {"type": "future_provider_block", "payload": "unknown"},
+    ],
+)
+def test_script_group_plaintext_rejects_non_text_content_blocks(
+    block: dict[str, object],
+) -> None:
+    with pytest.raises(AgentProtocolError, match="non-text content block"):
+        _message_plaintext(AIMessage(content=["正文", block]))
 
 
 @pytest.mark.asyncio
