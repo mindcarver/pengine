@@ -166,9 +166,13 @@ _REQUIRED_READ_PATHS_BLOCK = re.compile(
     re.DOTALL,
 )
 _STORY_OUTLINE_EPISODE_SECTION = re.compile(
-    r"^[ \t]*(?:#{1,6}[ \t]+|[-+*][ \t]+|[0-9]+[.)][ \t]+)?\*{0,2}[ \t]*"
+    r"^[ \t]*(?:"
+    r"(?:#{1,6}[ \t]+|[-+*][ \t]+|[0-9]+[.)][ \t]+)\*{0,2}[ \t]*"
     r"(?:第[ \t]*(?:\d+|[一二三四五六七八九十百零〇两]+)[ \t]*集"
-    r"(?:[ \t]*[|｜:：·-])?|episode[ \t]+\d+\b)",
+    r"(?:[ \t]*[|｜:：·-])?|episode[ \t]+\d+\b)"
+    r"|\*{0,2}[ \t]*(?:第[ \t]*(?:\d+|[一二三四五六七八九十百零〇两]+)"
+    r"[ \t]*集|episode[ \t]+\d+\b)[ \t]*[|｜:：·-]"
+    r")",
     re.IGNORECASE | re.MULTILINE,
 )
 # outline gets a light single-lens pass with up to two repair rounds; character
@@ -2123,6 +2127,7 @@ _SAFE_VALIDATION_MESSAGES = frozenset(
         "Canon repair target IDs must be globally unique",
         "L0 selection requires only variant and rationale",
         "Story artifact stages require only content",
+        "Episode-by-episode content belongs in generating_episode_outline, not the story outline",
         "Episode plans must be ordered and contiguous from 1",
         "Outline repair paths must target episode plans or generation groups",
         "Story contract episode count must match the episode plan",
