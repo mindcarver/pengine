@@ -1111,9 +1111,12 @@ def _locked_numeric_content_mismatches(
             if any(_spans_overlap(match.span(), span) for span in temporal_spans):
                 continue
             raw_value = match.group(1)
-            if locked_unit == "年" and re.fullmatch(r"\d{3,4}", raw_value):
-                # A calendar year like 2026 年 is not a restatement of a
-                # locked year-count fact.
+            if locked_unit == "年" and (
+                re.fullmatch(r"\d{3,4}", raw_value)
+                or re.fullmatch(rf"[{_CHINESE_DIGIT_CHARS}]{{4}}", raw_value)
+            ):
+                # A calendar year like 2026 年 or 二〇二六年 is not a
+                # restatement of a locked year-count fact.
                 continue
             after_subject = content.rfind(fact.subject, 0, match.start())
             adjacent = (

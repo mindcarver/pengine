@@ -745,12 +745,14 @@ async def test_script_group_sidecar_binds_hash_without_repeating_screenplay_json
                     "group_id": "opening_unit",
                     "start_episode": 1,
                     "end_episode": 1,
+                    "writer_notes": "分组级冗余备注应被忽略",
                     "episodes": [
                         {
                             "episode_number": 1,
                             "screenplay_sha256": screenplay_sha256,
                             "state_delta": _state_delta(contract, 1),
                             "writer_notes": "下一集继续",
+                            "status_summary": "单集级冗余状态也应被忽略",
                         }
                     ],
                 },
@@ -768,6 +770,7 @@ async def test_script_group_sidecar_binds_hash_without_repeating_screenplay_json
 
     assert result.episodes[0].content == content
     assert result.episodes[0].writer_notes == "下一集继续"
+    assert len(model.model_message_batches) == 1
     schema = ScriptGenerationGroupSidecar.model_json_schema()
     assert "content" not in json.dumps(schema, ensure_ascii=False)
     sidecar_input = "\n".join(str(message.content) for message in model.model_message_batches[0])

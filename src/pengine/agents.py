@@ -31,6 +31,7 @@ from langchain_core.tools import StructuredTool, ToolException
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 from pydantic import (
+    ConfigDict,
     Field,
     JsonValue,
     TypeAdapter,
@@ -1555,6 +1556,8 @@ class ScriptGenerationGroupResult(StrictModel):
 class ScriptEpisodeSidecar(StrictModel):
     """Machine state bound to one already-generated plaintext screenplay."""
 
+    model_config = ConfigDict(extra="ignore")
+
     episode_number: int = Field(ge=1)
     screenplay_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     state_delta: EpisodeStateDelta
@@ -1569,6 +1572,8 @@ class ScriptEpisodeSidecar(StrictModel):
 
 class ScriptGenerationGroupSidecar(StrictModel):
     """Compact machine-readable state for a plaintext screenplay group."""
+
+    model_config = ConfigDict(extra="ignore")
 
     stage: Literal["generating_episode_scripts"]
     group_id: StableId
