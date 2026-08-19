@@ -56,7 +56,6 @@ from pengine.continuity import (
     render_story_contract_markdown,
     repair_constraint_id,
     required_episode_evidence_target_ids,
-    requires_locked_fact_semantic_review,
     story_contract_sha256,
     validate_episode_candidate,
     validate_repair_constraints,
@@ -2302,6 +2301,53 @@ async def _invoke_direct_structured_with_retry(
     if isinstance(corrected_error, Exception):
         raise corrected_error
     raise AgentProtocolError("Subagent returned invalid structured output")
+
+
+def _resolve_json_schema(schema: Mapping[str, Any], root: Mapping[str, Any]) -> Mapping[str, Any]:
+    reference = schema.get("$ref")
+    if not isinstance(reference, str) or not reference.startswith("#/$defs/"):
+        return schema
+    resolved = root.get("$defs", {}).get(reference.removeprefix("#/$defs/"))
+    return resolved if isinstance(resolved, Mapping) else schema
+
+
+def _normalize_structured_transport(
+    value: Any,
+    schema: Mapping[str, Any],
+    root: Mapping[str, Any],
+) -> Any:
+    """Normalize harmless provider wrappers without changing review semantics."""
+    schema = _resolve_json_schema(schema, root)
+    variants = schema.get("anyOf")
+    if isinstance(variants, list):
+        non_null = [item for item in variants if item.get("type") != "null"]
+        if len(non_null) == 1:
+            return _normalize_structured_transport(value, non_null[0], root)
+    expected_type = schema.get("type")
+    if isinstance(value, str) and expected_type in {"object", "array"}:
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = value
+        if (expected_type == "object" and isinstance(decoded, Mapping)) or (
+            expected_type == "array" and isinstance(decoded, list)
+        ):
+            value = decoded
+    if expected_type == "object" and isinstance(value, Mapping):
+        properties = schema.get("properties")
+        if not isinstance(properties, Mapping):
+            return dict(value)
+        return {
+            key: _normalize_structured_transport(item, properties[key], root)
+            for key, item in value.items()
+            if key in properties
+        }
+    if expected_type == "array" and isinstance(value, list):
+        item_schema = schema.get("items")
+        if not isinstance(item_schema, Mapping):
+            return list(value)
+        return [_normalize_structured_transport(item, item_schema, root) for item in value]
+    return value
 
 
 def _message_plaintext(response: Any) -> str:
@@ -7797,59 +7843,12 @@ class StageGuardMiddleware(AgentMiddleware):
                     )
                     deterministic_issues.extend(constraint_issues)
                     semantic_reviews.append(constraint_review)
-                if not deterministic_issues and requires_locked_fact_semantic_review(
-                    contract,
-                    prior_state,
-                    parsed.content,
-                ):
-                    recent_scripts = _trusted_series_prefix_json(
-                        (
-                            episode_number,
-                            self.episode_drafts[episode_number].content,
-                        )
-                        for episode_number in recent_episode_numbers
-                        if episode_number in self.episode_drafts
-                    )
-                    semantic_reviews.append(
-                        await self._invoke_semantic_reviewer(
-                            request=request,
-                            handler=handler,
-                            subagent_type="episode_reviewer",
-                            description=(
-                                f"Perform a targeted hard-Canon review of episode "
-                                f"{plan.episode_number}. A deterministic risk signal found a "
-                                "numeric or temporal restatement that may refer indirectly to "
-                                "an established fact. Read only the compact current-group Canon, "
-                                "established-fact index, recent screenplay window, current "
-                                "candidate, and candidate state delta. Resolve aliases and "
-                                "pronouns from those files. Fail only for a direct contradiction "
-                                "to a locked value; do not review style, format, pacing, or "
-                                "unlocked creative choices. Bind every issue to exact fact IDs "
-                                "and a verbatim script excerpt. Return structured evidence only."
-                            ),
-                            files={
-                                "/workspace/current_group_canon.json": current_group_canon_json,
-                                "/workspace/established_facts.json": established_facts_json,
-                                "/workspace/series_state.json": prior_state.model_dump_json(),
-                                "/workspace/recent_scripts.json": recent_scripts,
-                                "/workspace/candidate_episode.md": parsed.content,
-                                "/workspace/candidate_state_delta.json": (
-                                    parsed.state_delta.model_dump_json()
-                                ),
-                            },
-                            schema=EpisodeReviewerResult,
-                            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
-                            minimal_context=True,
-                        )
-                    )
-                elif self.series_bible is not None:
+                if self.series_bible is not None:
                     if not semantic_reviews:
                         semantic_reviews.append(
                             SemanticReview(
                                 passed=True,
-                                evidence=(
-                                    "确定性逐集校验通过；本集未触发既有数值或时间事实的语义风险审查。"
-                                ),
+                                evidence="确定性逐集校验通过；语义一致性延后至结构里程碑审查。",
                             )
                         )
                 else:
