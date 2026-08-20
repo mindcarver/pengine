@@ -38,9 +38,12 @@ progress evidence but are never formal delivery.
 
 ### Persona package
 
-A `PersonaPackage` is an operator-owned, versioned set of nine UTF-8 Markdown
-content files plus one `manifest.json`. Its source files are read-only to the
-application.
+A `PersonaPackage` is an operator-owned, versioned set of eight UTF-8 Markdown
+content files plus one `manifest.json` (persona schema v3: `paradigm`, `project`,
+`l0`, `soul`, `l3`, `l4`, `l5`, `l6`). Historical v1 packages carried nine files
+with separate `l1`/`l2`; they remain restorable only as immutable snapshots for
+existing runs and are no longer selectable for new work. Source files are
+read-only to the application.
 
 An accepted package is copied once into a content-addressed, immutable local
 snapshot. A creation references the snapshot hash, not a mutable source path.
@@ -118,41 +121,53 @@ four primary synchronous subagents:
   and relationship logic through stage-specific structured tasks;
 - `episode_planner` handles the episode outline;
 - `script_writer` handles episode scripts;
-- `quality_reviewer` produces structured L0/L4 evidence and revision-feedback
-  coverage.
+- `quality_reviewer` is retained only so already-persisted legacy L0/L4 gate
+  runs can be read or resumed; current gates are evidence labels carried by
+  bound reviews.
 
 The `workflow_supervisor`, `story_architect`, `episode_planner`,
-`script_writer`, direct story/outline patch generators, and `episode_repair`
-always use the generation route. `quality_reviewer`, `canon_reviewer`, and
-`episode_reviewer`, plus `series_reviewer`, always use the review route;
-`story_repair` uses generation. Roles cannot be swapped and do not fall back to
-one another.
+`script_writer`, direct story/outline patch generators, `episode_repair`, and
+`story_repair` always use the generation route. `quality_reviewer`,
+`canon_reviewer`, `episode_reviewer`, `series_reviewer`, and the
+`repair_constraint_extractor`/`repair_constraint_validator` helpers always use
+the review route. Roles cannot be swapped and do not fall back to one another.
 
-One `EpisodePlannerResult` currently contains the complete episode outline and
-versioned `StoryContract`, including every episode plan, obligation, and review
-milestone. There is no chunked outline planner yet. The contract is
-the sole machine-readable source for cast membership, relationships, typed
-facts and units, temporal order, character knowledge, clue lifecycle, and
-per-episode obligations. The service runs deterministic validation and then a
-fresh `canon_reviewer` model review. A failing candidate may be handled by the
-generation route's structured outline-patch call at most twice. Only a candidate
-that passes both checks is persisted with its canonical Markdown projection and
-SHA-256 in the approved episode-outline checkpoint.
+Episode-outline planning is chunked. The run first generates a compact
+whole-season `OutlineSeasonMap` that divides episodes into consecutive natural
+groups of 1-4 episodes along action, reveal, temporal, relationship, suspense,
+or stage boundaries. Each group then generates and persists canonical
+per-episode Markdown prose plus a structured continuity sidecar (facts,
+timeline, clues, and obligations); deterministic validation and an independent
+review-route check precede each group's immutable content-hash checkpoint, with
+at most two repair rounds per rejected group and resume from the first
+uncommitted group. A sidecar schema failure retries only the sidecar and never
+rewrites the persisted Markdown. Once every group is committed, the service
+deterministically assembles the complete `StoryContract` and runs a whole-season
+final review before locking. The contract is the sole machine-readable source
+for cast membership, relationships, typed facts and units, temporal order,
+character knowledge, clue lifecycle, and per-episode obligations. A failing
+assembled contract may be repaired by the generation route's bounded outline
+patch at most twice before pausing.
 
 The schema accepts `episode_count >= 1`, but that is not production evidence for
-arbitrarily long series. In particular, 60-100 episodes still amplify one-call
-structured-output truncation, JSON retry, and global-consistency risk. Pengine
-must not claim reliable long-series support until outline planning, locking, and
-cross-batch validation are chunked and accepted with real runs.
+arbitrarily long series. Outline planning, locking, and cross-batch validation
+are now chunked, but full 60-100-episode production reliability still requires
+real isolated runs to verify context growth, call budgets, whole-series
+consistency, and total duration; Pengine must not claim it until then.
 
-For each episode, `script_writer` returns both script text and a typed
-`EpisodeStateDelta`. Deterministic validation compares them with the locked
-contract and preceding folded `SeriesState`; a fresh `episode_reviewer` then
-checks semantic continuity. The skill-scoped `episode_repair` subagent may
-repair only the current unlocked episode, at most twice. A successful commit
-atomically persists the full script, delta, folded state, semantic evidence,
-repair count, and content/state hashes. Specialist skills are loaded only into
-their matching review or repair subagents, never into the supervisor globally.
+Scripts are written in design-bound natural groups. For each episode,
+`script_writer` returns runtime-bordered plain script text plus a compact
+sidecar (episode number, content hash, typed `EpisodeStateDelta`, and evidence
+targets). Deterministic validation compares them with the locked contract and
+preceding folded `SeriesState`. Under an active SeriesBible the per-episode
+model review is skipped and semantic consistency is deferred to the milestone
+structural reviews; `episode_reviewer` remains only for the legacy path without
+an active SeriesBible. The skill-scoped `episode_repair` subagent may repair
+only the current unlocked episode, at most twice. A successful commit atomically
+persists the full script, delta, folded state, semantic evidence, repair count,
+and content/state hashes; script text that succeeded while its sidecar failed
+retries only the sidecar. Specialist skills are loaded only into their matching
+review or repair subagents, never into the supervisor globally.
 
 There are two distinct checkpoint meanings:
 
@@ -217,9 +232,11 @@ immutable episode candidate versions plus one active pointer per episode.
   next version, and deterministic contract/state replay. A failing or late
   candidate is retained as non-active (or `stale`) evidence with its usage and
   can never move an active pointer.
-- Every episode request carries the complete active SeriesBible projections,
-  the locked contract, the exact episode plan and obligation, the verbatim
-  active scripts 1..N-1, the folded SeriesState, and bounded WriterNotes. No
+- Every episode request is assembled by a lossless context compiler. It
+  verifies the complete committed prefix by content hash, then exposes the
+  active SeriesBible projections, the locked contract, the exact current-group
+  Canon projection, the verbatim recent committed window, deterministically
+  referenced older scripts, the folded SeriesState, and bounded WriterNotes. No
   summary substitutes prior scripts, and WriterNotes are never canonical.
 
 The active candidate projection stays readable through the workbench after a
@@ -432,12 +449,13 @@ immutable snapshots already referenced by creations.
 ## Persona-package loading contract
 
 `manifest.json` is governed by `contracts/persona-package.schema.json`. The
-manifest is metadata and is not one of the nine content files.
+manifest is metadata and is not one of the content files.
 
-`package_sha256` is the SHA-256 of the canonical ordered concatenation of the
-nine lowercase per-file SHA-256 values in this order:
-`paradigm`, `project`, `l0`, `l1`, `l2`, `l3`, `l4`, `l5`, `l6`. The manifest
-itself is excluded, avoiding a circular hash.
+For schema v3 (and v2), `package_sha256` is the SHA-256 of the canonical
+ordered concatenation of the eight lowercase per-file SHA-256 values in this
+order: `paradigm`, `project`, `l0`, `soul`, `l3`, `l4`, `l5`, `l6`. Historical
+v1 packages hashed nine values with `l1` and `l2` in place of `soul`. The
+manifest itself is excluded, avoiding a circular hash.
 
 API `snapshot_sha256` is the domain-separated SHA-256 of `package_sha256` plus
 the canonical complete manifest. It therefore addresses the immutable package
@@ -447,12 +465,11 @@ identical Markdown without sharing or replacing a snapshot.
 | Logical file | Fixed name | Minimum required structure | Runtime use | V1 write policy |
 |---|---|---|---|---|
 | Paradigm | `paradigm.md` | L0-L6 definitions; arbitration; L0 structure; translation; feedback, blank-space, gates, discipline, ownership | Rule provenance and conflict resolution | Read-only |
-| Project instruction | `project.md` | Identity; L0 full text; L1-L6 summaries and statuses; four iron rules; arbitration; workflow; gates/feedback summary | Full boot context for every run | Read-only |
+| Project instruction | `project.md` | Identity; L0 handling; layer arbitration; workflow; gates/feedback summary; ownership | Deterministically inlined in full into the five content generation/repair subagents and both direct patch calls; not carried by the supervisor or reviewers | Read-only |
 | L0 | `l0.md` | Variants; red lines; temperature; item ownership/status markers | Included through project context; gate source | Read-only |
-| L1 | `l1.md` | Source profile plus summary | Summary through project context | Read-only |
-| L2 | `l2.md` | Source profile plus summary | Summary through project context | Read-only |
-| L3 | `l3.md` | Methods, cognition, and shortcomings plus summary | Summary through project context | Read-only |
-| L4 | `l4.md` | L4-A values; L4-B five-stage craft rules and numeric parameters | Stage-scoped constraints and validation | Read-only |
+| Soul | `soul.md` | Stable creative identity and expression defaults, compiled offline from historical L1/L2 sources | Full text read by every model stage; never summarized, sliced, or silently truncated | Read-only |
+| L3 | `l3.md` | Creative methods and cognitive path | Full text enters the working context as creative-decision method; cannot override L0 or reopen approved directions | Read-only |
+| L4 | `l4.md` | Hard rules (creator-confirmed), confirmed creative advice, and Pengine-owned parameter sections | Stage-projected: L0 selection and gates read L4-A; generation stages read stage rules plus general rules; the final gate reads the full L4 | Read-only |
 | L5 | `l5.md` | Works and experience entries | Bounded on-demand style references | Read-only |
 | L6 | `l6.md` | External craft entries | Bounded on-demand craft references | Read-only |
 
@@ -469,8 +486,9 @@ file is projected wholesale into Agent state.
 For each run, the loader seeds only the approved compiled context into the
 Deep Agents `StateBackend` virtual tree:
 
-- `/persona/` is read-only and contains the full project instruction, required
-  L0 material, L1-L3 summaries, and stage-scoped L4 material;
+- `/persona/` is read-only and contains the full Project instruction, required
+  L0 material, the full Soul text, the full L3 method text (v3), and
+  stage-scoped L4 material;
 - `/workspace/` is thread-scoped scratch shared by the supervisor and its
   synchronous subagents;
 - L5/L6 content is available only through a bounded read-only retrieval tool,
@@ -503,7 +521,7 @@ checkpointed thread. V1 does not configure `StoreBackend`, `CompositeBackend`
 memory routes, or any other cross-thread writable memory. A later version may
 add an explicitly namespaced `/memories/` route after memory sources, write
 approval, curation, invalidation, and rollback are defined. Such memory must
-remain separate from the immutable nine-file persona authority.
+remain separate from the immutable eight-file persona authority.
 
 The configured persona root is operator-owned source data. The application
 owns immutable, content-addressed snapshots under its local data directory.
@@ -550,11 +568,13 @@ duplicate the full field contract.
   complete prompts, raw provider responses, and secrets.
 - Persona paths are resolved below the configured persona root; absolute paths
   and traversal outside that root are rejected.
-- The default Deep Agents general-purpose subagent is disabled. Only the four
-  primary subagents, `canon_reviewer`, `episode_reviewer`, `series_reviewer`,
-  `episode_repair`, and `story_repair` are registered. Four of the review/repair
-  agents load dedicated skills; direct story/outline patch generators are bounded structured
-  generation calls, not additional subagents.
+- The default Deep Agents general-purpose subagent is disabled. Eleven
+  synchronous subagents are registered: the four primary subagents, the legacy
+  `quality_reviewer`, `canon_reviewer`, `episode_reviewer`,
+  `repair_constraint_extractor`, `repair_constraint_validator`,
+  `series_reviewer`, `episode_repair`, and `story_repair`. Four of the
+  review/repair agents load dedicated skills; direct story/outline patch
+  generators are bounded structured generation calls, not additional subagents.
 - `FilesystemBackend`, `LocalShellBackend`, sandbox `execute`, asynchronous or
   remote subagents, arbitrary MCP tools, agent-authored skills, and
   cross-creation writable memory are disabled in V1.
@@ -643,10 +663,13 @@ run-control commands are additive. Breaking HTTP or persona format changes
 require a new contract version. Persona source packages remain outside the
 database so application rollback does not rewrite operator content.
 
-SQLite schema version 18 preserves the prior contract-bound content and repair
-records, migrates episode attempts into explicit rewrite cycles, adds model-call
-`operation_id`, and binds approved outline checkpoints to physical
-`review_call_id` provenance. Migrations
+The SQLite schema is a forward-only migration chain, currently at version 29.
+Across the chain it preserves prior contract-bound content and repair records,
+migrates episode attempts into explicit rewrite cycles, adds model-call
+`operation_id`, binds approved outline checkpoints to physical `review_call_id`
+provenance, and introduces SeriesBible candidates, script batches,
+structural-review receipts, grouped outline season maps with markdown sidecars,
+and quality-gate repair tracking. Migrations
 must remain forward and transactional where SQLite permits; production rollback
 automation is outside this architecture-delivery slice.
 
@@ -680,7 +703,7 @@ Implementation evidence must include:
 - isolated SQLite tests for transactions, leases, checkpoints, and attempt
   exhaustion;
 - Deep Agents integration tests proving the persona-bound supervisor invokes
-  only the nine registered synchronous subagents, routes each subagent and
+  only the eleven registered synchronous subagents, routes each subagent and
   direct repair call to the fixed model role, returns structured results, and
   cannot access host files, shell, MCP, or cross-thread memory;
 - checkpoint tests proving a stopped run resumes the same `thread_id`, approved
@@ -704,10 +727,11 @@ quality.
 
 - Modular monolith, FastAPI/Pydantic HTTP layer, direct SQLite repository, one
   embedded worker, and an embedded Deep Agents/LangGraph creative runtime.
-- One persona-bound `workflow_supervisor`; four primary subagents; the
-  `canon_reviewer`, `episode_reviewer`, and `series_reviewer`; plus
-  `episode_repair` and `story_repair`. Four review/repair agents load dedicated
-  skills.
+- One persona-bound `workflow_supervisor`; eleven synchronous subagents: the
+  four primary subagents, the legacy `quality_reviewer`, `canon_reviewer`,
+  `episode_reviewer`, `series_reviewer`, the two repair-constraint helpers,
+  `episode_repair`, and `story_repair`. Four review/repair agents load
+  dedicated skills.
 - Two preconfigured LangChain clients share the operator-supplied relay URL/key:
   `ChatAnthropic` with `claude-opus-5` for generation and creative repair, and a
   review client whose Anthropic, OpenAI, or DeepSeek protocol is selected from
@@ -737,8 +761,9 @@ quality.
 - No architecture decision remains open.
 - The governing delivery source is
   <https://github.com/mindcarver/pengine/issues/1>.
-- Four bundled nine-file persona packages are explicitly non-production
-  prototypes; creator-confirmed production persona quality remains unverified.
+- Of the four bundled persona v3 packages, only `shouzhuo` carries
+  creator-confirmed L0/Soul/L3/L4 material; the other three remain explicitly
+  non-production prototypes.
 - The configured generation and review relay routes have exercised real tool-use
   and structured-output paths, but a complete workbench initial-plus-revision
   acceptance run for Issue #10 remains required.
