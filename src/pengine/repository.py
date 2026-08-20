@@ -98,7 +98,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 # Failure codes an operator can fix outside Pengine (relay quota, availability,
@@ -1136,6 +1136,26 @@ CREATE INDEX outline_generation_groups_run
 ON outline_generation_groups(run_id, position);
 
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (29);
+"""
+
+_SCHEMA_V30_OUTLINE_MARKDOWN_FAILURES_SQL = """
+CREATE TABLE IF NOT EXISTS outline_markdown_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    attempt_index INTEGER NOT NULL CHECK (attempt_index >= 1),
+    raw_text TEXT NOT NULL,
+    raw_text_sha256 TEXT NOT NULL,
+    normalized_text TEXT NOT NULL,
+    normalized_text_sha256 TEXT NOT NULL,
+    parse_error TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS outline_markdown_failures_run
+ON outline_markdown_failures(run_id, group_id, attempt_index);
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (30);
 """
 
 _SCHEMA_V27_GROUPED_OUTLINE_SQL = """
@@ -2411,6 +2431,16 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 29
+            if schema_version == 29:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.executescript(_SCHEMA_V30_OUTLINE_MARKDOWN_FAILURES_SQL)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 30
 
     async def setup(self) -> None:
         await self.initialize()
@@ -2785,6 +2815,44 @@ class Repository:
                   AND status = 'generating'
                 """,
                 (_timestamp(_utc_now()), str(run_id), group_id, operation_id),
+            )
+
+    async def record_outline_markdown_failure(
+        self,
+        run_id: UUID,
+        *,
+        group_id: str,
+        operation_id: str,
+        attempt_index: int,
+        raw_text: str,
+        normalized_text: str,
+        parse_error: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Persist immutable raw-model-text evidence when outline parsing exhausts retries."""
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            await connection.execute(
+                """
+                INSERT INTO outline_markdown_failures(
+                    run_id, group_id, operation_id, attempt_index,
+                    raw_text, raw_text_sha256,
+                    normalized_text, normalized_text_sha256,
+                    parse_error, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(run_id),
+                    group_id,
+                    operation_id,
+                    attempt_index,
+                    raw_text,
+                    hashlib.sha256(raw_text.encode()).hexdigest(),
+                    normalized_text,
+                    hashlib.sha256(normalized_text.encode()).hexdigest(),
+                    parse_error,
+                    timestamp,
+                ),
             )
 
     async def replay_create_creation(

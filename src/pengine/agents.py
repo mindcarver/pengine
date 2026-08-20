@@ -81,6 +81,7 @@ from pengine.outline_context import (
     compile_outline_group_context,
     compile_outline_group_sidecar_context,
     compile_season_map_context,
+    normalize_outline_group_markdown,
     parse_outline_group_markdown,
     validate_outline_group_references,
 )
@@ -153,6 +154,7 @@ OutlineGroupBodyLoad = Callable[[str], Awaitable[Mapping[str, Any] | None]]
 OutlineGroupBodyPersist = Callable[..., Awaitable[str]]
 OutlineGroupComplete = Callable[..., Awaitable[None]]
 OutlineGroupFail = Callable[..., Awaitable[None]]
+OutlineMarkdownFailureRecorder = Callable[..., Awaitable[None]]
 ScriptGroupGenerator = Callable[..., Awaitable["ScriptGenerationGroupResult"]]
 StructuralReviewGenerator = Callable[[CompiledReviewContext], Awaitable[StructuralReviewResult]]
 SeriesReviewBoundaryRetriever = Callable[[int], Awaitable[BoundStructuralReview | None]]
@@ -2400,6 +2402,7 @@ async def _invoke_outline_group_markdown(
     group: ScriptGenerationGroup,
     repair_feedback: str | None = None,
     output_language_contract: str = "",
+    record_failure: OutlineMarkdownFailureRecorder | None = None,
 ) -> EpisodeOutlineGroupMarkdown:
     parse_error: OutlineContextError | None = None
     for attempt in range(3):
@@ -2414,7 +2417,10 @@ async def _invoke_outline_group_markdown(
         if parse_error is not None:
             instruction += (
                 " The prior Markdown violated the deterministic heading protocol: "
-                f"{parse_error}. Regenerate the complete current group."
+                f"{parse_error}. Regenerate the complete current group. Every episode must "
+                "begin with a heading line that contains only the episode marker, for "
+                "example a line reading exactly `## 第1集` — no episode title after 集, "
+                "no commentary before the first heading, and no code fence."
             )
         model_input = compiled.model_input
         if repair_feedback is not None:
@@ -2448,9 +2454,10 @@ async def _invoke_outline_group_markdown(
                 {"role": "user", "content": model_input},
             ]
         )
+        response_text = _message_plaintext(response, producer="Episode planner")
         try:
             return parse_outline_group_markdown(
-                _message_plaintext(response, producer="Episode planner"),
+                response_text,
                 group_id=group.group_id,
                 start_episode=group.start_episode,
                 end_episode=group.end_episode,
@@ -2458,6 +2465,13 @@ async def _invoke_outline_group_markdown(
         except OutlineContextError as error:
             parse_error = error
             if attempt == 2:
+                if record_failure is not None:
+                    await record_failure(
+                        attempt_index=attempt + 1,
+                        raw_text=response_text,
+                        normalized_text=normalize_outline_group_markdown(response_text.strip()),
+                        parse_error=str(error),
+                    )
                 raise
     raise AssertionError("unreachable outline Markdown retry state")
 
@@ -2559,6 +2573,7 @@ async def _generate_outline_group_with_sidecar(
     repair_mode: Literal["sidecar", "full"] = "sidecar",
     load_body: OutlineGroupBodyLoad | None,
     persist_body: OutlineGroupBodyPersist | None,
+    record_markdown_failure: OutlineMarkdownFailureRecorder | None = None,
     model_call_state: ModelCallState | None,
     output_language_contract: str = "",
 ) -> EpisodeOutlineGroupResult:
@@ -2571,6 +2586,7 @@ async def _generate_outline_group_with_sidecar(
             group=group,
             repair_feedback=repair_feedback if repair_mode == "full" else None,
             output_language_contract=output_language_contract,
+            record_failure=record_markdown_failure,
         )
         if persist_body is not None:
             persist_arguments = {
@@ -8986,6 +9002,7 @@ class DeepAgentWorkflow:
         persist_outline_group_body: OutlineGroupBodyPersist | None = None,
         complete_outline_group: OutlineGroupComplete | None = None,
         fail_outline_group: OutlineGroupFail | None = None,
+        record_outline_markdown_failure: OutlineMarkdownFailureRecorder | None = None,
     ) -> WorkflowResult:
         approved_source = approved_checkpoints if approved_checkpoints is not None else {}
         approved_payloads: dict[InternalStage, Any] = {
@@ -9110,6 +9127,17 @@ class DeepAgentWorkflow:
             sidecar_context: Mapping[str, Any],
             repair_mode: Literal["sidecar", "full"],
         ) -> EpisodeOutlineGroupResult:
+            recorder: OutlineMarkdownFailureRecorder | None = None
+            if record_outline_markdown_failure is not None:
+                outer_hook = record_outline_markdown_failure
+
+                async def recorder(**evidence: Any) -> None:
+                    await outer_hook(
+                        group_id=group.group_id,
+                        operation_id=operation_id,
+                        **evidence,
+                    )
+
             return await _generate_outline_group_with_sidecar(
                 self.generation_model,
                 compiled=compiled,
@@ -9120,6 +9148,7 @@ class DeepAgentWorkflow:
                 repair_mode=repair_mode,
                 load_body=load_outline_group_body,
                 persist_body=persist_outline_group_body,
+                record_markdown_failure=recorder,
                 model_call_state=self.model_call_state,
                 output_language_contract=output_language_contract,
             )

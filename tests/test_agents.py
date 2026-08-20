@@ -143,7 +143,9 @@ from pengine.outline_context import (
     CompiledOutlineContext,
     EpisodeOutlineGroupResult,
     EpisodeOutlineGroupSidecar,
+    OutlineContextError,
     OutlineGroupAssemblyError,
+    parse_outline_group_markdown,
 )
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
@@ -690,6 +692,97 @@ async def test_outline_group_body_is_plain_markdown_without_structured_coordinat
     assert model.bound_tool_names == [[]]
     assert "group_id" not in markdown.raw_text
     assert "start_episode" not in markdown.raw_text
+
+
+@pytest.mark.asyncio
+async def test_outline_group_body_normalizes_benign_heading_deviations() -> None:
+    group = ScriptGenerationGroup(
+        group_id="titled_group",
+        start_episode=1,
+        end_episode=2,
+        dramatic_unit="归乡与发现",
+        boundary_reason="发现推动下一组",
+    )
+    compiled = CompiledOutlineContext(
+        model_input="FULL-CONTEXT-SENTINEL",
+        bundle_sha256="a" * 64,
+        manifest={"group_id": group.group_id},
+        manifest_json='{"group_id":"titled_group"}',
+        output_tokens=12_288,
+    )
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content=(
+                    "以下是本组的分集大纲：\n\n"
+                    "## 第1集：归乡\n\n林荷回到旧屋。\n\n"
+                    "## 第 2 集｜旧照\n\n她发现照片日期被改。"
+                )
+            )
+        ]
+    )
+
+    markdown = await _invoke_outline_group_markdown(model, compiled, group=group)
+
+    assert [item.episode_number for item in markdown.episodes] == [1, 2]
+    heading_lines = [line for line in markdown.raw_text.splitlines() if line.startswith("## ")]
+    assert heading_lines == ["## 第1集", "## 第2集"]
+    # The persisted canonical text re-parses to the identical hash.
+    reparsed = parse_outline_group_markdown(
+        markdown.raw_text,
+        group_id=group.group_id,
+        start_episode=1,
+        end_episode=2,
+    )
+    assert reparsed.sha256 == markdown.sha256
+
+
+@pytest.mark.asyncio
+async def test_outline_markdown_failure_records_evidence_and_retries_with_exact_example() -> None:
+    group = ScriptGenerationGroup(
+        group_id="broken_group",
+        start_episode=1,
+        end_episode=2,
+        dramatic_unit="失败场景",
+        boundary_reason="测试",
+    )
+    compiled = CompiledOutlineContext(
+        model_input="FULL-CONTEXT-SENTINEL",
+        bundle_sha256="a" * 64,
+        manifest={"group_id": group.group_id},
+        manifest_json='{"group_id":"broken_group"}',
+        output_tokens=12_288,
+    )
+    bad_texts = [
+        "I'm structuring the outline in my head, no headings yet.",
+        "still no episode heading",
+        "third attempt also missing every heading",
+    ]
+    model = ToolCallingFakeModel(responses=[AIMessage(content=text) for text in bad_texts])
+    recorded: list[dict[str, Any]] = []
+
+    async def record_failure(**evidence: Any) -> None:
+        recorded.append(evidence)
+
+    with pytest.raises(OutlineContextError):
+        await _invoke_outline_group_markdown(
+            model,
+            compiled,
+            group=group,
+            record_failure=record_failure,
+        )
+
+    assert len(recorded) == 1
+    evidence = recorded[0]
+    assert evidence["attempt_index"] == 3
+    assert evidence["raw_text"] == bad_texts[2]
+    assert evidence["normalized_text"] == bad_texts[2]
+    assert evidence["parse_error"]
+    # Retry instructions carry the exact heading-format example after the first miss.
+    assert len(model.model_system_prompts) == 3
+    for prompt in model.model_system_prompts[1:]:
+        assert "## 第1集" in prompt
+        assert "no episode title after 集" in prompt
 
 
 @pytest.mark.asyncio

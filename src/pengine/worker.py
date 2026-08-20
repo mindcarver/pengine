@@ -986,6 +986,25 @@ class Worker:
                         operation_id=operation_id,
                     )
 
+                async def record_outline_markdown_failure(
+                    *,
+                    group_id: str,
+                    operation_id: str,
+                    attempt_index: int,
+                    raw_text: str,
+                    normalized_text: str,
+                    parse_error: str,
+                ) -> None:
+                    await self.repository.record_outline_markdown_failure(
+                        work.run_id,
+                        group_id=group_id,
+                        operation_id=operation_id,
+                        attempt_index=attempt_index,
+                        raw_text=raw_text,
+                        normalized_text=normalized_text,
+                        parse_error=parse_error,
+                    )
+
                 generation_window_context: dict[str, tuple[str, int]] = {}
 
                 async def begin_generation_group(
@@ -1364,6 +1383,7 @@ class Worker:
                                 "persist_outline_group_body": persist_outline_group_body,
                                 "complete_outline_group": complete_outline_group,
                                 "fail_outline_group": fail_outline_group,
+                                "record_outline_markdown_failure": record_outline_markdown_failure,
                             }
                         )
                     suffix_rewrite_feedback = await self._suffix_rewrite_feedback_for_writer(
