@@ -7602,6 +7602,7 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
     repair_feedbacks: list[str] = []
     failed: list[str] = []
     fail_second_once = True
+    protocol_invalid_once = True
     reject_first_group_once = True
     final_review_calls = 0
     projection_repair_constraints: list[str | None] = []
@@ -7633,7 +7634,7 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
         compiled: Any,
         repair_feedback: str | None,
     ) -> Mapping[str, Any]:
-        nonlocal fail_second_once
+        nonlocal fail_second_once, protocol_invalid_once
         group_id = compiled.manifest["group_id"]
         generated.append(group_id)
         if repair_feedback is not None:
@@ -7642,7 +7643,11 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
             fail_second_once = False
             raise TimeoutError("simulated current-group interruption")
         if group_id == "opening":
-            return group_payload("opening", 1, 1)
+            payload = group_payload("opening", 1, 1)
+            if protocol_invalid_once:
+                protocol_invalid_once = False
+                payload["timeline"][0]["participant_ids"].append("undeclared_witness")
+            return payload
         return group_payload("pursuit", 2, 3)
 
     async def review_group(_: Any, __: Any) -> SemanticReview:
@@ -7784,9 +7789,18 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
         request.tool_call["args"],
     )
 
-    assert generated == ["season_map", "opening", "opening", "pursuit", "pursuit"]
-    assert len(repair_feedbacks) == 1
-    assert "new_unapproved_character" in repair_feedbacks[0]
+    assert generated == [
+        "season_map",
+        "opening",
+        "opening",
+        "opening",
+        "pursuit",
+        "pursuit",
+    ]
+    assert len(repair_feedbacks) == 2
+    assert "current_group_protocol_violation" in repair_feedbacks[0]
+    assert "undeclared_witness" in repair_feedbacks[0]
+    assert "new_unapproved_character" in repair_feedbacks[1]
     assert failed == ["pursuit"]
     assert committed[0]["content_sha256"] == first_group_hash
     assert isinstance(returned, ToolMessage)

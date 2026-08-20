@@ -94,6 +94,7 @@ class EpisodeOutlineGroupResult(ContinuityModel):
     end_episode: int = Field(ge=1)
     content: NonEmptyText
     episodes: list[EpisodePlan] = Field(min_length=1)
+    character_introductions: list[CharacterSpec] = Field(default_factory=list)
     facts: list[StoryFact] = Field(min_length=1)
     timeline: list[OutlineTimelineEvent] = Field(min_length=1)
     knowledge_states: list[CharacterKnowledgeState] = Field(default_factory=list)
@@ -124,6 +125,114 @@ class EpisodeOutlineGroupResult(ContinuityModel):
             ):
                 raise ValueError("Group obligations must match the group's fact reveals")
         return self
+
+
+def validate_outline_group_references(
+    season_map: OutlineSeasonMap,
+    prior_groups: Sequence[EpisodeOutlineGroupResult],
+    candidate: EpisodeOutlineGroupResult,
+) -> None:
+    """Validate one group against the immutable cumulative outline prefix."""
+
+    character_ids = {item.character_id for item in season_map.characters}
+    character_names = {item.name for item in season_map.characters}
+    fact_ids: set[str] = set()
+    clue_ids: set[str] = set()
+    obligation_ids: set[str] = set()
+    event_ids: set[str] = set()
+    knowledge_pairs: set[tuple[int, str]] = set()
+
+    for group in [*prior_groups, candidate]:
+        for character in group.character_introductions:
+            if character.character_id in character_ids:
+                raise OutlineContextError(
+                    f"Outline group redeclares character ID: {character.character_id}"
+                )
+            if character.name in character_names:
+                raise OutlineContextError(
+                    f"Outline group redeclares character name: {character.name}"
+                )
+            if character.initial_known_fact_ids:
+                raise OutlineContextError(
+                    "Group-introduced characters must declare knowledge in knowledge_states"
+                )
+            character_ids.add(character.character_id)
+            character_names.add(character.name)
+
+        group_fact_ids = {item.fact_id for item in group.facts}
+        group_clue_ids = {item.clue_id for item in group.clues}
+        group_obligation_ids = {item.obligation_id for item in group.episode_obligations}
+        group_event_ids = {item.event_id for item in group.timeline}
+        if len(group_fact_ids) != len(group.facts) or fact_ids & group_fact_ids:
+            raise OutlineContextError("Outline groups contain a duplicate fact ID")
+        if len(group_clue_ids) != len(group.clues) or clue_ids & group_clue_ids:
+            raise OutlineContextError("Outline groups contain a duplicate clue ID")
+        if (
+            len(group_obligation_ids) != len(group.episode_obligations)
+            or obligation_ids & group_obligation_ids
+        ):
+            raise OutlineContextError("Outline groups contain a duplicate obligation ID")
+        if len(group_event_ids) != len(group.timeline) or event_ids & group_event_ids:
+            raise OutlineContextError("Outline groups contain a duplicate timeline event ID")
+
+        evidence_ids = {
+            *fact_ids,
+            *clue_ids,
+            *obligation_ids,
+            *group_fact_ids,
+            *group_clue_ids,
+            *group_obligation_ids,
+        }
+        expected_evidence_count = (
+            len(fact_ids)
+            + len(clue_ids)
+            + len(obligation_ids)
+            + len(group_fact_ids)
+            + len(group_clue_ids)
+            + len(group_obligation_ids)
+        )
+        if len(evidence_ids) != expected_evidence_count:
+            raise OutlineContextError("Fact, clue, and obligation IDs must be globally unique")
+
+        available_fact_ids = fact_ids | group_fact_ids
+        available_clue_ids = clue_ids | group_clue_ids
+        for event in group.timeline:
+            unknown_characters = sorted(set(event.participant_ids) - character_ids)
+            if unknown_characters:
+                raise OutlineContextError(
+                    "Outline timeline references unknown character IDs: "
+                    + ", ".join(unknown_characters)
+                )
+            unknown_facts = sorted(set(event.fact_ids) - available_fact_ids)
+            if unknown_facts:
+                raise OutlineContextError(
+                    "Outline timeline references unknown fact IDs: " + ", ".join(unknown_facts)
+                )
+        for state in group.knowledge_states:
+            if state.character_id not in character_ids:
+                raise OutlineContextError(
+                    "Outline knowledge references unknown character ID: " + state.character_id
+                )
+            unknown_facts = sorted(set(state.known_fact_ids) - available_fact_ids)
+            if unknown_facts:
+                raise OutlineContextError(
+                    "Outline knowledge references unknown fact IDs: " + ", ".join(unknown_facts)
+                )
+            pair = (state.episode_number, state.character_id)
+            if pair in knowledge_pairs:
+                raise OutlineContextError("Outline groups contain a duplicate knowledge state")
+            knowledge_pairs.add(pair)
+        for obligation in group.episode_obligations:
+            unknown_clues = sorted(set(obligation.required_clue_ids) - available_clue_ids)
+            if unknown_clues:
+                raise OutlineContextError(
+                    "Outline obligation references unknown clue IDs: " + ", ".join(unknown_clues)
+                )
+
+        fact_ids.update(group_fact_ids)
+        clue_ids.update(group_clue_ids)
+        obligation_ids.update(group_obligation_ids)
+        event_ids.update(group_event_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +419,9 @@ def compile_outline_group_context(
             "group_id": item.group_id,
             "start_episode": item.start_episode,
             "end_episode": item.end_episode,
+            "character_introductions": [
+                value.model_dump(mode="json") for value in item.character_introductions
+            ],
             "facts": [value.model_dump(mode="json") for value in item.facts],
             "timeline": [value.model_dump(mode="json") for value in item.timeline],
             "knowledge_states": [value.model_dump(mode="json") for value in item.knowledge_states],
@@ -414,6 +526,14 @@ def assemble_episode_outline(
             or actual.end_episode != expected.end_episode
         ):
             raise OutlineContextError("Outline group range changed after season-map commitment")
+    validated_prefix: list[EpisodeOutlineGroupResult] = []
+    for group in groups:
+        validate_outline_group_references(season_map, validated_prefix, group)
+        validated_prefix.append(group)
+    characters = [
+        *season_map.characters,
+        *(character for group in groups for character in group.character_introductions),
+    ]
     timeline: list[TimelineEvent] = []
     for group in groups:
         for item in group.timeline:
@@ -427,7 +547,7 @@ def assemble_episode_outline(
                 )
             )
     known_by_character = {
-        item.character_id: set(item.initial_known_fact_ids) for item in season_map.characters
+        item.character_id: set(item.initial_known_fact_ids) for item in characters
     }
     knowledge_states: list[CharacterKnowledgeState] = []
     for group in groups:
@@ -437,7 +557,7 @@ def assemble_episode_outline(
             knowledge_states.append(item.model_copy(update={"known_fact_ids": sorted(known)}))
     contract = StoryContract(
         episode_count=season_map.episode_count,
-        characters=season_map.characters,
+        characters=characters,
         relationships=season_map.relationships,
         facts=[item for group in groups for item in group.facts],
         timeline=timeline,
