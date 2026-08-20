@@ -33,6 +33,7 @@ from pengine.model_calls import (
 from pengine.observability import record_model_call_event
 from pengine.relay import (
     PreflightBlockedError,
+    RelayError,
     _ModelCallAuditHandler,
     build_relay_adapter,
     build_relay_routes,
@@ -1000,11 +1001,12 @@ def test_on_llm_error_persists_redacted_provider_400_evidence(tmp_path: Path) ->
     handler.on_llm_error(error, run_id=run_id)
 
     row = store._connection.execute(
-        "SELECT status, outcome, error_type, http_status, provider_error_code, "
+        "SELECT status, outcome, error_code, error_type, http_status, provider_error_code, "
         "redacted_response FROM model_calls WHERE run_id = 'run-provider-400'"
     ).fetchone()
     assert row["status"] == "failed"
     assert row["outcome"] == "failure"
+    assert row["error_code"] == "relay_rejected"
     assert row["http_status"] == 400
     assert row["provider_error_code"] == "invalid_request_error"
     assert row["redacted_response"] is not None
@@ -1050,10 +1052,82 @@ def test_on_llm_error_persists_generic_upstream_400_evidence(tmp_path: Path) -> 
     handler.on_llm_error(error, run_id=callback_run_id)
 
     row = store._connection.execute(
-        "SELECT http_status, provider_error_code, redacted_response "
+        "SELECT error_code, http_status, provider_error_code, redacted_response "
         "FROM model_calls WHERE run_id = 'run-upstream-400'"
     ).fetchone()
+    assert row["error_code"] == "relay_unavailable"
     assert row["http_status"] == 400
     assert row["provider_error_code"] == "upstream_error"
     assert json.loads(row["redacted_response"]) == body
+    store.close()
+
+
+def test_on_llm_error_persists_relay_protocol_error_code(tmp_path: Path) -> None:
+    store = ModelCallStore(tmp_path / "model_calls.sqlite3")
+    state = ModelCallState(store=store)
+    state.context.run_id = "run-relay-protocol"
+    state.context.stage = "generating_character_relationships"
+    handler = _ModelCallAuditHandler(
+        role="generation",
+        model_id="claude-opus-5",
+        adapter="anthropic",
+        provider="anthropic",
+        model_call_state=state,
+        context_limit_tokens=200_000,
+        reserved_output_tokens=128_000,
+    )
+    callback_run_id = uuid4()
+    handler.on_chat_model_start(
+        {},
+        [[{"role": "user", "content": "生成角色关系。"}]],
+        run_id=callback_run_id,
+    )
+
+    handler.on_llm_error(
+        RelayError(
+            code="relay_incompatible",
+            safe_message="The relay returned incompatible stream metadata.",
+        ),
+        run_id=callback_run_id,
+    )
+
+    row = store._connection.execute(
+        "SELECT status, outcome, error_code, error_type FROM model_calls "
+        "WHERE run_id = 'run-relay-protocol'"
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["outcome"] == "failure"
+    assert row["error_code"] == "relay_incompatible"
+    assert row["error_type"] == "RelayError"
+    store.close()
+
+
+def test_on_llm_error_does_not_mislabel_internal_failure_as_relay(tmp_path: Path) -> None:
+    store = ModelCallStore(tmp_path / "model_calls.sqlite3")
+    state = ModelCallState(store=store)
+    state.context.run_id = "run-internal-model-call"
+    state.context.stage = "generating_character_relationships"
+    handler = _ModelCallAuditHandler(
+        role="generation",
+        model_id="claude-opus-5",
+        adapter="anthropic",
+        provider="anthropic",
+        model_call_state=state,
+        context_limit_tokens=200_000,
+        reserved_output_tokens=128_000,
+    )
+    callback_run_id = uuid4()
+    handler.on_chat_model_start(
+        {},
+        [[{"role": "user", "content": "生成角色关系。"}]],
+        run_id=callback_run_id,
+    )
+
+    handler.on_llm_error(AttributeError("local conversion failed"), run_id=callback_run_id)
+
+    row = store._connection.execute(
+        "SELECT error_code, error_type FROM model_calls WHERE run_id = 'run-internal-model-call'"
+    ).fetchone()
+    assert row["error_code"] == "internal_error"
+    assert row["error_type"] == "AttributeError"
     store.close()
