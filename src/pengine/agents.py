@@ -74,6 +74,7 @@ from pengine.outline_context import (
     EpisodeOutlineGroupResult,
     EpisodeOutlineGroupSidecar,
     OutlineContextError,
+    OutlineGroupAssemblyError,
     OutlineSeasonMap,
     assemble_episode_outline,
     assemble_outline_group_result,
@@ -6372,18 +6373,40 @@ class StageGuardMiddleware(AgentMiddleware):
                 repair_feedback: str | None = None
                 repair_rounds = 0
                 while True:
-                    with self._compiled_model_context(
-                        requested_output_tokens=compiled.output_tokens,
-                        bundle_sha256=compiled.bundle_sha256,
-                        manifest_json=compiled.manifest_json,
-                    ):
-                        parsed = await generate_group(
-                            compiled,
-                            repair_feedback,
-                            group=group,
-                            operation_id=operation_id,
-                            sidecar_context=sidecar_context,
+                    try:
+                        with self._compiled_model_context(
+                            requested_output_tokens=compiled.output_tokens,
+                            bundle_sha256=compiled.bundle_sha256,
+                            manifest_json=compiled.manifest_json,
+                        ):
+                            parsed = await generate_group(
+                                compiled,
+                                repair_feedback,
+                                group=group,
+                                operation_id=operation_id,
+                                sidecar_context=sidecar_context,
+                            )
+                    except OutlineGroupAssemblyError as error:
+                        if repair_rounds >= 2:
+                            raise
+                        repair_rounds += 1
+                        repair_feedback = json.dumps(
+                            {
+                                "repair_round": repair_rounds,
+                                "evidence": str(error),
+                                "issues": [
+                                    {
+                                        "code": "current_group_protocol_violation",
+                                        "message": str(error),
+                                    }
+                                ],
+                                "previous_sidecar": error.sidecar.model_dump(mode="json"),
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
                         )
+                        continue
                     try:
                         validate_outline_group_references(season_map, committed, parsed)
                     except OutlineContextError as error:

@@ -219,6 +219,38 @@ def test_outline_group_assembly_binds_markdown_and_preserves_character_introduct
     assert result.character_introductions[0].character_id == "village_doctor"
 
 
+def test_outline_group_assembly_exposes_schema_valid_sidecar_for_bounded_repair() -> None:
+    group = make_season_map(2).script_generation_groups[0]
+    markdown = parse_outline_group_markdown(
+        "## 第1集\n\n林岚发现两条线索。\n\n## 第2集\n\n林岚继续调查。",
+        group_id=group.group_id,
+        start_episode=group.start_episode,
+        end_episode=group.end_episode,
+    )
+    payload = make_group(group).model_dump(mode="json")
+    payload["facts"].append(
+        {
+            "fact_id": "fact_unbound",
+            "subject": "林岚",
+            "predicate": "发现线索",
+            "kind": "text",
+            "value": "未绑定到义务的新线索",
+            "first_revealed_episode": 1,
+        }
+    )
+    sidecar = EpisodeOutlineGroupSidecar.model_validate(
+        {field: payload[field] for field in EpisodeOutlineGroupSidecar.model_fields}
+    )
+
+    with pytest.raises(
+        OutlineContextError,
+        match="Group obligations must match the group's fact reveals",
+    ) as error:
+        assemble_outline_group_result(group, markdown, sidecar)
+
+    assert getattr(error.value, "sidecar", None) is sidecar
+
+
 def test_outline_compilers_include_only_named_components_and_deduplicate() -> None:
     compiled = compile_season_map_context(
         creation_request="相同故事资料",

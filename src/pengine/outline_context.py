@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationError, model_validator
 
 from pengine.continuity import (
     CharacterKnowledgeState,
@@ -139,6 +139,14 @@ class EpisodeOutlineGroupSidecar(ContinuityModel):
     episode_obligations: list[EpisodeObligation] = Field(min_length=1)
 
 
+class OutlineGroupAssemblyError(OutlineContextError):
+    """A schema-valid sidecar that cannot satisfy the complete group contract."""
+
+    def __init__(self, message: str, *, sidecar: EpisodeOutlineGroupSidecar) -> None:
+        super().__init__(message)
+        self.sidecar = sidecar
+
+
 @dataclass(frozen=True, slots=True)
 class OutlineMarkdownEpisode:
     episode_number: int
@@ -234,22 +242,26 @@ def assemble_outline_group_result(
         or markdown.end_episode != group.end_episode
     ):
         raise OutlineContextError("Outline Markdown no longer matches the season-map group")
-    return EpisodeOutlineGroupResult(
-        group_id=group.group_id,
-        start_episode=group.start_episode,
-        end_episode=group.end_episode,
-        content=markdown.raw_text,
-        episodes=[
-            EpisodePlan(episode_number=episode.episode_number, plan=episode.content)
-            for episode in markdown.episodes
-        ],
-        character_introductions=sidecar.character_introductions,
-        facts=sidecar.facts,
-        timeline=sidecar.timeline,
-        knowledge_states=sidecar.knowledge_states,
-        clues=sidecar.clues,
-        episode_obligations=sidecar.episode_obligations,
-    )
+    try:
+        return EpisodeOutlineGroupResult(
+            group_id=group.group_id,
+            start_episode=group.start_episode,
+            end_episode=group.end_episode,
+            content=markdown.raw_text,
+            episodes=[
+                EpisodePlan(episode_number=episode.episode_number, plan=episode.content)
+                for episode in markdown.episodes
+            ],
+            character_introductions=sidecar.character_introductions,
+            facts=sidecar.facts,
+            timeline=sidecar.timeline,
+            knowledge_states=sidecar.knowledge_states,
+            clues=sidecar.clues,
+            episode_obligations=sidecar.episode_obligations,
+        )
+    except ValidationError as error:
+        evidence = "; ".join(str(issue["msg"]) for issue in error.errors(include_url=False))
+        raise OutlineGroupAssemblyError(evidence, sidecar=sidecar) from error
 
 
 def validate_outline_group_references(
