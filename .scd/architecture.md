@@ -137,17 +137,22 @@ whole-season `OutlineSeasonMap` that divides episodes into consecutive natural
 groups of 1-4 episodes along action, reveal, temporal, relationship, suspense,
 or stage boundaries. Each group then generates and persists canonical
 per-episode Markdown prose plus a structured continuity sidecar (facts,
-timeline, clues, and obligations); deterministic validation and an independent
-review-route check precede each group's immutable content-hash checkpoint, with
-at most two repair rounds per rejected group and resume from the first
-uncommitted group. A sidecar schema failure retries only the sidecar and never
-rewrites the persisted Markdown. Once every group is committed, the service
-deterministically assembles the complete `StoryContract` and runs a whole-season
-final review before locking. The contract is the sole machine-readable source
-for cast membership, relationships, typed facts and units, temporal order,
-character knowledge, clue lifecycle, and per-episode obligations. A failing
-assembled contract may be repaired by the generation route's bounded outline
-patch at most twice before pausing.
+timeline, clues, and obligations); benign heading decorations (an episode-title
+suffix after `集`, spacing around the heading marker, or a preamble before the
+first heading) are canonically normalized before the deterministic parse, the
+normalized text is what gets persisted and hashed, and a final parse failure
+persists the raw model text as immutable evidence. Deterministic validation
+and an independent review-route check precede each group's immutable
+content-hash checkpoint, with at most two repair rounds per rejected group and
+resume from the first uncommitted group. A sidecar schema failure retries only
+the sidecar and never rewrites the persisted Markdown. Once every group is
+committed, the service deterministically assembles the complete
+`StoryContract` and runs a whole-season final review before locking. The
+contract is the sole machine-readable source for cast membership,
+relationships, typed facts and units, temporal order, character knowledge,
+clue lifecycle, and per-episode obligations. A failing assembled contract may
+be repaired by the generation route's bounded outline patch at most twice
+before pausing.
 
 The schema accepts `episode_count >= 1`, but that is not production evidence for
 arbitrarily long series. Outline planning, locking, and cross-batch validation
@@ -672,7 +677,7 @@ run-control commands are additive. Breaking HTTP or persona format changes
 require a new contract version. Persona source packages remain outside the
 database so application rollback does not rewrite operator content.
 
-The SQLite schema is a forward-only migration chain, currently at version 29.
+The SQLite schema is a forward-only migration chain, currently at version 30.
 Across the chain it preserves prior contract-bound content and repair records,
 migrates episode attempts into explicit rewrite cycles, adds model-call
 `operation_id`, binds approved outline checkpoints to physical `review_call_id`

@@ -164,7 +164,64 @@ class EpisodeOutlineGroupMarkdown:
 
 
 _OUTLINE_EPISODE_HEADING = re.compile(r"^## 第([1-9][0-9]*)集[ \t]*$")
+# Tolerant heading shape used only for deterministic normalization: optional
+# spaces around ``##``/``第``/the number, plus an optional episode-title suffix
+# that must start with an explicit separator (colon, pipe, dot, dash, tilde) or
+# whitespace. The separator requirement keeps non-heading lines such as
+# ``## 第1集团军`` from being mistaken for episode headings.
+_OUTLINE_EPISODE_HEADING_TOLERANT = re.compile(r"^##[ \t]*第[ \t]*([1-9][0-9]*)[ \t]*集(.*)$")
+_OUTLINE_TITLE_SEPARATORS = frozenset("：:｜|·•—–-－~～")
 _MARKDOWN_FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+
+
+def normalize_outline_group_markdown(raw_text: str) -> str:
+    """Canonically normalize benign heading deviations before strict parsing.
+
+    Deterministic and idempotent: spaces around the heading marker and episode
+    number are collapsed, an episode-title suffix after ``集`` (introduced by an
+    explicit separator or whitespace) is dropped, and any preamble before the
+    first recognizable heading is removed. Lines inside fenced code blocks are
+    never rewritten, and lines that do not carry a separator-backed title stay
+    untouched so non-heading prose is never reinterpreted.
+    """
+    lines = raw_text.splitlines(keepends=True)
+    normalized: list[str] = []
+    first_heading_index: int | None = None
+    fence_character: str | None = None
+    fence_length = 0
+    for line in lines:
+        line_without_ending = line.rstrip("\r\n")
+        line_ending = line[len(line_without_ending) :]
+        fence = _MARKDOWN_FENCE.match(line_without_ending)
+        if fence is not None:
+            marker = fence.group(1)
+            if fence_character is None:
+                fence_character = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                fence_character = None
+                fence_length = 0
+            normalized.append(line)
+            continue
+        if fence_character is None:
+            tolerant = _OUTLINE_EPISODE_HEADING_TOLERANT.match(line_without_ending)
+            if tolerant is not None:
+                rest = tolerant.group(2)
+                rest_stripped = rest.strip()
+                is_heading = True
+                if rest_stripped:
+                    separator_backed = rest.lstrip()[0] in _OUTLINE_TITLE_SEPARATORS
+                    space_backed = rest[0] in " \t"
+                    is_heading = separator_backed or space_backed
+                if is_heading:
+                    if first_heading_index is None:
+                        first_heading_index = len(normalized)
+                    normalized.append(f"## 第{tolerant.group(1)}集{line_ending}")
+                    continue
+        normalized.append(line)
+    if first_heading_index is None:
+        return raw_text
+    return "".join(normalized[first_heading_index:])
 
 
 def parse_outline_group_markdown(
@@ -174,11 +231,17 @@ def parse_outline_group_markdown(
     start_episode: int,
     end_episode: int,
 ) -> EpisodeOutlineGroupMarkdown:
-    """Parse exact level-two episode headings outside fenced code blocks."""
+    """Parse exact level-two episode headings outside fenced code blocks.
+
+    Benign heading deviations (episode-title suffixes, spacing around the
+    heading marker, and a preamble before the first heading) are canonically
+    normalized first; the returned ``raw_text`` and ``sha256`` address the
+    normalized text, and re-parsing stored canonical Markdown is a no-op.
+    """
 
     if start_episode < 1 or end_episode < start_episode:
         raise OutlineContextError("Outline Markdown group range is invalid")
-    canonical = raw_text.strip()
+    canonical = normalize_outline_group_markdown(raw_text.strip())
     if not canonical:
         raise OutlineContextError("Outline Markdown is empty")
 

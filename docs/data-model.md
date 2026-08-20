@@ -51,7 +51,7 @@ LangGraph checkpoint = 可恢复、但仍可能未批准的执行上下文
 
 ## 3. 逻辑表分组
 
-当前 `src/pengine/repository.py` 的迁移头版本为 `29`。下表按领域归纳表，而不是要求调用方直接依赖内部 SQL；SQL schema 变化必须通过迁移维护。
+当前 `src/pengine/repository.py` 的迁移头版本为 `30`。下表按领域归纳表，而不是要求调用方直接依赖内部 SQL；SQL schema 变化必须通过迁移维护。
 
 | 领域 | 逻辑表 | 作用 |
 | --- | --- | --- |

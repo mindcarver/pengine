@@ -149,7 +149,6 @@ def test_outline_markdown_accepts_varied_content_and_natural_group_sizes(
         "## 第2集\n正文\n\n## 第2集\n重复",
         "## 第2集\n正文\n\n## 第4集\n越界",
         "## 第2集\n\n## 第3集\n正文",
-        "额外前缀\n\n## 第2集\n正文\n\n## 第3集\n正文",
     ],
 )
 def test_outline_markdown_rejects_missing_duplicate_out_of_range_or_empty_sections(
@@ -161,6 +160,68 @@ def test_outline_markdown_rejects_missing_duplicate_out_of_range_or_empty_sectio
             group_id="current_group",
             start_episode=2,
             end_episode=3,
+        )
+
+
+@pytest.mark.parametrize(
+    "heading_line",
+    [
+        "## 第1集：归乡",
+        "## 第1集:归乡",
+        "## 第1集｜旧屋",
+        "## 第1集|旧屋",
+        "## 第1集 · 旧照",
+        "## 第1集——旧照",
+        "## 第 1 集",
+        "##第1集",
+        "## 第1集 旧照",
+    ],
+)
+def test_outline_markdown_normalizes_benign_heading_decorations(heading_line: str) -> None:
+    parsed = parse_outline_group_markdown(
+        f"开场导语。\n\n{heading_line}\n\n正文第一集。\n\n## 第2集\n\n正文第二集。",
+        group_id="normalized_group",
+        start_episode=1,
+        end_episode=2,
+    )
+
+    assert [item.episode_number for item in parsed.episodes] == [1, 2]
+    heading_lines = [line for line in parsed.raw_text.splitlines() if line.startswith("## ")]
+    assert heading_lines == ["## 第1集", "## 第2集"]
+    assert "开场导语" not in parsed.raw_text
+    # Canonical output re-parses to the same hash (idempotent normalization).
+    reparsed = parse_outline_group_markdown(
+        parsed.raw_text,
+        group_id="normalized_group",
+        start_episode=1,
+        end_episode=2,
+    )
+    assert reparsed.sha256 == parsed.sha256
+
+
+def test_outline_markdown_normalization_keeps_non_heading_prose_and_fences() -> None:
+    parsed = parse_outline_group_markdown(
+        "## 第1集团军\n\n军团番号不是标题。\n\n"
+        "## 第1集\n\n正文第一集。\n\n```markdown\n## 第2集：围栏内示例\n```\n\n"
+        "## 第2集\n\n正文第二集。",
+        group_id="guarded_group",
+        start_episode=1,
+        end_episode=2,
+    )
+
+    assert [item.episode_number for item in parsed.episodes] == [1, 2]
+    # The non-heading line before the first real heading is dropped as preamble,
+    # but a fenced example inside an episode is preserved verbatim.
+    assert "## 第2集：围栏内示例" in parsed.episodes[0].content
+
+
+def test_outline_markdown_without_any_heading_stays_rejected() -> None:
+    with pytest.raises(OutlineContextError):
+        parse_outline_group_markdown(
+            "整段都是正文，没有任何剧集标题。",
+            group_id="headingless_group",
+            start_episode=1,
+            end_episode=2,
         )
 
 
