@@ -101,6 +101,9 @@ from pengine.series_review import (
 SCHEMA_VERSION = 29
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
+# Failure codes an operator can fix outside Pengine (relay quota, availability,
+# or timeout). Only these allow reviving a terminally failed initial run.
+RETRYABLE_FAILURE_CODES = frozenset({"relay_unavailable"})
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
 
 _EXTENDED_REPAIR_STAGES = frozenset(
@@ -8450,6 +8453,124 @@ class Repository:
             )
             return response
 
+    async def retry_run(
+        self,
+        *,
+        creation_id: UUID,
+        run_kind: RunKind,
+        idempotency_key: str,
+        now: datetime | None = None,
+    ) -> RunControlAccepted:
+        """Revive a terminally failed initial run after an operator-fixable relay failure.
+
+        The transition is the inverse of ``fail_run`` for the external-failure
+        allowlist only: the run requeues with its original thread, approved
+        business checkpoints, and attempt accounting intact, so the worker
+        resumes through the same recovery path as a process restart.
+        """
+        timestamp = _timestamp(now or _utc_now())
+        scope = f"run-control:{creation_id}:{run_kind}:retry"
+        payload_hash = canonical_payload_hash({"action": "retry"})
+
+        async with self._transaction() as connection:
+            replay = await self._idempotency_replay(
+                connection,
+                idempotency_key,
+                scope,
+                payload_hash,
+                RunControlAccepted,
+            )
+            if replay is not None:
+                return replay
+
+            run = await self._fetch_control_run(connection, creation_id, run_kind)
+            if run_kind != "initial":
+                raise DomainError(
+                    "run_not_controllable",
+                    "A failed revision run is retried by resubmitting its frozen feedback.",
+                    409,
+                )
+            if run["execution_state"] != "failed":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Only a failed workflow run can be retried.",
+                    409,
+                )
+            if run["failure_code"] not in RETRYABLE_FAILURE_CODES:
+                raise DomainError(
+                    "run_not_controllable",
+                    "The failure is not an operator-fixable relay failure.",
+                    409,
+                )
+            if not await self._has_remaining_attempts(
+                connection,
+                run_id=run["id"],
+                current_stage=run["current_stage"],
+                current_episode=run["current_episode"],
+            ):
+                raise DomainError(
+                    "run_not_controllable",
+                    "The stage attempt limit has been exhausted.",
+                    409,
+                )
+            await connection.execute(
+                """
+                UPDATE runs
+                SET state = 'queued',
+                    failure_code = NULL,
+                    failure_message = NULL,
+                    failed_stage = NULL,
+                    failure_attempt_count = NULL,
+                    completed_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, run["id"]),
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET execution_state = 'queued',
+                    recovery_reason = 'none',
+                    content_repair_count = NULL,
+                    pause_message = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, run["id"]),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued',
+                    available_at = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, timestamp, run["id"]),
+            )
+            response = RunControlAccepted(
+                creation_id=creation_id,
+                run_kind=run_kind,
+                run_state="queued",
+                resource_url=f"/creations/{creation_id}",
+            )
+            await connection.execute(
+                "UPDATE creations SET updated_at = ? WHERE id = ?",
+                (timestamp, str(creation_id)),
+            )
+            await self._store_idempotency(
+                connection,
+                idempotency_key,
+                scope,
+                payload_hash,
+                response,
+                timestamp,
+            )
+            return response
+
     async def end_run(
         self,
         *,
@@ -9686,6 +9807,17 @@ class Repository:
                 )
             ),
             can_end=execution_state == "paused",
+            can_retry=(
+                execution_state == "failed"
+                and run["kind"] == "initial"
+                and run["failure_code"] in RETRYABLE_FAILURE_CODES
+                and await self._has_remaining_attempts(
+                    connection,
+                    run_id=progress["run_id"],
+                    current_stage=progress["current_stage"],
+                    current_episode=progress["current_episode"],
+                )
+            ),
         )
 
     async def _draft_snapshot(
@@ -10418,6 +10550,7 @@ class Repository:
             SELECT
                 runs.id,
                 runs.state AS run_state,
+                runs.failure_code,
                 run_progress.current_stage,
                 run_progress.current_episode,
                 run_progress.execution_state,

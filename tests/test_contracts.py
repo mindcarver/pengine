@@ -50,6 +50,7 @@ def test_openapi_exposes_creation_and_run_control_operations() -> None:
         ("POST", "/creations/{creation_id}/runs/{run_kind}/retry-final-review"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/authorize-repair"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
+        ("POST", "/creations/{creation_id}/runs/{run_kind}/retry"),
     }
 
 

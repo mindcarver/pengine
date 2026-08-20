@@ -512,6 +512,71 @@
         }
       }
     },
+    "/creations/{creation_id}/runs/{run_kind}/retry": {
+      "post": {
+        "summary": "Retry Run",
+        "description": "Revive a failed initial run whose failure was an operator-fixable relay error.\n\nOnly a terminally failed initial run whose failure code is in the external\nrelay allowlist and whose stage attempt budget is not exhausted can be\nretried. The run requeues with its original thread and approved business\ncheckpoints, so already approved content is never regenerated. A failed\nrevision run keeps its own resubmit-frozen-feedback semantics.",
+        "operationId": "retryRun",
+        "parameters": [
+          {
+            "name": "creation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Creation Id"
+            }
+          },
+          {
+            "name": "run_kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "initial",
+                "revision"
+              ],
+              "type": "string",
+              "title": "Run Kind"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunControlAccepted"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/creations/{creation_id}/runs/{run_kind}/presentation": {
       "get": {
         "summary": "Read one succeeded run as a structured delivery presentation",
@@ -2101,6 +2166,11 @@
           "can_end": {
             "type": "boolean",
             "title": "Can End"
+          },
+          "can_retry": {
+            "type": "boolean",
+            "title": "Can Retry",
+            "default": false
           }
         },
         "additionalProperties": false,

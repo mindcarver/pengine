@@ -274,6 +274,115 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
+def test_external_relay_failure_offers_inline_retry_control() -> None:
+    root = Path(__file__).parents[1]
+    script_path = root / "src" / "pengine" / "web" / "app.js"
+    page = (root / "src" / "pengine" / "web" / "index.html").read_text()
+    assert 'id="retry-run"' in page
+
+    assertions = """
+Object.assign(elements, {
+  "task-waiting": { hidden: false },
+  "failure-panel": { hidden: true },
+  "result-workspace": { hidden: true },
+  "failure-label": { textContent: "" },
+  "failure-title": { textContent: "" },
+  "failure-message": { textContent: "" },
+  "failure-guidance": { hidden: true, textContent: "" },
+  "failure-code": { textContent: "" },
+  "failure-actions": { hidden: true },
+  "retry-run": { hidden: true, disabled: false },
+  "quality-rejection-details": { hidden: true },
+});
+
+state.creationId = "failed-relay-creation";
+state.creation = { initial: { state: "failed" }, revision: { state: "unavailable" } };
+
+showFailure(
+  { code: "relay_unavailable", message: "The model relay request failed (HTTP 402)." },
+  "初稿生成失败",
+  { canStartNewCreation: true, canRetry: true },
+);
+if (elements["retry-run"].hidden) throw new Error("retryable failure hid the retry control");
+if (!elements["failure-guidance"].textContent.includes("原样重试")) {
+  throw new Error("retryable failure did not explain the inline retry");
+}
+
+showFailure(
+  { code: "internal_error", message: "The workflow failed safely." },
+  "初稿生成失败",
+  { canStartNewCreation: true },
+);
+if (!elements["retry-run"].hidden) {
+  throw new Error("non-retryable failure exposed the retry control");
+}
+if (!elements["failure-guidance"].textContent.includes("不会自动重试")) {
+  throw new Error("non-retryable failure lost its terminal guidance");
+}
+
+state.runControlBusy = true;
+showFailure(
+  { code: "relay_unavailable", message: "failed" },
+  "初稿生成失败",
+  { canStartNewCreation: true, canRetry: true },
+);
+if (!elements["retry-run"].disabled) throw new Error("busy workbench left retry enabled");
+state.runControlBusy = false;
+
+let posted = "";
+apiRequest = async (url, options) => {
+  posted = `${url}:${options.method}:${options.headers["Idempotency-Key"]}`;
+  return { run_state: "queued" };
+};
+let refreshed = false;
+refreshCreation = async () => {
+  refreshed = true;
+};
+renderProgress = () => {};
+renderQualityRejectionControls = () => {};
+await handleRunControl("retry", {
+  runKind: "initial",
+  messageElement: elements["failure-guidance"],
+});
+const expectedPost =
+  "/creations/failed-relay-creation/runs/initial/retry:POST:web-run-initial-retry-test-id";
+if (posted !== expectedPost) {
+  throw new Error(`retry control posted unexpectedly: ${posted}`);
+}
+if (!elements["failure-guidance"].textContent.includes("正在从已批准进度重试")) {
+  throw new Error("retry control did not announce the bounded retry");
+}
+if (!refreshed) throw new Error("retry control did not refresh the creation");
+if (state.runControlBusy) throw new Error("retry control stayed busy");
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}} }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(async () => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_workbench_uses_four_gated_creation_scenes() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"

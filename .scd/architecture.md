@@ -445,6 +445,14 @@ immutable snapshots already referenced by creations.
 - A paused or ended job is excluded from lease-expiry reconciliation. Refresh
   reconstructs its stage, completed checkpoints, frozen elapsed time, and
   available actions from SQLite.
+- A terminally failed initial run whose failure code is an operator-fixable
+  external relay error (`relay_unavailable`, for example HTTP 402 quota
+  exhaustion) can be revived once per condition by the idempotent `retry`
+  command: the run requeues with its original `thread_id`, approved business
+  checkpoints, and attempt accounting intact, and `RunProgress.can_retry`
+  tells the operator whether the conditions (external code plus remaining
+  attempts) currently hold. Other failure codes and failed revision runs keep
+  their terminal/requeue-frozen-feedback semantics.
 
 ## Persona-package loading contract
 
@@ -644,7 +652,8 @@ duplicate the full field contract.
 - There is no ordinary-running cancellation, priority, SSE/WebSocket streaming,
   token streaming, partial result, percentage, ETA, or budget display in V1.
   Manual continue/end is available only after the second shared interruption
-  pauses a run.
+  pauses a run; the retry command is available only for a terminally failed
+  initial run with an operator-fixable external relay failure code.
 
 ## Compatibility, migration, and rollback
 

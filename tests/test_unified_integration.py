@@ -63,7 +63,7 @@ from pengine.model_calls import (
     build_started_record,
 )
 from pengine.personas import PersonaCatalog
-from pengine.relay import PreflightBlockedError
+from pengine.relay import PreflightBlockedError, RelayError
 from pengine.repository import SCHEMA_VERSION, Repository
 from pengine.schemas import (
     ContentPackage,
@@ -242,6 +242,10 @@ class UnifiedWorkflow:
       second pass after an automatic design rebuild.
     - ``preflight_block`` raises :class:`PreflightBlockedError` before any
       generation, proving zero outbound content attempts.
+    - ``fail_first_execution`` raises :class:`RelayError` (an operator-fixable
+      external failure, for example HTTP 402 quota exhaustion) on the first
+      pass after approving exactly the L0 checkpoint, so a revived run must
+      preserve that checkpoint instead of regenerating it.
     """
 
     def __init__(
@@ -254,6 +258,7 @@ class UnifiedWorkflow:
         rebuild_contract: StoryContract | None = None,
         preflight_block: bool = False,
         persistent_defects: bool = False,
+        fail_first_execution: bool = False,
     ) -> None:
         self.episode_count = episode_count
         self.review_milestones = list(review_milestones)
@@ -262,7 +267,9 @@ class UnifiedWorkflow:
         self.rebuild_contract = rebuild_contract
         self.preflight_block = preflight_block
         self.persistent_defects = persistent_defects
+        self.fail_first_execution = fail_first_execution
         self.pass_count = 0
+        self.l0_approval_count = 0
         self.execution_count = 0
         self.committed: list[int] = []
         self.registered_reviews: list[dict[str, Any]] = []
@@ -316,13 +323,7 @@ class UnifiedWorkflow:
             return self.rebuild_contract
         return self.contract_a
 
-    async def _approve_design(
-        self,
-        before_stage,
-        approve_stage,
-        approved: dict[InternalStage, Any],
-        contract: StoryContract,
-    ) -> None:
+    def _design_payloads(self, contract: StoryContract) -> dict[InternalStage, dict[str, Any]]:
         contract_hash = story_contract_sha256(contract)
         payloads: dict[InternalStage, dict[str, Any]] = {
             InternalStage.SELECTING_L0_VARIANT: {
@@ -361,6 +362,16 @@ class UnifiedWorkflow:
                 "review_milestones": self.review_milestones,
             },
         }
+        return payloads
+
+    async def _approve_design(
+        self,
+        before_stage,
+        approve_stage,
+        approved: dict[InternalStage, Any],
+        contract: StoryContract,
+    ) -> None:
+        payloads = self._design_payloads(contract)
         for stage in (
             InternalStage.SELECTING_L0_VARIANT,
             InternalStage.GENERATING_STORY_OUTLINE,
@@ -369,6 +380,8 @@ class UnifiedWorkflow:
         ):
             if stage not in approved:
                 await before_stage(stage)
+                if stage is InternalStage.SELECTING_L0_VARIANT:
+                    self.l0_approval_count += 1
                 if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
                     self.record_physical_call("review")
                 await approve_stage(stage, payloads[stage])
@@ -398,6 +411,26 @@ class UnifiedWorkflow:
                 episode_number=None,
                 required_tokens=2_000_000,
                 verified_limit_tokens=200_000,
+            )
+
+        if self.fail_first_execution and self.execution_count == 1:
+            # Reproduce an operator-fixable external relay failure (for example
+            # HTTP 402 monthly quota exhaustion) after approving exactly the L0
+            # checkpoint, so a revived run must preserve that checkpoint.
+            payloads = self._design_payloads(self._pick_contract(approved))
+            await before_stage(InternalStage.SELECTING_L0_VARIANT)
+            await approve_stage(
+                InternalStage.SELECTING_L0_VARIANT,
+                payloads[InternalStage.SELECTING_L0_VARIANT],
+            )
+            self.l0_approval_count += 1
+            await before_stage(InternalStage.GENERATING_STORY_OUTLINE)
+            raise RelayError(
+                code="relay_unavailable",
+                safe_message=(
+                    "The model relay request failed (HTTP 402). Provider response: "
+                    "monthly request quota has been exhausted."
+                ),
             )
 
         contract = self._pick_contract(approved)
@@ -1162,6 +1195,59 @@ async def test_int_a7_context_overflow_pauses_with_zero_outbound_calls(
         == 0
     )
     assert resource.initial.progress.recovery_reason == "context_budget"
+
+
+# ---------------------------------------------------------------------------
+# INT-RETRY: revive an externally failed run from its approved checkpoints
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_int_retry_revives_relay_failed_run_without_regenerating_approved_stages(
+    tmp_path: Path,
+) -> None:
+    """An HTTP-402-style terminal failure revives via retry and still delivers."""
+    settings, catalog, repository = await _services(tmp_path)
+    workflow = UnifiedWorkflow(episode_count=3, fail_first_execution=True)
+    worker = _audited_worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="retry-worker",
+    )
+    accepted = await _create_creation(repository, catalog, "retry-relay-402")
+
+    await worker.run_once()
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.state == "failed"
+    assert failed.initial.failure.code == "relay_unavailable"
+    assert failed.initial.failure.failed_stage == InternalStage.GENERATING_STORY_OUTLINE
+    assert failed.initial.progress.can_retry is True
+    assert workflow.l0_approval_count == 1
+
+    app = create_app(settings=settings, repository=repository, catalog=catalog)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
+    ):
+        response = await client.post(
+            f"/creations/{accepted.creation_id}/runs/initial/retry",
+            headers={"Idempotency-Key": "retry-relay-402-1"},
+        )
+    assert response.status_code == 202
+    assert response.json()["run_state"] == "queued"
+
+    await worker.run_once()
+    succeeded = await repository.get_creation(accepted.creation_id)
+    assert succeeded is not None
+    assert succeeded.initial.state == "succeeded"
+    assert succeeded.initial.result.content_package.episode_scripts
+    assert workflow.execution_count == 2
+    # The L0 checkpoint approved before the external failure was never regenerated.
+    assert workflow.l0_approval_count == 1
+    assert workflow.committed == [1, 2, 3]
 
 
 # ---------------------------------------------------------------------------

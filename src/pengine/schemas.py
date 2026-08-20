@@ -474,6 +474,7 @@ class RunProgress(StrictModel):
     model_calls: list[ModelCallSummary] = Field(default_factory=list)
     can_continue: bool
     can_end: bool
+    can_retry: bool = False
 
 
 class CreativeDirectionDraft(StrictModel):

@@ -360,6 +360,12 @@ curl --fail-with-body -X POST \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/authorize-repair \
   -H 'Idempotency-Key: repair-authorization-001'
 
+# 外部 relay 错误（如配额耗尽）导致的初稿终态失败，可原样重试；
+# 已批准检查点不会重新生成，详见 initial.progress.can_retry
+curl --fail-with-body -X POST \
+  http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/retry \
+  -H 'Idempotency-Key: retry-001'
+
 curl --fail-with-body -X POST \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/end \
   -H 'Idempotency-Key: end-001'
