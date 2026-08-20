@@ -18,7 +18,6 @@ from pengine.continuity import (
     initial_series_state,
     render_story_contract_markdown,
     repair_constraint_id,
-    requires_locked_fact_semantic_review,
     story_contract_sha256,
     validate_episode_candidate,
     validate_repair_constraints,
@@ -68,38 +67,6 @@ def test_repair_constraint_ledger_binds_stable_id_range_and_verbatim_source() ->
         "repair_constraint_id_mismatch",
         "repair_constraint_evidence_invalid",
     }
-
-
-def test_indirect_numeric_restatement_requires_semantic_review() -> None:
-    contract = make_contract(
-        numeric_facts=[
-            {
-                "fact_id": "sister_age",
-                "subject": "许知妍",
-                "predicate": "年龄",
-                "kind": "count",
-                "value": "23",
-                "unit": "岁",
-                "first_revealed_episode": 1,
-            }
-        ]
-    )
-    prior = SeriesState(
-        contract_sha256=story_contract_sha256(contract),
-        locked_through_episode=1,
-        established_fact_ids=["sister_age"],
-    )
-
-    assert requires_locked_fact_semantic_review(
-        contract,
-        prior,
-        "许知遥看着妹妹：她二十六岁，她自己的日子。",
-    )
-    assert not requires_locked_fact_semantic_review(
-        contract,
-        prior,
-        "许知遥看着妹妹：她自己的日子应由她决定。",
-    )
 
 
 def make_contract(*, numeric_facts: list[dict] | None = None) -> StoryContract:

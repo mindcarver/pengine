@@ -1138,6 +1138,39 @@ async def test_direct_structural_review_uses_one_model_call_without_file_tools()
 
 
 @pytest.mark.asyncio
+async def test_direct_structural_review_ignores_top_level_extra_fields() -> None:
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call(
+                "StructuralReviewResult",
+                {
+                    "passed": True,
+                    "category": "pass",
+                    "evidence": (
+                        "L4硬规则：未发现阻断。\nL4价值观：未发现阻断。\nL4创作建议：未发现阻断。"
+                    ),
+                    "earliest_affected_episode": None,
+                    "reviewer_notes": "不属于审查协议的附加说明",
+                },
+                1,
+            )
+        ]
+    )
+
+    result = await _invoke_structural_review_structured(
+        model,
+        [
+            {"role": "system", "content": "Return the structural decision."},
+            {"role": "user", "content": "INLINE-REVIEW-PACKET"},
+        ],
+        output_language="zh-CN",
+    )
+
+    assert result.passed is True
+    assert len(model.model_message_batches) == 1
+
+
+@pytest.mark.asyncio
 async def test_direct_structural_review_protocol_repair_cannot_change_decision() -> None:
     model = ToolCallingFakeModel(
         responses=[
@@ -8795,11 +8828,11 @@ async def test_episode_repair_receives_deterministic_and_semantic_issues_togethe
 
 
 @pytest.mark.asyncio
-async def test_pronoun_numeric_fact_drift_triggers_targeted_review_and_repair(
+async def test_pronoun_numeric_fact_drift_is_deferred_without_episode_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """代词复述年龄时，紧凑语义审查必须拦截并进入局部修复。"""
+    """含糊的代词数值复述不再触发逐集模型审查或局部修复。"""
     database = tmp_path / "numeric-fact-drift.sqlite3"
     contract_payload = _story_contract(episode_count=2).model_dump(mode="json")
     contract_payload["facts"].insert(
@@ -8903,39 +8936,8 @@ async def test_pronoun_numeric_fact_drift_triggers_targeted_review_and_repair(
     review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
     responses[review_index] = _tool_call(
         "EpisodeReviewerResult",
-        {
-            "passed": False,
-            "evidence": "代词指向测试人物，年龄与锁定事实冲突",
-            "issues": [
-                {
-                    "code": "locked_numeric_fact_mismatch",
-                    "message": "测试人物锁定为59岁，正文写成六十岁",
-                    "contract_refs": ["su_hui_age"],
-                    "script_excerpt": "她六十岁",
-                }
-            ],
-        },
+        {"passed": True, "evidence": "里程碑结构审查通过", "issues": []},
         review_index,
-    )
-    repaired_args = {
-        "stage": "generating_episode_scripts",
-        "episode_number": 2,
-        "content": invalid_content,
-        "state_delta": copy.deepcopy(writer_args["episodes"][0]["state_delta"]),
-        "writer_notes": "",
-    }
-    repaired_args["content"] = "她五十九岁，推门进来。\n事实2\n钩子2"
-    responses.insert(
-        review_index + 1,
-        _tool_call("ScriptWriterResult", repaired_args, 201),
-    )
-    responses.insert(
-        review_index + 2,
-        _tool_call(
-            "EpisodeReviewerResult",
-            {"passed": True, "evidence": "修复后分集一致", "issues": []},
-            202,
-        ),
     )
 
     captured_writer_files: list[Mapping[str, str]] = []
@@ -9026,28 +9028,9 @@ async def test_pronoun_numeric_fact_drift_triggers_targeted_review_and_repair(
     assert age_entries[0]["value"] == "59"
     assert age_entries[0]["committed_evidence"] == "测试人物今年五十九岁"
 
-    assert len(captured_review_files) == 2
-    assert set(captured_review_files[0]) == {
-        "/workspace/current_group_canon.json",
-        "/workspace/established_facts.json",
-        "/workspace/series_state.json",
-        "/workspace/recent_scripts.json",
-        "/workspace/candidate_episode.md",
-        "/workspace/candidate_state_delta.json",
-    }
-    assert "/workspace/story_contract.json" not in captured_review_files[0]
-
-    review = json.loads(captured_repair_files[0]["/workspace/episode_review.json"])
-    numeric_issue = next(
-        issue for issue in review["issues"] if issue["code"] == "locked_numeric_fact_mismatch"
-    )
-    assert numeric_issue["contract_refs"] == ["su_hui_age"]
-
-    repair_established = json.loads(captured_repair_files[0]["/workspace/established_facts.json"])
-    assert repair_established == writer_established
-    assert "Numeric fact repair is mandatory" in captured_repair_descriptions[0]
-    assert '["su_hui_age"]' in captured_repair_descriptions[0]
-    assert "五十九/59" in captured_repair_descriptions[0]
+    assert captured_review_files == []
+    assert captured_repair_files == []
+    assert captured_repair_descriptions == []
     assert InternalStage.GENERATING_EPISODE_SCRIPTS in approved
 
 
