@@ -283,6 +283,17 @@ adapter/provider/requested model、Relay 实际回报的 `response_model_ids`、
 分集候选、全剧审核和锁定后的剧情合同必须引用状态为 `succeeded` 的真实物理调用，不能
 用合成 `call_id` 补齐来源。
 
+### 可选观测（Langfuse）
+
+Pengine 可以把每次物理模型调用镜像到一套自托管
+[Langfuse](https://langfuse.com/)：默认关闭，`PENGINE_LANGFUSE_ENABLED`、
+`PENGINE_LANGFUSE_HOST`、`PENGINE_LANGFUSE_PUBLIC_KEY` 和
+`PENGINE_LANGFUSE_SECRET_KEY` 全部配置后才启用。观测是尽力而为的，失败只记日志，
+不改变任何业务状态，SQLite 仍是唯一权威；事件不包含 prompt 或模型响应正文，只携带
+`call_id`、模型身份、用量和阶段维度。本地 Langfuse v4 全套服务（全部只绑回环地址）见
+[`docker-compose.langfuse.yml`](docker-compose.langfuse.yml)，配置与查询说明见
+[开发文档](https://mindcarver.github.io/pengine/development/)。
+
 确认 `PENGINE_PERSONA_ROOT=./personas` 后启动：
 
 ```bash
@@ -348,6 +359,12 @@ curl --fail-with-body -X POST \
 curl --fail-with-body -X POST \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/authorize-repair \
   -H 'Idempotency-Key: repair-authorization-001'
+
+# 外部 relay 错误（如配额耗尽）导致的初稿终态失败，可原样重试；
+# 已批准检查点不会重新生成，详见 initial.progress.can_retry
+curl --fail-with-body -X POST \
+  http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/retry \
+  -H 'Idempotency-Key: retry-001'
 
 curl --fail-with-body -X POST \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/end \

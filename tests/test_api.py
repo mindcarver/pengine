@@ -14,7 +14,14 @@ from pengine.api import _error_response, create_app
 from pengine.config import Settings
 from pengine.errors import DomainError
 from pengine.repository import Repository
-from pengine.schemas import ContentPackage, Delivery, DeliveryReport, GateResult, InternalStage
+from pengine.schemas import (
+    ContentPackage,
+    Delivery,
+    DeliveryReport,
+    GateResult,
+    InternalStage,
+    RunFailure,
+)
 
 
 def _app(tmp_path: Path):
@@ -72,6 +79,7 @@ async def test_frontend_and_assets_are_served_with_run_control_openapi(
         ("POST", "/creations/{creation_id}/runs/{run_kind}/retry-final-review"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/authorize-repair"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
+        ("POST", "/creations/{creation_id}/runs/{run_kind}/retry"),
     }
 
     retry = app.openapi()["paths"]["/creations/{creation_id}/runs/{run_kind}/retry-final-review"][
@@ -271,6 +279,7 @@ async def test_persona_creation_and_query_contract(tmp_path: Path) -> None:
                 "model_calls": [],
                 "can_continue": False,
                 "can_end": False,
+                "can_retry": False,
             },
             "drafts": {
                 "artifacts": [],
@@ -399,6 +408,71 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
         )
         assert cannot_continue.status_code == 409
         assert cannot_continue.json()["code"] == "run_not_controllable"
+
+
+@pytest.mark.asyncio
+async def test_failed_relay_run_retry_command_is_idempotent(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client,
+    ):
+        accepted = await client.post(
+            "/creations",
+            headers={"Idempotency-Key": "retry-create"},
+            json={
+                "persona_id": "test-persona",
+                "story": "一个人回乡面对旧事。",
+                "requirements": "生成完整短剧。",
+            },
+        )
+        creation_id = accepted.json()["creation_id"]
+        repository = app.state.repository
+        lease = await repository.lease_next_job("retry-worker-1", 30)
+        assert lease is not None
+        await repository.record_stage_attempt(
+            lease.run_id,
+            InternalStage.GENERATING_STORY_OUTLINE,
+        )
+        await repository.fail_run(
+            lease.run_id,
+            RunFailure(
+                code="relay_unavailable",
+                message="The model relay request failed (HTTP 402).",
+                failed_stage=InternalStage.GENERATING_STORY_OUTLINE,
+                attempt_count=1,
+            ),
+        )
+
+        failed = await client.get(f"/creations/{creation_id}")
+        assert failed.json()["initial"]["state"] == "failed"
+        assert failed.json()["initial"]["progress"]["can_retry"] is True
+
+        first = await client.post(
+            f"/creations/{creation_id}/runs/initial/retry",
+            headers={"Idempotency-Key": "retry-relay"},
+        )
+        replay = await client.post(
+            f"/creations/{creation_id}/runs/initial/retry",
+            headers={"Idempotency-Key": "retry-relay"},
+        )
+        assert first.status_code == 202
+        assert replay.json() == first.json()
+        assert first.json()["run_state"] == "queued"
+
+        revived = await client.get(f"/creations/{creation_id}")
+        assert revived.json()["initial"]["state"] == "queued"
+        assert revived.json()["initial"]["progress"]["can_retry"] is False
+
+        not_failed = await client.post(
+            f"/creations/{creation_id}/runs/initial/retry",
+            headers={"Idempotency-Key": "retry-relay-queued"},
+        )
+        assert not_failed.status_code == 409
+        assert not_failed.json()["code"] == "run_not_controllable"
 
 
 @pytest.mark.asyncio

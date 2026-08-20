@@ -21,7 +21,7 @@ from pengine.model_calls import (
     build_started_record,
     new_call_id,
 )
-from pengine.repository import SCHEMA_VERSION, Repository
+from pengine.repository import MAX_STAGE_ATTEMPTS, SCHEMA_VERSION, Repository
 from pengine.schemas import (
     ContentPackage,
     CreateCreationRequest,
@@ -1458,6 +1458,206 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
             idempotency_key="continue-ended",
         )
     assert cannot_continue.value.code == "run_not_controllable"
+
+
+async def test_retry_run_revives_external_relay_failure_and_requeues_the_same_thread(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        {
+            "stage": "selecting_l0_variant",
+            "selected_l0_variant": "主动选择",
+            "selection_rationale": "符合测试故事。",
+        },
+        now=NOW,
+    )
+    await repository.record_stage_attempt(
+        lease.run_id, InternalStage.GENERATING_STORY_OUTLINE, now=NOW
+    )
+    await repository.fail_run(
+        lease.run_id,
+        RunFailure(
+            code="relay_unavailable",
+            message="The model relay request failed (HTTP 402).",
+            failed_stage=InternalStage.GENERATING_STORY_OUTLINE,
+            attempt_count=1,
+        ),
+        now=NOW,
+    )
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.state == "failed"
+    assert failed.initial.progress.can_retry is True
+
+    first = await repository.retry_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-relay",
+        now=NOW + timedelta(seconds=10),
+    )
+    replay = await repository.retry_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-relay",
+        now=NOW + timedelta(seconds=11),
+    )
+    assert replay == first
+    assert first.run_state == "queued"
+
+    revived = await repository.get_creation(accepted.creation_id)
+    assert revived is not None
+    assert revived.initial.state == "queued"
+    checkpoints = await repository.get_business_checkpoints(lease.run_id)
+    assert checkpoints[InternalStage.SELECTING_L0_VARIANT]["selected_l0_variant"] == "主动选择"
+
+    resumed = await repository.lease_next_job(
+        "worker-2",
+        30,
+        now=NOW + timedelta(seconds=12),
+    )
+    assert resumed is not None
+    assert resumed.run_id == lease.run_id
+    assert resumed.thread_id == lease.thread_id
+
+
+async def test_retry_run_rejects_running_and_non_external_failures(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+
+    with pytest.raises(DomainError) as running_reject:
+        await repository.retry_run(
+            creation_id=accepted.creation_id,
+            run_kind="initial",
+            idempotency_key="retry-running",
+        )
+    assert running_reject.value.code == "run_not_controllable"
+
+    for index, code in enumerate(
+        ("ended_by_user", "attempts_exhausted", "content_review_rejected")
+    ):
+        accepted = await repository.create_creation(
+            idempotency_key=f"create-retry-code-{index}",
+            request=creation_request,
+            persona_snapshot=persona,
+            now=NOW + timedelta(minutes=index),
+        )
+        lease = await repository.lease_next_job(
+            worker_id=f"worker-code-{index}",
+            lease_seconds=30,
+            now=NOW + timedelta(minutes=index),
+        )
+        assert lease is not None
+        await repository.fail_run(
+            lease.run_id,
+            RunFailure(
+                code=code,
+                message="Terminal failure under test.",
+                failed_stage=InternalStage.GENERATING_STORY_OUTLINE,
+                attempt_count=1,
+            ),
+            now=NOW + timedelta(minutes=index),
+        )
+        failed = await repository.get_creation(accepted.creation_id)
+        assert failed is not None
+        assert failed.initial.state == "failed"
+        assert failed.initial.progress.can_retry is False
+        with pytest.raises(DomainError) as code_reject:
+            await repository.retry_run(
+                creation_id=accepted.creation_id,
+                run_kind="initial",
+                idempotency_key=f"retry-{code}",
+            )
+        assert code_reject.value.code == "run_not_controllable"
+
+
+async def test_retry_run_rejects_revision_kind_and_exhausted_attempts(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, initial_lease = await create_and_lease_initial(
+        repository,
+        persona,
+        creation_request,
+    )
+    await repository.succeed_run(initial_lease.run_id, make_delivery(), now=NOW)
+    await repository.create_or_retry_revision(
+        creation_id=accepted.creation_id,
+        idempotency_key="revision-1",
+        request=RevisionRequest(feedback="加强结尾行动。"),
+        now=NOW + timedelta(minutes=1),
+    )
+    revision_lease = await repository.lease_next_job(
+        worker_id="worker-1",
+        lease_seconds=30,
+        now=NOW + timedelta(minutes=1),
+    )
+    assert revision_lease is not None
+    await repository.fail_run(
+        revision_lease.run_id,
+        RunFailure(
+            code="relay_unavailable",
+            message="The model relay request failed (HTTP 402).",
+            failed_stage=InternalStage.GENERATING_STORY_OUTLINE,
+            attempt_count=1,
+        ),
+    )
+    with pytest.raises(DomainError) as revision_reject:
+        await repository.retry_run(
+            creation_id=accepted.creation_id,
+            run_kind="revision",
+            idempotency_key="retry-revision",
+        )
+    assert revision_reject.value.code == "run_not_controllable"
+    assert "frozen feedback" in revision_reject.value.message
+
+    accepted = await repository.create_creation(
+        idempotency_key="create-retry-exhausted",
+        request=creation_request,
+        persona_snapshot=persona,
+        now=NOW + timedelta(minutes=2),
+    )
+    lease = await repository.lease_next_job(
+        worker_id="worker-retry-exhausted",
+        lease_seconds=30,
+        now=NOW + timedelta(minutes=2),
+    )
+    assert lease is not None
+    for index in range(MAX_STAGE_ATTEMPTS):
+        await repository.record_stage_attempt(
+            lease.run_id,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            now=NOW + timedelta(seconds=index),
+        )
+    await repository.fail_run(
+        lease.run_id,
+        RunFailure(
+            code="relay_unavailable",
+            message="The model relay request failed (HTTP 402).",
+            failed_stage=InternalStage.GENERATING_STORY_OUTLINE,
+            attempt_count=MAX_STAGE_ATTEMPTS,
+        ),
+        now=NOW + timedelta(seconds=30),
+    )
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.progress.can_retry is False
+    with pytest.raises(DomainError) as exhausted_reject:
+        await repository.retry_run(
+            creation_id=accepted.creation_id,
+            run_kind="initial",
+            idempotency_key="retry-exhausted",
+        )
+    assert exhausted_reject.value.code == "run_not_controllable"
+    assert "attempt limit" in exhausted_reject.value.message
 
 
 async def test_relay_interruption_is_delayed_and_shares_the_stage_recovery_budget(

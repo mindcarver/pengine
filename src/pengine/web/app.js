@@ -224,6 +224,7 @@ function cacheElements() {
     "quality-rejection-attempt",
     "failure-code",
     "failure-actions",
+    "retry-run",
     "start-new-creation",
     "quality-rejection-actions",
     "retry-final-review",
@@ -280,6 +281,13 @@ function bindEvents() {
     );
   }
   elements["end-run"].addEventListener("click", () => void handleRunControl("end"));
+  elements["retry-run"].addEventListener("click", () => {
+    elements["retry-run"].disabled = true;
+    void handleRunControl("retry", {
+      runKind: "initial",
+      messageElement: elements["failure-guidance"],
+    });
+  });
   elements["start-new-creation"].addEventListener("click", startNewCreation);
   elements["retry-final-review"].addEventListener("click", () =>
     void handleQualityRejectionControl("retry-final-review"),
@@ -600,6 +608,8 @@ async function handleRunControl(action, options = {}) {
       actionMessage = "正在按审核证据执行受限修复并重新审核……";
     } else if (action === "authorize-repair") {
       actionMessage = "正在授权一次修复循环……";
+    } else if (action === "retry") {
+      actionMessage = "正在从已批准进度重试当前任务……";
     }
     messageElement.textContent = actionMessage;
   }
@@ -830,6 +840,7 @@ function renderCreation() {
     const showWorkspace = renderWorkspace();
     showFailure(initial.failure, "初稿生成失败", {
       canStartNewCreation: true,
+      canRetry: initial.progress?.can_retry === true,
       showWorkspace,
       stageLabel: USER_STAGE_LABELS.get(initial.failure?.failed_stage),
     });
@@ -1125,10 +1136,18 @@ function showFailure(failure, title, options = {}) {
     ? `${failureMessage} 失败阶段：${options.stageLabel}。`
     : failureMessage;
   const canStartNewCreation = options.canStartNewCreation === true;
-  elements["failure-guidance"].hidden = !canStartNewCreation;
-  elements["failure-guidance"].textContent = canStartNewCreation
-    ? "本次任务已停止，刷新页面不会自动重试。请重新填写故事并投递新的任务。"
-    : "";
+  const canRetry = options.canRetry === true;
+  const retryButton = elements["retry-run"];
+  if (retryButton) {
+    retryButton.hidden = !canRetry;
+    retryButton.disabled = state.runControlBusy || !canRetry;
+  }
+  elements["failure-guidance"].hidden = !canStartNewCreation && !canRetry;
+  elements["failure-guidance"].textContent = canRetry
+    ? "本次任务因外部服务错误停止。修复 relay 后可从这里原样重试：已批准内容不会重新生成；也可以重新开始新任务。"
+    : canStartNewCreation
+      ? "本次任务已停止，刷新页面不会自动重试。请重新填写故事并投递新的任务。"
+      : "";
   elements["failure-code"].textContent = failure?.code
     ? `错误代码：${failure.code}`
     : "错误代码：未提供";

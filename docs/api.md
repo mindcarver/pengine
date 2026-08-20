@@ -33,11 +33,13 @@ Pengine 的机器接口是本地 JSON HTTP API。完整字段合同在 [`contrac
 | `GET` | `/personas` | 返回当前有效可选人格包 | `200 PersonaList` |
 | `POST` | `/creations` | 排队一轮初稿全流程 | `202 CreationAccepted` |
 | `GET` | `/creations/{creation_id}` | 查询初稿、修订状态、进度、草稿、证据和交付 | `200 CreationResource` |
+| `GET` | `/creations/{creation_id}/runs/{run_kind}/presentation` | 把指定 run 的正式交付读成结构化成品投影 | `200 DeliveryPresentation` |
 | `POST` | `/creations/{creation_id}/revision` | 冻结并排队唯一修订，或重排队相同反馈的失败修订 | `202 RevisionAccepted` |
 | `POST` | `/creations/{creation_id}/runs/{run_kind}/continue` | 继续暂停的初稿/修订 run | `202 RunControlAccepted` |
 | `POST` | `/creations/{creation_id}/runs/{run_kind}/retry-final-review` | 只重跑被拒绝的 L0/L4 最终审核 | `202 RunControlAccepted` |
 | `POST` | `/creations/{creation_id}/runs/{run_kind}/authorize-repair` | 授权一次绑定血缘的内容修复周期 | `202 RunControlAccepted` |
 | `POST` | `/creations/{creation_id}/runs/{run_kind}/end` | 结束可控制的暂停/拒绝 run | `202 RunControlAccepted` |
+| `POST` | `/creations/{creation_id}/runs/{run_kind}/retry` | 复活因外部 relay 错误终态失败的初稿 run | `202 RunControlAccepted` |
 
 其中 `{run_kind}` 只能是 `initial` 或 `revision`；`{creation_id}` 是 UUID。
 
@@ -128,6 +130,15 @@ curl --fail-with-body \
 
 不应根据 `current_stage` 自己推断正文已经成功；以 `business_checkpoints` 映射出的 `completed_stages` 和最终状态为准。
 
+### 成品投影
+
+```bash
+curl --fail-with-body \
+  http://127.0.0.1:8000/creations/CREATION_ID/runs/initial/presentation
+```
+
+只读端点，把一个 `succeeded` run 的正式交付投影成结构化阅览视图：五类产物（故事大纲、人物小传、关系逻辑、分集大纲、分集剧本）各自返回 `structured` 或 `source` 模式，整体 `status` 汇总为 `complete`、`partial` 或 `source`。投影按唯一锚点切分，锚点不唯一或乱序时该产物降级为原文模式，不会猜测结构。端点不暴露草稿、不改变状态；请求的 run 尚无正式交付时返回 `409 presentation_not_available`。设计来源见 [`.scd/designs/deliverable-presentation-read-model.md`](https://github.com/mindcarver/pengine/blob/main/.scd/designs/deliverable-presentation-read-model.md)。
+
 ## 6. 修订
 
 初稿必须是 `succeeded` 才能提交修订：
@@ -193,6 +204,16 @@ curl --fail-with-body -X POST \
 
 结束会保留已提交的业务 checkpoint、草稿、review 和 model-call audit，但不会生成 delivery，也不会把当前未提交候选视为正式内容。
 
+### Retry
+
+```bash
+curl --fail-with-body -X POST \
+  http://127.0.0.1:8000/creations/CREATION_ID/runs/initial/retry \
+  -H 'Idempotency-Key: retry-001'
+```
+
+只用于因**操作员可修复的外部 relay 错误**（`failure.code == relay_unavailable`，例如 HTTP 402 配额耗尽、服务不可用或 relay 超时）终态失败的初稿 run。满足条件时 run 回到 `queued`，沿用原 `thread_id` 和已批准业务检查点续跑——已批准内容不会重新生成。要求对应阶段仍有尝试预算；内容性拒绝、协议不兼容、预算耗尽和 `ended_by_user` 保持终态。失败的修订 run 不走此命令，继续使用相同 feedback 重排队语义。资源中的 `initial.progress.can_retry` 标明当前失败 run 是否可重试。
+
 ## 8. 状态值
 
 ### Run
@@ -223,6 +244,7 @@ curl --fail-with-body -X POST \
 | `404 persona_not_found` | persona_id 不存在 | 重新 GET `/personas` |
 | `503 persona_package_unavailable` | 人格包存在但未通过加载/快照条件 | 修复人格包，不要猜测正文 |
 | `404 creation_not_found` | creation_id 不存在 | 检查保存的资源地址 |
+| `409 presentation_not_available` | 请求的 run 没有可展示的正式交付 | 先轮询 run 状态，成功后再取投影 |
 | `409 idempotency_conflict` | 同 key 的 payload 不同 | 使用原 payload 或新的 key |
 | `409 revision_not_allowed` | 初稿未成功或修订已关闭 | 读取完整资源状态 |
 | `409 revision_feedback_locked` | feedback 已冻结且新值不同 | 只能使用原 feedback |

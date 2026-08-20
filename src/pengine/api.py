@@ -309,4 +309,29 @@ def create_app(
             idempotency_key=idempotency_key,
         )
 
+    @app.post(
+        "/creations/{creation_id}/runs/{run_kind}/retry",
+        operation_id="retryRun",
+        status_code=202,
+        response_model=RunControlAccepted,
+    )
+    async def retry_run(
+        creation_id: UUID,
+        run_kind: Literal["initial", "revision"],
+        idempotency_key: IdempotencyKey,
+    ) -> RunControlAccepted:
+        """Revive a failed initial run whose failure was an operator-fixable relay error.
+
+        Only a terminally failed initial run whose failure code is in the external
+        relay allowlist and whose stage attempt budget is not exhausted can be
+        retried. The run requeues with its original thread and approved business
+        checkpoints, so already approved content is never regenerated. A failed
+        revision run keeps its own resubmit-frozen-feedback semantics.
+        """
+        return await resolved_repository.retry_run(
+            creation_id=creation_id,
+            run_kind=run_kind,
+            idempotency_key=idempotency_key,
+        )
+
     return app
