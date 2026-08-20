@@ -5,6 +5,7 @@ import anthropic
 import httpx
 import openai
 import pytest
+from anthropic.types import RawMessageDeltaEvent
 from langchain_anthropic import ChatAnthropic
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
@@ -244,6 +245,83 @@ def test_anthropic_sync_stream_deduplicates_identical_model_identity_chunks(
         combined += chunk
 
     assert combined.message.response_metadata["model_name"] == "claude-opus-5"
+
+
+def test_anthropic_message_delta_normalizes_mapping_context_management() -> None:
+    """Exercise the SDK event -> LangChain chunk boundary used by real streams."""
+    model = build_chat_model(_role_settings(), role="generation")
+    event = RawMessageDeltaEvent.model_validate(
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 17},
+            "context_management": {
+                "applied_edits": [{"type": "clear_tool_uses_20250919", "cleared_tool_uses": 3}]
+            },
+        }
+    )
+
+    chunk, block_start = model._make_message_chunk_from_anthropic_event(
+        event,
+        stream_usage=True,
+        coerce_content_to_string=True,
+    )
+
+    assert block_start is None
+    assert chunk is not None
+    assert chunk.response_metadata["context_management"] == {
+        "applied_edits": [{"type": "clear_tool_uses_20250919", "cleared_tool_uses": 3}]
+    }
+    assert chunk.usage_metadata is not None
+    assert chunk.usage_metadata["output_tokens"] == 17
+
+
+def test_anthropic_message_delta_rejects_invalid_context_management_shape() -> None:
+    model = build_chat_model(_role_settings(), role="generation")
+    event = RawMessageDeltaEvent.model_validate(
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 17},
+            "context_management": ["unexpected"],
+        }
+    )
+
+    with pytest.raises(RelayError) as caught:
+        model._make_message_chunk_from_anthropic_event(
+            event,
+            stream_usage=True,
+            coerce_content_to_string=True,
+        )
+
+    assert caught.value.code == "relay_incompatible"
+    assert "context_management" in caught.value.safe_message
+    assert "model_dump" not in caught.value.safe_message
+
+
+def test_anthropic_message_delta_preserves_model_context_management() -> None:
+    class ContextManagementMetadata(BaseModel):
+        applied_edits: list[str]
+
+    model = build_chat_model(_role_settings(), role="generation")
+    event = RawMessageDeltaEvent.model_validate(
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 17},
+        }
+    ).model_copy(
+        update={"context_management": ContextManagementMetadata(applied_edits=["clear_tool_uses"])}
+    )
+
+    chunk, _ = model._make_message_chunk_from_anthropic_event(
+        event,
+        stream_usage=True,
+        coerce_content_to_string=True,
+    )
+
+    assert chunk is not None
+    assert chunk.response_metadata["context_management"] == {"applied_edits": ["clear_tool_uses"]}
 
 
 def test_model_call_audit_accepts_official_gpt55_snapshot_identity(caplog) -> None:

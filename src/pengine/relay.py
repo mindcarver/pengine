@@ -5,7 +5,7 @@ import logging
 import re
 import ssl
 import threading
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -143,6 +143,22 @@ class _SerialChatAnthropic(ChatAnthropic):
         configured = self.max_tokens
         requested = context.requested_output_tokens
         return {**kwargs, "max_tokens": min(configured, requested) if configured else requested}
+
+    def _make_message_chunk_from_anthropic_event(
+        self,
+        event: Any,
+        *,
+        stream_usage: bool = True,
+        coerce_content_to_string: bool,
+        block_start_event: Any | None = None,
+    ) -> tuple[Any | None, Any | None]:
+        event = _normalize_anthropic_stream_event(event)
+        return super()._make_message_chunk_from_anthropic_event(
+            event,
+            stream_usage=stream_usage,
+            coerce_content_to_string=coerce_content_to_string,
+            block_start_event=block_start_event,
+        )
 
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
         seen_model_ids: dict[str, str] = {}
@@ -515,7 +531,22 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         sequence, repair_round = self._pending_lineage.pop(run_id, (None, None))
         physical_call_id = record.call_id if record is not None else str(run_id)
         failure = _extract_provider_failure(error)
-        http_status = failure.http_status if failure is not None else None
+        mapped_error = _model_call_error(error)
+        http_status = (
+            error.http_status
+            if isinstance(error, RelayError)
+            else (failure.http_status if failure is not None else None)
+        )
+        provider_error_code = (
+            error.provider_error_code
+            if isinstance(error, RelayError)
+            else (failure.provider_code if failure is not None else None)
+        )
+        redacted_body = (
+            error.redacted_body
+            if isinstance(error, RelayError)
+            else (failure.redacted_body if failure is not None else None)
+        )
         if record is not None:
             timed_out = isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower()
             self._finalize(
@@ -529,15 +560,15 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                     "cache_creation_tokens": None,
                 },
                 finish_reason="timeout" if timed_out else None,
-                error_code="relay_timeout" if timed_out else "relay_error",
+                error_code=mapped_error.code,
                 error_type=type(error).__name__,
+                safe_message=mapped_error.safe_message,
                 http_status=http_status,
-                provider_error_code=(failure.provider_code if failure is not None else None),
-                redacted_body=(failure.redacted_body if failure is not None else None),
+                provider_error_code=provider_error_code,
+                redacted_body=redacted_body,
                 sequence=sequence,
                 repair_round=repair_round,
             )
-        redacted = failure.redacted_body if failure is not None else None
         _MODEL_CALL_LOGGER.warning(
             "model_call event=error role=%s requested_model_id=%s call_id=%s "
             "error_type=%s http_status=%s provider_error_code=%s redacted_response=%s",
@@ -546,8 +577,8 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             physical_call_id,
             type(error).__name__,
             http_status if http_status is not None else "none",
-            (failure.provider_code if failure is not None else "none"),
-            _truncate(redacted, 300) if redacted else "none",
+            provider_error_code if provider_error_code is not None else "none",
+            _truncate(redacted_body, 300) if redacted_body else "none",
         )
 
     def _persist(self, record: ModelCallRecord) -> None:
@@ -966,6 +997,78 @@ class RelayError(Exception):
 
     def __str__(self) -> str:
         return self.safe_message
+
+
+class RelayProtocolError(RelayError):
+    """Fail closed when an Anthropic stream event has an unsupported metadata shape."""
+
+    def __init__(self, *, field_name: str, value: Any) -> None:
+        self.field_name = field_name
+        self.value_type = type(value).__name__
+        super().__init__(
+            code="relay_incompatible",
+            safe_message=(
+                "The model relay returned incompatible Anthropic stream metadata for "
+                f"{field_name} (received {self.value_type}). The response was discarded; "
+                "verify relay protocol compatibility before continuing."
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelDumpMapping:
+    """Present Relay mapping metadata through the interface LangChain expects."""
+
+    value: dict[str, Any]
+
+    def model_dump(self, *, mode: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        del mode, kwargs
+        return dict(self.value)
+
+
+def _normalize_anthropic_stream_event(event: Any) -> Any:
+    """Normalize Relay extensions before LangChain's Anthropic event conversion."""
+    if getattr(event, "type", None) != "message_delta":
+        return event
+    context_management = getattr(event, "context_management", None)
+    if context_management is None or callable(getattr(context_management, "model_dump", None)):
+        return event
+    if not isinstance(context_management, Mapping):
+        raise RelayProtocolError(
+            field_name="context_management",
+            value=context_management,
+        )
+    model_copy = getattr(event, "model_copy", None)
+    if not callable(model_copy):
+        raise RelayProtocolError(field_name="message_delta", value=event)
+    return model_copy(update={"context_management": _ModelDumpMapping(dict(context_management))})
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelCallError:
+    code: str
+    safe_message: str
+
+
+def _model_call_error(error: BaseException) -> _ModelCallError:
+    if isinstance(error, RelayError):
+        return _ModelCallError(code=error.code, safe_message=error.safe_message)
+    timed_out = isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower()
+    if timed_out:
+        return _ModelCallError(
+            code="relay_unavailable",
+            safe_message="The model relay timed out.",
+        )
+    if isinstance(error, Exception) and is_relay_exception(error):
+        classified = classify_relay_exception(error)
+        return _ModelCallError(
+            code=classified.code,
+            safe_message=classified.safe_message,
+        )
+    return _ModelCallError(
+        code="internal_error",
+        safe_message="The model call failed safely.",
+    )
 
 
 class RelayIdentityError(RelayError):
