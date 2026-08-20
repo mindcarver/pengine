@@ -365,6 +365,8 @@ class WorkflowExecutor(Protocol):
         series_bible: SeriesBibleSummary | None = None,
         register_series_review: SeriesReviewRegistration | None = None,
         get_series_bible: Callable[[], Awaitable[SeriesBibleSummary | None]] | None = None,
+        get_series_review_boundary: Callable[[int], Awaitable[BoundStructuralReview | None]]
+        | None = None,
         suffix_rewrite_feedback: Mapping[str, Any] | None = None,
     ) -> WorkflowResult: ...
 
@@ -428,6 +430,8 @@ class Worker:
                     review_provider_profile_key=routes.review.provider_profile_key,
                     model_call_state=state,
                     generation_max_output_tokens=self.settings.generation_max_output_tokens,
+                    review_max_output_tokens=self.settings.review_max_output_tokens,
+                    review_context_limit_tokens=self.settings.review_context_limit_tokens,
                 )
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop(), name="pengine-worker")
@@ -1275,6 +1279,29 @@ class Worker:
                     )
                     return bound.review_id
 
+                async def get_series_review_boundary(
+                    episode_number: int,
+                ) -> BoundStructuralReview | None:
+                    """Return the latest passing receipt in the exact active lineage."""
+                    active = await self.repository.get_run_series_bible(work.run_id)
+                    batch = await self.repository.get_script_batch_lineage(work.run_id)
+                    if active is None or batch is None:
+                        return None
+                    eligible = [
+                        review
+                        for review in await self.repository.get_series_reviews(work.run_id)
+                        if review.status == "active"
+                        and review.passed
+                        and review.category == "pass"
+                        and review.episode_number < episode_number
+                        and review.design_candidate_id == active.candidate_id
+                        and review.design_content_hash == active.content_hash
+                        and review.design_epoch == active.design_epoch
+                        and review.batch_id == batch.batch_id
+                        and review.batch_epoch == batch.batch_epoch
+                    ]
+                    return max(eligible, key=lambda review: review.episode_number, default=None)
+
                 run_timeout_scope = asyncio.timeout(self.settings.run_timeout_seconds)
                 async with run_timeout_scope:
 
@@ -1311,6 +1338,7 @@ class Worker:
                     if isinstance(self.workflow, DeepAgentWorkflow):
                         workflow_kwargs.update(
                             {
+                                "get_series_review_boundary": get_series_review_boundary,
                                 "begin_generation_group": begin_generation_group,
                                 "complete_generation_group": complete_generation_group,
                                 "fail_generation_group": fail_generation_group,

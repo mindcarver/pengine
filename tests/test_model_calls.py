@@ -102,6 +102,34 @@ def test_model_call_store_persists_content_free_script_context_manifest(tmp_path
     store.close()
 
 
+def test_review_call_persists_compiled_context_manifest(tmp_path: Path) -> None:
+    store = ModelCallStore(tmp_path / "review-manifest.sqlite3")
+    manifest = {"mode": "full_prefix", "components": [{"name": "series_state"}]}
+    record = build_started_record(
+        role="review",
+        adapter="anthropic",
+        provider="anthropic",
+        model="claude-opus-5",
+        context=ModelCallContext(
+            run_id="run-review-context",
+            stage="generating_episode_scripts",
+            context_bundle_sha256="b" * 64,
+            context_manifest_json=json.dumps(manifest),
+        ),
+        estimated_input_tokens=100,
+        estimated_output_tokens=4_096,
+        verified_limit_tokens=64_000,
+    )
+
+    store.upsert(record)
+    row = store._connection.execute(
+        "SELECT context_bundle_sha256, context_manifest_json FROM model_calls"
+    ).fetchone()
+
+    assert tuple(row) == ("b" * 64, json.dumps(manifest))
+    store.close()
+
+
 def test_preflight_blocks_oversized_request_with_zero_outbound_calls(
     tmp_path: Path,
 ) -> None:

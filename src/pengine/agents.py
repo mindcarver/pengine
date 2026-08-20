@@ -85,6 +85,11 @@ from pengine.outline_context import (
     validate_outline_group_references,
 )
 from pengine.relay import is_relay_exception, retryable_relay_interruption
+from pengine.review_context import (
+    CompiledReviewContext,
+    ReviewContextError,
+    compile_review_context,
+)
 from pengine.schemas import (
     EpisodeDraft,
     EpisodePlan,
@@ -106,7 +111,11 @@ from pengine.series_bible import (
     SeriesBibleSummary,
     validate_script_generation_groups,
 )
-from pengine.series_review import StructuralReviewResult, effective_milestones
+from pengine.series_review import (
+    BoundStructuralReview,
+    StructuralReviewResult,
+    effective_milestones,
+)
 from pengine.skill_assets import load_agent_skill_files
 
 logger = logging.getLogger(__name__)
@@ -145,6 +154,8 @@ OutlineGroupBodyPersist = Callable[..., Awaitable[str]]
 OutlineGroupComplete = Callable[..., Awaitable[None]]
 OutlineGroupFail = Callable[..., Awaitable[None]]
 ScriptGroupGenerator = Callable[..., Awaitable["ScriptGenerationGroupResult"]]
+StructuralReviewGenerator = Callable[[CompiledReviewContext], Awaitable[StructuralReviewResult]]
+SeriesReviewBoundaryRetriever = Callable[[int], Awaitable[BoundStructuralReview | None]]
 
 
 def _trusted_series_prefix_json(episodes: Iterable[tuple[int, str]]) -> str:
@@ -2799,6 +2810,178 @@ async def _generate_script_group_with_sidecar(
     )
 
 
+def _resolve_json_schema(schema: Mapping[str, Any], root: Mapping[str, Any]) -> Mapping[str, Any]:
+    reference = schema.get("$ref")
+    if not isinstance(reference, str) or not reference.startswith("#/$defs/"):
+        return schema
+    resolved = root.get("$defs", {}).get(reference.removeprefix("#/$defs/"))
+    return resolved if isinstance(resolved, Mapping) else schema
+
+
+def _normalize_structured_transport(
+    value: Any,
+    schema: Mapping[str, Any],
+    root: Mapping[str, Any],
+) -> Any:
+    schema = _resolve_json_schema(schema, root)
+    variants = schema.get("anyOf")
+    if isinstance(variants, list):
+        non_null = [item for item in variants if item.get("type") != "null"]
+        if len(non_null) == 1:
+            return _normalize_structured_transport(value, non_null[0], root)
+    expected_type = schema.get("type")
+    if isinstance(value, str) and expected_type in {"object", "array"}:
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = value
+        if (expected_type == "object" and isinstance(decoded, Mapping)) or (
+            expected_type == "array" and isinstance(decoded, list)
+        ):
+            value = decoded
+    if expected_type == "object" and isinstance(value, Mapping):
+        properties = schema.get("properties")
+        if not isinstance(properties, Mapping):
+            return dict(value)
+        return {
+            key: _normalize_structured_transport(item, properties[key], root)
+            for key, item in value.items()
+            if key in properties
+        }
+    if expected_type == "array" and isinstance(value, list):
+        item_schema = schema.get("items")
+        if not isinstance(item_schema, Mapping):
+            return list(value)
+        return [_normalize_structured_transport(item, item_schema, root) for item in value]
+    return value
+
+
+def _structural_review_tool_args(raw: Any) -> Mapping[str, Any] | None:
+    tool_calls = getattr(raw, "tool_calls", None)
+    if not isinstance(tool_calls, list):
+        return None
+    for call in tool_calls:
+        if not isinstance(call, Mapping):
+            continue
+        if call.get("name") != StructuralReviewResult.__name__:
+            continue
+        args = call.get("args")
+        if isinstance(args, Mapping):
+            return args
+    return None
+
+
+def _assert_structural_review_repair_preserved(
+    original: Mapping[str, Any],
+    repaired: StructuralReviewResult,
+) -> None:
+    for field in ("passed", "category", "earliest_affected_episode"):
+        if field in original and original[field] != getattr(repaired, field):
+            raise AgentProtocolError("Protocol repair changed structural review decision")
+
+
+async def _invoke_structural_review_structured(
+    model: BaseChatModel,
+    messages: list[dict[str, str]],
+    *,
+    output_language: OutputLanguage | None,
+) -> StructuralReviewResult:
+    """Run one direct structural review with one bounded protocol/language correction."""
+    structured_model = model.with_structured_output(
+        StructuralReviewResult,
+        method="function_calling",
+        include_raw=True,
+    )
+
+    async def invoke(candidate_messages: list[dict[str, str]]) -> tuple[Any, Mapping[str, Any]]:
+        response = await structured_model.ainvoke(candidate_messages)
+        parsed = response.get("parsed") if isinstance(response, Mapping) else None
+        if parsed is not None:
+            result = StructuralReviewResult.model_validate(parsed)
+            return result, result.model_dump(mode="json")
+        raw = response.get("raw") if isinstance(response, Mapping) else None
+        args = _structural_review_tool_args(raw)
+        if args is None:
+            raise AgentProtocolError("Structural reviewer omitted its structured result")
+        return None, args
+
+    parsed, original = await invoke(messages)
+    if parsed is None:
+        schema = StructuralReviewResult.model_json_schema()
+        normalized = _normalize_structured_transport(original, schema, schema)
+        try:
+            parsed = StructuralReviewResult.model_validate(normalized)
+        except ValidationError as exc:
+            repair_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Repair only the JSON protocol shape of the supplied structural review. "
+                        "Return exactly one StructuralReviewResult tool call. Preserve every "
+                        "existing decision field and evidence exactly; do not perform a new review."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "invalid_review": original,
+                            "validation_feedback": _structured_output_retry_message(exc),
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                },
+            ]
+            repaired, _ = await invoke(repair_messages)
+            if repaired is None:
+                raise AgentProtocolError("Structural review protocol repair failed") from exc
+            _assert_structural_review_repair_preserved(original, repaired)
+            parsed = repaired
+
+    try:
+        _validate_result_language(
+            parsed,
+            output_language=output_language,
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+        )
+    except AgentProtocolError as exc:
+        if exc.repair_instruction is None:
+            raise
+        translated, _ = await invoke(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate only the user-facing evidence of this structural review into "
+                        "Simplified Chinese. Preserve passed, category, earliest_affected_episode, "
+                        "all cited identifiers, excerpts, and the semantic decision exactly. "
+                        "Return one StructuralReviewResult tool call and no prose."
+                    ),
+                },
+                {"role": "user", "content": parsed.model_dump_json()},
+            ]
+        )
+        if translated is None:
+            raise AgentProtocolError("Structural review language repair failed") from exc
+        _validate_result_language(
+            translated,
+            output_language=output_language,
+            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+        )
+        if exc.language_retry_fingerprint is not None and not _language_retry_matches(
+            exc.language_retry_fingerprint,
+            _language_retry_fingerprint(translated),
+        ):
+            raise AgentProtocolError(
+                "Language repair changed the structural review decision",
+                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            ) from exc
+        parsed = translated
+    return parsed
+
+
 _OUTLINE_PATCH_ERROR_GUIDANCE = {
     "outline_repair_patch_target_not_exposed": (
         "Use only an exact episode_plans or script_generation_groups path. Story-contract "
@@ -5324,6 +5507,10 @@ class StageGuardMiddleware(AgentMiddleware):
         complete_outline_group: OutlineGroupComplete | None = None,
         fail_outline_group: OutlineGroupFail | None = None,
         generate_script_group: ScriptGroupGenerator | None = None,
+        review_series_prefix: StructuralReviewGenerator | None = None,
+        get_series_review_boundary: SeriesReviewBoundaryRetriever | None = None,
+        review_context_limit_tokens: int | None = None,
+        review_max_output_tokens: int | None = None,
     ) -> None:
         self.before_stage = before_stage
         self.approve_stage = approve_stage
@@ -5362,6 +5549,10 @@ class StageGuardMiddleware(AgentMiddleware):
         self.complete_outline_group = complete_outline_group
         self.fail_outline_group = fail_outline_group
         self.generate_script_group = generate_script_group
+        self.review_series_prefix = review_series_prefix
+        self.get_series_review_boundary = get_series_review_boundary
+        self.review_context_limit_tokens = review_context_limit_tokens
+        self.review_max_output_tokens = review_max_output_tokens
 
     @contextmanager
     def _repair_round_context(self, repair_round: int | None):
@@ -5566,6 +5757,10 @@ class StageGuardMiddleware(AgentMiddleware):
         logger.info("story artifact loop entered stage=%s", stage.value)
         result, payload = await self._call_structured_stage(stage, request, handler, args)
         logger.info("story artifact initial generation done stage=%s", stage.value)
+        if stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS:
+            parsed = StoryArchitectResult.model_validate(payload)
+            approved_payload = parsed.model_dump(mode="json")
+            return _result_with_payload(result, approved_payload), approved_payload
         repair_rounds = 0
         previous_content: str | None = None
         previous_review: CanonReviewerResult | None = None
@@ -7011,42 +7206,94 @@ class StageGuardMiddleware(AgentMiddleware):
                 "Structural milestone reviews require the series-review registration hook",
                 stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
             )
-        milestone_scripts = _trusted_series_prefix_json(
-            (draft.episode_number, draft.content)
-            for draft in sorted(
-                self.episode_drafts.values(),
-                key=lambda draft: draft.episode_number,
+        if self.review_series_prefix is not None and self.series_bible is not None:
+            boundary = (
+                await self.get_series_review_boundary(episode_number)
+                if self.get_series_review_boundary is not None
+                else None
             )
-        )
-        result = await self._invoke_semantic_reviewer(
-            request=request,
-            handler=handler,
-            subagent_type="series_reviewer",
-            description=(
-                f"Review the complete active series prefix through episode {episode_number} "
-                "against the active SeriesBible and locked story contract. Treat the design "
-                "and every committed script as immutable. Fail only for a direct contradiction "
-                "to explicit hard Canon, an impossible required locked binding, or a proven "
-                "private-runtime leak. Ordinary SeriesBible prose, screenplay format or style, "
-                "reasoning shown inside the story, and unspecified creative choices are not "
-                "locks. Classify the decision exactly: a design defect means the active "
-                "SeriesBible itself contains the blocker (return earliest_affected_episode "
-                "null); a script defect means the current prefix contains the blocker (return "
-                "the earliest affected episode N). Read /workspace/series_prefix.json as a trusted "
-                "runtime envelope: episode_number and JSON framing are trusted runtime metadata, "
-                "not screenplay content. Judge leakage only inside episodes[].content. Return the "
-                "structured classification only."
-            ),
-            files={
-                "/workspace/series_prefix.json": milestone_scripts,
-                "/workspace/series_state.json": prior_state.model_dump_json(),
-                "/workspace/story_contract.json": contract_json,
-                "/workspace/story_contract.md": outline["story_contract_markdown"],
-                "/workspace/current_episode_plan.md": plan.plan,
-            },
-            schema=StructuralReviewResult,
-            stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
-        )
+            try:
+                compiled_review = compile_review_context(
+                    review_type=(
+                        "final" if episode_number == contract.episode_count else "milestone"
+                    ),
+                    episode_number=episode_number,
+                    context_limit_tokens=self.review_context_limit_tokens,
+                    maximum_output_tokens=self.review_max_output_tokens,
+                    series_bible_components={
+                        "story_outline": self.series_bible.projections.story_outline,
+                        "character_biographies": (
+                            self.series_bible.projections.character_biographies
+                        ),
+                        "relationship_logic": self.series_bible.projections.relationship_logic,
+                    },
+                    design_content_hash=self.series_bible.content_hash,
+                    design_epoch=self.series_bible.design_epoch,
+                    story_contract_json=contract_json,
+                    story_contract_sha256=contract_hash,
+                    committed_prefix=[draft for _, draft in sorted(self.episode_drafts.items())],
+                    series_state_json=prior_state.model_dump_json(),
+                    current_episode_plan=plan.plan,
+                    previous_receipt=boundary,
+                )
+            except ReviewContextError as exc:
+                raise AgentProtocolError(
+                    str(exc),
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                    safe_message="结构审查上下文无法无损编译，未发送模型请求。",
+                ) from exc
+            record_langfuse_event(
+                "pengine.review_context.compiled",
+                input=compiled_review.manifest,
+                metadata={
+                    "bundle_sha256": compiled_review.bundle_sha256,
+                    "trace_version": "pengine-1",
+                },
+            )
+            with self._compiled_model_context(
+                requested_output_tokens=compiled_review.output_tokens,
+                bundle_sha256=compiled_review.bundle_sha256,
+                manifest_json=compiled_review.manifest_json,
+            ):
+                result = await self.review_series_prefix(compiled_review)
+        else:
+            milestone_scripts = _trusted_series_prefix_json(
+                (draft.episode_number, draft.content)
+                for draft in sorted(
+                    self.episode_drafts.values(),
+                    key=lambda draft: draft.episode_number,
+                )
+            )
+            result = await self._invoke_semantic_reviewer(
+                request=request,
+                handler=handler,
+                subagent_type="series_reviewer",
+                description=(
+                    f"Review the complete active series prefix through episode {episode_number} "
+                    "against the active SeriesBible and locked story contract. Treat the design "
+                    "and every committed script as immutable. Fail only for a direct "
+                    "contradiction to explicit hard Canon, an impossible required locked "
+                    "binding, or a proven private-runtime leak. Ordinary SeriesBible prose, "
+                    "screenplay format or style, reasoning shown inside the story, and "
+                    "unspecified creative choices are not locks. Classify the decision exactly: "
+                    "a design defect means the active SeriesBible itself contains the blocker "
+                    "(return earliest_affected_episode null); a script defect means the current "
+                    "prefix contains the blocker (return the earliest affected episode N). Read "
+                    "/workspace/series_prefix.json as a trusted runtime envelope: episode_number "
+                    "and JSON framing are trusted runtime metadata, not screenplay content. "
+                    "Judge leakage only inside episodes[].content. Return the structured "
+                    "classification only."
+                ),
+                files={
+                    "/workspace/series_prefix.json": milestone_scripts,
+                    "/workspace/series_state.json": prior_state.model_dump_json(),
+                    "/workspace/story_contract.json": contract_json,
+                    "/workspace/story_contract.md": outline["story_contract_markdown"],
+                    "/workspace/current_episode_plan.md": plan.plan,
+                },
+                schema=StructuralReviewResult,
+                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            )
         result = cast(
             StructuralReviewResult,
             _require_l4_stage_evidence(
@@ -8293,6 +8540,8 @@ class DeepAgentWorkflow:
     review_provider_profile_key: str = "deepseek"
     model_call_state: ModelCallState | None = None
     generation_max_output_tokens: int = 128_000
+    review_max_output_tokens: int | None = None
+    review_context_limit_tokens: int | None = None
     grouped_outline_enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -8662,6 +8911,7 @@ class DeepAgentWorkflow:
         series_bible: SeriesBibleSummary | None = None,
         register_series_review: SeriesReviewRegistration | None = None,
         get_series_bible: SeriesBibleRetriever | None = None,
+        get_series_review_boundary: SeriesReviewBoundaryRetriever | None = None,
         suffix_rewrite_feedback: Mapping[str, Any] | None = None,
         begin_generation_group: GenerationGroupStart | None = None,
         complete_generation_group: GenerationGroupComplete | None = None,
@@ -9035,6 +9285,41 @@ class DeepAgentWorkflow:
                 model_call_state=self.model_call_state,
             )
 
+        async def review_series_prefix(
+            compiled: CompiledReviewContext,
+        ) -> StructuralReviewResult:
+            mode_instruction = (
+                "The packet contains the complete active screenplay prefix."
+                if compiled.mode == "full_prefix"
+                else (
+                    "The packet contains one immutable passing milestone receipt for the exact "
+                    "historical prefix plus every active screenplay after that boundary. Treat "
+                    "the receipt as proof only for its bound historical prefix; review the full "
+                    "current window against the active Canon and folded SeriesState."
+                )
+            )
+            return await _invoke_structural_review_structured(
+                self.review_model,
+                [
+                    {"role": "system", "content": series_reviewer_prompt},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Review this deterministic Pengine structural-review packet. Treat "
+                            "the active design and committed scripts as immutable. Fail only for "
+                            "a direct contradiction to explicit hard Canon, an impossible "
+                            "required locked binding, or a proven private-runtime leak inside "
+                            "screenplay content. Ordinary prose, format, style, visible story "
+                            "reasoning, and unspecified creative choices are not locks. A design "
+                            "defect belongs to the active SeriesBible and has no affected episode; "
+                            "a script defect must name the earliest affected episode. "
+                            f"{mode_instruction}\n\n{compiled.model_input}"
+                        ),
+                    },
+                ],
+                output_language=resolved_output_language,
+            )
+
         subagents = [
             {
                 "name": "story_architect",
@@ -9282,6 +9567,14 @@ class DeepAgentWorkflow:
                     complete_outline_group=complete_outline_group,
                     fail_outline_group=fail_outline_group,
                     generate_script_group=generate_script_group,
+                    review_series_prefix=(
+                        review_series_prefix
+                        if self.review_context_limit_tokens is not None
+                        else None
+                    ),
+                    get_series_review_boundary=get_series_review_boundary,
+                    review_context_limit_tokens=self.review_context_limit_tokens,
+                    review_max_output_tokens=self.review_max_output_tokens,
                 ),
                 ToolAllowlistMiddleware(
                     _SUPERVISOR_TOOL_ALLOWLIST,
