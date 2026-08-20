@@ -10,6 +10,7 @@ from pengine.outline_context import (
     compile_outline_group_context,
     compile_season_map_context,
     outline_group_output_tokens,
+    validate_outline_group_references,
 )
 from pengine.series_bible import ScriptGenerationGroup
 
@@ -159,6 +160,154 @@ def test_group_context_keeps_full_ledger_but_only_two_recent_outline_groups() ->
     assert [item["group_id"] for item in recent] == ["group_2", "group_3"]
     assert "content" not in ledger[0]
     assert recent[0]["content"] == "group_2 的分集大纲正文"
+
+
+def test_group_context_carries_prior_character_introductions_in_the_ledger() -> None:
+    season_map = make_season_map(5)
+    first = make_group(season_map.script_generation_groups[0])
+    payload = first.model_dump(mode="json")
+    payload["character_introductions"] = [
+        {
+            "character_id": "village_doctor",
+            "name": "村医",
+            "role": "提供伤情判断",
+            "initial_known_fact_ids": [],
+        }
+    ]
+    first = EpisodeOutlineGroupResult.model_validate(payload)
+
+    compiled = compile_outline_group_context(
+        creation_request="乡村悬疑故事",
+        persona_components={},
+        story_outline="调查旧案",
+        character_biographies="调查者返乡",
+        relationship_logic="村民互相隐瞒",
+        season_map=season_map,
+        prior_groups=[first],
+        group=season_map.script_generation_groups[1],
+        maximum_output_tokens=128_000,
+    )
+    components = {
+        item["name"]: item["content"] for item in json.loads(compiled.model_input)["components"]
+    }
+    ledger = json.loads(components["committed_continuity_ledger"])
+
+    assert ledger[0]["character_introductions"][0]["character_id"] == "village_doctor"
+
+
+def test_group_reference_validation_rejects_an_undeclared_character_before_commit() -> None:
+    season_map = make_season_map(3)
+    group = make_group(season_map.script_generation_groups[0])
+    payload = group.model_dump(mode="json")
+    payload["timeline"][0]["participant_ids"].append("new_witness")
+    candidate = EpisodeOutlineGroupResult.model_validate(payload)
+
+    with pytest.raises(OutlineContextError, match="unknown character IDs.*new_witness"):
+        validate_outline_group_references(season_map, [], candidate)
+
+
+def test_group_can_declare_a_character_for_same_and_later_group_references() -> None:
+    season_map = make_season_map(5)
+    groups = [make_group(group) for group in season_map.script_generation_groups]
+    first_payload = groups[0].model_dump(mode="json")
+    first_payload["character_introductions"] = [
+        {
+            "character_id": "new_witness",
+            "name": "新证人",
+            "role": "掌握旧案线索的证人",
+            "initial_known_fact_ids": [],
+        }
+    ]
+    first_payload["timeline"][0]["participant_ids"].append("new_witness")
+    groups[0] = EpisodeOutlineGroupResult.model_validate(first_payload)
+    validate_outline_group_references(season_map, [], groups[0])
+
+    second_payload = groups[1].model_dump(mode="json")
+    second_payload["timeline"][0]["participant_ids"].append("new_witness")
+    groups[1] = EpisodeOutlineGroupResult.model_validate(second_payload)
+    validate_outline_group_references(season_map, groups[:1], groups[1])
+
+    payload = assemble_episode_outline(season_map, groups)
+
+    assert [item["character_id"] for item in payload["story_contract"]["characters"]].count(
+        "new_witness"
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    ("introduction", "message"),
+    [
+        (
+            {
+                "character_id": "lin_lan",
+                "name": "另一个林岚",
+                "role": "冲突人物",
+                "initial_known_fact_ids": [],
+            },
+            "character ID",
+        ),
+        (
+            {
+                "character_id": "other_lin_lan",
+                "name": "林岚",
+                "role": "重名人物",
+                "initial_known_fact_ids": [],
+            },
+            "character name",
+        ),
+    ],
+)
+def test_group_reference_validation_rejects_character_redeclarations(
+    introduction: dict[str, object],
+    message: str,
+) -> None:
+    season_map = make_season_map(3)
+    payload = make_group(season_map.script_generation_groups[0]).model_dump(mode="json")
+    payload["character_introductions"] = [introduction]
+    candidate = EpisodeOutlineGroupResult.model_validate(payload)
+
+    with pytest.raises(OutlineContextError, match=message):
+        validate_outline_group_references(season_map, [], candidate)
+
+
+def test_group_reference_validation_rejects_unknown_fact_and_clue_references() -> None:
+    season_map = make_season_map(3)
+    base = make_group(season_map.script_generation_groups[0]).model_dump(mode="json")
+    base["timeline"][0]["fact_ids"] = ["unknown_fact"]
+    with pytest.raises(OutlineContextError, match="unknown fact IDs.*unknown_fact"):
+        validate_outline_group_references(
+            season_map,
+            [],
+            EpisodeOutlineGroupResult.model_validate(base),
+        )
+
+    base = make_group(season_map.script_generation_groups[0]).model_dump(mode="json")
+    base["episode_obligations"][0]["required_clue_ids"] = ["unknown_clue"]
+    with pytest.raises(OutlineContextError, match="unknown clue IDs.*unknown_clue"):
+        validate_outline_group_references(
+            season_map,
+            [],
+            EpisodeOutlineGroupResult.model_validate(base),
+        )
+
+
+def test_group_reference_validation_rejects_cross_type_evidence_id_collisions() -> None:
+    season_map = make_season_map(3)
+    payload = make_group(season_map.script_generation_groups[0]).model_dump(mode="json")
+    payload["clues"] = [
+        {
+            "clue_id": payload["facts"][0]["fact_id"],
+            "description": "与事实错误共用 ID 的线索",
+            "introduced_episode": 1,
+            "explained_episode": 2,
+            "callback_episode": 3,
+            "introduction_is_visible_or_audible": True,
+        }
+    ]
+    candidate = EpisodeOutlineGroupResult.model_validate(payload)
+
+    with pytest.raises(OutlineContextError, match="globally unique"):
+        validate_outline_group_references(season_map, [], candidate)
 
 
 def test_group_context_rejects_a_non_contiguous_committed_prefix() -> None:
