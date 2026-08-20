@@ -84,6 +84,7 @@ from pengine.agents import (
     _generate_script_group_with_sidecar,
     _invoke_direct_structured_with_retry,
     _invoke_outline_group_markdown,
+    _invoke_outline_group_review,
     _invoke_script_group_sidecar,
     _invoke_script_group_text,
     _invoke_structural_review_structured,
@@ -585,6 +586,83 @@ async def test_direct_structured_call_repairs_parameter_name_json_wrapper() -> N
 
 
 @pytest.mark.asyncio
+async def test_outline_group_review_repairs_invalid_contract_reference() -> None:
+    candidate = EpisodeOutlineGroupResult.model_validate(
+        {
+            "group_id": "last_table",
+            "start_episode": 28,
+            "end_episode": 28,
+            "content": "## 第28集\n\n秀梅七岁，秀山十六。",
+            "episodes": [{"episode_number": 28, "plan": "秀梅七岁，秀山十六。"}],
+            "facts": [
+                {
+                    "fact_id": "xiushan_age_then",
+                    "subject": "何秀山",
+                    "predicate": "当年年纪",
+                    "kind": "count",
+                    "value": "16",
+                    "unit": "岁",
+                    "first_revealed_episode": 28,
+                }
+            ],
+            "timeline": [
+                {
+                    "event_id": "mother_admits",
+                    "when": "同夜",
+                    "participant_ids": [],
+                    "fact_ids": ["xiushan_age_then"],
+                }
+            ],
+            "episode_obligations": [
+                {
+                    "obligation_id": "mother_owns_it",
+                    "episode_number": 28,
+                    "new_information_fact_ids": ["xiushan_age_then"],
+                    "required_clue_ids": [],
+                    "end_hook": "母亲认账",
+                }
+            ],
+        }
+    )
+    compiled = CompiledOutlineContext(
+        model_input='{"character_biographies":"何秀山四十一岁；何秀梅三十七岁"}',
+        bundle_sha256="c" * 64,
+        manifest={"group_id": "last_table"},
+        manifest_json='{"group_id":"last_table"}',
+        output_tokens=8_192,
+    )
+    invalid = {
+        "passed": False,
+        "evidence": "L4硬规则：人物年龄与已批准小传矛盾。",
+        "issues": [
+            {
+                "code": "hard_canon_age_contradiction",
+                "message": "秀梅七岁时秀山应为十一岁。",
+                "contract_refs": ["character_biographies", "season_map", "persona.l4"],
+            }
+        ],
+    }
+    corrected = copy.deepcopy(invalid)
+    corrected["issues"][0]["contract_refs"] = ["character_biographies", "season_map"]
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call("SemanticReview", invalid, 1),
+            _tool_call("SemanticReview", corrected, 2),
+        ]
+    )
+
+    result = await _invoke_outline_group_review(model, compiled, candidate)
+
+    assert result == SemanticReview.model_validate(corrected)
+    assert len(model.model_message_batches) == 2
+    feedback = next(
+        message for message in model.model_message_batches[1] if isinstance(message, ToolMessage)
+    )
+    assert "contract_refs.2" in feedback.content
+    assert "StableId" in model.model_system_prompts[0]
+
+
+@pytest.mark.asyncio
 async def test_outline_group_body_is_plain_markdown_without_structured_coordinates() -> None:
     group = ScriptGenerationGroup(
         group_id="community_choice",
@@ -647,6 +725,7 @@ async def test_outline_sidecar_failure_and_resume_reuse_persisted_markdown() -> 
     }
     stored: dict[str, Any] = {}
     persisted_hashes: list[str] = []
+    replacement_expectations: list[str | None] = []
 
     async def load_body(_: str) -> Mapping[str, Any] | None:
         return stored or None
@@ -657,7 +736,9 @@ async def test_outline_sidecar_failure_and_resume_reuse_persisted_markdown() -> 
         operation_id: str,
         outline_markdown: str,
         outline_markdown_sha256: str,
+        expected_outline_markdown_sha256: str | None = None,
     ) -> str:
+        replacement_expectations.append(expected_outline_markdown_sha256)
         stored.update(
             {
                 "operation_id": operation_id,
@@ -786,6 +867,44 @@ async def test_outline_sidecar_failure_and_resume_reuse_persisted_markdown() -> 
     )
     assert "FULL-CONTEXT-SENTINEL" not in resumed_input
     assert fixed_hash in resumed_input
+
+    repaired_sidecar = copy.deepcopy(valid_sidecar)
+    repaired_sidecar["facts"][0]["value"] = "十一岁"
+    repaired_model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(content="## 第1集\n\n林荷决定留下守夜，年龄改为十一岁。"),
+            _tool_call("EpisodeOutlineGroupSidecar", repaired_sidecar, 4),
+        ]
+    )
+    repair_feedback = json.dumps(
+        {
+            "repair_round": 1,
+            "evidence": "当前正文年龄违反硬 Canon。",
+            "issues": [{"code": "hard_canon_age_contradiction"}],
+        },
+        ensure_ascii=False,
+    )
+
+    repaired = await _generate_outline_group_with_sidecar(
+        repaired_model,
+        compiled=compiled,
+        group=group,
+        operation_id="outline-operation-2",
+        sidecar_context=sidecar_context,
+        repair_feedback=repair_feedback,
+        repair_mode="full",
+        load_body=load_body,
+        persist_body=persist_body,
+        model_call_state=None,
+    )
+
+    assert "年龄改为十一岁" in repaired.content
+    assert persisted_hashes == [fixed_hash, stored["outline_markdown_sha256"]]
+    assert replacement_expectations == [None, fixed_hash]
+    repaired_input = "\n".join(
+        str(message.content) for message in repaired_model.model_message_batches[0]
+    )
+    assert "hard_canon_age_contradiction" in repaired_input
 
 
 @pytest.mark.asyncio
@@ -8012,6 +8131,7 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
     stored_map: dict[str, Any] | None = None
     committed: list[dict[str, Any]] = []
     generated: list[str] = []
+    repair_modes: list[str] = []
     repair_feedbacks: list[str] = []
     failed: list[str] = []
     fail_second_once = True
@@ -8052,11 +8172,12 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
     async def generate_group(
         compiled: Any,
         repair_feedback: str | None,
-        **_: Any,
+        **kwargs: Any,
     ) -> EpisodeOutlineGroupResult:
         nonlocal assembly_invalid_once, fail_second_once
         group_id = compiled.manifest["group_id"]
         generated.append(group_id)
+        repair_modes.append(kwargs["repair_mode"])
         if repair_feedback is not None:
             repair_feedbacks.append(repair_feedback)
         if group_id == "pursuit" and fail_second_once:
@@ -8238,6 +8359,7 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
         "pursuit",
         "pursuit",
     ]
+    assert repair_modes == ["sidecar", "sidecar", "full", "sidecar", "sidecar"]
     assert len(repair_feedbacks) == 2
     assert "current_group_protocol_violation" in repair_feedbacks[0]
     assert "Group obligations must match the group's fact reveals" in repair_feedbacks[0]
@@ -8410,6 +8532,171 @@ async def test_grouped_outline_stops_after_two_assembly_repairs() -> None:
     assert all(
         item["previous_sidecar"]["facts"][1]["fact_id"] == "fact_unbound" for item in feedbacks
     )
+    assert failed == ["opening"]
+
+
+@pytest.mark.asyncio
+async def test_grouped_outline_stops_after_two_semantic_repairs() -> None:
+    season_payload = {
+        "episode_count": 1,
+        "characters": [
+            {
+                "character_id": "lin_lan",
+                "name": "林岚",
+                "role": "调查者",
+                "initial_known_fact_ids": [],
+            }
+        ],
+        "relationships": [],
+        "prohibitions": [],
+        "review_milestones": [],
+        "script_generation_groups": [
+            {
+                "group_id": "opening",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "发现旧信",
+                "boundary_reason": "线索改变目标",
+            }
+        ],
+    }
+    candidate = EpisodeOutlineGroupResult.model_validate(
+        {
+            "group_id": "opening",
+            "start_episode": 1,
+            "end_episode": 1,
+            "content": "## 第1集\n\n林岚发现旧信。",
+            "episodes": [{"episode_number": 1, "plan": "林岚发现旧信。"}],
+            "facts": [
+                {
+                    "fact_id": "letter_found",
+                    "subject": "林岚",
+                    "predicate": "发现",
+                    "kind": "text",
+                    "value": "旧信",
+                    "first_revealed_episode": 1,
+                }
+            ],
+            "timeline": [
+                {
+                    "event_id": "find_letter",
+                    "when": "第一天",
+                    "participant_ids": [],
+                    "fact_ids": ["letter_found"],
+                }
+            ],
+            "knowledge_states": [],
+            "clues": [],
+            "episode_obligations": [
+                {
+                    "obligation_id": "opening_hook",
+                    "episode_number": 1,
+                    "new_information_fact_ids": ["letter_found"],
+                    "required_clue_ids": [],
+                    "end_hook": "旧信来源成谜",
+                }
+            ],
+        }
+    )
+    stored_map: dict[str, Any] | None = None
+    repair_modes: list[str] = []
+    feedbacks: list[dict[str, Any]] = []
+    failed: list[str] = []
+
+    async def load_season_map() -> Mapping[str, Any] | None:
+        return stored_map
+
+    async def commit_season_map(payload: Mapping[str, Any]) -> None:
+        nonlocal stored_map
+        stored_map = {"content": dict(payload)}
+
+    async def generate_group(
+        _: Any,
+        repair_feedback: str | None,
+        **kwargs: Any,
+    ) -> EpisodeOutlineGroupResult:
+        repair_modes.append(kwargs["repair_mode"])
+        if repair_feedback is not None:
+            feedbacks.append(json.loads(repair_feedback))
+        return candidate
+
+    async def reject_group(_: Any, __: Any) -> SemanticReview:
+        return SemanticReview.model_validate(
+            {
+                "passed": False,
+                "evidence": "L4硬规则：人物年龄仍与已批准小传矛盾。",
+                "issues": [
+                    {
+                        "code": "hard_canon_age_contradiction",
+                        "message": "重写当前组正文中的年龄。",
+                        "contract_refs": ["character_biographies", "season_map"],
+                    }
+                ],
+            }
+        )
+
+    async def generate_season_map(_: Any) -> Mapping[str, Any]:
+        return season_payload
+
+    async def load_groups() -> list[Mapping[str, Any]]:
+        return []
+
+    async def begin_group(**_: Any) -> str:
+        return "operation-opening"
+
+    async def fail_group(**kwargs: Any) -> None:
+        failed.append(kwargs["group_id"])
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_season_map=generate_season_map,
+        generate_outline_group=generate_group,
+        review_outline_group=reject_group,
+        load_outline_season_map=load_season_map,
+        commit_outline_season_map=commit_season_map,
+        load_outline_groups=load_groups,
+        begin_outline_group=begin_group,
+        load_outline_group_body=lambda _: _async_none(),
+        persist_outline_group_body=lambda *_, **__: _async_none(),
+        complete_outline_group=lambda **_: _async_none(),
+        fail_outline_group=fail_group,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] generate outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-grouped-semantic-limit",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={
+            "files": {
+                "/workspace/creation-request.md": {"content": "故事需求"},
+                "/workspace/story_outline.md": {"content": "故事梗概"},
+                "/workspace/character_biographies.md": {"content": "人物小传"},
+                "/workspace/relationship_logic.md": {"content": "人物关系"},
+            }
+        },
+        runtime=None,
+    )
+
+    with pytest.raises(ContentReviewRejectedError) as error:
+        await middleware._generate_grouped_outline(
+            request,
+            lambda _: _async_none(),
+            request.tool_call["args"],
+        )
+
+    assert error.value.repair_rounds == 2
+    assert repair_modes == ["sidecar", "full", "full"]
+    assert [item["repair_round"] for item in feedbacks] == [1, 2]
+    assert all(item["issues"][0]["code"] == "hard_canon_age_contradiction" for item in feedbacks)
     assert failed == ["opening"]
 
 

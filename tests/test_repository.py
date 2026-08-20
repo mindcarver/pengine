@@ -574,6 +574,35 @@ async def test_grouped_outline_checkpoints_are_immutable_and_resume_failed_group
         outline_markdown_sha256=hashlib.sha256(pursuit_markdown.encode()).hexdigest(),
         body_call_id="pursuit-body-call",
     )
+    pursuit_hash = hashlib.sha256(pursuit_markdown.encode()).hexdigest()
+    repaired_markdown = "## 第2集\n\n追踪修正\n\n## 第3集\n\n结果"
+    repaired_hash = hashlib.sha256(repaired_markdown.encode()).hexdigest()
+    with pytest.raises(DomainError, match="no longer matches"):
+        await repository.replace_outline_group_body(
+            lease.run_id,
+            group_id="pursuit",
+            operation_id="pursuit-op-2",
+            expected_outline_markdown_sha256="0" * 64,
+            outline_markdown=repaired_markdown,
+            outline_markdown_sha256=repaired_hash,
+            body_call_id="pursuit-repair-body-call",
+        )
+    await repository.replace_outline_group_body(
+        lease.run_id,
+        group_id="pursuit",
+        operation_id="pursuit-op-2",
+        expected_outline_markdown_sha256=pursuit_hash,
+        outline_markdown=repaired_markdown,
+        outline_markdown_sha256=repaired_hash,
+        body_call_id="pursuit-repair-body-call",
+    )
+    replaced_body = await repository.get_outline_group_body(
+        lease.run_id,
+        group_id="pursuit",
+    )
+    assert replaced_body is not None
+    assert replaced_body["outline_markdown"] == repaired_markdown
+    pursuit_markdown = repaired_markdown
     await repository.fail_outline_group(
         lease.run_id,
         group_id="pursuit",
@@ -609,7 +638,7 @@ async def test_grouped_outline_checkpoints_are_immutable_and_resume_failed_group
     assert [item["attempt_count"] for item in groups] == [1, 2]
     assert [item["call_id"] for item in groups] == [
         "opening-body-call",
-        "pursuit-body-call",
+        "pursuit-repair-body-call",
     ]
     assert [item["sidecar_call_id"] for item in groups] == [
         "opening-sidecar-call",

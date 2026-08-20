@@ -2669,6 +2669,65 @@ class Repository:
             return None
         return dict(row)
 
+    async def replace_outline_group_body(
+        self,
+        run_id: UUID,
+        *,
+        group_id: str,
+        operation_id: str,
+        expected_outline_markdown_sha256: str,
+        outline_markdown: str,
+        outline_markdown_sha256: str,
+        body_call_id: str,
+    ) -> None:
+        if not outline_markdown.strip() or _text_hash(outline_markdown) != outline_markdown_sha256:
+            raise DomainError(
+                "invalid_outline_markdown",
+                "The outline Markdown artifact is empty or has an invalid hash.",
+                409,
+            )
+        timestamp = _timestamp(_utc_now())
+        async with self._transaction() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE outline_generation_groups
+                SET outline_markdown = ?, outline_markdown_sha256 = ?, body_call_id = ?,
+                    sidecar_call_id = NULL, content_json = NULL, content_sha256 = NULL,
+                    updated_at = ?
+                WHERE run_id = ? AND group_id = ? AND operation_id = ?
+                  AND status = 'body_generated' AND outline_markdown_sha256 = ?
+                """,
+                (
+                    outline_markdown,
+                    outline_markdown_sha256,
+                    body_call_id,
+                    timestamp,
+                    str(run_id),
+                    group_id,
+                    operation_id,
+                    expected_outline_markdown_sha256,
+                ),
+            )
+            if cursor.rowcount == 1:
+                return
+            existing = await self._fetchone(
+                connection,
+                """
+                SELECT outline_markdown, outline_markdown_sha256, body_call_id
+                FROM outline_generation_groups
+                WHERE run_id = ? AND group_id = ? AND operation_id = ?
+                  AND status = 'body_generated'
+                """,
+                (str(run_id), group_id, operation_id),
+            )
+            expected = (outline_markdown, outline_markdown_sha256, body_call_id)
+            if existing is None or tuple(existing) != expected:
+                raise DomainError(
+                    "outline_group_body_conflict",
+                    "The outline Markdown no longer matches its active group.",
+                    409,
+                )
+
     async def complete_outline_group(
         self,
         run_id: UUID,
