@@ -894,6 +894,44 @@ class Worker:
                     outline_group_context[group_id] = (operation_id, start_episode)
                     return operation_id
 
+                async def load_outline_group_body(
+                    group_id: str,
+                ) -> Mapping[str, Any] | None:
+                    return await self.repository.get_outline_group_body(
+                        work.run_id,
+                        group_id=group_id,
+                    )
+
+                async def persist_outline_group_body(
+                    group_id: str,
+                    *,
+                    operation_id: str,
+                    outline_markdown: str,
+                    outline_markdown_sha256: str,
+                ) -> str:
+                    expected_operation, start_episode = outline_group_context[group_id]
+                    if expected_operation != operation_id:
+                        raise AgentProtocolError(
+                            "Outline body operation no longer matches its active attempt",
+                            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                        )
+                    body_call_id = await self._require_physical_call_id(
+                        run_id=work.run_id,
+                        role="generation",
+                        stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                        episode_number=start_episode,
+                        operation_id=operation_id,
+                    )
+                    await self.repository.save_outline_group_body(
+                        work.run_id,
+                        group_id=group_id,
+                        operation_id=operation_id,
+                        outline_markdown=outline_markdown,
+                        outline_markdown_sha256=outline_markdown_sha256,
+                        body_call_id=body_call_id,
+                    )
+                    return body_call_id
+
                 async def complete_outline_group(
                     *,
                     group_id: str,
@@ -906,7 +944,7 @@ class Worker:
                             "Outline group operation no longer matches its active attempt",
                             stage=InternalStage.GENERATING_EPISODE_OUTLINE,
                         )
-                    call_id = await self._require_physical_call_id(
+                    sidecar_call_id = await self._require_physical_call_id(
                         run_id=work.run_id,
                         role="generation",
                         stage=InternalStage.GENERATING_EPISODE_OUTLINE,
@@ -918,7 +956,7 @@ class Worker:
                         group_id=group_id,
                         operation_id=operation_id,
                         payload=payload,
-                        call_id=call_id,
+                        sidecar_call_id=sidecar_call_id,
                     )
 
                 async def fail_outline_group(
@@ -1282,6 +1320,8 @@ class Worker:
                                 "commit_outline_season_map": commit_outline_season_map,
                                 "load_outline_groups": load_outline_groups,
                                 "begin_outline_group": begin_outline_group,
+                                "load_outline_group_body": load_outline_group_body,
+                                "persist_outline_group_body": persist_outline_group_body,
                                 "complete_outline_group": complete_outline_group,
                                 "fail_outline_group": fail_outline_group,
                             }

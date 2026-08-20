@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -125,6 +126,130 @@ class EpisodeOutlineGroupResult(ContinuityModel):
             ):
                 raise ValueError("Group obligations must match the group's fact reveals")
         return self
+
+
+class EpisodeOutlineGroupSidecar(ContinuityModel):
+    """Machine-readable continuity extracted from immutable outline Markdown."""
+
+    character_introductions: list[CharacterSpec] = Field(default_factory=list)
+    facts: list[StoryFact] = Field(min_length=1)
+    timeline: list[OutlineTimelineEvent] = Field(min_length=1)
+    knowledge_states: list[CharacterKnowledgeState] = Field(default_factory=list)
+    clues: list[ClueSpec] = Field(default_factory=list)
+    episode_obligations: list[EpisodeObligation] = Field(min_length=1)
+
+
+@dataclass(frozen=True, slots=True)
+class OutlineMarkdownEpisode:
+    episode_number: int
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeOutlineGroupMarkdown:
+    group_id: str
+    start_episode: int
+    end_episode: int
+    raw_text: str
+    sha256: str
+    episodes: tuple[OutlineMarkdownEpisode, ...]
+
+
+_OUTLINE_EPISODE_HEADING = re.compile(r"^## 第([1-9][0-9]*)集[ \t]*$")
+_MARKDOWN_FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+
+
+def parse_outline_group_markdown(
+    raw_text: str,
+    *,
+    group_id: str,
+    start_episode: int,
+    end_episode: int,
+) -> EpisodeOutlineGroupMarkdown:
+    """Parse exact level-two episode headings outside fenced code blocks."""
+
+    if start_episode < 1 or end_episode < start_episode:
+        raise OutlineContextError("Outline Markdown group range is invalid")
+    canonical = raw_text.strip()
+    if not canonical:
+        raise OutlineContextError("Outline Markdown is empty")
+
+    headings: list[tuple[int, int, int]] = []
+    offset = 0
+    fence_character: str | None = None
+    fence_length = 0
+    for line in canonical.splitlines(keepends=True):
+        line_without_ending = line.rstrip("\r\n")
+        fence = _MARKDOWN_FENCE.match(line_without_ending)
+        if fence is not None:
+            marker = fence.group(1)
+            if fence_character is None:
+                fence_character = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                fence_character = None
+                fence_length = 0
+        elif fence_character is None:
+            heading = _OUTLINE_EPISODE_HEADING.fullmatch(line_without_ending)
+            if heading is not None:
+                headings.append((int(heading.group(1)), offset, offset + len(line)))
+        offset += len(line)
+
+    expected = list(range(start_episode, end_episode + 1))
+    if [number for number, _, _ in headings] != expected:
+        raise OutlineContextError(
+            "Outline Markdown headings must exactly cover the current group in order"
+        )
+    if canonical[: headings[0][1]].strip():
+        raise OutlineContextError("Outline Markdown contains text before the first episode heading")
+
+    episodes: list[OutlineMarkdownEpisode] = []
+    for index, (episode_number, _, content_start) in enumerate(headings):
+        content_end = headings[index + 1][1] if index + 1 < len(headings) else len(canonical)
+        content = canonical[content_start:content_end].strip()
+        if not content:
+            raise OutlineContextError("Outline Markdown contains an empty episode")
+        episodes.append(OutlineMarkdownEpisode(episode_number=episode_number, content=content))
+
+    return EpisodeOutlineGroupMarkdown(
+        group_id=group_id,
+        start_episode=start_episode,
+        end_episode=end_episode,
+        raw_text=canonical,
+        sha256=hashlib.sha256(canonical.encode()).hexdigest(),
+        episodes=tuple(episodes),
+    )
+
+
+def assemble_outline_group_result(
+    group: ScriptGenerationGroup,
+    markdown: EpisodeOutlineGroupMarkdown,
+    sidecar: EpisodeOutlineGroupSidecar,
+) -> EpisodeOutlineGroupResult:
+    """Bind engine-owned coordinates and Markdown to one continuity sidecar."""
+
+    if (
+        markdown.group_id != group.group_id
+        or markdown.start_episode != group.start_episode
+        or markdown.end_episode != group.end_episode
+    ):
+        raise OutlineContextError("Outline Markdown no longer matches the season-map group")
+    return EpisodeOutlineGroupResult(
+        group_id=group.group_id,
+        start_episode=group.start_episode,
+        end_episode=group.end_episode,
+        content=markdown.raw_text,
+        episodes=[
+            EpisodePlan(episode_number=episode.episode_number, plan=episode.content)
+            for episode in markdown.episodes
+        ],
+        character_introductions=sidecar.character_introductions,
+        facts=sidecar.facts,
+        timeline=sidecar.timeline,
+        knowledge_states=sidecar.knowledge_states,
+        clues=sidecar.clues,
+        episode_obligations=sidecar.episode_obligations,
+    )
 
 
 def validate_outline_group_references(
@@ -510,6 +635,36 @@ def compile_outline_group_context(
             "end_episode": group.end_episode,
         },
     )
+
+
+def compile_outline_group_sidecar_context(
+    *,
+    season_map: OutlineSeasonMap,
+    prior_groups: Sequence[EpisodeOutlineGroupResult],
+    group: ScriptGenerationGroup,
+) -> dict[str, Any]:
+    """Return only the cumulative registries needed to structure fixed Markdown."""
+
+    characters = [
+        *season_map.characters,
+        *(character for prior in prior_groups for character in prior.character_introductions),
+    ]
+    return {
+        "current_group": group.model_dump(mode="json"),
+        "known_characters": [item.model_dump(mode="json") for item in characters],
+        "committed_facts": [
+            item.model_dump(mode="json") for prior in prior_groups for item in prior.facts
+        ],
+        "committed_clues": [
+            item.model_dump(mode="json") for prior in prior_groups for item in prior.clues
+        ],
+        "committed_obligation_ids": [
+            item.obligation_id for prior in prior_groups for item in prior.episode_obligations
+        ],
+        "committed_timeline_event_ids": [
+            item.event_id for prior in prior_groups for item in prior.timeline
+        ],
+    }
 
 
 def assemble_episode_outline(

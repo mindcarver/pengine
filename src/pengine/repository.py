@@ -98,7 +98,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
@@ -1049,6 +1049,90 @@ INSERT OR IGNORE INTO pengine_schema(version) VALUES (26);
 
 _SCHEMA_V28_SCRIPT_TEXT_SIDECAR_SQL = """
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (28);
+"""
+
+_SCHEMA_V29_OUTLINE_MARKDOWN_SIDECAR_SQL = """
+CREATE TABLE outline_generation_groups_v29 (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL,
+    position INTEGER NOT NULL CHECK (position >= 1),
+    start_episode INTEGER NOT NULL CHECK (start_episode >= 1),
+    end_episode INTEGER NOT NULL CHECK (end_episode >= start_episode),
+    operation_id TEXT NOT NULL,
+    call_id TEXT,
+    status TEXT NOT NULL CHECK (
+        status IN ('generating', 'body_generated', 'committed', 'failed')
+    ),
+    attempt_count INTEGER NOT NULL CHECK (attempt_count >= 1),
+    outline_markdown TEXT,
+    outline_markdown_sha256 TEXT,
+    body_call_id TEXT,
+    sidecar_call_id TEXT,
+    content_json TEXT,
+    content_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, group_id),
+    UNIQUE (run_id, position),
+    CHECK (
+        (
+            status = 'committed'
+            AND call_id IS NOT NULL
+            AND content_json IS NOT NULL
+            AND content_sha256 IS NOT NULL
+            AND (
+                (
+                    outline_markdown IS NULL
+                    AND outline_markdown_sha256 IS NULL
+                    AND body_call_id IS NULL
+                    AND sidecar_call_id IS NULL
+                )
+                OR (
+                    outline_markdown IS NOT NULL
+                    AND outline_markdown_sha256 IS NOT NULL
+                    AND body_call_id IS NOT NULL
+                    AND sidecar_call_id IS NOT NULL
+                )
+            )
+        )
+        OR (
+            status = 'body_generated'
+            AND call_id IS NULL
+            AND outline_markdown IS NOT NULL
+            AND outline_markdown_sha256 IS NOT NULL
+            AND body_call_id IS NOT NULL
+            AND sidecar_call_id IS NULL
+            AND content_json IS NULL
+            AND content_sha256 IS NULL
+        )
+        OR (
+            status IN ('generating', 'failed')
+            AND call_id IS NULL
+            AND outline_markdown IS NULL
+            AND outline_markdown_sha256 IS NULL
+            AND body_call_id IS NULL
+            AND sidecar_call_id IS NULL
+            AND content_json IS NULL
+            AND content_sha256 IS NULL
+        )
+    )
+);
+
+INSERT INTO outline_generation_groups_v29(
+    run_id, group_id, position, start_episode, end_episode, operation_id,
+    call_id, status, attempt_count, content_json, content_sha256, created_at, updated_at
+)
+SELECT
+    run_id, group_id, position, start_episode, end_episode, operation_id,
+    call_id, status, attempt_count, content_json, content_sha256, created_at, updated_at
+FROM outline_generation_groups;
+
+DROP TABLE outline_generation_groups;
+ALTER TABLE outline_generation_groups_v29 RENAME TO outline_generation_groups;
+CREATE INDEX outline_generation_groups_run
+ON outline_generation_groups(run_id, position);
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (29);
 """
 
 _SCHEMA_V27_GROUPED_OUTLINE_SQL = """
@@ -2314,6 +2398,16 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 28
+            if schema_version == 28:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.executescript(_SCHEMA_V29_OUTLINE_MARKDOWN_SIDECAR_SQL)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 29
 
     async def setup(self) -> None:
         await self.initialize()
@@ -2387,7 +2481,8 @@ class Repository:
                 await connection.execute(
                     """
                 SELECT group_id, position, start_episode, end_episode, content_json,
-                       content_sha256, call_id, attempt_count
+                       content_sha256, call_id, attempt_count, outline_markdown,
+                       outline_markdown_sha256, body_call_id, sidecar_call_id
                 FROM outline_generation_groups
                 WHERE run_id = ? AND status = 'committed'
                 ORDER BY position
@@ -2405,6 +2500,10 @@ class Repository:
                 "content_sha256": row["content_sha256"],
                 "call_id": row["call_id"],
                 "attempt_count": int(row["attempt_count"]),
+                "outline_markdown": row["outline_markdown"],
+                "outline_markdown_sha256": row["outline_markdown_sha256"],
+                "body_call_id": row["body_call_id"],
+                "sidecar_call_id": row["sidecar_call_id"],
             }
             for row in rows
         ]
@@ -2468,17 +2567,107 @@ class Repository:
                     "The outline group is already committed.",
                     409,
                 )
+            if existing["status"] == "body_generated":
+                await connection.execute(
+                    """
+                    UPDATE outline_generation_groups
+                    SET operation_id = ?, updated_at = ?
+                    WHERE run_id = ? AND group_id = ? AND status = 'body_generated'
+                    """,
+                    (operation_id, timestamp, str(run_id), group_id),
+                )
+                return int(existing["attempt_count"])
             attempt_count = int(existing["attempt_count"]) + 1
             await connection.execute(
                 """
                 UPDATE outline_generation_groups
                 SET operation_id = ?, call_id = NULL, status = 'generating',
-                    attempt_count = ?, updated_at = ?
+                    attempt_count = ?, outline_markdown = NULL,
+                    outline_markdown_sha256 = NULL, body_call_id = NULL,
+                    sidecar_call_id = NULL, content_json = NULL,
+                    content_sha256 = NULL, updated_at = ?
                 WHERE run_id = ? AND group_id = ?
                 """,
                 (operation_id, attempt_count, timestamp, str(run_id), group_id),
             )
             return attempt_count
+
+    async def save_outline_group_body(
+        self,
+        run_id: UUID,
+        *,
+        group_id: str,
+        operation_id: str,
+        outline_markdown: str,
+        outline_markdown_sha256: str,
+        body_call_id: str,
+    ) -> None:
+        if not outline_markdown.strip() or _text_hash(outline_markdown) != outline_markdown_sha256:
+            raise DomainError(
+                "invalid_outline_markdown",
+                "The outline Markdown artifact is empty or has an invalid hash.",
+                409,
+            )
+        timestamp = _timestamp(_utc_now())
+        async with self._transaction() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE outline_generation_groups
+                SET status = 'body_generated', outline_markdown = ?,
+                    outline_markdown_sha256 = ?, body_call_id = ?, updated_at = ?
+                WHERE run_id = ? AND group_id = ? AND operation_id = ?
+                  AND status = 'generating' AND outline_markdown IS NULL
+                """,
+                (
+                    outline_markdown,
+                    outline_markdown_sha256,
+                    body_call_id,
+                    timestamp,
+                    str(run_id),
+                    group_id,
+                    operation_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                existing = await self._fetchone(
+                    connection,
+                    """
+                    SELECT outline_markdown, outline_markdown_sha256, body_call_id
+                    FROM outline_generation_groups
+                    WHERE run_id = ? AND group_id = ? AND operation_id = ?
+                      AND status = 'body_generated'
+                    """,
+                    (str(run_id), group_id, operation_id),
+                )
+                expected = (outline_markdown, outline_markdown_sha256, body_call_id)
+                if existing is None or tuple(existing) != expected:
+                    raise DomainError(
+                        "outline_group_body_conflict",
+                        "The outline Markdown no longer matches its active group.",
+                        409,
+                    )
+
+    async def get_outline_group_body(
+        self,
+        run_id: UUID,
+        *,
+        group_id: str,
+    ) -> dict[str, Any] | None:
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT outline_markdown, outline_markdown_sha256, body_call_id, operation_id
+                FROM outline_generation_groups
+                WHERE run_id = ? AND group_id = ?
+                  AND status IN ('body_generated', 'committed')
+                  AND outline_markdown IS NOT NULL
+                """,
+                (str(run_id), group_id),
+            )
+        if row is None:
+            return None
+        return dict(row)
 
     async def complete_outline_group(
         self,
@@ -2487,7 +2676,7 @@ class Repository:
         group_id: str,
         operation_id: str,
         payload: Mapping[str, Any],
-        call_id: str,
+        sidecar_call_id: str,
     ) -> None:
         content_json = _json(payload)
         content_sha256 = _text_hash(content_json)
@@ -2496,13 +2685,13 @@ class Repository:
             cursor = await connection.execute(
                 """
                 UPDATE outline_generation_groups
-                SET call_id = ?, status = 'committed', content_json = ?,
-                    content_sha256 = ?, updated_at = ?
+                SET call_id = body_call_id, sidecar_call_id = ?, status = 'committed',
+                    content_json = ?, content_sha256 = ?, updated_at = ?
                 WHERE run_id = ? AND group_id = ? AND operation_id = ?
-                  AND status = 'generating'
+                  AND status = 'body_generated'
                 """,
                 (
-                    call_id,
+                    sidecar_call_id,
                     content_json,
                     content_sha256,
                     timestamp,
@@ -2513,8 +2702,8 @@ class Repository:
             )
             if cursor.rowcount != 1:
                 raise DomainError(
-                    "outline_group_not_generating",
-                    "The outline group generation operation is not active.",
+                    "outline_group_body_not_generated",
+                    "The outline group Markdown artifact is not active.",
                     409,
                 )
 

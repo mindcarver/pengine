@@ -75,7 +75,8 @@ loading_persona
 
 1. `story_architect` 生成故事大纲。
 2. `story_architect` 生成角色和关系逻辑。
-3. `episode_planner` 生成分集大纲和 `StoryContract`。
+3. `episode_planner` 按自然组先生成规范 Markdown 正文，持久化后再生成独立连续性 Sidecar；
+   引擎确定性组装分集大纲和 `StoryContract`。
 4. 故事、人物关系和合同审核只把明确的 L4 硬规则冲突列为 blocker；通过证据以 `L4硬规则：` 标识所检查的适用规则，确认建议或审美偏好不阻断。
 5. 合同经过确定性校验，再由绑定该候选的 `canon_reviewer` 独立审核。
 6. 合同及其 Markdown 投影、hash 一起写入 approved checkpoint。
@@ -91,10 +92,9 @@ Supervisor 只编排阶段，不接收完整 Project。Reviewer 只接收“不�
 L0、适用的 L4 硬规则和输出协议独立判断。结构化结果纠错只有在系统提示明确禁止内容
 变更时才允许省略 Project。
 
-这里有一个必须显式保留的当前限制：第 3 步仍是一次结构化模型调用，返回全量
-`episode_plans`、合同事实/线索/义务和里程碑。schema 没有限制集数上限，但 60–100 集
-会显著放大输出截断、JSON 解析重试和单次全局编排失真的风险；当前实现没有按批次生成并
-逐批锁定分集大纲。
+当前流程不再使用一次全量结构化输出生成分集大纲。每个自然组的 Markdown 通过
+`## 第N集` 标题校验后立即持久化；Sidecar 只返回人物增量、事实、时间线、知识状态、线索和
+分集义务，不复制组坐标或正文。60–100 集仍需对累计账本、调用预算和总耗时分别做真实验收。
 
 ### 3.3 逐集写作
 
