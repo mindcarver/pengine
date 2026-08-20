@@ -912,6 +912,7 @@ class Worker:
                     operation_id: str,
                     outline_markdown: str,
                     outline_markdown_sha256: str,
+                    expected_outline_markdown_sha256: str | None = None,
                 ) -> str:
                     expected_operation, start_episode = outline_group_context[group_id]
                     if expected_operation != operation_id:
@@ -926,14 +927,25 @@ class Worker:
                         episode_number=start_episode,
                         operation_id=operation_id,
                     )
-                    await self.repository.save_outline_group_body(
-                        work.run_id,
-                        group_id=group_id,
-                        operation_id=operation_id,
-                        outline_markdown=outline_markdown,
-                        outline_markdown_sha256=outline_markdown_sha256,
-                        body_call_id=body_call_id,
-                    )
+                    if expected_outline_markdown_sha256 is None:
+                        await self.repository.save_outline_group_body(
+                            work.run_id,
+                            group_id=group_id,
+                            operation_id=operation_id,
+                            outline_markdown=outline_markdown,
+                            outline_markdown_sha256=outline_markdown_sha256,
+                            body_call_id=body_call_id,
+                        )
+                    else:
+                        await self.repository.replace_outline_group_body(
+                            work.run_id,
+                            group_id=group_id,
+                            operation_id=operation_id,
+                            expected_outline_markdown_sha256=(expected_outline_markdown_sha256),
+                            outline_markdown=outline_markdown,
+                            outline_markdown_sha256=outline_markdown_sha256,
+                            body_call_id=body_call_id,
+                        )
                     return body_call_id
 
                 async def complete_outline_group(
