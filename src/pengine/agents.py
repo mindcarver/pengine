@@ -9108,6 +9108,7 @@ class DeepAgentWorkflow:
             group: ScriptGenerationGroup,
             operation_id: str,
             sidecar_context: Mapping[str, Any],
+            repair_mode: Literal["sidecar", "full"],
         ) -> EpisodeOutlineGroupResult:
             return await _generate_outline_group_with_sidecar(
                 self.generation_model,
@@ -9116,6 +9117,7 @@ class DeepAgentWorkflow:
                 operation_id=operation_id,
                 sidecar_context=sidecar_context,
                 repair_feedback=repair_feedback,
+                repair_mode=repair_mode,
                 load_body=load_outline_group_body,
                 persist_body=persist_outline_group_body,
                 model_call_state=self.model_call_state,

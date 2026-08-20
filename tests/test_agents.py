@@ -6431,7 +6431,7 @@ def test_calculate_arithmetic_rejects_non_finite_or_unbounded_operands(
 
 
 @pytest.mark.asyncio
-async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
+async def test_workflow_routes_models_and_wires_outline_group_repair_mode(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -6539,6 +6539,53 @@ async def test_workflow_routes_generation_and_review_roles_to_distinct_models(
         for middleware in spec["middleware"]:
             if isinstance(middleware, ToolAllowlistMiddleware):
                 assert middleware.compact_tool_history is False
+    captured_modes: list[str] = []
+
+    async def capture_group_generation(
+        *args: Any,
+        **kwargs: Any,
+    ) -> str:
+        del args
+        repair_mode = kwargs["repair_mode"]
+        captured_modes.append(repair_mode)
+        return repair_mode
+
+    monkeypatch.setattr(
+        "pengine.agents._generate_outline_group_with_sidecar",
+        capture_group_generation,
+    )
+    stage_guard = next(
+        item for item in captured["middleware"] if isinstance(item, StageGuardMiddleware)
+    )
+    generator = stage_guard.generate_outline_group
+    assert generator is not None
+    group = ScriptGenerationGroup(
+        group_id="opening",
+        start_episode=1,
+        end_episode=2,
+        dramatic_unit="主角回家并发现旧照",
+        boundary_reason="线索改变调查目标",
+    )
+    compiled = CompiledOutlineContext(
+        model_input="compiled",
+        bundle_sha256="a" * 64,
+        manifest={"group_id": group.group_id},
+        manifest_json='{"group_id":"opening"}',
+        output_tokens=12_288,
+    )
+
+    for repair_mode in ("sidecar", "full"):
+        result = await generator(
+            compiled,
+            None,
+            group=group,
+            operation_id="operation-1",
+            sidecar_context={},
+            repair_mode=repair_mode,
+        )
+        assert result == repair_mode
+
+    assert captured_modes == ["sidecar", "full"]
 
 
 @pytest.mark.asyncio
