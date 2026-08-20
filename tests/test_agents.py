@@ -138,7 +138,12 @@ from pengine.model_calls import (
     build_started_record,
     new_call_id,
 )
-from pengine.outline_context import CompiledOutlineContext, EpisodeOutlineGroupResult
+from pengine.outline_context import (
+    CompiledOutlineContext,
+    EpisodeOutlineGroupResult,
+    EpisodeOutlineGroupSidecar,
+    OutlineGroupAssemblyError,
+)
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import (
@@ -665,21 +670,52 @@ async def test_outline_sidecar_failure_and_resume_reuse_persisted_markdown() -> 
 
     invalid_sidecar = {
         "character_introductions": [],
-        "facts": [],
-        "timeline": [],
+        "facts": [
+            {
+                "fact_id": "fact_stays",
+                "subject": "林荷",
+                "predicate": "决定",
+                "kind": "text",
+                "value": "留下守夜",
+                "first_revealed_episode": 1,
+            },
+            {
+                "fact_id": "fact_unbound",
+                "subject": "林荷",
+                "predicate": "发现",
+                "kind": "text",
+                "value": "未绑定线索",
+                "first_revealed_episode": 1,
+            },
+        ],
+        "timeline": [
+            {
+                "event_id": "event_stays",
+                "when": "台风前夜",
+                "participant_ids": ["lin_he"],
+                "fact_ids": ["fact_stays", "fact_unbound"],
+            }
+        ],
         "knowledge_states": [],
         "clues": [],
-        "episode_obligations": [],
+        "episode_obligations": [
+            {
+                "obligation_id": "obligation_stays",
+                "episode_number": 1,
+                "new_information_fact_ids": ["fact_stays"],
+                "end_hook": "台风即将登陆",
+                "required_clue_ids": [],
+            }
+        ],
     }
     first_model = ToolCallingFakeModel(
         responses=[
             AIMessage(content="## 第1集\n\n林荷决定留下守夜。"),
             _tool_call("EpisodeOutlineGroupSidecar", invalid_sidecar, 1),
-            _tool_call("EpisodeOutlineGroupSidecar", invalid_sidecar, 2),
         ]
     )
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(OutlineGroupAssemblyError):
         await _generate_outline_group_with_sidecar(
             first_model,
             compiled=compiled,
@@ -7979,7 +8015,7 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
     repair_feedbacks: list[str] = []
     failed: list[str] = []
     fail_second_once = True
-    protocol_invalid_once = True
+    assembly_invalid_once = True
     reject_first_group_once = True
     final_review_calls = 0
     projection_repair_constraints: list[str | None] = []
@@ -8018,7 +8054,7 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
         repair_feedback: str | None,
         **_: Any,
     ) -> EpisodeOutlineGroupResult:
-        nonlocal fail_second_once, protocol_invalid_once
+        nonlocal assembly_invalid_once, fail_second_once
         group_id = compiled.manifest["group_id"]
         generated.append(group_id)
         if repair_feedback is not None:
@@ -8028,9 +8064,28 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
             raise TimeoutError("simulated current-group interruption")
         if group_id == "opening":
             payload = group_payload("opening", 1, 1)
-            if protocol_invalid_once:
-                protocol_invalid_once = False
-                payload["timeline"][0]["participant_ids"].append("undeclared_witness")
+            if assembly_invalid_once:
+                assembly_invalid_once = False
+                payload["facts"].append(
+                    {
+                        "fact_id": "fact_unbound",
+                        "subject": "林岚",
+                        "predicate": "确认线索",
+                        "kind": "text",
+                        "value": "未绑定到义务的新线索",
+                        "first_revealed_episode": 1,
+                    }
+                )
+                sidecar = EpisodeOutlineGroupSidecar.model_validate(
+                    {
+                        field: payload.get(field, [])
+                        for field in EpisodeOutlineGroupSidecar.model_fields
+                    }
+                )
+                raise OutlineGroupAssemblyError(
+                    "Value error, Group obligations must match the group's fact reveals",
+                    sidecar=sidecar,
+                )
             return EpisodeOutlineGroupResult.model_validate(payload)
         return EpisodeOutlineGroupResult.model_validate(group_payload("pursuit", 2, 3))
 
@@ -8185,7 +8240,8 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
     ]
     assert len(repair_feedbacks) == 2
     assert "current_group_protocol_violation" in repair_feedbacks[0]
-    assert "undeclared_witness" in repair_feedbacks[0]
+    assert "Group obligations must match the group's fact reveals" in repair_feedbacks[0]
+    assert "fact_unbound" in repair_feedbacks[0]
     assert "new_unapproved_character" in repair_feedbacks[1]
     assert failed == ["pursuit"]
     assert committed[0]["content_sha256"] == first_group_hash
@@ -8196,6 +8252,165 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
     assert locked["contract_review"]["passed"] is True
     assert len(projection_repair_constraints) == 1
     assert "dramatic_unit" in (projection_repair_constraints[0] or "")
+
+
+@pytest.mark.asyncio
+async def test_grouped_outline_stops_after_two_assembly_repairs() -> None:
+    season_payload = {
+        "episode_count": 1,
+        "characters": [
+            {
+                "character_id": "lin_lan",
+                "name": "林岚",
+                "role": "调查者",
+                "initial_known_fact_ids": [],
+            }
+        ],
+        "relationships": [],
+        "prohibitions": [],
+        "review_milestones": [],
+        "script_generation_groups": [
+            {
+                "group_id": "opening",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "发现旧信",
+                "boundary_reason": "线索改变目标",
+            }
+        ],
+    }
+    sidecar = EpisodeOutlineGroupSidecar.model_validate(
+        {
+            "character_introductions": [],
+            "facts": [
+                {
+                    "fact_id": "fact_1",
+                    "subject": "林岚",
+                    "predicate": "确认线索",
+                    "kind": "text",
+                    "value": "旧信",
+                    "first_revealed_episode": 1,
+                },
+                {
+                    "fact_id": "fact_unbound",
+                    "subject": "林岚",
+                    "predicate": "确认线索",
+                    "kind": "text",
+                    "value": "未绑定线索",
+                    "first_revealed_episode": 1,
+                },
+            ],
+            "timeline": [
+                {
+                    "event_id": "event_1",
+                    "when": "第一天",
+                    "participant_ids": ["lin_lan"],
+                    "fact_ids": ["fact_1", "fact_unbound"],
+                }
+            ],
+            "knowledge_states": [],
+            "clues": [],
+            "episode_obligations": [
+                {
+                    "obligation_id": "obligation_1",
+                    "episode_number": 1,
+                    "new_information_fact_ids": ["fact_1"],
+                    "end_hook": "旧信来源成谜",
+                    "required_clue_ids": [],
+                }
+            ],
+        }
+    )
+    stored_map: dict[str, Any] | None = None
+    generate_calls = 0
+    feedbacks: list[dict[str, Any]] = []
+    failed: list[str] = []
+
+    async def generate_season_map(_: Any) -> Mapping[str, Any]:
+        return season_payload
+
+    async def load_season_map() -> Mapping[str, Any] | None:
+        return stored_map
+
+    async def commit_season_map(payload: Mapping[str, Any]) -> None:
+        nonlocal stored_map
+        stored_map = {"content": dict(payload)}
+
+    async def generate_group(
+        _: Any,
+        repair_feedback: str | None,
+        **__: Any,
+    ) -> EpisodeOutlineGroupResult:
+        nonlocal generate_calls
+        generate_calls += 1
+        if repair_feedback is not None:
+            feedbacks.append(json.loads(repair_feedback))
+        raise OutlineGroupAssemblyError(
+            "Value error, Group obligations must match the group's fact reveals",
+            sidecar=sidecar,
+        )
+
+    async def fail_group(**kwargs: Any) -> None:
+        failed.append(kwargs["group_id"])
+
+    async def load_groups() -> list[Mapping[str, Any]]:
+        return []
+
+    async def begin_group(**_: Any) -> str:
+        return "operation-opening"
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_season_map=generate_season_map,
+        generate_outline_group=generate_group,
+        review_outline_group=lambda _compiled, _parsed: _async_none(),
+        load_outline_season_map=load_season_map,
+        commit_outline_season_map=commit_season_map,
+        load_outline_groups=load_groups,
+        begin_outline_group=begin_group,
+        load_outline_group_body=lambda _: _async_none(),
+        persist_outline_group_body=lambda *_, **__: _async_none(),
+        complete_outline_group=lambda **_: _async_none(),
+        fail_outline_group=fail_group,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] generate outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-grouped-assembly-limit",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={
+            "files": {
+                "/workspace/creation-request.md": {"content": "故事需求"},
+                "/workspace/story_outline.md": {"content": "故事梗概"},
+                "/workspace/character_biographies.md": {"content": "人物小传"},
+                "/workspace/relationship_logic.md": {"content": "人物关系"},
+            }
+        },
+        runtime=None,
+    )
+
+    with pytest.raises(OutlineGroupAssemblyError):
+        await middleware._generate_grouped_outline(
+            request,
+            lambda _: _async_none(),
+            request.tool_call["args"],
+        )
+
+    assert generate_calls == 3
+    assert [item["repair_round"] for item in feedbacks] == [1, 2]
+    assert all(
+        item["previous_sidecar"]["facts"][1]["fact_id"] == "fact_unbound" for item in feedbacks
+    )
+    assert failed == ["opening"]
 
 
 @pytest.mark.asyncio
