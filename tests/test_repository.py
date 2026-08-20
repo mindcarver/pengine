@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -195,7 +196,7 @@ def persist_succeeded_outline_review(
 
 
 async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository) -> None:
-    assert SCHEMA_VERSION == 28
+    assert SCHEMA_VERSION == 29
     async with repository._connection() as connection:
         journal = await (await connection.execute("PRAGMA journal_mode")).fetchone()
         foreign_keys = await (await connection.execute("PRAGMA foreign_keys")).fetchone()
@@ -254,6 +255,7 @@ async def test_schema_v24_to_v25_adds_episode_generation_windows(repository) -> 
         await connection.execute("DELETE FROM pengine_schema WHERE version = 26")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 27")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 28")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 29")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -281,6 +283,7 @@ async def test_schema_v25_to_v26_adds_script_context_audit_columns(repository) -
         await connection.execute("DELETE FROM pengine_schema WHERE version = 26")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 27")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 28")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 29")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -302,6 +305,7 @@ async def test_schema_v26_to_v27_adds_grouped_outline_tables(repository) -> None
         await connection.execute("DROP TABLE outline_season_maps")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 27")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 28")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 29")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -331,6 +335,7 @@ async def test_schema_v27_to_v28_adds_plaintext_sidecar_columns(repository) -> N
         for column in columns_to_remove:
             await connection.execute(f"ALTER TABLE episode_generation_windows DROP COLUMN {column}")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 28")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 29")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -345,6 +350,72 @@ async def test_schema_v27_to_v28_adds_plaintext_sidecar_columns(repository) -> N
 
     assert set(columns_to_remove) <= {row[1] for row in columns}
     assert version[0] == SCHEMA_VERSION
+
+
+async def test_schema_v28_to_v29_preserves_legacy_committed_outline_groups(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    _, lease = await create_and_lease_initial(repository, persona, creation_request)
+    content_json = '{"content":"legacy","group_id":"opening"}'
+    content_sha256 = hashlib.sha256(content_json.encode()).hexdigest()
+    async with repository._connection() as connection:
+        await connection.execute("DROP TABLE outline_generation_groups")
+        await connection.executescript(
+            """
+            CREATE TABLE outline_generation_groups (
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                group_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                start_episode INTEGER NOT NULL,
+                end_episode INTEGER NOT NULL,
+                operation_id TEXT NOT NULL,
+                call_id TEXT,
+                status TEXT NOT NULL CHECK (status IN ('generating', 'committed', 'failed')),
+                attempt_count INTEGER NOT NULL,
+                content_json TEXT,
+                content_sha256 TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, group_id),
+                UNIQUE (run_id, position)
+            );
+            CREATE INDEX outline_generation_groups_run
+            ON outline_generation_groups(run_id, position);
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO outline_generation_groups(
+                run_id, group_id, position, start_episode, end_episode, operation_id,
+                call_id, status, attempt_count, content_json, content_sha256,
+                created_at, updated_at
+            ) VALUES (?, 'opening', 1, 1, 1, 'legacy-op', 'legacy-call',
+                      'committed', 1, ?, ?, ?, ?)
+            """,
+            (str(lease.run_id), content_json, content_sha256, NOW.isoformat(), NOW.isoformat()),
+        )
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 29")
+        await connection.commit()
+
+    restarted = Repository(repository.database_path)
+    await restarted.initialize()
+    groups = await restarted.get_committed_outline_groups(lease.run_id)
+    async with restarted._connection() as connection:
+        columns = await (
+            await connection.execute("PRAGMA table_info(outline_generation_groups)")
+        ).fetchall()
+
+    assert {
+        "outline_markdown",
+        "outline_markdown_sha256",
+        "body_call_id",
+        "sidecar_call_id",
+    } <= {row[1] for row in columns}
+    assert groups[0]["content"] == {"content": "legacy", "group_id": "opening"}
+    assert groups[0]["outline_markdown"] is None
+    assert groups[0]["body_call_id"] is None
 
 
 async def test_plaintext_generation_window_survives_sidecar_failure_and_reuses_attempt(
@@ -451,12 +522,21 @@ async def test_grouped_outline_checkpoints_are_immutable_and_resume_failed_group
         )
         == 1
     )
+    opening_markdown = "## 第1集\n\n第一组"
+    await repository.save_outline_group_body(
+        lease.run_id,
+        group_id="opening",
+        operation_id="opening-op",
+        outline_markdown=opening_markdown,
+        outline_markdown_sha256=hashlib.sha256(opening_markdown.encode()).hexdigest(),
+        body_call_id="opening-body-call",
+    )
     await repository.complete_outline_group(
         lease.run_id,
         group_id="opening",
         operation_id="opening-op",
         payload={"group_id": "opening", "content": "第一组"},
-        call_id="opening-call",
+        sidecar_call_id="opening-sidecar-call",
     )
     assert (
         await repository.begin_outline_group(
@@ -485,17 +565,56 @@ async def test_grouped_outline_checkpoints_are_immutable_and_resume_failed_group
         )
         == 2
     )
-    await repository.complete_outline_group(
+    pursuit_markdown = "## 第2集\n\n追踪\n\n## 第3集\n\n结果"
+    await repository.save_outline_group_body(
         lease.run_id,
         group_id="pursuit",
         operation_id="pursuit-op-2",
+        outline_markdown=pursuit_markdown,
+        outline_markdown_sha256=hashlib.sha256(pursuit_markdown.encode()).hexdigest(),
+        body_call_id="pursuit-body-call",
+    )
+    await repository.fail_outline_group(
+        lease.run_id,
+        group_id="pursuit",
+        operation_id="pursuit-op-2",
+    )
+    assert (
+        await repository.begin_outline_group(
+            lease.run_id,
+            group_id="pursuit",
+            position=2,
+            start_episode=2,
+            end_episode=3,
+            operation_id="pursuit-op-3",
+        )
+        == 2
+    )
+    stored_body = await repository.get_outline_group_body(
+        lease.run_id,
+        group_id="pursuit",
+    )
+    assert stored_body is not None
+    assert stored_body["outline_markdown"] == pursuit_markdown
+    await repository.complete_outline_group(
+        lease.run_id,
+        group_id="pursuit",
+        operation_id="pursuit-op-3",
         payload={"group_id": "pursuit", "content": "第二组"},
-        call_id="pursuit-call",
+        sidecar_call_id="pursuit-sidecar-call",
     )
 
     groups = await repository.get_committed_outline_groups(lease.run_id)
     assert [item["group_id"] for item in groups] == ["opening", "pursuit"]
     assert [item["attempt_count"] for item in groups] == [1, 2]
+    assert [item["call_id"] for item in groups] == [
+        "opening-body-call",
+        "pursuit-body-call",
+    ]
+    assert [item["sidecar_call_id"] for item in groups] == [
+        "opening-sidecar-call",
+        "pursuit-sidecar-call",
+    ]
     with pytest.raises(DomainError, match="already committed"):
         await repository.begin_outline_group(
             lease.run_id,
@@ -639,7 +758,7 @@ async def test_schema_v18_migrates_episode_attempts_to_cycle_zero(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
 
     await repository.initialize()
@@ -692,7 +811,7 @@ async def test_schema_v19_to_v20_adds_identity_evidence_and_pause_reason(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
 
     await repository.initialize()
@@ -1636,7 +1755,7 @@ async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_draf
             DELETE FROM pengine_schema WHERE version = 20;
             DELETE FROM pengine_schema WHERE version = 21;
             DELETE FROM pengine_schema WHERE version = 22;
-                DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28);
+                DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29);
             ALTER TABLE creations DROP COLUMN output_language;
             """
         )
@@ -2504,7 +2623,7 @@ async def test_schema_v6_recovers_legacy_failed_episode_without_replacing_drafts
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
@@ -2558,7 +2677,7 @@ async def test_schema_v7_creation_is_backfilled_to_chinese_output_language(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
@@ -2611,7 +2730,7 @@ async def test_schema_v8_migration_resumes_when_column_already_exists(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.execute(
             "UPDATE creations SET output_language = NULL WHERE id = ?",
@@ -2693,7 +2812,7 @@ async def test_schema_v8_content_rejections_migrate_without_losing_rows(
             DELETE FROM pengine_schema WHERE version = 20;
             DELETE FROM pengine_schema WHERE version = 21;
             DELETE FROM pengine_schema WHERE version = 22;
-                DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28);
+                DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29);
             """
         )
         await connection.commit()
@@ -2865,7 +2984,7 @@ async def test_schema_v9_repair_limits_migrate_without_losing_pause(
             DELETE FROM pengine_schema WHERE version = 20;
             DELETE FROM pengine_schema WHERE version = 21;
             DELETE FROM pengine_schema WHERE version = 22;
-                DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28);
+                DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29);
             """
         )
         await connection.commit()
@@ -2984,7 +3103,7 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
@@ -3045,7 +3164,7 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
@@ -3134,7 +3253,7 @@ async def test_schema_v4_recovery_rows_gain_the_timeout_reason_without_losing_dr
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
@@ -3198,7 +3317,7 @@ async def test_schema_v10_to_v11_preserves_run_progress_and_model_calls(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.commit()
 
@@ -3249,7 +3368,7 @@ async def test_schema_v20_to_v21_adds_l3_audit_columns_without_changing_old_rows
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.commit()
 
@@ -3308,7 +3427,7 @@ async def test_schema_v21_to_v22_adds_nullable_delivery_presentation(
         await connection.execute("ALTER TABLE deliveries DROP COLUMN presentation_manifest_sha256")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.commit()
 
@@ -3348,7 +3467,7 @@ async def test_schema_v17_to_v18_adds_hidden_model_call_provenance(repository) -
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.commit()
 
@@ -3380,7 +3499,7 @@ async def test_schema_v18_collision_repairs_missing_model_call_provenance(reposi
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.commit()
 
@@ -3439,7 +3558,7 @@ async def test_schema_v18_collision_repairs_missing_episode_attempt_cycles(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29)"
         )
         await connection.commit()
 

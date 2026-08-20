@@ -4,12 +4,15 @@ import pytest
 
 from pengine.outline_context import (
     EpisodeOutlineGroupResult,
+    EpisodeOutlineGroupSidecar,
     OutlineContextError,
     OutlineSeasonMap,
     assemble_episode_outline,
+    assemble_outline_group_result,
     compile_outline_group_context,
     compile_season_map_context,
     outline_group_output_tokens,
+    parse_outline_group_markdown,
     validate_outline_group_references,
 )
 from pengine.series_bible import ScriptGenerationGroup
@@ -109,6 +112,111 @@ def test_season_map_accepts_natural_variable_groups_for_thirty_episodes() -> Non
     } > {2}
     assert season_map.script_generation_groups[0].start_episode == 1
     assert season_map.script_generation_groups[-1].end_episode == 30
+
+
+@pytest.mark.parametrize(
+    ("genre", "start_episode", "end_episode"),
+    [("现实", 1, 1), ("悬疑", 7, 9), ("古装", 17, 20)],
+)
+def test_outline_markdown_accepts_varied_content_and_natural_group_sizes(
+    genre: str,
+    start_episode: int,
+    end_episode: int,
+) -> None:
+    raw_text = "\n\n".join(
+        f"## 第{episode_number}集\n\n{genre}行动 {episode_number}\n\n### 集尾钩子\n选择产生代价"
+        for episode_number in range(start_episode, end_episode + 1)
+    )
+
+    parsed = parse_outline_group_markdown(
+        raw_text,
+        group_id="natural_turn",
+        start_episode=start_episode,
+        end_episode=end_episode,
+    )
+
+    assert [item.episode_number for item in parsed.episodes] == list(
+        range(start_episode, end_episode + 1)
+    )
+    assert all(genre in item.content for item in parsed.episodes)
+    assert parsed.raw_text == raw_text
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        "## 第1集\n正文",
+        "## 第2集\n正文\n\n## 第2集\n重复",
+        "## 第2集\n正文\n\n## 第4集\n越界",
+        "## 第2集\n\n## 第3集\n正文",
+        "额外前缀\n\n## 第2集\n正文\n\n## 第3集\n正文",
+    ],
+)
+def test_outline_markdown_rejects_missing_duplicate_out_of_range_or_empty_sections(
+    raw_text: str,
+) -> None:
+    with pytest.raises(OutlineContextError):
+        parse_outline_group_markdown(
+            raw_text,
+            group_id="current_group",
+            start_episode=2,
+            end_episode=3,
+        )
+
+
+def test_outline_markdown_ignores_episode_like_text_and_fenced_headings() -> None:
+    parsed = parse_outline_group_markdown(
+        "## 第1集\n\n人物说第2集才会离开。\n\n```markdown\n## 第2集\n```\n\n本集仍是第一集。",
+        group_id="single_episode",
+        start_episode=1,
+        end_episode=1,
+    )
+
+    assert len(parsed.episodes) == 1
+    assert "## 第2集" in parsed.episodes[0].content
+
+
+def test_outline_sidecar_excludes_engine_coordinates_and_markdown() -> None:
+    assert set(EpisodeOutlineGroupSidecar.model_json_schema()["properties"]) == {
+        "character_introductions",
+        "facts",
+        "timeline",
+        "knowledge_states",
+        "clues",
+        "episode_obligations",
+    }
+
+
+def test_outline_group_assembly_binds_markdown_and_preserves_character_introductions() -> None:
+    group = make_season_map(2).script_generation_groups[0]
+    markdown = parse_outline_group_markdown(
+        "## 第1集\n\n村医帮林岚核对伤情。\n\n## 第2集\n\n林岚确认了新线索。",
+        group_id=group.group_id,
+        start_episode=group.start_episode,
+        end_episode=group.end_episode,
+    )
+    payload = make_group(group).model_dump(mode="json")
+    payload["character_introductions"] = [
+        {
+            "character_id": "village_doctor",
+            "name": "村医",
+            "role": "提供伤情判断",
+            "initial_known_fact_ids": [],
+        }
+    ]
+    sidecar = EpisodeOutlineGroupSidecar.model_validate(
+        {field: payload[field] for field in EpisodeOutlineGroupSidecar.model_fields}
+    )
+
+    result = assemble_outline_group_result(group, markdown, sidecar)
+
+    assert result.group_id == group.group_id
+    assert result.content == markdown.raw_text
+    assert [item.plan for item in result.episodes] == [
+        "村医帮林岚核对伤情。",
+        "林岚确认了新线索。",
+    ]
+    assert result.character_introductions[0].character_id == "village_doctor"
 
 
 def test_outline_compilers_include_only_named_components_and_deduplicate() -> None:

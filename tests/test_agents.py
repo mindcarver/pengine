@@ -80,8 +80,10 @@ from pengine.agents import (
     _drop_dangling_tool_call_messages,
     _established_facts_payload,
     _evidence_contract,
+    _generate_outline_group_with_sidecar,
     _generate_script_group_with_sidecar,
     _invoke_direct_structured_with_retry,
+    _invoke_outline_group_markdown,
     _invoke_script_group_sidecar,
     _invoke_script_group_text,
     _language_retry_fingerprint,
@@ -135,6 +137,7 @@ from pengine.model_calls import (
     build_started_record,
     new_call_id,
 )
+from pengine.outline_context import CompiledOutlineContext, EpisodeOutlineGroupResult
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.schemas import (
@@ -572,6 +575,179 @@ async def test_direct_structured_call_repairs_parameter_name_json_wrapper() -> N
     )
     assert "$PARAMETER_NAME" in feedback.content
     assert "JSON string" in feedback.content
+
+
+@pytest.mark.asyncio
+async def test_outline_group_body_is_plain_markdown_without_structured_coordinates() -> None:
+    group = ScriptGenerationGroup(
+        group_id="community_choice",
+        start_episode=7,
+        end_episode=8,
+        dramatic_unit="护士决定留下",
+        boundary_reason="选择改变后续目标",
+    )
+    compiled = CompiledOutlineContext(
+        model_input="FULL-CONTEXT-SENTINEL",
+        bundle_sha256="a" * 64,
+        manifest={"group_id": group.group_id},
+        manifest_json='{"group_id":"community_choice"}',
+        output_tokens=12_288,
+    )
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(content=("## 第7集\n\n林荷决定留下守夜。\n\n## 第8集\n\n她向院长说明代价。"))
+        ]
+    )
+
+    markdown = await _invoke_outline_group_markdown(model, compiled, group=group)
+
+    assert [item.episode_number for item in markdown.episodes] == [7, 8]
+    assert model.bound_tool_names == [[]]
+    assert "group_id" not in markdown.raw_text
+    assert "start_episode" not in markdown.raw_text
+
+
+@pytest.mark.asyncio
+async def test_outline_sidecar_failure_and_resume_reuse_persisted_markdown() -> None:
+    group = ScriptGenerationGroup(
+        group_id="community_choice",
+        start_episode=1,
+        end_episode=1,
+        dramatic_unit="护士决定留下",
+        boundary_reason="选择改变后续目标",
+    )
+    compiled = CompiledOutlineContext(
+        model_input="FULL-CONTEXT-SENTINEL",
+        bundle_sha256="b" * 64,
+        manifest={"group_id": group.group_id},
+        manifest_json='{"group_id":"community_choice"}',
+        output_tokens=8_192,
+    )
+    sidecar_context = {
+        "current_group": group.model_dump(mode="json"),
+        "known_characters": [
+            {
+                "character_id": "lin_he",
+                "name": "林荷",
+                "role": "社区护士",
+                "initial_known_fact_ids": [],
+            }
+        ],
+        "committed_facts": [],
+        "committed_clues": [],
+        "committed_obligation_ids": [],
+        "committed_timeline_event_ids": [],
+    }
+    stored: dict[str, Any] = {}
+    persisted_hashes: list[str] = []
+
+    async def load_body(_: str) -> Mapping[str, Any] | None:
+        return stored or None
+
+    async def persist_body(
+        _: str,
+        *,
+        operation_id: str,
+        outline_markdown: str,
+        outline_markdown_sha256: str,
+    ) -> str:
+        stored.update(
+            {
+                "operation_id": operation_id,
+                "outline_markdown": outline_markdown,
+                "outline_markdown_sha256": outline_markdown_sha256,
+            }
+        )
+        persisted_hashes.append(outline_markdown_sha256)
+        return "body-call"
+
+    invalid_sidecar = {
+        "character_introductions": [],
+        "facts": [],
+        "timeline": [],
+        "knowledge_states": [],
+        "clues": [],
+        "episode_obligations": [],
+    }
+    first_model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(content="## 第1集\n\n林荷决定留下守夜。"),
+            _tool_call("EpisodeOutlineGroupSidecar", invalid_sidecar, 1),
+            _tool_call("EpisodeOutlineGroupSidecar", invalid_sidecar, 2),
+        ]
+    )
+
+    with pytest.raises(ValidationError):
+        await _generate_outline_group_with_sidecar(
+            first_model,
+            compiled=compiled,
+            group=group,
+            operation_id="outline-operation-1",
+            sidecar_context=sidecar_context,
+            repair_feedback=None,
+            load_body=load_body,
+            persist_body=persist_body,
+            model_call_state=None,
+        )
+
+    fixed_hash = stored["outline_markdown_sha256"]
+    valid_sidecar = {
+        "character_introductions": [],
+        "facts": [
+            {
+                "fact_id": "fact_stays",
+                "subject": "林荷",
+                "predicate": "决定",
+                "kind": "text",
+                "value": "留下守夜",
+                "first_revealed_episode": 1,
+            }
+        ],
+        "timeline": [
+            {
+                "event_id": "event_stays",
+                "when": "台风前夜",
+                "participant_ids": ["lin_he"],
+                "fact_ids": ["fact_stays"],
+            }
+        ],
+        "knowledge_states": [],
+        "clues": [],
+        "episode_obligations": [
+            {
+                "obligation_id": "obligation_stays",
+                "episode_number": 1,
+                "new_information_fact_ids": ["fact_stays"],
+                "end_hook": "台风即将登陆",
+                "required_clue_ids": [],
+            }
+        ],
+    }
+    resumed_model = ToolCallingFakeModel(
+        responses=[_tool_call("EpisodeOutlineGroupSidecar", valid_sidecar, 3)]
+    )
+
+    result = await _generate_outline_group_with_sidecar(
+        resumed_model,
+        compiled=compiled,
+        group=group,
+        operation_id="outline-operation-2",
+        sidecar_context=sidecar_context,
+        repair_feedback=None,
+        load_body=load_body,
+        persist_body=persist_body,
+        model_call_state=None,
+    )
+
+    assert result.content == "## 第1集\n\n林荷决定留下守夜。"
+    assert result.episodes[0].plan == "林荷决定留下守夜。"
+    assert persisted_hashes == [fixed_hash]
+    assert len(resumed_model.model_message_batches) == 1
+    resumed_input = "\n".join(
+        str(message.content) for message in resumed_model.model_message_batches[0]
+    )
+    assert "FULL-CONTEXT-SENTINEL" not in resumed_input
+    assert fixed_hash in resumed_input
 
 
 @pytest.mark.asyncio
@@ -7630,10 +7806,17 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
     async def begin_group(**kwargs: Any) -> str:
         return f"operation-{kwargs['group_id']}"
 
+    async def load_group_body(_: str) -> Mapping[str, Any] | None:
+        return None
+
+    async def persist_group_body(*_: Any, **__: Any) -> str:
+        return "body-call"
+
     async def generate_group(
         compiled: Any,
         repair_feedback: str | None,
-    ) -> Mapping[str, Any]:
+        **_: Any,
+    ) -> EpisodeOutlineGroupResult:
         nonlocal fail_second_once, protocol_invalid_once
         group_id = compiled.manifest["group_id"]
         generated.append(group_id)
@@ -7647,8 +7830,8 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
             if protocol_invalid_once:
                 protocol_invalid_once = False
                 payload["timeline"][0]["participant_ids"].append("undeclared_witness")
-            return payload
-        return group_payload("pursuit", 2, 3)
+            return EpisodeOutlineGroupResult.model_validate(payload)
+        return EpisodeOutlineGroupResult.model_validate(group_payload("pursuit", 2, 3))
 
     async def review_group(_: Any, __: Any) -> SemanticReview:
         nonlocal reject_first_group_once
@@ -7747,6 +7930,8 @@ async def test_grouped_outline_resumes_from_the_first_uncommitted_group() -> Non
             commit_outline_season_map=commit_season_map,
             load_outline_groups=load_groups,
             begin_outline_group=begin_group,
+            load_outline_group_body=load_group_body,
+            persist_outline_group_body=persist_group_body,
             complete_outline_group=complete_group,
             fail_outline_group=fail_group,
             generate_outline_patch=generate_outline_patch,
