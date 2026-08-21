@@ -162,18 +162,65 @@ class _SerialChatAnthropic(ChatAnthropic):
 
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
         seen_model_ids: dict[str, str] = {}
+        completion = _AnthropicStreamCompletion()
         for chunk in super()._stream(*args, **self._with_call_output_budget(kwargs)):
+            completion.observe(chunk)
             yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
+        _require_anthropic_stream_completion(completion)
 
     async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         seen_model_ids: dict[str, str] = {}
+        completion = _AnthropicStreamCompletion()
         async for chunk in super()._astream(*args, **self._with_call_output_budget(kwargs)):
+            completion.observe(chunk)
             yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
+        _require_anthropic_stream_completion(completion)
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
         kwargs["parallel_tool_calls"] = False
         kwargs["tool_choice"] = "auto" if self.model in _AUTO_TOOL_CHOICE_MODELS else "any"
         return super().bind_tools(tools, **kwargs)
+
+
+@dataclass(slots=True)
+class _AnthropicStreamCompletion:
+    """Protocol completion evidence observed across one streamed response."""
+
+    stop_reason_seen: bool = False
+    usage_seen: bool = False
+
+    def observe(self, chunk: Any) -> None:
+        message = getattr(chunk, "message", None)
+        metadata = getattr(message, "response_metadata", None)
+        if isinstance(metadata, dict):
+            for key in ("stop_reason", "stopReason"):
+                if metadata.get(key):
+                    self.stop_reason_seen = True
+            usage = metadata.get("usage")
+            if isinstance(usage, dict) and usage.get("output_tokens") is not None:
+                self.usage_seen = True
+        if getattr(message, "usage_metadata", None):
+            self.usage_seen = True
+
+
+def _require_anthropic_stream_completion(completion: _AnthropicStreamCompletion) -> None:
+    """Fail closed when a generation stream ends without protocol completion evidence.
+
+    A completed Anthropic stream always finishes with a ``message_delta`` that
+    carries the stop reason (and output usage). Neither evidence means the relay
+    closed an incomplete stream — a provider-side transport failure, not a model
+    contract violation — so it maps to the operator-retryable
+    ``relay_unavailable`` code instead of ``structured_output_invalid``.
+    """
+    if completion.stop_reason_seen or completion.usage_seen:
+        return
+    raise RelayError(
+        code="relay_unavailable",
+        safe_message=(
+            "The model relay closed the generation stream without a finish "
+            "reason or usage evidence."
+        ),
+    )
 
 
 def _deduplicate_stream_model_identity(chunk: Any, seen_model_ids: dict[str, str]) -> Any:

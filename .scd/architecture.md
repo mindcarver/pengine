@@ -614,7 +614,9 @@ duplicate the full field contract.
   routes pass smoke testing.
 - Every response must report the model ID configured for its role. A missing or
   mismatched identity is a terminal protocol incompatibility, not a fallback
-  signal.
+  signal. A generation stream that closes without a stop reason or usage
+  evidence is likewise a provider transport failure (`relay_unavailable`,
+  operator-retryable) rather than a model contract violation.
 - Every real model request is preflighted at the common outbound-call boundary
   against the route's verified context window
   (`generation_context_limit_tokens` / `review_context_limit_tokens`). The
