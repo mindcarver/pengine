@@ -136,7 +136,7 @@ persona/
 
 `workflow_supervisor`、三个创作 Agent、故事／分集大纲补丁生成、`episode_repair` 和
 `story_repair` 固定使用生成路由；`quality_reviewer`、`canon_reviewer`、
-`episode_reviewer` 与 `series_reviewer` 固定使用审核路由。两个角色不互换，也不会在
+`series_reviewer` 与修复约束助手固定使用审核路由。两个角色不互换，也不会在
 一路失败时回退到另一路。
 
 分集大纲批准前，系统先生成紧凑的全季 `OutlineSeasonMap`，按行动、揭示、时空、关系、
@@ -157,7 +157,7 @@ Markdown。拒绝时最多只修复当前组两轮，恢复时也只从
 结构化审核调用返回结论，不再让模型逐文件读取工作区；完整前缀超过已验证审核窗口时，
 只能以活动 lineage 中最近通过且前缀哈希匹配的里程碑收据作为历史边界，同时保留边界后
 全部剧本原文、当前 `series_state` 和锁定合同，任何断链或哈希不匹配都在模型请求前阻断。
-`episode_reviewer` 保留给没有 active SeriesBible 的兼容路径，不是统一流程每集必调的模型。
+逐集语义审查已整体移除：每集只执行确定性合同/状态校验，语义一致性统一由声明的结构里程碑与终审承担。
 Skill 只加载到对应审查或修复子代理，不作为监督 Agent 的全局提示。
 
 剧本正文以带运行时边界标记的纯文本生成；紧凑 Sidecar 只承载分集编号、正文哈希、状态

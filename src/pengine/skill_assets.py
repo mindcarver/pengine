@@ -2,7 +2,6 @@ from importlib.resources import files
 
 _SKILLS = (
     "canon-review",
-    "episode-continuity-review",
     "continuity-repair",
     "story-repair",
 )

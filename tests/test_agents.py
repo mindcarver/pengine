@@ -127,7 +127,6 @@ from pengine.continuity import (
     SemanticReview,
     SeriesState,
     StoryContract,
-    canonical_model_hash,
     render_story_contract_markdown,
     repair_constraint_id,
     story_contract_sha256,
@@ -2221,15 +2220,6 @@ def _successful_responses(*, contract: StoryContract | None = None) -> list[AIMe
                 )
             )
             index += 1
-        if stage == "generating_episode_scripts":
-            responses.append(
-                _tool_call(
-                    "EpisodeReviewerResult",
-                    {"passed": True, "evidence": "分集一致", "issues": []},
-                    index,
-                )
-            )
-            index += 1
     responses.append(
         _tool_call(
             "WorkflowCompletion",
@@ -2270,23 +2260,28 @@ def _successful_responses_unified() -> list[AIMessage]:
     result for the single-episode series.
     """
     responses = _successful_responses()
-    episode_review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
-    unified: list[AIMessage] = []
+    # The legacy per-episode reviewer delegation no longer exists, so the bound
+    # final series review rides on the first script-stage result slot.
+    final_index = None
     for index, response in enumerate(responses):
-        if index == episode_review_index:
-            unified.append(
-                _tool_call(
-                    "StructuralReviewResult",
-                    {
-                        "passed": True,
-                        "category": "pass",
-                        "evidence": "L4硬规则：全系列适用硬规则一致。",
-                    },
-                    index,
-                )
-            )
-        else:
-            unified.append(response)
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if any(tc.get("name") == "WorkflowCompletion" for tc in tool_calls if isinstance(tc, dict)):
+            final_index = index
+            break
+    assert final_index is not None
+    unified = list(responses)
+    unified.insert(
+        final_index,
+        _tool_call(
+            "StructuralReviewResult",
+            {
+                "passed": True,
+                "category": "pass",
+                "evidence": "L4硬规则：全系列适用硬规则一致。",
+            },
+            final_index,
+        ),
+    )
     return unified
 
 
@@ -6558,8 +6553,6 @@ def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> 
     assert "locked story contract priority" in _EPISODE_REPAIR_PROMPT
     assert "verbatim_fact_missing" in _EPISODE_REPAIR_PROMPT
     assert "required_verbatim_facts" in _EPISODE_REPAIR_PROMPT
-    assert "locked_numeric_fact_mismatch" in _EPISODE_REPAIR_PROMPT
-    assert "/workspace/established_facts.json" in _EPISODE_REPAIR_PROMPT
 
 
 def test_story_outline_episode_section_error_provides_safe_actionable_feedback() -> None:
@@ -6864,13 +6857,11 @@ def test_evidence_contract_includes_required_and_callback_clues() -> None:
 def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> None:
     assert _SPECIALIST_SKILL_SOURCES == {
         "canon_reviewer": ["/skills/canon-review"],
-        "episode_reviewer": ["/skills/episode-continuity-review"],
         "episode_repair": ["/skills/continuity-repair"],
         "story_repair": ["/skills/story-repair"],
     }
     assert set(load_agent_skill_files()) == {
         "/skills/canon-review/SKILL.md",
-        "/skills/episode-continuity-review/SKILL.md",
         "/skills/continuity-repair/SKILL.md",
         "/skills/story-repair/SKILL.md",
     }
@@ -6886,14 +6877,6 @@ def test_specialist_skills_are_packaged_and_not_assigned_to_stage_owners() -> No
         "writer is free to choose unspecified details"
         in skill_files["/skills/canon-review/SKILL.md"]
     )
-    assert (
-        "complete committed series prefix"
-        in skill_files["/skills/episode-continuity-review/SKILL.md"]
-    )
-    episode_skill = skill_files["/skills/episode-continuity-review/SKILL.md"]
-    assert "Ordinary prose in an approved" in episode_skill
-    assert "leave unspecified" in episode_skill
-    assert "free" in episode_skill
 
 
 def test_review_prompts_do_not_turn_missing_creative_detail_into_failure() -> None:
@@ -6982,7 +6965,6 @@ async def test_workflow_routes_models_and_wires_outline_group_repair_mode(
     assert {name for name, model in subagent_models.items() if model is review_model} == {
         "quality_reviewer",
         "canon_reviewer",
-        "episode_reviewer",
         "repair_constraint_extractor",
         "repair_constraint_validator",
         "series_reviewer",
@@ -7004,7 +6986,6 @@ async def test_workflow_routes_models_and_wires_outline_group_repair_mode(
     for name in (
         "quality_reviewer",
         "canon_reviewer",
-        "episode_reviewer",
         "series_reviewer",
     ):
         system_prompt = subagents_by_name[name]["system_prompt"]
@@ -7015,7 +6996,6 @@ async def test_workflow_routes_models_and_wires_outline_group_repair_mode(
     for name in (
         "script_writer",
         "quality_reviewer",
-        "episode_reviewer",
         "series_reviewer",
     ):
         system_prompt = subagents_by_name[name]["system_prompt"]
@@ -7431,7 +7411,6 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
         }
         reviewer_result_tools = {
             "CanonReviewerResult",
-            "EpisodeReviewerResult",
         }
         for offered_tools, system_prompt in zip(
             model.bound_tool_names,
@@ -7491,7 +7470,6 @@ async def test_real_deepagents_topology_and_structured_flow(tmp_path: Path) -> N
             "StoryArchitectResult",
             "EpisodePlannerResult",
             "CanonReviewerResult",
-            "EpisodeReviewerResult",
         ):
             result_bindings = bindings_for(result_tool)
             assert result_bindings, result_tool
@@ -9763,10 +9741,10 @@ async def test_grouped_outline_final_rejection_reports_two_real_repair_rounds() 
 
 @pytest.mark.asyncio
 async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: Path) -> None:
+    """Deterministic evidence failures alone drive the per-episode repair loop."""
     database = tmp_path / "checkpoints.sqlite3"
     responses = _successful_responses()
     writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupSidecar", occurrence=1)
-    review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
     writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
     sidecar_episode = writer_payload["episodes"][0]
     sidecar_episode["state_delta"]["evidence"] = [
@@ -9784,23 +9762,9 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
         "state_delta": sidecar_episode["state_delta"],
         "writer_notes": "",
     }
-    failed_review = {
-        "passed": False,
-        "evidence": "人物身份与上游小传不一致",
-        "issues": [
-            {
-                "code": "identity_drift",
-                "message": "剧本把母亲姓名改成了合同外角色",
-                "contract_refs": ["semantic_target"],
-                "script_excerpt": "事实1",
-            }
-        ],
-    }
-    responses[review_index] = _tool_call("EpisodeReviewerResult", failed_review, review_index)
-    responses.insert(review_index + 1, _tool_call("ScriptWriterResult", writer_episode, 201))
-    responses.insert(review_index + 2, _tool_call("EpisodeReviewerResult", failed_review, 202))
-    responses.insert(review_index + 3, _tool_call("ScriptWriterResult", writer_episode, 203))
-    responses.insert(review_index + 4, _tool_call("EpisodeReviewerResult", failed_review, 204))
+    responses.insert(writer_index + 1, _tool_call("ScriptWriterResult", writer_episode, 201))
+    responses.insert(writer_index + 2, _tool_call("ScriptWriterResult", writer_episode, 203))
+    responses.insert(writer_index + 3, _tool_call("ScriptWriterResult", writer_episode, 204))
     approved: list[InternalStage] = []
     episode_hooks, episode_attempts = _episode_hook_kwargs()
 
@@ -9833,7 +9797,7 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
     assert error.value.repair_rounds == 2
     assert "missing_evidence_targets" in error.value.evidence
     assert "目标：fact_ep1" in error.value.evidence
-    assert "审查目标：fact_ep1, semantic_target" in error.value.evidence
+    assert "审查目标：fact_ep1" in error.value.evidence
     assert episode_attempts == [1]
     assert InternalStage.GENERATING_EPISODE_SCRIPTS not in approved
     repair_requests = [
@@ -9850,542 +9814,6 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
         assert tool_names == {"read_file", "calculate_arithmetic", "ScriptWriterResult"}
         for hidden_tool in ("ls", "glob", "grep", "write_todos", "write_file", "edit_file"):
             assert not _prompt_mentions_tool(system_prompt, hidden_tool)
-
-
-@pytest.mark.asyncio
-async def test_episode_repair_receives_deterministic_and_semantic_issues_together(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    database = tmp_path / "checkpoints.sqlite3"
-    contract = _story_contract(verbatim_episodes={1})
-    responses = _successful_responses(contract=contract)
-    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupSidecar", occurrence=1)
-    plaintext_index = _index_of_script_plaintext(responses)
-    review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
-    sidecar_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
-    repaired_writer_payload = {
-        "stage": "generating_episode_scripts",
-        "episode_number": 1,
-        "content": "事实1\n钩子1",
-        "state_delta": sidecar_payload["episodes"][0]["state_delta"],
-        "writer_notes": "",
-    }
-    invalid_writer_payload = copy.deepcopy(repaired_writer_payload)
-    invalid_writer_payload["content"] = "钩子1"
-    invalid_writer_payload["state_delta"]["evidence"] = [
-        item
-        for item in invalid_writer_payload["state_delta"]["evidence"]
-        if item["target_id"] != "fact_ep1"
-    ]
-    invalid_writer_payload["state_delta"]["evidence"].append(
-        {"target_id": "stale_target", "excerpt": "钩子1"}
-    )
-    invalid_content = invalid_writer_payload["content"]
-    responses[plaintext_index] = AIMessage(
-        content=(
-            "<<<PENGINE_EPISODE_START:{PENGINE_NONCE}:1>>>\n"
-            f"{invalid_content}\n"
-            "<<<PENGINE_EPISODE_END:{PENGINE_NONCE}:1>>>"
-        )
-    )
-    sidecar_payload["episodes"][0]["screenplay_sha256"] = hashlib.sha256(
-        invalid_content.encode()
-    ).hexdigest()
-    sidecar_payload["episodes"][0]["state_delta"] = invalid_writer_payload["state_delta"]
-    responses[writer_index] = _tool_call(
-        "ScriptGenerationGroupSidecar", sidecar_payload, writer_index
-    )
-    responses[review_index] = _tool_call(
-        "EpisodeReviewerResult",
-        {
-            "passed": False,
-            "evidence": "人物身份发生漂移",
-            "issues": [
-                {
-                    "code": "identity_drift",
-                    "message": "人物身份与上游不一致",
-                    "script_excerpt": "钩子1",
-                },
-                {
-                    "code": "unknown_speaker",
-                    "message": "剧本引入了锁定角色表之外的说话人 年轻协办",
-                    "script_excerpt": "年轻协办：我来开车。",
-                },
-                {
-                    "code": "evidence_coverage_mismatch",
-                    "message": "剧本证据未覆盖全部必需事实、线索和分集义务",
-                    "contract_refs": ["fact_ep1", "obligation_ep1"],
-                },
-            ],
-        },
-        review_index,
-    )
-    responses.insert(
-        review_index + 1,
-        _tool_call("ScriptWriterResult", repaired_writer_payload, 201),
-    )
-    responses.insert(
-        review_index + 2,
-        _tool_call(
-            "EpisodeReviewerResult",
-            {"passed": True, "evidence": "修复后分集一致", "issues": []},
-            202,
-        ),
-    )
-    captured_files: list[Mapping[str, str]] = []
-    captured_descriptions: list[str] = []
-    original_repair = StageGuardMiddleware._invoke_repair_subagent
-
-    async def capture_repair(
-        middleware: StageGuardMiddleware,
-        **kwargs: Any,
-    ) -> tuple[Any, dict[str, Any]]:
-        captured_files.append(kwargs["files"])
-        captured_descriptions.append(kwargs["description"])
-        return await original_repair(middleware, **kwargs)
-
-    monkeypatch.setattr(StageGuardMiddleware, "_invoke_repair_subagent", capture_repair)
-    approved: list[InternalStage] = []
-
-    async def before_stage(_: InternalStage) -> int:
-        return 1
-
-    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
-        approved.append(stage)
-
-    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
-        await saver.setup()
-        workflow = _fake_workflow(
-            model=ToolCallingFakeModel(responses=responses),
-            checkpointer=saver,
-            provider_profile_key="toolcallingfakemodel",
-        )
-        await workflow.execute(
-            thread_id="merged-episode-review-thread",
-            story="故事",
-            requirements="要求",
-            persona_files={"/persona/project.md": "规则"},
-            before_stage=before_stage,
-            approve_stage=approve_stage,
-            suffix_rewrite_feedback={
-                "version": 1,
-                "effective_earliest_affected_episode": 1,
-                "reviews": [
-                    {
-                        "review_id": "suffix-review",
-                        "category": "script_defect",
-                        "evidence": "重写原因：校牌事实冲突。",
-                        "earliest_affected_episode": 1,
-                        "binding": {"review_epoch": 1, "batch_id": "batch-1"},
-                    }
-                ],
-            },
-            **_episode_hook_kwargs()[0],
-        )
-
-    review = json.loads(captured_files[0]["/workspace/episode_review.json"])
-    assert {issue["code"] for issue in review["issues"]} >= {
-        "missing_evidence_targets",
-        "identity_drift",
-    }
-    missing = next(
-        issue for issue in review["issues"] if issue["code"] == "missing_evidence_targets"
-    )
-    assert missing["contract_refs"] == ["fact_ep1"]
-    assert "exactly one state_delta.evidence entry" in captured_descriptions[0]
-    assert "remove every unexpected target" in captured_descriptions[0]
-    assert "verbatim" in captured_descriptions[0]
-    assert captured_files[0]["/workspace/current_episode_plan.md"] == "第一集计划"
-    obligation = json.loads(captured_files[0]["/workspace/current_episode_obligation.json"])
-    assert obligation["end_hook"] == "钩子1"
-    assert "/workspace/speaker_contract.json" not in captured_files[0]
-    evidence_contract = json.loads(captured_files[0]["/workspace/evidence_contract.json"])
-    assert evidence_contract["episode_number"] == 1
-    assert evidence_contract["phase"] == "episode_repair"
-    assert evidence_contract["required_evidence_target_ids"] == [
-        "fact_ep1",
-        "obligation_ep1",
-    ]
-    assert evidence_contract["required_verbatim_facts"] == [
-        {"fact_id": "fact_ep1", "value": "事实1"}
-    ]
-    evidence_issues = evidence_contract["rejected_issues"]
-    assert {issue["code"] for issue in evidence_issues} == {
-        "evidence_coverage_mismatch",
-        "missing_evidence_targets",
-        "unexpected_evidence_targets",
-        "verbatim_fact_missing",
-    }
-    coverage_issue = next(
-        issue for issue in evidence_issues if issue["code"] == "evidence_coverage_mismatch"
-    )
-    assert coverage_issue["contract_refs"] == ["fact_ep1", "obligation_ep1"]
-    assert coverage_issue["message"] == "剧本证据未覆盖全部必需事实、线索和分集义务"
-    verbatim_issue = next(
-        issue for issue in evidence_issues if issue["code"] == "verbatim_fact_missing"
-    )
-    assert verbatim_issue["contract_refs"] == ["fact_ep1"]
-    assert "事实1" in verbatim_issue["message"]
-    suffix_review = json.loads(captured_files[0]["/workspace/suffix_rewrite_review.json"])
-    assert suffix_review["reviews"][0]["evidence"] == "重写原因：校牌事实冲突。"
-    assert len(captured_descriptions) == 1
-    repair_description = captured_descriptions[0]
-    assert "suffix_rewrite_review.json" in repair_description
-    assert "fix every named conflict" in repair_description
-    assert "unknown_speaker" in repair_description
-    assert "genuinely new continuity-bearing character" in repair_description
-    assert "preserving surface notation" in repair_description
-    assert "Do not rewrite a label merely because it is an alias" in repair_description
-    assert "generic or descriptive label" in repair_description
-    assert "speaker_contract.json" not in repair_description
-    assert (
-        'issue.contract_refs: ["fact_ep1", "obligation_ep1", "stale_target"]' in repair_description
-    )
-    assert "exact set" in repair_description
-    assert "no extras" in repair_description
-    assert "no duplicates" in repair_description
-    assert "every required target exactly once" in repair_description
-    assert "Verbatim fact repair is mandatory" in repair_description
-    assert "fact.value" in repair_description
-    assert "/workspace/established_facts.json" in captured_files[0]
-    assert InternalStage.GENERATING_EPISODE_SCRIPTS in approved
-
-
-@pytest.mark.asyncio
-async def test_pronoun_numeric_fact_drift_is_deferred_without_episode_review(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """含糊的代词数值复述不再触发逐集模型审查或局部修复。"""
-    database = tmp_path / "numeric-fact-drift.sqlite3"
-    contract_payload = _story_contract(episode_count=2).model_dump(mode="json")
-    contract_payload["facts"].insert(
-        0,
-        {
-            "fact_id": "su_hui_age",
-            "subject": "测试人物",
-            "predicate": "现年年龄",
-            "kind": "count",
-            "value": "59",
-            "unit": "岁",
-            "first_revealed_episode": 1,
-        },
-    )
-    contract_payload["episode_obligations"][0]["new_information_fact_ids"].append("su_hui_age")
-    contract_payload["timeline"][0]["fact_ids"].append("su_hui_age")
-    contract_payload["knowledge_states"][0]["known_fact_ids"].append("su_hui_age")
-    contract_payload["knowledge_states"][1]["known_fact_ids"].append("su_hui_age")
-    contract = StoryContract.model_validate(contract_payload)
-    contract_hash = story_contract_sha256(contract)
-
-    ep1_content = "测试人物今年五十九岁。\n事实1\n钩子1"
-    ep1_delta_payload = _state_delta(contract, 1)
-    ep1_delta_payload["established_fact_ids"] = ["fact_ep1", "su_hui_age"]
-    ep1_delta_payload["evidence"].append(
-        {"target_id": "su_hui_age", "excerpt": "测试人物今年五十九岁"}
-    )
-    ep1_delta = EpisodeStateDelta.model_validate(ep1_delta_payload)
-    ep1_state = SeriesState.model_validate(
-        {
-            "contract_sha256": contract_hash,
-            "locked_through_episode": 1,
-            "established_fact_ids": ["fact_ep1", "su_hui_age"],
-            "character_knowledge": [
-                {
-                    "character_id": "test_character",
-                    "known_fact_ids": ["fact_ep1", "su_hui_age"],
-                }
-            ],
-            "handoff": "第1集结束",
-        }
-    )
-    ep1_draft = EpisodeDraft(
-        episode_number=1,
-        content=ep1_content,
-        content_sha256=hashlib.sha256(ep1_content.encode()).hexdigest(),
-        completed_at=datetime(2026, 7, 31, tzinfo=UTC),
-        contract_sha256=contract_hash,
-        state_delta=ep1_delta,
-        series_state=ep1_state,
-        series_state_sha256=canonical_model_hash(ep1_state),
-    )
-
-    responses = _successful_responses(contract=contract)
-    planner_index = _index_of_tool_call(responses, "EpisodePlannerResult")
-    planner_args = responses[planner_index].tool_calls[0]["args"]
-    planner_args["episode_count"] = 2
-    planner_args["episodes"] = [
-        {"episode_number": 1, "plan": "第一集计划"},
-        {"episode_number": 2, "plan": "第二集计划"},
-    ]
-    planner_args["story_contract"] = contract.model_dump(mode="json")
-    planner_args["script_generation_groups"] = [
-        {
-            "group_id": "episode_one",
-            "start_episode": 1,
-            "end_episode": 1,
-            "dramatic_unit": "第一集",
-            "boundary_reason": "第一集结束",
-        },
-        {
-            "group_id": "episode_two",
-            "start_episode": 2,
-            "end_episode": 2,
-            "dramatic_unit": "第二集",
-            "boundary_reason": "全剧结束",
-        },
-    ]
-
-    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupSidecar", occurrence=1)
-    plaintext_index = _index_of_script_plaintext(responses)
-    writer_args = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
-    writer_args["group_id"] = "episode_two"
-    writer_args["start_episode"] = 2
-    writer_args["end_episode"] = 2
-    writer_args["episodes"][0]["episode_number"] = 2
-    invalid_content = "她六十岁，推门进来。\n事实2\n钩子2"
-    responses[plaintext_index] = AIMessage(
-        content=(
-            "<<<PENGINE_EPISODE_START:{PENGINE_NONCE}:2>>>\n"
-            f"{invalid_content}\n"
-            "<<<PENGINE_EPISODE_END:{PENGINE_NONCE}:2>>>"
-        )
-    )
-    writer_args["episodes"][0]["screenplay_sha256"] = hashlib.sha256(
-        invalid_content.encode()
-    ).hexdigest()
-    writer_args["episodes"][0]["state_delta"] = _state_delta(contract, 2)
-    responses[writer_index] = _tool_call("ScriptGenerationGroupSidecar", writer_args, writer_index)
-
-    review_index = _index_of_tool_call(responses, "EpisodeReviewerResult", occurrence=1)
-    responses[review_index] = _tool_call(
-        "EpisodeReviewerResult",
-        {"passed": True, "evidence": "里程碑结构审查通过", "issues": []},
-        review_index,
-    )
-
-    captured_writer_files: list[Mapping[str, str]] = []
-    captured_repair_files: list[Mapping[str, str]] = []
-    captured_repair_descriptions: list[str] = []
-    captured_review_files: list[Mapping[str, str]] = []
-    original_call = StageGuardMiddleware._generate_script_group_candidate
-    original_repair = StageGuardMiddleware._invoke_repair_subagent
-    original_review = StageGuardMiddleware._invoke_semantic_reviewer
-
-    async def capture_call(
-        middleware: StageGuardMiddleware,
-        request: ToolCallRequest,
-        handler: Any,
-        args: Mapping[str, Any],
-        *,
-        expected_episode_number: int,
-        **kwargs: Any,
-    ) -> tuple[Any, Mapping[str, Any]]:
-        captured_writer_files.append(request.state["files"])
-        return await original_call(
-            middleware,
-            request,
-            handler,
-            args,
-            expected_episode_number=expected_episode_number,
-            **kwargs,
-        )
-
-    async def capture_repair(
-        middleware: StageGuardMiddleware,
-        **kwargs: Any,
-    ) -> tuple[Any, dict[str, Any]]:
-        captured_repair_files.append(kwargs["files"])
-        captured_repair_descriptions.append(kwargs["description"])
-        return await original_repair(middleware, **kwargs)
-
-    async def capture_review(
-        middleware: StageGuardMiddleware,
-        **kwargs: Any,
-    ) -> SemanticReview:
-        if kwargs.get("minimal_context"):
-            captured_review_files.append(kwargs["files"])
-        return await original_review(middleware, **kwargs)
-
-    monkeypatch.setattr(
-        StageGuardMiddleware,
-        "_generate_script_group_candidate",
-        capture_call,
-    )
-    monkeypatch.setattr(StageGuardMiddleware, "_invoke_repair_subagent", capture_repair)
-    monkeypatch.setattr(StageGuardMiddleware, "_invoke_semantic_reviewer", capture_review)
-
-    approved: list[InternalStage] = []
-
-    async def before_stage(_: InternalStage) -> int:
-        return 1
-
-    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
-        approved.append(stage)
-
-    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
-        await saver.setup()
-        workflow = _fake_workflow(
-            model=ToolCallingFakeModel(responses=responses),
-            checkpointer=saver,
-            provider_profile_key="toolcallingfakemodel",
-        )
-        await workflow.execute(
-            thread_id="numeric-fact-drift-writer-thread",
-            story="故事",
-            requirements="要求",
-            persona_files={"/persona/project.md": "规则"},
-            before_stage=before_stage,
-            approve_stage=approve_stage,
-            **_episode_hook_kwargs(episode_drafts=[ep1_draft])[0],
-        )
-
-    writer_established = json.loads(
-        captured_writer_files[0]["/workspace/established_facts.json"]["content"]
-    )
-    age_entries = [
-        entry
-        for entry in writer_established["established_facts"]
-        if entry["fact_id"] == "su_hui_age"
-    ]
-    assert len(age_entries) == 1
-    assert age_entries[0]["value"] == "59"
-    assert age_entries[0]["committed_evidence"] == "测试人物今年五十九岁"
-
-    assert captured_review_files == []
-    assert captured_repair_files == []
-    assert captured_repair_descriptions == []
-    assert InternalStage.GENERATING_EPISODE_SCRIPTS in approved
-
-
-@pytest.mark.asyncio
-async def test_last_episode_review_receives_complete_series_prefix_before_approval() -> None:
-    contract = _story_contract(episode_count=2)
-    contract_hash = story_contract_sha256(contract)
-    approved_payloads: dict[InternalStage, dict[str, Any]] = {
-        InternalStage.SELECTING_L0_VARIANT: {
-            "stage": "selecting_l0_variant",
-            "selected_l0_variant": "主动选择",
-            "selection_rationale": "契合故事",
-        },
-        InternalStage.GENERATING_STORY_OUTLINE: {
-            "stage": "generating_story_outline",
-            "content": "故事大纲",
-            "character_biographies": None,
-            "relationship_logic": None,
-        },
-        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
-            "stage": "generating_character_relationships",
-            "content": None,
-            "character_biographies": "人物小传",
-            "relationship_logic": "关系逻辑",
-        },
-        InternalStage.GENERATING_EPISODE_OUTLINE: {
-            "stage": "generating_episode_outline",
-            "content": "两集分集大纲",
-            "episode_count": 2,
-            "episodes": [
-                {"episode_number": 1, "plan": "第一集计划"},
-                {"episode_number": 2, "plan": "第二集计划"},
-            ],
-            "story_contract": contract.model_dump(mode="json"),
-            "story_contract_sha256": contract_hash,
-            "story_contract_markdown": render_story_contract_markdown(contract, contract_hash),
-            "contract_review": {"passed": True, "evidence": "合同一致", "issues": []},
-            "contract_repair_rounds": 0,
-        },
-    }
-    approved_stages = set(approved_payloads)
-    approvals: dict[InternalStage, dict[str, Any]] = {}
-    episode_hooks, attempts = _episode_hook_kwargs()
-
-    async def before_stage(_: InternalStage) -> int:
-        return 1
-
-    async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
-        approvals[stage] = payload
-
-    middleware = StageGuardMiddleware(
-        before_stage=before_stage,
-        approve_stage=approve_stage,
-        approved_stages=approved_stages,
-        approved_payloads=approved_payloads,
-        **episode_hooks,
-    )
-    request = ToolCallRequest(
-        tool_call={
-            "name": "task",
-            "args": {
-                "description": "[stage=generating_episode_scripts] write scripts",
-                "subagent_type": "script_writer",
-            },
-            "id": "call-series-prefix",
-            "type": "tool_call",
-        },
-        tool=None,
-        state={"files": {}},
-        runtime=None,
-    )
-    reviewed_prefixes: list[set[str]] = []
-    reviewed_prefix_contents: list[str] = []
-
-    async def handler(subagent_request: ToolCallRequest) -> ToolMessage:
-        description = subagent_request.tool_call["args"]["description"]
-        subagent_type = subagent_request.tool_call["args"]["subagent_type"]
-        episode_number = 2 if "episode=2" in description or "episode 2" in description else 1
-        if subagent_type == "script_writer":
-            payload = {
-                "stage": "generating_episode_scripts",
-                "episode_number": episode_number,
-                "content": f"事实{episode_number}\n钩子{episode_number}",
-                "state_delta": _state_delta(contract, episode_number),
-            }
-        else:
-            assert subagent_type == "episode_reviewer"
-            _assert_task_lists_exact_workspace_paths(subagent_request)
-            assert "complete committed series prefix" in description
-            assert "trusted runtime metadata" in description
-            assert "episodes[].content" in description
-            for required_check in (
-                "identities",
-                "relationships",
-                "pronouns",
-                "call participants",
-                "clue meanings",
-            ):
-                assert required_check in description
-            reviewed_prefixes.append(set(subagent_request.state["files"]))
-            prefix_file = subagent_request.state["files"]["/workspace/series_prefix.json"]
-            reviewed_prefix_contents.append(prefix_file["content"])
-            payload = {"passed": True, "evidence": "完整前缀一致", "issues": []}
-        return ToolMessage(
-            content=json.dumps(payload, ensure_ascii=False),
-            tool_call_id="call-series-prefix",
-        )
-
-    await middleware.awrap_tool_call(request, handler)
-
-    assert attempts == [1, 2]
-    assert "/workspace/episodes/ep1.md" not in reviewed_prefixes[0]
-    assert {
-        "/workspace/episodes/ep1.md",
-        "/workspace/candidate_episode.md",
-        "/workspace/story_outline.md",
-        "/workspace/character_biographies.md",
-        "/workspace/relationship_logic.md",
-        "/workspace/episode_outline.md",
-        "/workspace/story_contract.json",
-        "/workspace/series_prefix.json",
-    } <= reviewed_prefixes[1]
-    assert json.loads(reviewed_prefix_contents[1]) == {
-        "episodes": [
-            {"episode_number": 1, "content": "事实1\n钩子1"},
-            {"episode_number": 2, "content": "事实2\n钩子2"},
-        ]
-    }
-    assert "第 1 集" not in reviewed_prefix_contents[1]
-    assert InternalStage.GENERATING_EPISODE_SCRIPTS in approvals
 
 
 @pytest.mark.asyncio
@@ -10500,9 +9928,6 @@ async def test_episode_writer_receives_compact_active_design_and_recent_verbatim
                 "category": "pass",
                 "evidence": "全系列一致",
             }
-        else:
-            assert subagent_type == "episode_reviewer"
-            payload = {"passed": True, "evidence": "完整前缀一致", "issues": []}
         return ToolMessage(
             content=json.dumps(payload, ensure_ascii=False),
             tool_call_id="call-writer-input",

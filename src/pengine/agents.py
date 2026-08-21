@@ -204,7 +204,6 @@ _PRIMARY_STORY_ARTIFACT_REPAIR_ROUNDS = 4
 _MAX_STORY_ARTIFACT_REPAIR_ROUNDS = 4
 _SPECIALIST_SKILL_SOURCES = {
     "canon_reviewer": ["/skills/canon-review"],
-    "episode_reviewer": ["/skills/episode-continuity-review"],
     "episode_repair": ["/skills/continuity-repair"],
     "story_repair": ["/skills/story-repair"],
 }
@@ -605,9 +604,6 @@ _EPISODE_REPAIR_PROMPT = (
     "the review contains verbatim_fact_missing issues, use each issue.contract_refs entry to "
     "find the matching required_verbatim_facts item and restore its exact fact.value as a "
     "contiguous substring in content. Do not impose exact wording on facts not listed there. "
-    "When the review contains locked_numeric_fact_mismatch issues, use each "
-    "issue.contract_refs entry to find the matching /workspace/established_facts.json item "
-    "and restore the locked value exactly wherever the screenplay restates the number. "
     "When /workspace/suffix_rewrite_review.json is present, read it as the read-only bound "
     "rewrite "
     "cause, fix every conflict named in every review evidence entry, give the locked story "
@@ -652,13 +648,12 @@ _QUALITY_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
 )
 
 _EPISODE_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
-    "First read /skills/episode-continuity-review/SKILL.md. Follow that skill while treating "
-    "explicit contract facts and prior state as immutable and unspecified creative details as "
-    "free. Only a story_contract fact with verbatim=true requires its value to appear "
-    "contiguously word-for-word; all other facts, including kind=text facts, are reviewed for "
-    "semantic consistency only. Only an internal-runtime leak that meets the policy's provenance "
-    "and evidence standard is blocking. Screenplay formatting and story-world subject matter "
-    "named in the policy are never defects on their own. "
+    "Treat explicit contract facts and prior state as immutable and unspecified creative "
+    "details as free. Only a story_contract fact with verbatim=true requires its value to "
+    "appear contiguously word-for-word; all other facts, including kind=text facts, are "
+    "reviewed for semantic consistency only. Only an internal-runtime leak that meets the "
+    "policy's provenance and evidence standard is blocking. Screenplay formatting and "
+    "story-world subject matter named in the policy are never defects on their own. "
     "/workspace/series_prefix.json is a trusted runtime envelope: episode_number and JSON "
     "framing are trusted runtime metadata, not screenplay content. Judge leakage only inside "
     "episodes[].content. Return only structured review evidence and never repair content."
@@ -8285,61 +8280,16 @@ class StageGuardMiddleware(AgentMiddleware):
                     )
                     deterministic_issues.extend(constraint_issues)
                     semantic_reviews.append(constraint_review)
-                if self.series_bible is not None:
-                    if not semantic_reviews:
-                        semantic_reviews.append(
-                            SemanticReview(
-                                passed=True,
-                                evidence="确定性逐集校验通过；语义一致性延后至结构里程碑审查。",
-                            )
+                if not semantic_reviews:
+                    # Per-episode semantic review is intentionally gone: deterministic
+                    # validation covers hard continuity per episode and semantic arcs
+                    # are judged at structural milestones and the final review.
+                    semantic_reviews.append(
+                        SemanticReview(
+                            passed=True,
+                            evidence="确定性逐集校验通过；语义一致性延后至结构里程碑审查。",
                         )
-                else:
-                    full_episode_review = await self._invoke_semantic_reviewer(
-                        request=episode_request,
-                        handler=handler,
-                        subagent_type="episode_reviewer",
-                        description=(
-                            f"Review episode {plan.episode_number} and the complete committed "
-                            "series prefix against the locked contract and every approved upstream "
-                            "artifact. Compare only explicitly locked or formally committed "
-                            "identities, relationships, aliases, pronouns, ages, "
-                            "durations, call participants, clue meanings, causal facts, viewpoint "
-                            "knowledge, cast, and episode obligation across all prior scripts and "
-                            "the current candidate. The candidate's final dramatic beat must "
-                            "realize the locked end_hook without a later beat undoing it. On the "
-                            "final episode this is the whole-series consistency review before "
-                            "script-stage approval. Read /workspace/series_prefix.json as a "
-                            "trusted runtime envelope: episode_number and JSON framing are trusted "
-                            "runtime metadata, not screenplay content. Judge leakage only inside "
-                            "episodes[].content. Return structured evidence only."
-                        ),
-                        files={
-                            "/workspace/story_contract.json": contract_json,
-                            "/workspace/series_state.json": prior_state.model_dump_json(),
-                            "/workspace/current_episode_plan.md": plan.plan,
-                            "/workspace/current_episode_obligation.json": (
-                                current_obligation.model_dump_json()
-                            ),
-                            "/workspace/candidate_episode.md": parsed.content,
-                            "/workspace/series_prefix.json": _trusted_series_prefix_json(
-                                [
-                                    *(
-                                        (episode_number, draft.content)
-                                        for episode_number, draft in sorted(
-                                            self.episode_drafts.items()
-                                        )
-                                    ),
-                                    (plan.episode_number, parsed.content),
-                                ]
-                            ),
-                            "/workspace/candidate_state_delta.json": (
-                                parsed.state_delta.model_dump_json()
-                            ),
-                        },
-                        schema=EpisodeReviewerResult,
-                        stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
                     )
-                    semantic_reviews.append(full_episode_review)
                 review = _merge_episode_review_results(deterministic_issues, semantic_reviews)
                 if review.passed:
                     if suffix_feedback is not None and plan.episode_number < contract.episode_count:
@@ -8515,26 +8465,6 @@ class StageGuardMiddleware(AgentMiddleware):
                         "For each matching required_verbatim_facts item, restore its exact "
                         "fact.value as one contiguous substring in content; facts not listed "
                         "there remain semantic-only."
-                    )
-                numeric_fact_issues = [
-                    issue for issue in review.issues if issue.code == "locked_numeric_fact_mismatch"
-                ]
-                if numeric_fact_issues:
-                    numeric_fact_references = sorted(
-                        {
-                            reference
-                            for issue in numeric_fact_issues
-                            for reference in issue.contract_refs
-                        }
-                    )
-                    repair_description += (
-                        " Numeric fact repair is mandatory. Use the exact fact IDs from "
-                        "issue.contract_refs: "
-                        f"{json.dumps(numeric_fact_references, ensure_ascii=False)}. "
-                        "For each matching /workspace/established_facts.json entry, restore "
-                        "the locked value exactly when the screenplay restates the number "
-                        "(59 is 五十九/59, never 六十/60) and keep every other established "
-                        "fact unchanged."
                     )
                 repair_window_id = (
                     await self.begin_generation_group(
@@ -9533,23 +9463,6 @@ class DeepAgentWorkflow:
                 "skills": _SPECIALIST_SKILL_SOURCES["canon_reviewer"],
                 "response_format": ToolStrategy(
                     schema=CanonReviewerResult,
-                    handle_errors=structured_output_retry,
-                ),
-            },
-            {
-                "name": "episode_reviewer",
-                "description": "Independently reviews one episode against locked continuity.",
-                "system_prompt": episode_reviewer_prompt,
-                "model": self.review_model,
-                "tools": [],
-                "permissions": REVIEW_FILE_PERMISSIONS,
-                "middleware": stage_middleware(
-                    _REVIEW_TOOL_ALLOWLIST,
-                    system_prompt=episode_reviewer_prompt,
-                ),
-                "skills": _SPECIALIST_SKILL_SOURCES["episode_reviewer"],
-                "response_format": ToolStrategy(
-                    schema=EpisodeReviewerResult,
                     handle_errors=structured_output_retry,
                 ),
             },
