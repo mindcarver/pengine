@@ -785,6 +785,180 @@ async def test_outline_markdown_failure_records_evidence_and_retries_with_exact_
         assert "no episode title after 集" in prompt
 
 
+def _episode_group_candidate(group_id: str, start: int, end: int) -> dict[str, Any]:
+    return {
+        "group_id": group_id,
+        "start_episode": start,
+        "end_episode": end,
+        "content": "\n".join(
+            f"## 第{number}集\n\n第{number}集大纲。" for number in range(start, end + 1)
+        ),
+        "episodes": [
+            {"episode_number": number, "plan": f"第{number}集大纲。"}
+            for number in range(start, end + 1)
+        ],
+        "facts": [
+            {
+                "fact_id": f"fact_{number}",
+                "subject": "林岚",
+                "predicate": "确认线索",
+                "kind": "text",
+                "value": f"线索{number}",
+                "first_revealed_episode": number,
+            }
+            for number in range(start, end + 1)
+        ],
+        "timeline": [
+            {
+                "event_id": f"event_{number}",
+                "when": f"第{number}天",
+                "participant_ids": ["lin_lan"],
+                "fact_ids": [f"fact_{number}"],
+            }
+            for number in range(start, end + 1)
+        ],
+        "knowledge_states": [],
+        "clues": [],
+        "episode_obligations": [
+            {
+                "obligation_id": f"obligation_{number}",
+                "episode_number": number,
+                "new_information_fact_ids": [f"fact_{number}"],
+                "required_clue_ids": [],
+                "end_hook": f"第{number}集钩子",
+            }
+            for number in range(start, end + 1)
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_outline_groups_reset_the_run_deadline_per_group() -> None:
+    season_payload = {
+        "episode_count": 3,
+        "characters": [
+            {
+                "character_id": "lin_lan",
+                "name": "林岚",
+                "role": "调查者",
+                "initial_known_fact_ids": [],
+            }
+        ],
+        "relationships": [],
+        "prohibitions": [],
+        "review_milestones": [],
+        "script_generation_groups": [
+            {
+                "group_id": "opening",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "发现旧信",
+                "boundary_reason": "线索改变目标",
+            },
+            {
+                "group_id": "pursuit",
+                "start_episode": 2,
+                "end_episode": 3,
+                "dramatic_unit": "追查寄信人",
+                "boundary_reason": "行动获得结果",
+            },
+        ],
+    }
+    stored_map: dict[str, Any] | None = None
+    deadline_resets: list[str] = []
+
+    async def load_season_map() -> Mapping[str, Any] | None:
+        return stored_map
+
+    async def commit_season_map(payload: Mapping[str, Any]) -> None:
+        nonlocal stored_map
+        stored_map = {"content": dict(payload)}
+
+    async def generate_group(
+        _: Any,
+        repair_feedback: str | None,
+        **kwargs: Any,
+    ) -> EpisodeOutlineGroupResult:
+        del repair_feedback
+        return EpisodeOutlineGroupResult.model_validate(
+            _episode_group_candidate(
+                kwargs["group"].group_id,
+                kwargs["group"].start_episode,
+                kwargs["group"].end_episode,
+            )
+        )
+
+    async def accept_group(_: Any, __: Any) -> SemanticReview:
+        return SemanticReview.model_validate({"passed": True, "evidence": "一致。"})
+
+    async def generate_season_map(_: Any) -> Mapping[str, Any]:
+        return season_payload
+
+    async def load_groups() -> list[Mapping[str, Any]]:
+        return []
+
+    async def begin_group(**_: Any) -> str:
+        return "operation"
+
+    async def reset_deadline() -> None:
+        deadline_resets.append("reset")
+
+    async def handler(candidate_request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(
+                {"passed": True, "evidence": "L4硬规则：合同一致", "issues": []},
+                ensure_ascii=False,
+            ),
+            tool_call_id=str(candidate_request.tool_call.get("id") or "call-deadline"),
+        )
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_season_map=generate_season_map,
+        generate_outline_group=generate_group,
+        review_outline_group=accept_group,
+        load_outline_season_map=load_season_map,
+        commit_outline_season_map=commit_season_map,
+        load_outline_groups=load_groups,
+        begin_outline_group=begin_group,
+        load_outline_group_body=lambda _: _async_none(),
+        persist_outline_group_body=lambda *_, **__: _async_none(),
+        complete_outline_group=lambda **_: _async_none(),
+        fail_outline_group=lambda **_: _async_none(),
+        reset_episode_deadline=reset_deadline,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] generate outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-grouped-deadline-reset",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={
+            "files": {
+                "/workspace/creation-request.md": {"content": "故事需求"},
+                "/workspace/story_outline.md": {"content": "故事梗概"},
+                "/workspace/character_biographies.md": {"content": "人物小传"},
+                "/workspace/relationship_logic.md": {"content": "人物关系"},
+            }
+        },
+        runtime=None,
+    )
+
+    await middleware._generate_grouped_outline(request, handler, request.tool_call["args"])
+
+    # One deadline reset per started group: the outline stage gets the same
+    # per-unit wall clock the script stage already has per episode.
+    assert len(deadline_resets) == 2
+
+
 @pytest.mark.asyncio
 async def test_persisted_group_rejection_seeds_full_regeneration_on_resume() -> None:
     season_payload = {
