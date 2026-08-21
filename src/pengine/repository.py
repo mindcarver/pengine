@@ -98,7 +98,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 # Failure codes an operator can fix outside Pengine (relay quota, availability,
@@ -1156,6 +1156,21 @@ CREATE INDEX IF NOT EXISTS outline_markdown_failures_run
 ON outline_markdown_failures(run_id, group_id, attempt_index);
 
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (30);
+"""
+
+_SCHEMA_V31_OUTLINE_GROUP_REJECTIONS_SQL = """
+CREATE TABLE IF NOT EXISTS outline_group_rejections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    repair_rounds INTEGER NOT NULL CHECK (repair_rounds >= 1),
+    rejected_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS outline_group_rejections_run
+ON outline_group_rejections(run_id, group_id, rejected_at);
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (31);
 """
 
 _SCHEMA_V27_GROUPED_OUTLINE_SQL = """
@@ -2441,6 +2456,16 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 30
+            if schema_version == 30:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.executescript(_SCHEMA_V31_OUTLINE_GROUP_REJECTIONS_SQL)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 31
 
     async def setup(self) -> None:
         await self.initialize()
@@ -2816,6 +2841,34 @@ class Repository:
                 """,
                 (_timestamp(_utc_now()), str(run_id), group_id, operation_id),
             )
+
+    async def get_outline_group_rejection(
+        self,
+        run_id: UUID,
+        *,
+        group_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the latest persisted semantic rejection for one outline group."""
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT group_id, evidence, repair_rounds, rejected_at
+                FROM outline_group_rejections
+                WHERE run_id = ? AND group_id = ?
+                ORDER BY rejected_at DESC, id DESC
+                LIMIT 1
+                """,
+                (str(run_id), group_id),
+            )
+        if row is None:
+            return None
+        return {
+            "group_id": row["group_id"],
+            "evidence": row["evidence"],
+            "repair_rounds": int(row["repair_rounds"]),
+            "rejected_at": row["rejected_at"],
+        }
 
     async def record_outline_markdown_failure(
         self,
@@ -3738,6 +3791,7 @@ class Repository:
         evidence: str,
         repair_rounds: int,
         episode_number: int | None = None,
+        outline_group_id: str | None = None,
         now: datetime | None = None,
     ) -> None:
         if stage not in {
@@ -3756,6 +3810,8 @@ class Repository:
             )
         if (stage is InternalStage.GENERATING_EPISODE_SCRIPTS) != (episode_number is not None):
             raise ValueError("Episode number is required only for episode script rejection")
+        if outline_group_id is not None and stage is not InternalStage.GENERATING_EPISODE_OUTLINE:
+            raise ValueError("Outline group id is required only for outline group rejection")
         current = now or _utc_now()
         timestamp = _timestamp(current)
         async with self._transaction() as connection:
@@ -3792,6 +3848,21 @@ class Repository:
                     timestamp,
                 ),
             )
+            if outline_group_id is not None:
+                await connection.execute(
+                    """
+                    INSERT INTO outline_group_rejections(
+                        run_id, group_id, evidence, repair_rounds, rejected_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(run_id),
+                        outline_group_id,
+                        evidence,
+                        repair_rounds,
+                        timestamp,
+                    ),
+                )
             user_stage = _USER_STAGE_BY_INTERNAL[stage]
             await connection.execute(
                 """

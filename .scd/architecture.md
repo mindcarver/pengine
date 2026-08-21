@@ -677,7 +677,7 @@ run-control commands are additive. Breaking HTTP or persona format changes
 require a new contract version. Persona source packages remain outside the
 database so application rollback does not rewrite operator content.
 
-The SQLite schema is a forward-only migration chain, currently at version 30.
+The SQLite schema is a forward-only migration chain, currently at version 31.
 Across the chain it preserves prior contract-bound content and repair records,
 migrates episode attempts into explicit rewrite cycles, adds model-call
 `operation_id`, binds approved outline checkpoints to physical `review_call_id`

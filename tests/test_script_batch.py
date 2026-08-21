@@ -863,7 +863,7 @@ async def test_quality_repair_rejects_change_outside_saved_excerpt(
 
 
 async def test_v13_migration_preserves_existing_database(repository) -> None:
-    assert SCHEMA_VERSION == 30
+    assert SCHEMA_VERSION == 31
     accepted, lease = await create_leased_run(repository)
     contract, active, committed = await seed_batch_with_episodes(repository, lease.run_id, up_to=1)
     async with repository._connection() as connection:
