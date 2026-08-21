@@ -49,7 +49,14 @@ from pengine.observability import record_model_call_event
 
 _AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 _RESPONSE_MODEL_ID_EQUIVALENTS = MappingProxyType(
-    {"gpt-5.5": frozenset({"gpt-5.5", "gpt-5.5-2026-04-23"})}
+    {
+        "gpt-5.5": frozenset({"gpt-5.5", "gpt-5.5-2026-04-23"}),
+        # The relay's upstream reports the dated snapshot identity for the
+        # canonical deepseek route; -0731 is not independently routable
+        # (verified 2026-08-21: /models advertises deepseek-v4-flash only and
+        # requesting -0731 directly returns model-not-found).
+        "deepseek-v4-flash": frozenset({"deepseek-v4-flash", "deepseek-v4-flash-0731"}),
+    }
 )
 # Uvicorn owns the runtime log handlers. This child logger keeps the safe model-call
 # audit at INFO while ensuring it reaches the same server evidence stream.

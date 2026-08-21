@@ -430,6 +430,71 @@ def test_anthropic_message_delta_preserves_model_context_management() -> None:
     assert chunk.response_metadata["context_management"] == {"applied_edits": ["clear_tool_uses"]}
 
 
+def test_model_call_audit_accepts_official_deepseek_flash_snapshot_identity(caplog) -> None:
+    """The relay reports the dated snapshot for the canonical deepseek route."""
+    caplog.set_level("INFO", logger="uvicorn.error.pengine.model_calls")
+    handler = _ModelCallAuditHandler(role="review", model_id="deepseek-v4-flash")
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="",
+                        response_metadata={"model_name": "deepseek-v4-flash-0731"},
+                        tool_calls=[
+                            {
+                                "name": "SemanticReview",
+                                "args": {"passed": True, "evidence": "通过", "issues": []},
+                                "id": "review-result",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                )
+            ]
+        ]
+    )
+
+    handler.on_llm_end(response, run_id=uuid4())
+
+    assert "requested_model_id=deepseek-v4-flash" in caplog.text
+    assert "response_model_id=deepseek-v4-flash-0731" in caplog.text
+    assert "identity_match=explicit_equivalent" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "response_models",
+    [
+        [],
+        ["deepseek-v4-flash-2099"],
+        ["deepseek-v4-flash-pro"],
+        ["deepseek-v4-pro"],
+        ["deepseek-v4-flash", "deepseek-v4-flash-0731"],
+        ["gpt-5.5-2026-04-23", "deepseek-v4-flash"],
+    ],
+)
+def test_model_call_audit_rejects_unapproved_or_ambiguous_deepseek_identity(
+    response_models: list[str],
+) -> None:
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="untrusted",
+                        response_metadata={"model_name": model_id} if model_id else {},
+                    )
+                )
+                for model_id in (response_models or [""])
+            ]
+        ]
+    )
+    handler = _ModelCallAuditHandler(role="review", model_id="deepseek-v4-flash")
+
+    with pytest.raises(RelayIdentityError, match="identity did not match"):
+        handler.on_llm_end(response, run_id=uuid4())
+
+
 def test_model_call_audit_accepts_official_gpt55_snapshot_identity(caplog) -> None:
     caplog.set_level("INFO", logger="uvicorn.error.pengine.model_calls")
     handler = _ModelCallAuditHandler(role="review", model_id="gpt-5.5")
