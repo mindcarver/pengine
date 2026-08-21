@@ -175,7 +175,7 @@ L3/L4 在上述各阶段的真实文件、提示词、审核和持久化边界�
 | 类别 | 例子 | 自动行为 | 操作员动作 |
 | --- | --- | --- | --- |
 | 暂时 relay/网络 | 请求开始后的连接、DNS、TLS、读取超时或重置；relay `429/502/503/504` | 首次在同一 run/thread 上进入 `auto_resuming`，遵守至少 10 秒或更长 `Retry-After` | 若同一用户阶段再次共享中断，`Continue` 或 `End` |
-| 外部 relay 终态失败 | relay HTTP 402 配额耗尽、服务不可用、relay 超时（`relay_unavailable`） | 立即终态 `failed`，不自动重试 | 修复 relay（充值/换凭据等）后 `Retry` 复活同一 run，或新建任务 |
+| 外部 relay 终态失败 | relay HTTP 402 配额耗尽、服务不可用、relay 超时、有身份但零内容的空流（`relay_unavailable`） | 立即终态 `failed`，不自动重试 | 修复 relay（充值/换凭据等）后 `Retry` 复活同一 run，或新建任务 |
 | 语法正确地址但连接失败 | 主机名解析/连接失败，无法证明一定短暂 | 按受限 transport 路径计入调用预算，耗尽后失败 | 修正 relay 配置后新建任务 |
 | 配置/安全错误 | 缺 URL/key、非 loopback HTTP、证书校验失败 | 不自动降级，不切换模型 | 修正 `.env` 后重新运行 |
 | 模型身份错误 | 响应身份缺失、同时出现多个身份，或不等于配置模型及其显式允许的官方快照 | 丢弃响应，暂停为 `relay_identity_mismatch`，不自动重试 | 先核验 Relay；通过身份探测后 `Continue` |

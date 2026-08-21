@@ -206,6 +206,12 @@ async def test_anthropic_stream_deduplicates_only_identical_model_identity_chunk
                     response_metadata={"model_name": model_id},
                 )
             )
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="完成",
+                response_metadata={"model_name": "claude-opus-5", "stop_reason": "end_turn"},
+            )
+        )
 
     monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
     model = build_chat_model(_role_settings(), role="generation")
@@ -224,6 +230,100 @@ async def test_anthropic_stream_deduplicates_only_identical_model_identity_chunk
             handler.on_llm_end(response, run_id=uuid4())
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_reason", "content"),
+    [
+        ("end_turn", "完整文本"),
+        ("end_turn", ""),
+        ("tool_use", ""),
+        ("max_tokens", "截断文本"),
+    ],
+)
+async def test_anthropic_completed_streams_pass_the_completion_gate(
+    monkeypatch, stop_reason: str, content: str
+) -> None:
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content=content,
+                response_metadata={"model_name": "claude-opus-5", "stop_reason": stop_reason},
+            )
+        )
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(_role_settings(), role="generation")
+    chunks = [chunk async for chunk in model._astream([])]
+    assert chunks
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_with_usage_but_no_stop_reason_passes(monkeypatch) -> None:
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="",
+                response_metadata={"model_name": "claude-opus-5"},
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        )
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(_role_settings(), role="generation")
+    chunks = [chunk async for chunk in model._astream([])]
+    assert chunks
+
+
+@pytest.mark.asyncio
+async def test_anthropic_empty_stream_fails_as_relay_unavailable(monkeypatch) -> None:
+    """Identity without content or completion evidence is a transport failure."""
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="",
+                response_metadata={"model_name": "claude-opus-5"},
+            )
+        )
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(_role_settings(), role="generation")
+    with pytest.raises(RelayError) as error:
+        async for _ in model._astream([]):
+            pass
+    assert error.value.code == "relay_unavailable"
+    assert "without a finish reason" in error.value.safe_message
+
+
+@pytest.mark.asyncio
+async def test_anthropic_partially_streamed_text_without_completion_fails_as_relay(
+    monkeypatch,
+) -> None:
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        yield ChatGenerationChunk(message=AIMessageChunk(content="写到一半的"))
+        yield ChatGenerationChunk(message=AIMessageChunk(content="正文"))
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(_role_settings(), role="generation")
+    with pytest.raises(RelayError) as error:
+        async for _ in model._astream([]):
+            pass
+    assert error.value.code == "relay_unavailable"
+
+
+def test_anthropic_empty_stream_is_not_an_automatic_resume_interruption() -> None:
+    """No transport/status evidence: the failure stays operator-retryable only."""
+    error = RelayError(
+        code="relay_unavailable",
+        safe_message="The model relay closed the generation stream without a finish reason.",
+    )
+    assert retryable_relay_interruption(error) is None
+
+
 def test_anthropic_sync_stream_deduplicates_identical_model_identity_chunks(
     monkeypatch,
 ) -> None:
@@ -236,6 +336,12 @@ def test_anthropic_sync_stream_deduplicates_identical_model_identity_chunks(
                     response_metadata={"model_name": "claude-opus-5"},
                 )
             )
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="完成",
+                response_metadata={"model_name": "claude-opus-5", "stop_reason": "end_turn"},
+            )
+        )
 
     monkeypatch.setattr(ChatAnthropic, "_stream", fake_stream)
     model = build_chat_model(_role_settings(), role="generation")
