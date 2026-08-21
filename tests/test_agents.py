@@ -786,6 +786,63 @@ async def test_outline_markdown_failure_records_evidence_and_retries_with_exact_
 
 
 @pytest.mark.asyncio
+async def test_outline_repair_feedback_is_lifted_into_the_system_instruction() -> None:
+    group = ScriptGenerationGroup(
+        group_id="repair_group",
+        start_episode=1,
+        end_episode=1,
+        dramatic_unit="查看随身原片",
+        boundary_reason="发现推动下一组",
+    )
+    compiled = CompiledOutlineContext(
+        model_input='{"persona": "…", "continuity_ledger": "…"}',
+        bundle_sha256="a" * 64,
+        manifest={"group_id": group.group_id},
+        manifest_json='{"group_id":"repair_group"}',
+        output_tokens=12_288,
+    )
+    feedback = json.dumps(
+        {
+            "repair_round": 1,
+            "evidence": (
+                "committed 第 3 集已锁定原片在静秋口袋里；候选第 4 集场二把她写成"
+                "第一次从饼干盒取出原片，同一物件不可能同时在两处。"
+            ),
+            "issues": [
+                {
+                    "code": "continuity_break",
+                    "message": "把第 4 集场二改为查看随身携带的原片。",
+                    "contract_refs": ["committed_continuity_ledger"],
+                }
+            ],
+            "previous_sidecar": {},
+        },
+        ensure_ascii=False,
+    )
+    model = ToolCallingFakeModel(
+        responses=[AIMessage(content="## 第1集\n\n她翻过随身携带的原片，看清全幅第三人。")]
+    )
+
+    markdown = await _invoke_outline_group_markdown(
+        model,
+        compiled,
+        group=group,
+        repair_feedback=feedback,
+    )
+
+    assert markdown.episodes[0].episode_number == 1
+    system_prompt = model.model_system_prompts[0]
+    # The contradiction and the repair direction are instruction-level now.
+    assert "原片在静秋口袋里" in system_prompt
+    assert "把第 4 集场二改为查看随身携带的原片" in system_prompt
+    assert "treat every requirement in it as binding" in system_prompt
+    # The full structured feedback still travels as bounded_current_group_repair JSON.
+    user_message = model.model_message_batches[0][-1]
+    assert "bounded_current_group_repair" in str(user_message.content)
+    assert "continuity_break" in str(user_message.content)
+
+
+@pytest.mark.asyncio
 async def test_outline_sidecar_failure_and_resume_reuse_persisted_markdown() -> None:
     group = ScriptGenerationGroup(
         group_id="community_choice",
@@ -8838,6 +8895,187 @@ async def test_grouped_outline_stops_after_two_semantic_repairs() -> None:
     assert [item["repair_round"] for item in feedbacks] == [1, 2]
     assert all(item["issues"][0]["code"] == "hard_canon_age_contradiction" for item in feedbacks)
     assert failed == ["opening"]
+
+
+@pytest.mark.asyncio
+async def test_protocol_repair_does_not_consume_semantic_repair_rounds() -> None:
+    season_payload = {
+        "episode_count": 1,
+        "characters": [
+            {
+                "character_id": "lin_lan",
+                "name": "林岚",
+                "role": "调查者",
+                "initial_known_fact_ids": [],
+            }
+        ],
+        "relationships": [],
+        "prohibitions": [],
+        "review_milestones": [],
+        "script_generation_groups": [
+            {
+                "group_id": "opening",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "发现旧信",
+                "boundary_reason": "线索改变目标",
+            }
+        ],
+    }
+    candidate = EpisodeOutlineGroupResult.model_validate(
+        {
+            "group_id": "opening",
+            "start_episode": 1,
+            "end_episode": 1,
+            "content": "## 第1集\n\n林岚发现旧信。",
+            "episodes": [{"episode_number": 1, "plan": "林岚发现旧信。"}],
+            "facts": [
+                {
+                    "fact_id": "letter_found",
+                    "subject": "林岚",
+                    "predicate": "发现",
+                    "kind": "text",
+                    "value": "旧信",
+                    "first_revealed_episode": 1,
+                }
+            ],
+            "timeline": [
+                {
+                    "event_id": "find_letter",
+                    "when": "第一天",
+                    "participant_ids": [],
+                    "fact_ids": ["letter_found"],
+                }
+            ],
+            "knowledge_states": [],
+            "clues": [],
+            "episode_obligations": [
+                {
+                    "obligation_id": "opening_hook",
+                    "episode_number": 1,
+                    "new_information_fact_ids": ["letter_found"],
+                    "required_clue_ids": [],
+                    "end_hook": "旧信来源成谜",
+                }
+            ],
+        }
+    )
+    stored_map: dict[str, Any] | None = None
+    repair_modes: list[str] = []
+    feedbacks: list[dict[str, Any]] = []
+    review_calls = 0
+    assembly_failed_once = True
+
+    async def load_season_map() -> Mapping[str, Any] | None:
+        return stored_map
+
+    async def commit_season_map(payload: Mapping[str, Any]) -> None:
+        nonlocal stored_map
+        stored_map = {"content": dict(payload)}
+
+    async def generate_group(
+        _: Any,
+        repair_feedback: str | None,
+        **kwargs: Any,
+    ) -> EpisodeOutlineGroupResult:
+        nonlocal assembly_failed_once
+        repair_modes.append(kwargs["repair_mode"])
+        if repair_feedback is not None:
+            feedbacks.append(json.loads(repair_feedback))
+        if assembly_failed_once:
+            assembly_failed_once = False
+            sidecar = EpisodeOutlineGroupSidecar.model_validate(
+                {
+                    field: getattr(candidate, field)
+                    for field in EpisodeOutlineGroupSidecar.model_fields
+                }
+            )
+            raise OutlineGroupAssemblyError(
+                "Group obligations must match the group's fact reveals",
+                sidecar=sidecar,
+            )
+        return candidate
+
+    async def reject_group(_: Any, __: Any) -> SemanticReview:
+        nonlocal review_calls
+        review_calls += 1
+        return SemanticReview.model_validate(
+            {
+                "passed": False,
+                "evidence": "L4硬规则：原片第 3 集已在口袋里，第 4 集不得写首次取出。",
+                "issues": [
+                    {
+                        "code": "continuity_break",
+                        "message": "把场二改为查看随身原片。",
+                        "contract_refs": ["committed_continuity_ledger"],
+                    }
+                ],
+            }
+        )
+
+    async def generate_season_map(_: Any) -> Mapping[str, Any]:
+        return season_payload
+
+    async def load_groups() -> list[Mapping[str, Any]]:
+        return []
+
+    async def begin_group(**_: Any) -> str:
+        return "operation-opening"
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_season_map=generate_season_map,
+        generate_outline_group=generate_group,
+        review_outline_group=reject_group,
+        load_outline_season_map=load_season_map,
+        commit_outline_season_map=commit_season_map,
+        load_outline_groups=load_groups,
+        begin_outline_group=begin_group,
+        load_outline_group_body=lambda _: _async_none(),
+        persist_outline_group_body=lambda *_, **__: _async_none(),
+        complete_outline_group=lambda **_: _async_none(),
+        fail_outline_group=lambda **_: _async_none(),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] generate outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-grouped-budget-split",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={
+            "files": {
+                "/workspace/creation-request.md": {"content": "故事需求"},
+                "/workspace/story_outline.md": {"content": "故事梗概"},
+                "/workspace/character_biographies.md": {"content": "人物小传"},
+                "/workspace/relationship_logic.md": {"content": "人物关系"},
+            }
+        },
+        runtime=None,
+    )
+
+    with pytest.raises(ContentReviewRejectedError) as error:
+        await middleware._generate_grouped_outline(
+            request,
+            lambda _: _async_none(),
+            request.tool_call["args"],
+        )
+
+    # The one protocol repair never touches the semantic budget: the review loop
+    # still gets its full two regeneration rounds (three rejections total).
+    assert repair_modes == ["sidecar", "sidecar", "full", "full"]
+    assert [item["repair_round"] for item in feedbacks] == [1, 1, 2]
+    assert feedbacks[0]["issues"][0]["code"] == "current_group_protocol_violation"
+    assert feedbacks[1]["issues"][0]["code"] == "continuity_break"
+    assert error.value.repair_rounds == 2
+    assert review_calls == 3
 
 
 @pytest.mark.asyncio
