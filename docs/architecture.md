@@ -110,7 +110,6 @@ V1 进程只运行一个 Worker，并一次处理一个创作任务。Deep Agent
 | `script_writer` | 每集完整剧本 + `EpisodeStateDelta` | generation | 否 |
 | `quality_reviewer` | L0/L4 闸门证据、修订反馈覆盖 | review | 否 |
 | `canon_reviewer` | 故事候选/剧情合同的独立审查 | review | `canon-review` |
-| `episode_reviewer` | 无 active SeriesBible 的兼容路径单集语义审查；统一流程不逐集调用 | review | `episode-continuity-review` |
 | `series_reviewer` | 结构性里程碑和全剧审查，分类为通过/设计缺陷/剧本缺陷 | review | 审核范围由运行时注入 |
 | `episode_repair` | 只修复当前未锁定集 | generation | `continuity-repair` |
 | `story_repair` | 只修复未锁定的人物/关系候选 | generation | `story-repair` |

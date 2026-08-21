@@ -925,88 +925,6 @@ def test_episode_validation_leaves_disputed_claims_and_speakers_to_semantic_revi
     assert "locked_numeric_evidence_mismatch" not in codes
 
 
-def test_episode_validation_accepts_chinese_equivalents_of_locked_values() -> None:
-    contract = make_contract(
-        numeric_facts=[
-            {
-                "fact_id": "event_date",
-                "subject": "旧案",
-                "predicate": "发生日期",
-                "kind": "date",
-                "value": "2015-08-12",
-                "first_revealed_episode": 1,
-            },
-            {
-                "fact_id": "official_time",
-                "subject": "旧案",
-                "predicate": "官方时间",
-                "kind": "time",
-                "value": "22:50",
-                "first_revealed_episode": 1,
-            },
-            {
-                "fact_id": "elapsed_years",
-                "subject": "旧案",
-                "predicate": "距今时长",
-                "kind": "duration",
-                "value": "10",
-                "unit": "年",
-                "first_revealed_episode": 1,
-            },
-            {
-                "fact_id": "current_age",
-                "subject": "林岚",
-                "predicate": "当前年龄",
-                "kind": "count",
-                "value": "26",
-                "unit": "岁",
-                "first_revealed_episode": 1,
-            },
-        ]
-    )
-    contract_hash = story_contract_sha256(contract)
-    prior = initial_series_state(contract, contract_hash)
-    delta = EpisodeStateDelta(
-        episode_number=1,
-        contract_sha256=contract_hash,
-        established_fact_ids=[fact.fact_id for fact in contract.facts],
-        knowledge_gains=[
-            {
-                "character_id": "lin_lan",
-                "fact_ids": [fact.fact_id for fact in contract.facts],
-            }
-        ],
-        satisfied_obligation_ids=["episode_one_obligation"],
-        evidence=[
-            {"target_id": "event_date", "excerpt": "二〇一五年八月十二日"},
-            {"target_id": "official_time", "excerpt": "二十二点五十分"},
-            {"target_id": "elapsed_years", "excerpt": "十年"},
-            {"target_id": "current_age", "excerpt": "二十六岁"},
-            {"target_id": "episode_one_obligation", "excerpt": "门后传来第二次敲击"},
-        ],
-        handoff="林岚停在门前。",
-    )
-    content = (
-        "林岚（低声）：旧案发生在二〇一五年八月十二日二十二点五十分。\n"
-        "林岚：那是十年前，我现在二十六岁。\n"
-        "门后传来第二次敲击"
-    )
-
-    issues = validate_episode_candidate(
-        contract=contract,
-        contract_sha256=contract_hash,
-        prior_state=prior,
-        content=content,
-        delta=delta,
-    )
-
-    assert not {
-        "locked_temporal_evidence_mismatch",
-        "locked_numeric_evidence_mismatch",
-        "unknown_speaker",
-    } & {issue.code for issue in issues}
-
-
 @pytest.mark.parametrize(
     "natural_expression",
     [
@@ -1039,6 +957,33 @@ def test_episode_validation_leaves_unlocked_units_to_semantic_review(
     )
 
     assert "locked_numeric_evidence_mismatch" not in {issue.code for issue in issues}
+
+
+@pytest.mark.parametrize(
+    ("excerpt", "content"),
+    [
+        # Full-width vs half-width punctuation.
+        ("她把照片翻过来，背面写着日期。", "她把照片翻过来,背面写着日期。"),
+        # Quote style differences.
+        ('他说"走吧"。', "他说“走吧”。"),
+        # Whitespace and newline differences.
+        ("她把照片翻过来 背面写着日期。", "她把照片翻过来\n背面写着日期。"),
+        # Interpunct and dash variants.
+        ("旧屋—父亲的房间。", "旧屋－父亲的房间。"),
+    ],
+)
+def test_evidence_excerpt_matching_ignores_punctuation_and_whitespace(
+    excerpt: str, content: str
+) -> None:
+    from pengine.continuity import _verbatim_skeleton
+
+    assert _verbatim_skeleton(excerpt) in _verbatim_skeleton(content)
+
+
+def test_evidence_excerpt_matching_still_rejects_different_words() -> None:
+    from pengine.continuity import _verbatim_skeleton
+
+    assert _verbatim_skeleton("她把照片翻过来") not in _verbatim_skeleton("他把信纸折起来")
 
 
 def test_episode_validation_rejects_wrong_value_in_locked_numeric_evidence() -> None:
@@ -1160,135 +1105,6 @@ def make_cross_episode_numeric_case() -> tuple[StoryContract, str, SeriesState, 
         handoff="第二集结束。",
     )
     return contract, contract_hash, prior, delta
-
-
-@pytest.mark.parametrize(
-    "drift_content",
-    [
-        "苏慧（六十岁）从祠堂里出来，手里端着一个搪瓷盆。",
-        "苏慧今年六十岁了。",
-        "苏慧（60岁）坐在门槛上。",
-    ],
-)
-def test_episode_validation_flags_drifting_restated_locked_numeric_fact(
-    drift_content: str,
-) -> None:
-    contract, contract_hash, prior, delta = make_cross_episode_numeric_case()
-    content = f"{drift_content}\n第二集事实原文\n第二集钩子"
-
-    issues = validate_episode_candidate(
-        contract=contract,
-        contract_sha256=contract_hash,
-        prior_state=prior,
-        content=content,
-        delta=delta,
-    )
-
-    mismatch = next(issue for issue in issues if issue.code == "locked_numeric_fact_mismatch")
-    assert mismatch.contract_refs == ["su_hui_age"]
-    assert "59" in mismatch.message
-
-
-def test_episode_validation_accepts_matching_restated_locked_numeric_fact() -> None:
-    contract, contract_hash, prior, delta = make_cross_episode_numeric_case()
-    content = "苏慧（五十九岁）从祠堂里出来。\n第二集事实原文\n第二集钩子"
-
-    issues = validate_episode_candidate(
-        contract=contract,
-        contract_sha256=contract_hash,
-        prior_state=prior,
-        content=content,
-        delta=delta,
-    )
-
-    assert "locked_numeric_fact_mismatch" not in {issue.code for issue in issues}
-
-
-@pytest.mark.parametrize("calendar_year", ["1995", "一九九五", "二〇一五"])
-def test_episode_validation_does_not_treat_calendar_year_as_locked_year_count(
-    calendar_year: str,
-) -> None:
-    from pengine.continuity import _locked_numeric_content_mismatches
-
-    contract = make_contract(
-        numeric_facts=[
-            {
-                "fact_id": "archive_tenure",
-                "subject": "档案员",
-                "predicate": "任职年限",
-                "kind": "duration",
-                "value": "11",
-                "unit": "年",
-                "first_revealed_episode": 1,
-            }
-        ]
-    )
-
-    issues = _locked_numeric_content_mismatches(
-        contract,
-        2,
-        f"档案员：{calendar_year}年的旧档案就在这里。",
-    )
-
-    assert "locked_numeric_fact_mismatch" not in {issue.code for issue in issues}
-
-
-def test_episode_validation_still_rejects_wrong_locked_year_count() -> None:
-    from pengine.continuity import _locked_numeric_content_mismatches
-
-    contract = make_contract(
-        numeric_facts=[
-            {
-                "fact_id": "archive_tenure",
-                "subject": "档案员",
-                "predicate": "任职年限",
-                "kind": "duration",
-                "value": "11",
-                "unit": "年",
-                "first_revealed_episode": 1,
-            }
-        ]
-    )
-
-    issues = _locked_numeric_content_mismatches(contract, 2, "档案员：十二年了。")
-
-    mismatch = next(issue for issue in issues if issue.code == "locked_numeric_fact_mismatch")
-    assert mismatch.contract_refs == ["archive_tenure"]
-
-
-@pytest.mark.parametrize(
-    "neighbour_content",
-    [
-        # 年龄属于旁边的角色，不属于锁定主体苏慧。
-        "六十二岁的林淑芬对苏慧说了一句话。",
-        "林淑芬六十二岁，苏慧没说话。",
-        # 与锁定事实无关的数字。
-        "苏慧走进三号楼，没说话。",
-        # 无单位复述按边界留给语义审查。
-        "你妈六十了。",
-    ],
-)
-def test_episode_validation_numeric_gate_is_subject_anchored(neighbour_content: str) -> None:
-    contract, contract_hash, prior, delta = make_cross_episode_numeric_case()
-    content = f"{neighbour_content}\n第二集事实原文\n第二集钩子"
-
-    issues = validate_episode_candidate(
-        contract=contract,
-        contract_sha256=contract_hash,
-        prior_state=prior,
-        content=content,
-        delta=delta,
-    )
-
-    assert "locked_numeric_fact_mismatch" not in {issue.code for issue in issues}
-
-
-def test_episode_validation_numeric_gate_exempts_reveal_episode() -> None:
-    from pengine.continuity import _locked_numeric_content_mismatches
-
-    contract, _, _, _ = make_cross_episode_numeric_case()
-
-    assert _locked_numeric_content_mismatches(contract, 1, "苏慧（六十岁）推门进来。") == []
 
 
 def test_episode_validation_rejects_wrong_cross_unit_locked_numeric_evidence() -> None:

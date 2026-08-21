@@ -109,9 +109,9 @@ script_writer
   → declared milestone/final-prefix series_reviewer
 ```
 
-统一 SeriesBible 流程不会为每一集调用 `episode_reviewer`：逐集候选先由确定性合同和状态规则校验；
+所有运行都不会为每一集调用语义审查模型：逐集候选先由确定性合同和状态规则校验；
 声明的结构里程碑与最终完整前缀再由 `series_reviewer` 做绑定当前 design/batch/prefix 的语义分类。
-没有 active SeriesBible 的兼容路径才保留逐集 `episode_reviewer`。只有提交成功的集才会进入
+逐集语义审查模型已整体移除。只有提交成功的集才会进入
 active pointer；当前集没提交时，API 不展示它的正文，已提交前缀在刷新、结束或失败后仍可只读查看。
 
 每集至少需要一次生成；确定性失败、结构里程碑拒绝或最终前缀拒绝会增加修复与复审调用。

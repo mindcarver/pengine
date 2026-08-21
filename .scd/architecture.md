@@ -128,7 +128,7 @@ four primary synchronous subagents:
 The `workflow_supervisor`, `story_architect`, `episode_planner`,
 `script_writer`, direct story/outline patch generators, `episode_repair`, and
 `story_repair` always use the generation route. `quality_reviewer`,
-`canon_reviewer`, `episode_reviewer`, `series_reviewer`, and the
+`canon_reviewer`, `series_reviewer`, and the
 `repair_constraint_extractor`/`repair_constraint_validator` helpers always use
 the review route. Roles cannot be swapped and do not fall back to one another.
 
@@ -166,8 +166,7 @@ sidecar (episode number, content hash, typed `EpisodeStateDelta`, and evidence
 targets). Deterministic validation compares them with the locked contract and
 preceding folded `SeriesState`. Under an active SeriesBible the per-episode
 model review is skipped and semantic consistency is deferred to the milestone
-structural reviews; `episode_reviewer` remains only for the legacy path without
-an active SeriesBible. The skill-scoped `episode_repair` subagent may repair
+structural reviews; per-episode semantic review is removed entirely. The skill-scoped `episode_repair` subagent may repair
 only the current unlocked episode, at most twice. A successful commit atomically
 persists the full script, delta, folded state, semantic evidence, repair count,
 and content/state hashes; script text that succeeded while its sidecar failed
@@ -581,9 +580,9 @@ duplicate the full field contract.
   complete prompts, raw provider responses, and secrets.
 - Persona paths are resolved below the configured persona root; absolute paths
   and traversal outside that root are rejected.
-- The default Deep Agents general-purpose subagent is disabled. Eleven
+- The default Deep Agents general-purpose subagent is disabled. Ten
   synchronous subagents are registered: the four primary subagents, the legacy
-  `quality_reviewer`, `canon_reviewer`, `episode_reviewer`,
+  `quality_reviewer`, `canon_reviewer`,
   `repair_constraint_extractor`, `repair_constraint_validator`,
   `series_reviewer`, `episode_repair`, and `story_repair`. Four of the
   review/repair agents load dedicated skills; direct story/outline patch
@@ -719,7 +718,7 @@ Implementation evidence must include:
 - isolated SQLite tests for transactions, leases, checkpoints, and attempt
   exhaustion;
 - Deep Agents integration tests proving the persona-bound supervisor invokes
-  only the eleven registered synchronous subagents, routes each subagent and
+  only the ten registered synchronous subagents, routes each subagent and
   direct repair call to the fixed model role, returns structured results, and
   cannot access host files, shell, MCP, or cross-thread memory;
 - checkpoint tests proving a stopped run resumes the same `thread_id`, approved
@@ -743,10 +742,10 @@ quality.
 
 - Modular monolith, FastAPI/Pydantic HTTP layer, direct SQLite repository, one
   embedded worker, and an embedded Deep Agents/LangGraph creative runtime.
-- One persona-bound `workflow_supervisor`; eleven synchronous subagents: the
+- One persona-bound `workflow_supervisor`; ten synchronous subagents: the
   four primary subagents, the legacy `quality_reviewer`, `canon_reviewer`,
-  `episode_reviewer`, `series_reviewer`, the two repair-constraint helpers,
-  `episode_repair`, and `story_repair`. Four review/repair agents load
+  `series_reviewer`, the two repair-constraint helpers,
+  `episode_repair`, and `story_repair`. Three review/repair agents load
   dedicated skills.
 - Two preconfigured LangChain clients share the operator-supplied relay URL/key:
   `ChatAnthropic` with `claude-opus-5` for generation and creative repair, and a
