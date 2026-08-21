@@ -154,6 +154,7 @@ OutlineGroupBodyLoad = Callable[[str], Awaitable[Mapping[str, Any] | None]]
 OutlineGroupBodyPersist = Callable[..., Awaitable[str]]
 OutlineGroupComplete = Callable[..., Awaitable[None]]
 OutlineGroupFail = Callable[..., Awaitable[None]]
+OutlineGroupRejectionLoader = Callable[[str], Awaitable[Mapping[str, Any] | None]]
 OutlineMarkdownFailureRecorder = Callable[..., Awaitable[None]]
 ScriptGroupGenerator = Callable[..., Awaitable["ScriptGenerationGroupResult"]]
 StructuralReviewGenerator = Callable[[CompiledReviewContext], Awaitable[StructuralReviewResult]]
@@ -3877,9 +3878,11 @@ class ContentReviewRejectedError(RuntimeError):
         evidence: str,
         episode_number: int | None = None,
         repair_rounds: int = 2,
+        outline_group_id: str | None = None,
     ) -> None:
         super().__init__("Content review did not converge")
         self.stage = stage
+        self.outline_group_id = outline_group_id
         self.evidence = evidence
         self.episode_number = episode_number
         self.repair_rounds = repair_rounds
@@ -5638,6 +5641,7 @@ class StageGuardMiddleware(AgentMiddleware):
         persist_outline_group_body: OutlineGroupBodyPersist | None = None,
         complete_outline_group: OutlineGroupComplete | None = None,
         fail_outline_group: OutlineGroupFail | None = None,
+        load_outline_group_rejection: OutlineGroupRejectionLoader | None = None,
         generate_script_group: ScriptGroupGenerator | None = None,
         review_series_prefix: StructuralReviewGenerator | None = None,
         get_series_review_boundary: SeriesReviewBoundaryRetriever | None = None,
@@ -5680,6 +5684,7 @@ class StageGuardMiddleware(AgentMiddleware):
         self.persist_outline_group_body = persist_outline_group_body
         self.complete_outline_group = complete_outline_group
         self.fail_outline_group = fail_outline_group
+        self.load_outline_group_rejection = load_outline_group_rejection
         self.generate_script_group = generate_script_group
         self.review_series_prefix = review_series_prefix
         self.get_series_review_boundary = get_series_review_boundary
@@ -6476,6 +6481,12 @@ class StageGuardMiddleware(AgentMiddleware):
                 start_episode=group.start_episode,
                 end_episode=group.end_episode,
             )
+            # A persisted semantic rejection for exactly this group means a prior
+            # pause left rejected prose in place; resume must rewrite the body
+            # with that feedback instead of reusing it for sidecar-only repair.
+            pending_rejection: Mapping[str, Any] | None = None
+            if self.load_outline_group_rejection is not None:
+                pending_rejection = await self.load_outline_group_rejection(group.group_id)
             try:
                 compiled = compile_outline_group_context(
                     creation_request=creation_request,
@@ -6503,12 +6514,26 @@ class StageGuardMiddleware(AgentMiddleware):
                     group=group,
                 )
                 repair_feedback: str | None = None
+                if pending_rejection is not None:
+                    repair_feedback = json.dumps(
+                        {
+                            "repair_round": int(pending_rejection.get("repair_rounds") or 2),
+                            "evidence": str(pending_rejection.get("evidence") or ""),
+                            "issues": [],
+                            "resumed_rejection": True,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
                 # Protocol repairs (sidecar assembly/reference validation) and semantic
                 # review rejections keep separate two-round budgets: a schema-level fix
                 # must never consume the rounds the review repair contract promises.
                 protocol_repair_rounds = 0
                 review_repair_rounds = 0
-                repair_mode: Literal["sidecar", "full"] = "sidecar"
+                repair_mode: Literal["sidecar", "full"] = (
+                    "full" if pending_rejection is not None else "sidecar"
+                )
                 while True:
                     try:
                         with self._compiled_model_context(
@@ -6583,6 +6608,7 @@ class StageGuardMiddleware(AgentMiddleware):
                             stage=InternalStage.GENERATING_EPISODE_OUTLINE,
                             evidence=group_review.evidence,
                             repair_rounds=review_repair_rounds,
+                            outline_group_id=group.group_id,
                         )
                     review_repair_rounds += 1
                     repair_feedback = json.dumps(
@@ -9043,6 +9069,7 @@ class DeepAgentWorkflow:
         complete_outline_group: OutlineGroupComplete | None = None,
         fail_outline_group: OutlineGroupFail | None = None,
         record_outline_markdown_failure: OutlineMarkdownFailureRecorder | None = None,
+        load_outline_group_rejection: OutlineGroupRejectionLoader | None = None,
     ) -> WorkflowResult:
         approved_source = approved_checkpoints if approved_checkpoints is not None else {}
         approved_payloads: dict[InternalStage, Any] = {
@@ -9665,6 +9692,7 @@ class DeepAgentWorkflow:
                     persist_outline_group_body=persist_outline_group_body,
                     complete_outline_group=complete_outline_group,
                     fail_outline_group=fail_outline_group,
+                    load_outline_group_rejection=load_outline_group_rejection,
                     generate_script_group=generate_script_group,
                     review_series_prefix=(
                         review_series_prefix

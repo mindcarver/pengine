@@ -199,7 +199,7 @@ SQLite、结构化日志和 Langfuse 都保留 Relay 实际回报的原始 `resp
 
 ### Continue
 
-只适用于运行时/relay/timeout 等可继续路径。它重新排队同一个 run 和同一个 `thread_id`，不会改变已批准 checkpoint，也不能花掉内容修复预算。
+只适用于运行时/relay/timeout 等可继续路径。它重新排队同一个 run 和同一个 `thread_id`，不会改变已批准 checkpoint，也不能花掉内容修复预算。分集大纲因语义审查拒绝暂停时，继续会携带按组持久化的审查证据整体重写被拒的当前组正文，已提交组不受影响。
 
 ### Retry
 

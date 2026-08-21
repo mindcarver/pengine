@@ -148,7 +148,8 @@ Sidecar；三次解析全部失败时，模型原文会作为不可变证据落�
 整份 `approved-checkpoints` 或更早组的重复正文。当前组通过确定性校验与独立审查后才以
 内容哈希写入不可变检查点；Sidecar schema 失败或 Relay 中断只重试 Sidecar，不重写已持久化
 Markdown。拒绝时最多只修复当前组两轮，恢复时也只从
-第一个未提交组继续。全部组完成后再确定性组装完整 `StoryContract` 并做全季终审。
+第一个未提交组继续；因语义拒绝暂停的组会把审查证据按组持久化，继续时直接携带该反馈
+整体重写被拒正文，而不是复用旧稿只修 Sidecar。全部组完成后再确定性组装完整 `StoryContract` 并做全季终审。
 合同及其 SHA-256 写入业务检查点并锁定后，后续每集读取该合同、active SeriesBible、上一集
 折叠后的 `series_state` 和已锁剧本；统一 SeriesBible 流程先执行逐集确定性合同/状态
 校验，再原子提交剧本、`episode_state_delta`、新状态及其哈希。结构审查仍只在大纲声明的

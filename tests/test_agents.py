@@ -786,6 +786,177 @@ async def test_outline_markdown_failure_records_evidence_and_retries_with_exact_
 
 
 @pytest.mark.asyncio
+async def test_persisted_group_rejection_seeds_full_regeneration_on_resume() -> None:
+    season_payload = {
+        "episode_count": 1,
+        "characters": [
+            {
+                "character_id": "lin_lan",
+                "name": "林岚",
+                "role": "调查者",
+                "initial_known_fact_ids": [],
+            }
+        ],
+        "relationships": [],
+        "prohibitions": [],
+        "review_milestones": [],
+        "script_generation_groups": [
+            {
+                "group_id": "opening",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "发现旧信",
+                "boundary_reason": "线索改变目标",
+            }
+        ],
+    }
+    candidate = EpisodeOutlineGroupResult.model_validate(
+        {
+            "group_id": "opening",
+            "start_episode": 1,
+            "end_episode": 1,
+            "content": "## 第1集\n\n林岚翻看随身携带的旧信。",
+            "episodes": [{"episode_number": 1, "plan": "林岚翻看随身携带的旧信。"}],
+            "facts": [
+                {
+                    "fact_id": "letter_found",
+                    "subject": "林岚",
+                    "predicate": "发现",
+                    "kind": "text",
+                    "value": "旧信",
+                    "first_revealed_episode": 1,
+                }
+            ],
+            "timeline": [
+                {
+                    "event_id": "find_letter",
+                    "when": "第一天",
+                    "participant_ids": [],
+                    "fact_ids": ["letter_found"],
+                }
+            ],
+            "knowledge_states": [],
+            "clues": [],
+            "episode_obligations": [
+                {
+                    "obligation_id": "opening_hook",
+                    "episode_number": 1,
+                    "new_information_fact_ids": ["letter_found"],
+                    "required_clue_ids": [],
+                    "end_hook": "旧信来源成谜",
+                }
+            ],
+        }
+    )
+    stored_map: dict[str, Any] | None = None
+    repair_modes: list[str] = []
+    feedbacks: list[dict[str, Any]] = []
+
+    async def load_season_map() -> Mapping[str, Any] | None:
+        return stored_map
+
+    async def commit_season_map(payload: Mapping[str, Any]) -> None:
+        nonlocal stored_map
+        stored_map = {"content": dict(payload)}
+
+    async def generate_group(
+        _: Any,
+        repair_feedback: str | None,
+        **kwargs: Any,
+    ) -> EpisodeOutlineGroupResult:
+        repair_modes.append(kwargs["repair_mode"])
+        if repair_feedback is not None:
+            feedbacks.append(json.loads(repair_feedback))
+        return candidate
+
+    async def accept_group(_: Any, __: Any) -> SemanticReview:
+        return SemanticReview.model_validate({"passed": True, "evidence": "一致。"})
+
+    async def generate_season_map(_: Any) -> Mapping[str, Any]:
+        return season_payload
+
+    async def load_groups() -> list[Mapping[str, Any]]:
+        return []
+
+    async def begin_group(**_: Any) -> str:
+        return "operation-opening"
+
+    async def load_group_rejection(group_id: str) -> Mapping[str, Any] | None:
+        assert group_id == "opening"
+        return {
+            "group_id": "opening",
+            "evidence": "committed 第 3 集已锁定原片在静秋口袋里，第 4 集不得写从饼干盒首次取出。",
+            "repair_rounds": 2,
+            "rejected_at": "2026-08-20T15:25:06+00:00",
+        }
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_season_map=generate_season_map,
+        generate_outline_group=generate_group,
+        review_outline_group=accept_group,
+        load_outline_season_map=load_season_map,
+        commit_outline_season_map=commit_season_map,
+        load_outline_groups=load_groups,
+        begin_outline_group=begin_group,
+        load_outline_group_body=lambda _: _async_none(),
+        persist_outline_group_body=lambda *_, **__: _async_none(),
+        complete_outline_group=lambda **_: _async_none(),
+        fail_outline_group=lambda **_: _async_none(),
+        load_outline_group_rejection=load_group_rejection,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] generate outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-grouped-resume-rejection",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={
+            "files": {
+                "/workspace/creation-request.md": {"content": "故事需求"},
+                "/workspace/story_outline.md": {"content": "故事梗概"},
+                "/workspace/character_biographies.md": {"content": "人物小传"},
+                "/workspace/relationship_logic.md": {"content": "人物关系"},
+            }
+        },
+        runtime=None,
+    )
+
+    async def handler(candidate_request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(
+                {"passed": True, "evidence": "L4硬规则：合同一致", "issues": []},
+                ensure_ascii=False,
+            ),
+            tool_call_id=str(candidate_request.tool_call.get("id") or "call-resume"),
+        )
+
+    result = await middleware._generate_grouped_outline(
+        request,
+        handler,
+        request.tool_call["args"],
+    )
+
+    # The rejected prose is never reused: resume starts with a full body
+    # regeneration seeded by the persisted review evidence.
+    assert repair_modes == ["full"]
+    assert len(feedbacks) == 1
+    assert feedbacks[0]["resumed_rejection"] is True
+    assert "原片在静秋口袋里" in feedbacks[0]["evidence"]
+    returned, locked = result
+    assert isinstance(returned, ToolMessage)
+    assert locked["stage"] == "generating_episode_outline"
+
+
+@pytest.mark.asyncio
 async def test_outline_repair_feedback_is_lifted_into_the_system_instruction() -> None:
     group = ScriptGenerationGroup(
         group_id="repair_group",

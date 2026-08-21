@@ -986,6 +986,14 @@ class Worker:
                         operation_id=operation_id,
                     )
 
+                async def load_outline_group_rejection(
+                    group_id: str,
+                ) -> Mapping[str, Any] | None:
+                    return await self.repository.get_outline_group_rejection(
+                        work.run_id,
+                        group_id=group_id,
+                    )
+
                 async def record_outline_markdown_failure(
                     *,
                     group_id: str,
@@ -1384,6 +1392,7 @@ class Worker:
                                 "complete_outline_group": complete_outline_group,
                                 "fail_outline_group": fail_outline_group,
                                 "record_outline_markdown_failure": record_outline_markdown_failure,
+                                "load_outline_group_rejection": load_outline_group_rejection,
                             }
                         )
                     suffix_rewrite_feedback = await self._suffix_rewrite_feedback_for_writer(
@@ -1445,6 +1454,7 @@ class Worker:
                     evidence=exc.evidence,
                     repair_rounds=exc.repair_rounds,
                     episode_number=exc.episode_number,
+                    outline_group_id=exc.outline_group_id,
                 )
                 logger.info(
                     "content review paused run_id=%s creation_id=%s stage=%s episode=%s",
