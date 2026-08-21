@@ -6481,6 +6481,11 @@ class StageGuardMiddleware(AgentMiddleware):
                 start_episode=group.start_episode,
                 end_episode=group.end_episode,
             )
+            # Each outline group is one bounded unit of work; reset the overall
+            # run deadline so a long series' outline stage is not squeezed into a
+            # single wall-clock window (mirrors the per-episode script reset).
+            if self.reset_episode_deadline is not None:
+                await self.reset_episode_deadline()
             # A persisted semantic rejection for exactly this group means a prior
             # pause left rejected prose in place; resume must rewrite the body
             # with that feedback instead of reusing it for sidecar-only repair.
