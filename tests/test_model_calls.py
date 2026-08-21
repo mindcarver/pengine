@@ -25,6 +25,7 @@ from pengine.model_calls import (
     ModelCallContext,
     ModelCallState,
     ModelCallStore,
+    StageCallBudgetExceeded,
     build_started_record,
     estimate_text_tokens,
     extract_provider_usage,
@@ -1131,3 +1132,19 @@ def test_on_llm_error_does_not_mislabel_internal_failure_as_relay(tmp_path: Path
     assert row["error_code"] == "internal_error"
     assert row["error_type"] == "AttributeError"
     store.close()
+
+
+def test_reset_stage_budget_clears_only_the_target_stage() -> None:
+    state = ModelCallState()
+    state.context.stage = "generating_episode_outline"
+    for _ in range(48):
+        state.reserve_stage_call(role="generation", limit=48)
+    with pytest.raises(StageCallBudgetExceeded):
+        state.reserve_stage_call(role="generation", limit=48)
+    state.stage_role_call_counts[("generating_story_outline", "generation")] = 5
+
+    state.reset_stage_budget("generating_episode_outline")
+
+    assert state.reserve_stage_call(role="generation", limit=48) == 1
+    assert state.reserve_stage_call(role="review", limit=32) == 1
+    assert state.stage_role_call_counts[("generating_story_outline", "generation")] == 5

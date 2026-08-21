@@ -911,6 +911,18 @@ async def test_outline_groups_reset_the_run_deadline_per_group() -> None:
             tool_call_id=str(candidate_request.tool_call.get("id") or "call-deadline"),
         )
 
+    class _SpyBudgetState(ModelCallState):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resets: list[str] = []
+
+        def reset_stage_budget(self, stage: str) -> None:
+            self.resets.append(stage)
+            super().reset_stage_budget(stage)
+
+    budget_state = _SpyBudgetState()
+    budget_resets = budget_state.resets
+
     middleware = StageGuardMiddleware(
         before_stage=lambda _: _async_one(),
         approve_stage=lambda _stage, _payload: _async_none(),
@@ -928,6 +940,7 @@ async def test_outline_groups_reset_the_run_deadline_per_group() -> None:
         complete_outline_group=lambda **_: _async_none(),
         fail_outline_group=lambda **_: _async_none(),
         reset_episode_deadline=reset_deadline,
+        model_call_state=budget_state,
     )
     request = ToolCallRequest(
         tool_call={
@@ -956,6 +969,9 @@ async def test_outline_groups_reset_the_run_deadline_per_group() -> None:
     # One deadline reset per started group: the outline stage gets the same
     # per-unit wall clock the script stage already has per episode.
     assert len(deadline_resets) == 2
+    # The per-stage call budget resets per group too: the configured limits
+    # bound one group's calls, not the whole season.
+    assert budget_resets == ["generating_episode_outline", "generating_episode_outline"]
 
 
 @pytest.mark.asyncio
