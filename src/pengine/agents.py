@@ -6481,6 +6481,14 @@ class StageGuardMiddleware(AgentMiddleware):
             # single wall-clock window (mirrors the per-episode script reset).
             if self.reset_episode_deadline is not None:
                 await self.reset_episode_deadline()
+            # The per-stage call budget bounds this single group's calls, not the
+            # whole stage: a healthy 30-episode season needs more calls than the
+            # 6-episode-calibrated default, but one pathological group cannot
+            # exceed the limit.
+            if self.model_call_state is not None:
+                self.model_call_state.reset_stage_budget(
+                    InternalStage.GENERATING_EPISODE_OUTLINE.value
+                )
             # A persisted semantic rejection for exactly this group means a prior
             # pause left rejected prose in place; resume must rewrite the body
             # with that feedback instead of reusing it for sidecar-only repair.

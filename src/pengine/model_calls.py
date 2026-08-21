@@ -710,6 +710,19 @@ class ModelCallState:
     )
     _seen_physical_call_ids: set[str] = field(default_factory=set, repr=False)
 
+    def reset_stage_budget(self, stage: str) -> None:
+        """Grant one bounded work unit a fresh per-stage call budget.
+
+        Outline generation resets per natural group (mirroring the per-episode
+        script budget and the per-group run-deadline reset): the configured
+        limits bound a single group's calls, and the total stays bounded by
+        groups times the limit.
+        """
+        with self._count_lock:
+            self.stage_call_counts.pop(stage, None)
+            for key in [key for key in self.stage_role_call_counts if key[0] == stage]:
+                del self.stage_role_call_counts[key]
+
     def reset(self) -> None:
         self.context.reset()
         with self._count_lock:
