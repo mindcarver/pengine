@@ -142,7 +142,9 @@ suffix after `集`, spacing around the heading marker, or a preamble before the
 first heading) are canonically normalized before the deterministic parse, the
 normalized text is what gets persisted and hashed, and a final parse failure
 persists the raw model text as immutable evidence. Deterministic validation
-and an independent review-route check precede each group's immutable
+and an independent gatekeeping review (five hard blockers only; internal
+micro-tensions, derived arithmetic, pacing, and unsourced impressions are
+never rejection grounds) precede each group's immutable
 content-hash checkpoint, with at most two repair rounds per rejected group and
 resume from the first uncommitted group. A sidecar schema failure retries only
 the sidecar and never rewrites the persisted Markdown. Once every group is

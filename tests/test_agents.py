@@ -975,6 +975,54 @@ async def test_outline_groups_reset_the_run_deadline_per_group() -> None:
 
 
 @pytest.mark.asyncio
+async def test_outline_group_review_prompt_blocks_only_on_hard_criteria() -> None:
+    """The per-group review is a gatekeeper: five blockers, four never-reject classes."""
+    group = ScriptGenerationGroup(
+        group_id="gate_group",
+        start_episode=1,
+        end_episode=2,
+        dramatic_unit="归乡",
+        boundary_reason="发现推动下一组",
+    )
+    compiled = CompiledOutlineContext(
+        model_input="{}",
+        bundle_sha256="a" * 64,
+        manifest={"group_id": group.group_id},
+        manifest_json='{"group_id":"gate_group"}',
+        output_tokens=8_192,
+    )
+    candidate = EpisodeOutlineGroupResult.model_validate(
+        _episode_group_candidate("gate_group", 1, 2)
+    )
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call("SemanticReview", {"passed": True, "evidence": "通过。"}, 1),
+        ]
+    )
+
+    await _invoke_outline_group_review(model, compiled, candidate)
+
+    prompt = model.model_system_prompts[0]
+    for blocker in (
+        "direct contradiction of hard Canon",
+        "group boundary or episode-range mismatch",
+        "broken",
+        "impossible clue lifecycle",
+        "creator-confirmed persona L4 hard rule",
+    ):
+        assert blocker in prompt
+    for never in (
+        "internal timeline or knowledge-state",
+        "derived",
+        "pacing checks",
+        "cannot cite a locked source",
+    ):
+        assert never in prompt
+    # The exhaustive-audit invitation is gone.
+    assert "state the checked L4 hard-rule scope" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_persisted_group_rejection_seeds_full_regeneration_on_resume() -> None:
     season_payload = {
         "episode_count": 1,
