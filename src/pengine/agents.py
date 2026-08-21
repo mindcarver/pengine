@@ -2395,6 +2395,38 @@ def _message_plaintext(response: Any, *, producer: str = "Script writer") -> str
     raise AgentProtocolError(f"{producer} omitted its plaintext result")
 
 
+def _outline_repair_directive(repair_feedback: str) -> str:
+    """Lift the semantic review's evidence and issue messages to instruction level.
+
+    The full structured feedback still travels as ``bounded_current_group_repair``
+    JSON after the compiled context; this directive makes the concrete
+    contradiction and the repair direction impossible to miss at the top of the
+    prompt where regeneration decisions are anchored.
+    """
+    try:
+        payload: Any = json.loads(repair_feedback)
+    except json.JSONDecodeError:
+        return repair_feedback[:2000]
+    if not isinstance(payload, dict):
+        return repair_feedback[:2000]
+    parts: list[str] = []
+    evidence = payload.get("evidence")
+    if isinstance(evidence, str) and evidence.strip():
+        parts.append(evidence.strip())
+    issues = payload.get("issues")
+    if isinstance(issues, list):
+        messages = [
+            str(item.get("message", "")).strip()
+            for item in issues
+            if isinstance(item, dict) and str(item.get("message", "")).strip()
+        ]
+        if messages:
+            parts.append("Key issues: " + "; ".join(messages))
+    if not parts:
+        return repair_feedback[:2000]
+    return "\n".join(parts)
+
+
 async def _invoke_outline_group_markdown(
     model: BaseChatModel,
     compiled: CompiledOutlineContext,
@@ -2424,10 +2456,14 @@ async def _invoke_outline_group_markdown(
             )
         model_input = compiled.model_input
         if repair_feedback is not None:
+            directive = _outline_repair_directive(repair_feedback)
             instruction += (
-                " A prior semantic review rejected this uncommitted current group. Regenerate "
-                "the complete current-group Markdown using bounded_current_group_repair. Do not "
-                "change committed groups or the authoritative episode range."
+                " A prior semantic review rejected this uncommitted current group. The "
+                "review evidence below states what contradicts committed content and "
+                "how to repair it; treat every requirement in it as binding for the "
+                "regenerated Markdown. Do not change committed groups or the "
+                "authoritative episode range. Review evidence:\n"
+                f"{directive}"
             )
             try:
                 compiled_context: Any = json.loads(compiled.model_input)
@@ -6467,7 +6503,11 @@ class StageGuardMiddleware(AgentMiddleware):
                     group=group,
                 )
                 repair_feedback: str | None = None
-                repair_rounds = 0
+                # Protocol repairs (sidecar assembly/reference validation) and semantic
+                # review rejections keep separate two-round budgets: a schema-level fix
+                # must never consume the rounds the review repair contract promises.
+                protocol_repair_rounds = 0
+                review_repair_rounds = 0
                 repair_mode: Literal["sidecar", "full"] = "sidecar"
                 while True:
                     try:
@@ -6485,12 +6525,12 @@ class StageGuardMiddleware(AgentMiddleware):
                                 repair_mode=repair_mode,
                             )
                     except OutlineGroupAssemblyError as error:
-                        if repair_rounds >= 2:
+                        if protocol_repair_rounds >= 2:
                             raise
-                        repair_rounds += 1
+                        protocol_repair_rounds += 1
                         repair_feedback = json.dumps(
                             {
-                                "repair_round": repair_rounds,
+                                "repair_round": protocol_repair_rounds,
                                 "evidence": str(error),
                                 "issues": [
                                     {
@@ -6509,12 +6549,12 @@ class StageGuardMiddleware(AgentMiddleware):
                     try:
                         validate_outline_group_references(season_map, committed, parsed)
                     except OutlineContextError as error:
-                        if repair_rounds >= 2:
+                        if protocol_repair_rounds >= 2:
                             raise
-                        repair_rounds += 1
+                        protocol_repair_rounds += 1
                         repair_feedback = json.dumps(
                             {
-                                "repair_round": repair_rounds,
+                                "repair_round": protocol_repair_rounds,
                                 "evidence": str(error),
                                 "issues": [
                                     {
@@ -6538,16 +6578,16 @@ class StageGuardMiddleware(AgentMiddleware):
                     group_review = await review_group(compiled, parsed)
                     if group_review.passed:
                         break
-                    if repair_rounds >= 2:
+                    if review_repair_rounds >= 2:
                         raise ContentReviewRejectedError(
                             stage=InternalStage.GENERATING_EPISODE_OUTLINE,
                             evidence=group_review.evidence,
-                            repair_rounds=repair_rounds,
+                            repair_rounds=review_repair_rounds,
                         )
-                    repair_rounds += 1
+                    review_repair_rounds += 1
                     repair_feedback = json.dumps(
                         {
-                            "repair_round": repair_rounds,
+                            "repair_round": review_repair_rounds,
                             "evidence": group_review.evidence,
                             "issues": [
                                 issue.model_dump(mode="json") for issue in group_review.issues
