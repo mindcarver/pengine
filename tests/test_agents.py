@@ -1154,6 +1154,101 @@ def test_workspace_json_files_are_multi_line_and_parseable() -> None:
     assert _workspace_json("非 JSON 纯文本") == "非 JSON 纯文本"
 
 
+class _SpyBudgetState(ModelCallState):
+    def __init__(self) -> None:
+        super().__init__()
+        self.resets: list[str] = []
+
+    def reset_stage_budget(self, stage: str) -> None:
+        self.resets.append(stage)
+        super().reset_stage_budget(stage)
+
+
+@pytest.mark.asyncio
+async def test_script_generation_groups_reset_the_stage_total_budget_per_group() -> None:
+    """Whole-script-stage totals bound one group; per-episode budgets stay."""
+    budget_state = _SpyBudgetState()
+    hooks = _episode_hook_kwargs()[0]
+    approved = _successful_checkpoint_payloads()
+    contract = _story_contract(episode_count=2)
+    contract_hash = story_contract_sha256(contract)
+    approved[InternalStage.GENERATING_EPISODE_OUTLINE] = {
+        "stage": "generating_episode_outline",
+        "content": "两集分集大纲",
+        "episode_count": 2,
+        "episodes": [
+            {"episode_number": number, "plan": f"第{number}集计划。"} for number in (1, 2)
+        ],
+        "story_contract": contract,
+        "story_contract_sha256": contract_hash,
+        "story_contract_markdown": render_story_contract_markdown(contract, contract_hash),
+        "contract_review": {"passed": True, "evidence": "合同一致", "issues": []},
+        "contract_repair_rounds": 0,
+    }
+    approved.pop(InternalStage.GENERATING_EPISODE_SCRIPTS, None)
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] write episodes",
+                "subagent_type": "script_writer",
+            },
+            "id": "call-script-budget-reset",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+    begun_groups: list[str] = []
+
+    async def begin_group(**kwargs: Any) -> str:
+        begun_groups.append(kwargs["group_id"])
+        return f"window-{kwargs['group_id']}"
+
+    async def generate_group(description: str, **kwargs: Any) -> Any:
+        from pengine.agents import ScriptGenerationGroupResult
+
+        start = kwargs["start_episode"]
+        end = kwargs["end_episode"]
+        return ScriptGenerationGroupResult.model_validate(
+            {
+                "stage": "generating_episode_scripts",
+                "group_id": kwargs["group_id"],
+                "start_episode": start,
+                "end_episode": end,
+                "episodes": [
+                    {
+                        "stage": "generating_episode_scripts",
+                        "episode_number": number,
+                        "content": f"第{number}集事实{number}钩子{number}",
+                        "state_delta": _state_delta(contract, number),
+                        "writer_notes": "",
+                    }
+                    for number in range(start, end + 1)
+                ],
+            }
+        )
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(approved),
+        approved_payloads=dict(approved),
+        output_language=SIMPLIFIED_CHINESE,
+        model_call_state=budget_state,
+        begin_generation_group=begin_group,
+        generate_script_group=generate_group,
+        **hooks,
+    )
+
+    await middleware._write_episodes(request, lambda _: _async_none(), request.tool_call["args"])
+
+    # One whole-stage budget reset per started generation group.
+    assert budget_state.resets == ["generating_episode_scripts"] * len(begun_groups)
+    assert len(begun_groups) >= 1
+
+
 @pytest.mark.asyncio
 async def test_persisted_group_rejection_seeds_full_regeneration_on_resume() -> None:
     season_payload = {
