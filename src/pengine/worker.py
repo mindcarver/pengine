@@ -381,6 +381,7 @@ class Worker:
         workflow: WorkflowExecutor | None = None,
         worker_id: str | None = None,
     ) -> None:
+        self._flake_requeues: dict[UUID, int] = {}
         self.settings = settings
         self.repository = repository
         self.catalog = catalog
@@ -1445,6 +1446,59 @@ class Worker:
                     work.creation_id,
                     exc.episode_number,
                     recovery_state,
+                )
+                return
+            except (AgentProtocolError, StageValidationError) as exc:
+                # Structured-output flakes are stochastic model behavior, not
+                # terminal defects: consume the existing stage attempt budget
+                # (already recorded by before_stage) and auto-retry the stage
+                # from its approved checkpoints before ever failing the run.
+                failure_stage = (
+                    exc.stage
+                    if isinstance(getattr(exc, "stage", None), InternalStage)
+                    else InternalStage(work.current_stage or "loading_persona")
+                )
+                # Only retry stages that a resume will actually re-enter (not yet
+                # approved, so before_stage re-fires and the budget advances);
+                # approved-stage sync errors are deterministic and stay terminal.
+                # The script stage budgets per episode instead of stage_attempts
+                # and keeps its existing recoverable-episode pause path.
+                retryable_flake = (
+                    failure_stage is not InternalStage.GENERATING_EPISODE_SCRIPTS
+                    and failure_stage not in approved
+                )
+                requeues = self._flake_requeues.get(work.run_id, 0)
+                if retryable_flake and requeues < 2:
+                    self._flake_requeues[work.run_id] = requeues + 1
+                    await self.repository.requeue_stage_flake_retry(
+                        work.run_id,
+                        stage=failure_stage,
+                    )
+                    logger.warning(
+                        "structured flake retried run_id=%s creation_id=%s stage=%s "
+                        "requeue=%d error=%s",
+                        work.run_id,
+                        work.creation_id,
+                        failure_stage.value,
+                        requeues + 1,
+                        str(exc)[:200],
+                    )
+                    return
+                # Preserve the pre-existing recoverable-episode pause path.
+                if (
+                    failure_stage is InternalStage.GENERATING_EPISODE_SCRIPTS
+                    and await self._pause_recoverable_episode_error(work, failure_stage, exc)
+                ):
+                    return
+                failure = await self._safe_failure(work.run_id, failure_stage, exc)
+                await self.repository.fail_run(work.run_id, failure)
+                logger.warning(
+                    "workflow run failed run_id=%s creation_id=%s stage=%s code=%s "
+                    "(stage flake budget exhausted or terminal sync error)",
+                    work.run_id,
+                    work.creation_id,
+                    failure_stage.value,
+                    failure.code,
                 )
                 return
             except ContentReviewRejectedError as exc:

@@ -7969,6 +7969,62 @@ class Repository:
             now=now,
         )
 
+    async def requeue_stage_flake_retry(
+        self,
+        run_id: UUID,
+        *,
+        stage: InternalStage,
+        now: datetime | None = None,
+    ) -> None:
+        """Requeue a run after a bounded structured-flake retry.
+
+        The retry bound is a worker-side in-memory requeue counter (immune to
+        frozen stage-attempt counters such as grouped-outline resume); this
+        method only performs the immediate atomic requeue.
+        """
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            progress = await self._fetchone(
+                connection,
+                """
+                SELECT run_progress.*, runs.state AS run_state
+                FROM run_progress JOIN runs ON runs.id = run_progress.run_id
+                WHERE run_progress.run_id = ?
+                """,
+                (str(run_id),),
+            )
+            if progress is None:
+                raise DomainError("run_not_found", "Workflow run not found.", 404)
+            if progress["run_state"] != "running" or progress["execution_state"] != "running":
+                raise DomainError(
+                    "run_not_controllable",
+                    "Workflow run is not actively running.",
+                    409,
+                )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET current_stage = ?,
+                    execution_state = 'queued',
+                    active_started_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (stage.value, timestamp, str(run_id)),
+            )
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued',
+                    available_at = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, timestamp, str(run_id)),
+            )
+
     async def handle_run_interruption(
         self,
         run_id: UUID,
