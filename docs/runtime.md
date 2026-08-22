@@ -187,6 +187,7 @@ L3/L4 在上述各阶段的真实文件、提示词、审核和持久化边界�
 SQLite、结构化日志和 Langfuse 都保留 Relay 实际回报的原始 `response_model_ids`。
 | 协议错误 | OpenAI/Anthropic tool 协议不匹配、结构化输出无效 | 终止为安全错误 | 检查 relay adapter 和响应合同 |
 | 上下文预算 | 未设置可信上限，或序列化请求 + 保留输出超出上限 | 请求前阻断，0 outbound call，运行暂停为 `context_budget` | 增加已验证上限、缩小上下文或结束任务 |
+| 大纲组结构化装配/引用校验耗尽 | 组内两轮协议修复后仍不通过 | 暂停为 `content_rejected`（证据按组持久化），"继续"带反馈重写该组，不再终态作废整个运行 |
 | 内容审查不通过 | 合同、单集连续性、结构性里程碑失败 | 只做有界内容修复；预算耗尽后 `paused` | 需要 `authorize-repair` 才能消费一次授权周期，或保留并结束 |
 | L0/L4 最终拒绝 | 质量闸门返回 rejected | `quality_rejected`，不重跑前面内容 | `retry-final-review` 只重跑同一最终审核，或结束 |
 | checkpoint/图执行故障 | thread checkpoint 缺失、递归上限、未知内部错误 | `failed`，不把未验证 thread 内容升级为批准内容 | 保留错误和证据，修复运行环境后新建/重试适用命令 |

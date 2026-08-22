@@ -6598,7 +6598,18 @@ class StageGuardMiddleware(AgentMiddleware):
                             )
                     except OutlineGroupAssemblyError as error:
                         if protocol_repair_rounds >= 2:
-                            raise
+                            # Protocol exhaustion degrades to the same continuable
+                            # pause as a semantic rejection: one flaky group must
+                            # never terminal-kill a long season. Continuing reuses
+                            # the persisted group feedback to rewrite the body.
+                            raise ContentReviewRejectedError(
+                                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                                evidence=(
+                                    f"分集大纲组结构化装配未通过：{error}。可重新生成当前未锁内容。"
+                                ),
+                                repair_rounds=protocol_repair_rounds,
+                                outline_group_id=group.group_id,
+                            ) from error
                         protocol_repair_rounds += 1
                         repair_feedback = json.dumps(
                             {
@@ -6622,7 +6633,14 @@ class StageGuardMiddleware(AgentMiddleware):
                         validate_outline_group_references(season_map, committed, parsed)
                     except OutlineContextError as error:
                         if protocol_repair_rounds >= 2:
-                            raise
+                            raise ContentReviewRejectedError(
+                                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                                evidence=(
+                                    f"分集大纲组引用校验未通过：{error}。可重新生成当前未锁内容。"
+                                ),
+                                repair_rounds=protocol_repair_rounds,
+                                outline_group_id=group.group_id,
+                            ) from error
                         protocol_repair_rounds += 1
                         repair_feedback = json.dumps(
                             {
