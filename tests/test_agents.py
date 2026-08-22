@@ -1023,6 +1023,109 @@ async def test_outline_group_review_prompt_blocks_only_on_hard_criteria() -> Non
 
 
 @pytest.mark.asyncio
+async def test_repair_constraint_validator_receives_multi_line_workspace_files() -> None:
+    """End to end: the ledger and state files the validator reads are multi-line JSON."""
+    delta = EpisodeStateDelta.model_validate(
+        {
+            "episode_number": 1,
+            "contract_sha256": "a" * 64,
+            "established_fact_ids": [],
+            "knowledge_gains": [],
+            "introduced_clue_ids": [],
+            "resolved_clue_ids": [],
+            "satisfied_obligation_ids": [],
+            "evidence": [],
+            "handoff": "本集结束。",
+        }
+    )
+    constraint = RepairConstraint.model_validate(
+        {
+            "constraint_id": "repair_" + "a" * 24,
+            "source_episode": 1,
+            "applies_from_episode": 2,
+            "applies_through_episode": 3,
+            "kind": "continuity",
+            "statement": "照片实物始终在大哥裤兜。",
+            "evidence_excerpt": "进了他裤兜，此后没有再从他手里出来过。",
+        }
+    )
+    captured: dict[str, Any] = {}
+
+    async def capture_invoke(**kwargs: Any) -> RepairConstraintValidationResult:
+        captured.update(kwargs["files"])
+        return RepairConstraintValidationResult.model_validate(
+            {
+                "passed": True,
+                "evidence": "一致。",
+                "checks": [
+                    {
+                        "constraint_id": constraint.constraint_id,
+                        "status": "not_applicable",
+                        "explanation": "本集未涉及照片。",
+                    }
+                ],
+            }
+        )
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+    )
+    middleware._invoke_semantic_reviewer = capture_invoke  # type: ignore[method-assign]
+
+    await middleware._review_repair_constraints(
+        request=None,  # type: ignore[arg-type]
+        handler=None,  # type: ignore[arg-type]
+        constraints=[constraint],
+        episode_number=2,
+        candidate_content="第2集正文。",
+        candidate_state_delta=delta,
+    )
+
+    ledger = captured["/workspace/repair_constraint_ledger.json"]
+    state = captured["/workspace/candidate_state_delta.json"]
+    assert "\n" in ledger and "\n" in state
+    assert json.loads(ledger)[0]["constraint_id"] == constraint.constraint_id
+    assert json.loads(state)["handoff"] == "本集结束。"
+
+
+def test_workspace_json_files_are_multi_line_and_parseable() -> None:
+    """Subagent-readable workspace JSON must never be a single truncatable line."""
+    from pengine.agents import _workspace_json
+
+    payload = {
+        "constraints": [
+            {"id": f"repair_{index}", "evidence": "很长的一段证据文字" * 20} for index in range(5)
+        ]
+    }
+    rendered = _workspace_json(payload)
+    assert "\n" in rendered
+    assert json.loads(rendered) == payload
+
+    model_payload = EpisodeStateDelta.model_validate(
+        {
+            "episode_number": 1,
+            "contract_sha256": "a" * 64,
+            "established_fact_ids": [],
+            "knowledge_gains": [],
+            "introduced_clue_ids": [],
+            "resolved_clue_ids": [],
+            "satisfied_obligation_ids": [],
+            "evidence": [],
+            "handoff": "本集结束。",
+        }
+    )
+    assert "\n" in _workspace_json(model_payload)
+    assert json.loads(_workspace_json(model_payload))["handoff"] == "本集结束。"
+
+    compact_string = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    assert "\n" in _workspace_json(compact_string)
+    assert _workspace_json("非 JSON 纯文本") == "非 JSON 纯文本"
+
+
+@pytest.mark.asyncio
 async def test_persisted_group_rejection_seeds_full_regeneration_on_resume() -> None:
     season_payload = {
         "episode_count": 1,
