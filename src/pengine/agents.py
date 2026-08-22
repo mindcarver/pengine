@@ -9065,6 +9065,13 @@ class DeepAgentWorkflow:
         approved_payloads: dict[InternalStage, Any] = {
             stage: payload for stage, payload in approved_source.items()
         }
+        # Crash-recovery fast path: every specialist stage already holds an
+        # approved business checkpoint, so re-entering the supervisor graph would
+        # only replay a bloated thread against the context preflight. The result
+        # is reconstructed deterministically from the approved checkpoints,
+        # exactly like the documented resume semantics.
+        if all(stage in approved_payloads for stage in _ORDERED_SPECIALIST_STAGES):
+            return _workflow_result_from_checkpoints(approved_payloads, feedback=feedback)
         resolved_output_language = (
             infer_output_language(story, requirements)
             if output_language is _INFER_OUTPUT_LANGUAGE
