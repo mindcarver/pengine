@@ -8182,6 +8182,14 @@ class StageGuardMiddleware(AgentMiddleware):
                     if self.begin_generation_group is not None
                     else None
                 )
+                # The whole-script-stage totals bound one natural group's calls,
+                # not the entire season: ~2-3 generation calls per episode would
+                # otherwise exceed the 6-episode-calibrated 192/128 at ~80
+                # episodes. Per-episode budget counters are intentionally kept.
+                if self.model_call_state is not None:
+                    self.model_call_state.reset_stage_budget(
+                        InternalStage.GENERATING_EPISODE_SCRIPTS.value
+                    )
                 record_langfuse_event(
                     "pengine.script_generation_group.started",
                     input={
