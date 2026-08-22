@@ -12349,7 +12349,9 @@ async def test_episode_phase_uses_segmented_checkpoint_and_bounded_supervisor_bu
         )
 
     assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
-    assert observed_output_budgets == [4_096]
+    # With every specialist stage already approved, execute reconstructs the
+    # result from checkpoints and never re-enters the supervisor graph.
+    assert observed_output_budgets == []
     assert state.context.requested_output_tokens is None
 
 
