@@ -9331,13 +9331,16 @@ async def test_grouped_outline_stops_after_two_assembly_repairs() -> None:
         runtime=None,
     )
 
-    with pytest.raises(OutlineGroupAssemblyError):
+    with pytest.raises(ContentReviewRejectedError) as error:
         await middleware._generate_grouped_outline(
             request,
             lambda _: _async_none(),
             request.tool_call["args"],
         )
 
+    assert error.value.outline_group_id == "opening"
+    assert error.value.repair_rounds == 2
+    assert "装配未通过" in error.value.evidence
     assert generate_calls == 3
     assert [item["repair_round"] for item in feedbacks] == [1, 2]
     assert all(
