@@ -1120,6 +1120,143 @@ def test_workflow_result_from_checkpoints_synthesizes_revision_feedback_handling
     assert "终审" in item.result
 
 
+@pytest.mark.asyncio
+async def test_outline_group_auto_heal_succeeds_on_retry_without_pausing() -> None:
+    """First group attempt exhausts assembly; the second roll commits cleanly."""
+    season_payload = {
+        "episode_count": 1,
+        "characters": [
+            {
+                "character_id": "lin_lan",
+                "name": "林岚",
+                "role": "调查者",
+                "initial_known_fact_ids": [],
+            }
+        ],
+        "relationships": [],
+        "prohibitions": [],
+        "review_milestones": [],
+        "script_generation_groups": [
+            {
+                "group_id": "opening",
+                "start_episode": 1,
+                "end_episode": 1,
+                "dramatic_unit": "发现旧信",
+                "boundary_reason": "线索改变目标",
+            }
+        ],
+    }
+    stored_map: dict[str, Any] | None = None
+    committed: list[dict[str, Any]] = []
+    generate_calls = 0
+
+    async def load_season_map() -> Mapping[str, Any] | None:
+        return stored_map
+
+    async def commit_season_map(payload: Mapping[str, Any]) -> None:
+        nonlocal stored_map
+        stored_map = {"content": dict(payload)}
+
+    async def generate_group(
+        _: Any,
+        repair_feedback: str | None,
+        **kwargs: Any,
+    ) -> EpisodeOutlineGroupResult:
+        nonlocal generate_calls
+        generate_calls += 1
+        candidate = EpisodeOutlineGroupResult.model_validate(
+            _episode_group_candidate("opening", 1, 1)
+        )
+        if generate_calls <= 3:
+            # Fail the first attempt's assembly three times (initial + 2 repairs).
+            sidecar = EpisodeOutlineGroupSidecar.model_validate(
+                {
+                    field: getattr(candidate, field)
+                    for field in EpisodeOutlineGroupSidecar.model_fields
+                }
+            )
+            raise OutlineGroupAssemblyError(
+                "Group obligations must match the group's fact reveals",
+                sidecar=sidecar,
+            )
+        return candidate
+
+    async def accept_group(_: Any, __: Any) -> SemanticReview:
+        return SemanticReview.model_validate({"passed": True, "evidence": "一致。"})
+
+    async def generate_season_map(_: Any) -> Mapping[str, Any]:
+        return season_payload
+
+    async def load_groups() -> list[Mapping[str, Any]]:
+        return []
+
+    async def begin_group(**_: Any) -> str:
+        return "operation-opening"
+
+    async def complete_group(**kwargs: Any) -> None:
+        committed.append(kwargs["group_id"])
+
+    async def fail_group(**kwargs: Any) -> None:
+        raise AssertionError("A retried-then-committed group must not be marked failed")
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages=set(),
+        output_language=SIMPLIFIED_CHINESE,
+        generate_outline_season_map=generate_season_map,
+        generate_outline_group=generate_group,
+        review_outline_group=accept_group,
+        load_outline_season_map=load_season_map,
+        commit_outline_season_map=commit_season_map,
+        load_outline_groups=load_groups,
+        begin_outline_group=begin_group,
+        load_outline_group_body=lambda _: _async_none(),
+        persist_outline_group_body=lambda *_, **__: _async_none(),
+        complete_outline_group=complete_group,
+        fail_outline_group=fail_group,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_outline] generate outline",
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-auto-heal-retry",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={
+            "files": {
+                "/workspace/creation-request.md": {"content": "故事需求"},
+                "/workspace/story_outline.md": {"content": "故事梗概"},
+                "/workspace/character_biographies.md": {"content": "人物小传"},
+                "/workspace/relationship_logic.md": {"content": "人物关系"},
+            }
+        },
+        runtime=None,
+    )
+
+    async def handler(candidate_request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(
+                {"passed": True, "evidence": "L4硬规则：合同一致", "issues": []},
+                ensure_ascii=False,
+            ),
+            tool_call_id=str(candidate_request.tool_call.get("id") or "call-heal"),
+        )
+
+    result = await middleware._generate_grouped_outline(request, handler, request.tool_call["args"])
+
+    assert committed == ["opening"]
+    # First attempt burned 3 assembly calls; the retried attempt passed on its
+    # first call with no pause and no fail marker.
+    assert generate_calls == 4
+    returned, locked = result
+    assert isinstance(returned, ToolMessage)
+
+
 def test_workspace_json_files_are_multi_line_and_parseable() -> None:
     """Subagent-readable workspace JSON must never be a single truncatable line."""
     from pengine.agents import _workspace_json
@@ -9341,10 +9478,14 @@ async def test_grouped_outline_stops_after_two_assembly_repairs() -> None:
     assert error.value.outline_group_id == "opening"
     assert error.value.repair_rounds == 2
     assert "装配未通过" in error.value.evidence
-    assert generate_calls == 3
-    assert [item["repair_round"] for item in feedbacks] == [1, 2]
+    # Auto-heal: three group attempts × (1 initial + 2 protocol repairs).
+    assert generate_calls == 9
+    assert [item["repair_round"] for item in feedbacks] == [1, 2, 2, 1, 2, 2, 1, 2]
+    protocol_feedbacks = [item for item in feedbacks if "previous_sidecar" in item]
+    assert len(protocol_feedbacks) == 6
     assert all(
-        item["previous_sidecar"]["facts"][1]["fact_id"] == "fact_unbound" for item in feedbacks
+        item["previous_sidecar"]["facts"][1]["fact_id"] == "fact_unbound"
+        for item in protocol_feedbacks
     )
     assert failed == ["opening"]
 
@@ -9508,9 +9649,16 @@ async def test_grouped_outline_stops_after_two_semantic_repairs() -> None:
         )
 
     assert error.value.repair_rounds == 2
-    assert repair_modes == ["sidecar", "full", "full"]
-    assert [item["repair_round"] for item in feedbacks] == [1, 2]
-    assert all(item["issues"][0]["code"] == "hard_canon_age_contradiction" for item in feedbacks)
+    # Auto-heal: attempt 1 runs sidecar→full→full; seeded retries start in
+    # full mode with the last rejection evidence.
+    assert repair_modes == ["sidecar", "full", "full"] + ["full"] * 6
+    assert len(feedbacks) == 8
+    semantic_feedbacks = [
+        item for item in feedbacks if item.get("issues") and item["issues"][0].get("code")
+    ]
+    assert all(
+        item["issues"][0]["code"] == "hard_canon_age_contradiction" for item in semantic_feedbacks
+    )
     assert failed == ["opening"]
 
 
@@ -9686,13 +9834,15 @@ async def test_protocol_repair_does_not_consume_semantic_repair_rounds() -> None
         )
 
     # The one protocol repair never touches the semantic budget: the review loop
-    # still gets its full two regeneration rounds (three rejections total).
-    assert repair_modes == ["sidecar", "sidecar", "full", "full"]
-    assert [item["repair_round"] for item in feedbacks] == [1, 1, 2]
+    # still gets its full two regeneration rounds (three rejections total), then
+    # the auto-heal layer replays the whole cycle two more times before pausing.
+    assert repair_modes == ["sidecar", "sidecar", "full", "full"] + ["full"] * 6
+    assert [item["repair_round"] for item in feedbacks] == [1, 1, 2, 2, 1, 2, 2, 1, 2]
+    assert review_calls == 9
     assert feedbacks[0]["issues"][0]["code"] == "current_group_protocol_violation"
     assert feedbacks[1]["issues"][0]["code"] == "continuity_break"
     assert error.value.repair_rounds == 2
-    assert review_calls == 3
+    assert review_calls == 9  # 3 rejections × 3 auto-heal attempts
 
 
 @pytest.mark.asyncio

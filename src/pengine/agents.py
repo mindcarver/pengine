@@ -6534,123 +6534,159 @@ class StageGuardMiddleware(AgentMiddleware):
             pending_rejection: Mapping[str, Any] | None = None
             if self.load_outline_group_rejection is not None:
                 pending_rejection = await self.load_outline_group_rejection(group.group_id)
-            try:
-                compiled = compile_outline_group_context(
-                    creation_request=creation_request,
-                    persona_components=persona_components,
-                    story_outline=story_outline,
-                    character_biographies=character_biographies,
-                    relationship_logic=relationship_logic,
-                    season_map=season_map,
-                    prior_groups=committed,
-                    group=group,
-                    maximum_output_tokens=self.generation_max_output_tokens,
-                )
-                record_langfuse_event(
-                    "pengine.outline_context.compiled",
-                    input=compiled.manifest,
-                    metadata={
-                        "mode": "outline_group",
-                        "group_id": group.group_id,
-                        "trace_version": "pengine-1",
-                    },
-                )
-                sidecar_context = compile_outline_group_sidecar_context(
-                    season_map=season_map,
-                    prior_groups=committed,
-                    group=group,
-                )
-                repair_feedback: str | None = None
-                if pending_rejection is not None:
-                    repair_feedback = json.dumps(
-                        {
-                            "repair_round": int(pending_rejection.get("repair_rounds") or 2),
-                            "evidence": str(pending_rejection.get("evidence") or ""),
-                            "issues": [],
-                            "resumed_rejection": True,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
+            # Auto-heal first layer: assembly and review failures are stochastic,
+            # so a fresh group roll usually passes. Retry up to three group
+            # attempts (seeding the last rejection evidence) before pausing.
+            auto_rejection: ContentReviewRejectedError | None = None
+            for _group_attempt in range(3):
+                try:
+                    compiled = compile_outline_group_context(
+                        creation_request=creation_request,
+                        persona_components=persona_components,
+                        story_outline=story_outline,
+                        character_biographies=character_biographies,
+                        relationship_logic=relationship_logic,
+                        season_map=season_map,
+                        prior_groups=committed,
+                        group=group,
+                        maximum_output_tokens=self.generation_max_output_tokens,
                     )
-                # Protocol repairs (sidecar assembly/reference validation) and semantic
-                # review rejections keep separate two-round budgets: a schema-level fix
-                # must never consume the rounds the review repair contract promises.
-                protocol_repair_rounds = 0
-                review_repair_rounds = 0
-                repair_mode: Literal["sidecar", "full"] = (
-                    "full" if pending_rejection is not None else "sidecar"
-                )
-                while True:
-                    try:
-                        with self._compiled_model_context(
-                            requested_output_tokens=compiled.output_tokens,
-                            bundle_sha256=compiled.bundle_sha256,
-                            manifest_json=compiled.manifest_json,
-                        ):
-                            parsed = await generate_group(
-                                compiled,
-                                repair_feedback,
-                                group=group,
-                                operation_id=operation_id,
-                                sidecar_context=sidecar_context,
-                                repair_mode=repair_mode,
-                            )
-                    except OutlineGroupAssemblyError as error:
-                        if protocol_repair_rounds >= 2:
-                            # Protocol exhaustion degrades to the same continuable
-                            # pause as a semantic rejection: one flaky group must
-                            # never terminal-kill a long season. Continuing reuses
-                            # the persisted group feedback to rewrite the body.
-                            raise ContentReviewRejectedError(
-                                stage=InternalStage.GENERATING_EPISODE_OUTLINE,
-                                evidence=(
-                                    f"分集大纲组结构化装配未通过：{error}。可重新生成当前未锁内容。"
-                                ),
-                                repair_rounds=protocol_repair_rounds,
-                                outline_group_id=group.group_id,
-                            ) from error
-                        protocol_repair_rounds += 1
+                    record_langfuse_event(
+                        "pengine.outline_context.compiled",
+                        input=compiled.manifest,
+                        metadata={
+                            "mode": "outline_group",
+                            "group_id": group.group_id,
+                            "trace_version": "pengine-1",
+                        },
+                    )
+                    sidecar_context = compile_outline_group_sidecar_context(
+                        season_map=season_map,
+                        prior_groups=committed,
+                        group=group,
+                    )
+                    repair_feedback: str | None = None
+                    if pending_rejection is not None:
                         repair_feedback = json.dumps(
                             {
-                                "repair_round": protocol_repair_rounds,
-                                "evidence": str(error),
-                                "issues": [
-                                    {
-                                        "code": "current_group_protocol_violation",
-                                        "message": str(error),
-                                    }
-                                ],
-                                "previous_sidecar": error.sidecar.model_dump(mode="json"),
+                                "repair_round": int(pending_rejection.get("repair_rounds") or 2),
+                                "evidence": str(pending_rejection.get("evidence") or ""),
+                                "issues": [],
+                                "resumed_rejection": True,
                             },
                             ensure_ascii=False,
                             separators=(",", ":"),
                             sort_keys=True,
                         )
-                        repair_mode = "sidecar"
-                        continue
-                    try:
-                        validate_outline_group_references(season_map, committed, parsed)
-                    except OutlineContextError as error:
-                        if protocol_repair_rounds >= 2:
+                    # Protocol repairs (sidecar assembly/reference validation) and semantic
+                    # review rejections keep separate two-round budgets: a schema-level fix
+                    # must never consume the rounds the review repair contract promises.
+                    protocol_repair_rounds = 0
+                    review_repair_rounds = 0
+                    repair_mode: Literal["sidecar", "full"] = (
+                        "full" if pending_rejection is not None else "sidecar"
+                    )
+                    while True:
+                        try:
+                            with self._compiled_model_context(
+                                requested_output_tokens=compiled.output_tokens,
+                                bundle_sha256=compiled.bundle_sha256,
+                                manifest_json=compiled.manifest_json,
+                            ):
+                                parsed = await generate_group(
+                                    compiled,
+                                    repair_feedback,
+                                    group=group,
+                                    operation_id=operation_id,
+                                    sidecar_context=sidecar_context,
+                                    repair_mode=repair_mode,
+                                )
+                        except OutlineGroupAssemblyError as error:
+                            if protocol_repair_rounds >= 2:
+                                # Protocol exhaustion degrades to the same continuable
+                                # pause as a semantic rejection: one flaky group must
+                                # never terminal-kill a long season. Continuing reuses
+                                # the persisted group feedback to rewrite the body.
+                                raise ContentReviewRejectedError(
+                                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                                    evidence=(
+                                        f"分集大纲组结构化装配未通过：{error}。可重新生成当前未锁内容。"
+                                    ),
+                                    repair_rounds=protocol_repair_rounds,
+                                    outline_group_id=group.group_id,
+                                ) from error
+                            protocol_repair_rounds += 1
+                            repair_feedback = json.dumps(
+                                {
+                                    "repair_round": protocol_repair_rounds,
+                                    "evidence": str(error),
+                                    "issues": [
+                                        {
+                                            "code": "current_group_protocol_violation",
+                                            "message": str(error),
+                                        }
+                                    ],
+                                    "previous_sidecar": error.sidecar.model_dump(mode="json"),
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            repair_mode = "sidecar"
+                            continue
+                        try:
+                            validate_outline_group_references(season_map, committed, parsed)
+                        except OutlineContextError as error:
+                            if protocol_repair_rounds >= 2:
+                                raise ContentReviewRejectedError(
+                                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                                    evidence=(
+                                        f"分集大纲组引用校验未通过：{error}。可重新生成当前未锁内容。"
+                                    ),
+                                    repair_rounds=protocol_repair_rounds,
+                                    outline_group_id=group.group_id,
+                                ) from error
+                            protocol_repair_rounds += 1
+                            repair_feedback = json.dumps(
+                                {
+                                    "repair_round": protocol_repair_rounds,
+                                    "evidence": str(error),
+                                    "issues": [
+                                        {
+                                            "code": "current_group_protocol_violation",
+                                            "message": str(error),
+                                        }
+                                    ],
+                                    "previous_sidecar": EpisodeOutlineGroupSidecar.model_validate(
+                                        {
+                                            field: getattr(parsed, field)
+                                            for field in EpisodeOutlineGroupSidecar.model_fields
+                                        }
+                                    ).model_dump(mode="json"),
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            repair_mode = "sidecar"
+                            continue
+                        group_review = await review_group(compiled, parsed)
+                        if group_review.passed:
+                            break
+                        if review_repair_rounds >= 2:
                             raise ContentReviewRejectedError(
                                 stage=InternalStage.GENERATING_EPISODE_OUTLINE,
-                                evidence=(
-                                    f"分集大纲组引用校验未通过：{error}。可重新生成当前未锁内容。"
-                                ),
-                                repair_rounds=protocol_repair_rounds,
+                                evidence=group_review.evidence,
+                                repair_rounds=review_repair_rounds,
                                 outline_group_id=group.group_id,
-                            ) from error
-                        protocol_repair_rounds += 1
+                            )
+                        review_repair_rounds += 1
                         repair_feedback = json.dumps(
                             {
-                                "repair_round": protocol_repair_rounds,
-                                "evidence": str(error),
+                                "repair_round": review_repair_rounds,
+                                "evidence": group_review.evidence,
                                 "issues": [
-                                    {
-                                        "code": "current_group_protocol_violation",
-                                        "message": str(error),
-                                    }
+                                    issue.model_dump(mode="json") for issue in group_review.issues
                                 ],
                                 "previous_sidecar": EpisodeOutlineGroupSidecar.model_validate(
                                     {
@@ -6663,47 +6699,34 @@ class StageGuardMiddleware(AgentMiddleware):
                             separators=(",", ":"),
                             sort_keys=True,
                         )
-                        repair_mode = "sidecar"
-                        continue
-                    group_review = await review_group(compiled, parsed)
-                    if group_review.passed:
-                        break
-                    if review_repair_rounds >= 2:
-                        raise ContentReviewRejectedError(
-                            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
-                            evidence=group_review.evidence,
-                            repair_rounds=review_repair_rounds,
-                            outline_group_id=group.group_id,
-                        )
-                    review_repair_rounds += 1
-                    repair_feedback = json.dumps(
-                        {
-                            "repair_round": review_repair_rounds,
-                            "evidence": group_review.evidence,
-                            "issues": [
-                                issue.model_dump(mode="json") for issue in group_review.issues
-                            ],
-                            "previous_sidecar": EpisodeOutlineGroupSidecar.model_validate(
-                                {
-                                    field: getattr(parsed, field)
-                                    for field in EpisodeOutlineGroupSidecar.model_fields
-                                }
-                            ).model_dump(mode="json"),
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
+                        repair_mode = "full"
+                    await complete_group(
+                        group_id=group.group_id,
+                        operation_id=operation_id,
+                        payload=parsed.model_dump(mode="json"),
                     )
-                    repair_mode = "full"
-                await complete_group(
-                    group_id=group.group_id,
-                    operation_id=operation_id,
-                    payload=parsed.model_dump(mode="json"),
-                )
-                committed.append(parsed)
-            except Exception:
+                    committed.append(parsed)
+                    auto_rejection = None
+                    break
+                except ContentReviewRejectedError as exc:
+                    auto_rejection = exc
+                    if self.reset_episode_deadline is not None:
+                        await self.reset_episode_deadline()
+                    if self.model_call_state is not None:
+                        self.model_call_state.reset_stage_budget(
+                            InternalStage.GENERATING_EPISODE_OUTLINE.value
+                        )
+                    pending_rejection = {
+                        "repair_rounds": exc.repair_rounds,
+                        "evidence": exc.evidence,
+                    }
+                    continue
+                except Exception:
+                    await fail_group(group_id=group.group_id, operation_id=operation_id)
+                    raise
+            if auto_rejection is not None:
                 await fail_group(group_id=group.group_id, operation_id=operation_id)
-                raise
+                raise auto_rejection
 
         payload = assemble_episode_outline(season_map, committed)
         if self.model_call_state is not None:
