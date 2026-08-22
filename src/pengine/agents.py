@@ -5057,6 +5057,8 @@ def _validated_stage_payload(
 
 def _workflow_result_from_checkpoints(
     approved: Mapping[InternalStage, Any],
+    *,
+    feedback: str | None = None,
 ) -> WorkflowResult:
     missing = [stage for stage in _ORDERED_SPECIALIST_STAGES if stage not in approved]
     if missing:
@@ -5083,7 +5085,20 @@ def _workflow_result_from_checkpoints(
                 },
                 "selected_l0_variant": l0_selection["selected_l0_variant"],
                 "selection_rationale": l0_selection["selection_rationale"],
-                "feedback_handling": [],
+                "feedback_handling": (
+                    [
+                        {
+                            "feedback_item": feedback,
+                            "handling": (
+                                "修订以同一人格快照按该冻结反馈完整重跑工作流，"
+                                "反馈要求全程保留在生成上下文中。"
+                            ),
+                            "result": "全部分集锁定且绑定终审通过后，随修订交付落盘。",
+                        }
+                    ]
+                    if feedback
+                    else []
+                ),
             }
         )
     except AgentProtocolError:
@@ -9708,7 +9723,7 @@ class DeepAgentWorkflow:
         structured = result.get("structured_response")
         if structured is None:
             try:
-                return _workflow_result_from_checkpoints(approved_payloads)
+                return _workflow_result_from_checkpoints(approved_payloads, feedback=feedback)
             except AgentProtocolError as exc:
                 raise AgentProtocolError(
                     "Supervisor did not return structured output",
@@ -9719,7 +9734,7 @@ class DeepAgentWorkflow:
                 WorkflowCompletion.model_validate(structured)
             except Exception as exc:
                 raise AgentProtocolError("Supervisor returned invalid completion output") from exc
-        return _workflow_result_from_checkpoints(approved_payloads)
+        return _workflow_result_from_checkpoints(approved_payloads, feedback=feedback)
 
 
 def _supervisor_prompt(
