@@ -820,6 +820,17 @@ async def test_worker_rejects_undeclared_l0_variant_before_checkpoint(tmp_path: 
 
     assert await worker.run_once() is True
 
+    # The deterministic protocol error now auto-retries through the existing
+    # stage attempt budget before failing terminally.
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource is not None
+    assert resource.initial.state == "queued"
+
+    assert await worker.run_once() is True
+    resource = await repository.get_creation(accepted.creation_id)
+    assert resource.initial.state == "queued"
+    assert await worker.run_once() is True
+
     resource = await repository.get_creation(accepted.creation_id)
     assert resource is not None
     assert resource.initial.state == "failed"
@@ -2196,6 +2207,9 @@ async def test_worker_rejects_results_not_derived_from_approved_checkpoints(
         worker_id="checkpoint-truth-test-worker",
     )
 
+    assert await worker.run_once() is True
+    # Flake retry budget (2 requeues) must drain before the terminal failure.
+    assert await worker.run_once() is True
     assert await worker.run_once() is True
     resource = await repository.get_creation(accepted.creation_id)
 
