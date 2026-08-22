@@ -116,6 +116,7 @@ from pengine.agents import (
     _with_inline_project,
     _with_inline_soul,
     _with_l3_policy,
+    _workflow_result_from_checkpoints,
     apply_episode_content_patch,
     bind_quality_repair_plan,
     flatten_cr_candidate,
@@ -1089,6 +1090,34 @@ async def test_repair_constraint_validator_receives_multi_line_workspace_files()
     assert "\n" in ledger and "\n" in state
     assert json.loads(ledger)[0]["constraint_id"] == constraint.constraint_id
     assert json.loads(state)["handoff"] == "本集结束。"
+
+
+def test_workflow_result_from_checkpoints_synthesizes_revision_feedback_handling() -> None:
+    """A revision run must deliver itemized feedback handling; initial stays empty."""
+    approved = {
+        InternalStage.SELECTING_L0_VARIANT: {
+            "selected_l0_variant": "归返",
+            "selection_rationale": "契合故事母题。",
+        },
+        InternalStage.GENERATING_STORY_OUTLINE: {"content": "故事大纲正文。"},
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+            "character_biographies": "人物小传。",
+            "relationship_logic": "关系逻辑。",
+        },
+        InternalStage.GENERATING_EPISODE_OUTLINE: {"content": "分集大纲正文。"},
+        InternalStage.GENERATING_EPISODE_SCRIPTS: {"content": "第一集\n第二集"},
+    }
+    without = _workflow_result_from_checkpoints(approved)
+    assert without.feedback_handling == []
+
+    with_feedback = _workflow_result_from_checkpoints(
+        approved, feedback="让结尾的代价更明确，保留海边旧照这一核心意象。"
+    )
+    assert len(with_feedback.feedback_handling) == 1
+    item = with_feedback.feedback_handling[0]
+    assert item.feedback_item == "让结尾的代价更明确，保留海边旧照这一核心意象。"
+    assert "冻结反馈" in item.handling
+    assert "终审" in item.result
 
 
 def test_workspace_json_files_are_multi_line_and_parseable() -> None:
