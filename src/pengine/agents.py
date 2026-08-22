@@ -31,6 +31,7 @@ from langchain_core.tools import StructuredTool, ToolException
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 from pydantic import (
+    BaseModel,
     ConfigDict,
     Field,
     JsonValue,
@@ -2370,6 +2371,26 @@ async def _invoke_outline_group_review(
             ],
         )
     )
+
+
+def _workspace_json(payload: Any, **legacy_kwargs: Any) -> str:
+    """Serialize engine-authored data for subagent-readable workspace files.
+
+    Virtual ``read_file`` paginates and truncates by line, so a compact
+    single-line JSON projection loses its whole middle when truncated (observed
+    2026-08-21: the repair-constraint ledger dropped ~1417 middle characters).
+    Multi-line JSON bounds any loss to one visible line and keeps the file
+    parseable; message-body context stays compact elsewhere on purpose.
+    """
+    if isinstance(payload, BaseModel):
+        payload = payload.model_dump(mode="json")
+    elif isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return payload
+    del legacy_kwargs  # call sites previously passed ensure_ascii/sort_keys explicitly
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
 
 
 def _message_plaintext(response: Any, *, producer: str = "Script writer") -> str:
@@ -5096,7 +5117,7 @@ def _review_workspace_files(
             contract_markdown = payload.get("story_contract_markdown")
             if isinstance(contract, Mapping):
                 files["/workspace/story_contract.json"] = {
-                    "content": json.dumps(contract, ensure_ascii=False, sort_keys=True),
+                    "content": _workspace_json(contract),
                     "encoding": "utf-8",
                 }
             if isinstance(contract_markdown, str) and contract_markdown:
@@ -5110,7 +5131,7 @@ def _review_workspace_files(
         sort_keys=True,
     )
     files["/workspace/approved-checkpoints.json"] = {
-        "content": manifest,
+        "content": _workspace_json(manifest),
         "encoding": "utf-8",
     }
     return files
@@ -5930,11 +5951,8 @@ class StageGuardMiddleware(AgentMiddleware):
                     "/workspace/current_relationship_logic.md": (parsed.relationship_logic or ""),
                 }
             if previous_review is not None:
-                review_files["/workspace/previous_story_review.json"] = json.dumps(
-                    _canon_review_with_issue_ledger(previous_review),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
+                review_files["/workspace/previous_story_review.json"] = _workspace_json(
+                    _canon_review_with_issue_ledger(previous_review)
                 )
             review_prefix = (
                 f"Review only the unlocked {stage.value} candidate against the creation "
@@ -6124,14 +6142,11 @@ class StageGuardMiddleware(AgentMiddleware):
         if stage is InternalStage.GENERATING_CHARACTER_RELATIONSHIPS:
             review_files = {
                 "/workspace/current_story_candidate.md": content,
-                "/workspace/story_review.json": review.model_dump_json(),
+                "/workspace/story_review.json": _workspace_json(review),
             }
             if review.prior_issue_closures:
-                review_files["/workspace/previous_story_review.json"] = json.dumps(
-                    _canon_review_with_issue_ledger(review),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
+                review_files["/workspace/previous_story_review.json"] = _workspace_json(
+                    _canon_review_with_issue_ledger(review)
                 )
             _result, payload = await self._invoke_repair_subagent(
                 request=request,
@@ -6344,13 +6359,13 @@ class StageGuardMiddleware(AgentMiddleware):
             ),
             files={
                 **candidate_files,
-                "/workspace/previous_story_review.json": json.dumps(
+                "/workspace/previous_story_review.json": _workspace_json(
                     _canon_review_with_issue_ledger(previous_review),
                     ensure_ascii=False,
                     separators=(",", ":"),
                     sort_keys=True,
                 ),
-                "/workspace/current_story_review.json": json.dumps(
+                "/workspace/current_story_review.json": _workspace_json(
                     _canon_review_with_issue_ledger(current_review),
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -6731,19 +6746,19 @@ class StageGuardMiddleware(AgentMiddleware):
                 "make their combined StoryContract valid. Never infer or request broader access."
             )
             review_files = {
-                "/workspace/story_contract.json": json.dumps(
+                "/workspace/story_contract.json": _workspace_json(
                     contract.model_dump(mode="json"),
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
                 "/workspace/story_contract.md": contract_markdown,
                 "/workspace/episode_outline.md": payload["content"],
-                "/workspace/episode_plans.json": json.dumps(
+                "/workspace/episode_plans.json": _workspace_json(
                     payload["episodes"],
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
-                "/workspace/script_generation_groups.json": json.dumps(
+                "/workspace/script_generation_groups.json": _workspace_json(
                     payload["script_generation_groups"],
                     ensure_ascii=False,
                     sort_keys=True,
@@ -7005,7 +7020,7 @@ class StageGuardMiddleware(AgentMiddleware):
                 retry_request = _request_with_files(
                     retry_request,
                     {
-                        "/workspace/result_to_translate.json": json.dumps(
+                        "/workspace/result_to_translate.json": _workspace_json(
                             original_raw, ensure_ascii=False
                         )
                     },
@@ -7189,7 +7204,7 @@ class StageGuardMiddleware(AgentMiddleware):
                     },
                     state=_request_state_after_result(review_request, review_result),
                 ),
-                {"/workspace/review_to_translate.json": review.model_dump_json()},
+                {"/workspace/review_to_translate.json": _workspace_json(review)},
             )
             repaired, _ = await invoke(retry_request)
             _validate_result_language(
@@ -7491,9 +7506,9 @@ class StageGuardMiddleware(AgentMiddleware):
                     "classification only."
                 ),
                 files={
-                    "/workspace/series_prefix.json": milestone_scripts,
-                    "/workspace/series_state.json": prior_state.model_dump_json(),
-                    "/workspace/story_contract.json": contract_json,
+                    "/workspace/series_prefix.json": _workspace_json(milestone_scripts),
+                    "/workspace/series_state.json": _workspace_json(prior_state),
+                    "/workspace/story_contract.json": _workspace_json(contract_json),
                     "/workspace/story_contract.md": outline["story_contract_markdown"],
                     "/workspace/current_episode_plan.md": plan.plan,
                 },
@@ -7595,13 +7610,13 @@ class StageGuardMiddleware(AgentMiddleware):
                 "constraint exists. Return structured evidence only."
             ),
             files={
-                "/workspace/suffix_rewrite_review.json": json.dumps(
+                "/workspace/suffix_rewrite_review.json": _workspace_json(
                     suffix_feedback, ensure_ascii=False, sort_keys=True
                 ),
-                "/workspace/committed_rewrite_scripts.json": _trusted_series_prefix_json(
-                    sorted(source_scripts.items())
+                "/workspace/committed_rewrite_scripts.json": _workspace_json(
+                    _trusted_series_prefix_json(sorted(source_scripts.items()))
                 ),
-                "/workspace/repair_constraint_ledger.json": json.dumps(
+                "/workspace/repair_constraint_ledger.json": _workspace_json(
                     [item.model_dump(mode="json") for item in current_ledger],
                     ensure_ascii=False,
                     sort_keys=True,
@@ -7643,13 +7658,13 @@ class StageGuardMiddleware(AgentMiddleware):
                 "from the ledger. Return structured evidence only."
             ),
             files={
-                "/workspace/repair_constraint_ledger.json": json.dumps(
+                "/workspace/repair_constraint_ledger.json": _workspace_json(
                     [item.model_dump(mode="json") for item in constraints],
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
                 "/workspace/candidate_episode.md": candidate_content,
-                "/workspace/candidate_state_delta.json": (candidate_state_delta.model_dump_json()),
+                "/workspace/candidate_state_delta.json": _workspace_json(candidate_state_delta),
             },
             schema=RepairConstraintValidationResult,
             stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
@@ -7993,29 +8008,33 @@ class StageGuardMiddleware(AgentMiddleware):
                 )
             episode_files.update(
                 {
-                    "/workspace/current_group_canon.json": current_group_canon_json,
-                    "/workspace/evidence_contract.json": evidence_contract_json,
-                    "/workspace/established_facts.json": established_facts_json,
-                    "/workspace/series_state.json": prior_state.model_dump_json(),
+                    "/workspace/current_group_canon.json": _workspace_json(
+                        current_group_canon_json
+                    ),
+                    "/workspace/evidence_contract.json": _workspace_json(evidence_contract_json),
+                    "/workspace/established_facts.json": _workspace_json(established_facts_json),
+                    "/workspace/series_state.json": _workspace_json(prior_state),
                     "/workspace/previous_episode_handoff.md": prior_state.handoff or "None",
                     "/workspace/writer_notes.md": writer_notes or "None",
-                    "/workspace/generation_group.json": generation_group_json,
+                    "/workspace/generation_group.json": _workspace_json(generation_group_json),
                 }
             )
             episode_files.update(
                 {
-                    f"/workspace/evidence_contracts/ep{episode_number}.json": content
+                    f"/workspace/evidence_contracts/ep{episode_number}.json": _workspace_json(
+                        content
+                    )
                     for episode_number, content in evidence_contracts.items()
                 }
             )
             if suffix_feedback is not None:
-                episode_files["/workspace/suffix_rewrite_review.json"] = json.dumps(
+                episode_files["/workspace/suffix_rewrite_review.json"] = _workspace_json(
                     suffix_feedback,
                     ensure_ascii=False,
                     sort_keys=True,
                 )
             if repair_constraint_ledger_json is not None:
-                episode_files["/workspace/repair_constraint_ledger.json"] = (
+                episode_files["/workspace/repair_constraint_ledger.json"] = _workspace_json(
                     repair_constraint_ledger_json
                 )
             try:
@@ -8509,27 +8528,31 @@ class StageGuardMiddleware(AgentMiddleware):
                             subagent_type="episode_repair",
                             description=repair_description,
                             files={
-                                "/workspace/story_contract.json": contract_json,
-                                "/workspace/evidence_contract.json": _evidence_contract_json(
-                                    contract,
-                                    plan.episode_number,
-                                    rejected_issues=evidence_repair_issues,
-                                    phase="episode_repair",
+                                "/workspace/story_contract.json": _workspace_json(contract_json),
+                                "/workspace/evidence_contract.json": _workspace_json(
+                                    _evidence_contract_json(
+                                        contract,
+                                        plan.episode_number,
+                                        rejected_issues=evidence_repair_issues,
+                                        phase="episode_repair",
+                                    )
                                 ),
-                                "/workspace/established_facts.json": established_facts_json,
-                                "/workspace/series_state.json": prior_state.model_dump_json(),
+                                "/workspace/established_facts.json": _workspace_json(
+                                    established_facts_json
+                                ),
+                                "/workspace/series_state.json": _workspace_json(prior_state),
                                 "/workspace/current_episode_plan.md": plan.plan,
-                                "/workspace/current_episode_obligation.json": (
-                                    current_obligation.model_dump_json()
+                                "/workspace/current_episode_obligation.json": _workspace_json(
+                                    current_obligation
                                 ),
                                 "/workspace/candidate_episode.md": parsed.content,
-                                "/workspace/candidate_state_delta.json": (
-                                    parsed.state_delta.model_dump_json()
+                                "/workspace/candidate_state_delta.json": _workspace_json(
+                                    parsed.state_delta
                                 ),
-                                "/workspace/episode_review.json": review.model_dump_json(),
+                                "/workspace/episode_review.json": _workspace_json(review),
                                 **(
                                     {
-                                        "/workspace/suffix_rewrite_review.json": json.dumps(
+                                        "/workspace/suffix_rewrite_review.json": _workspace_json(
                                             suffix_feedback,
                                             ensure_ascii=False,
                                             sort_keys=True,
@@ -8540,7 +8563,7 @@ class StageGuardMiddleware(AgentMiddleware):
                                 ),
                                 **(
                                     {
-                                        "/workspace/repair_constraint_ledger.json": json.dumps(
+                                        "/workspace/repair_constraint_ledger.json": _workspace_json(
                                             [
                                                 item.model_dump(mode="json")
                                                 for item in applicable_repair_constraints
@@ -9058,11 +9081,7 @@ class DeepAgentWorkflow:
             ),
             "encoding": "utf-8",
         }
-        approved_json = json.dumps(
-            _approved_checkpoint_manifest(approved_checkpoints or {}),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        approved_json = _workspace_json(_approved_checkpoint_manifest(approved_checkpoints or {}))
         files["/workspace/approved-checkpoints.json"] = {
             "content": approved_json,
             "encoding": "utf-8",
