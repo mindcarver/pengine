@@ -1884,30 +1884,38 @@ class Worker:
                 candidate,
                 evidence,
             )
-            try:
-                candidate, evidence, outline = await self._repair_biography_projection(
-                    work,
-                    approved,
-                    original_candidate=original,
-                    repair_targets=repair_targets,
-                    persona_files=self._persona_files(work),
-                )
-            except Exception as exc:
-                await self.repository.fail_series_bible_projection_repair(
-                    work.run_id,
-                    failure_message=f"{type(exc).__name__}: {exc}",
-                )
-                logger.warning(
-                    "series bible projection repair failed run_id=%s candidate=%s error_type=%s",
-                    work.run_id,
-                    candidate.candidate_id,
-                    type(exc).__name__,
-                )
-                raise StageValidationError(
-                    "SeriesBible biography projection repair did not pass",
-                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
-                    safe_message="系列设计未通过确定性校验，未进入分集剧本生成。",
-                ) from exc
+            # The projection repair is a stochastic model call whose output is
+            # deterministically validated: one bad roll must not kill a whole
+            # season. Re-roll up to three attempts before failing terminally.
+            for _repair_attempt in range(3):
+                try:
+                    candidate, evidence, outline = await self._repair_biography_projection(
+                        work,
+                        approved,
+                        original_candidate=original,
+                        repair_targets=repair_targets,
+                        persona_files=self._persona_files(work),
+                    )
+                    break
+                except Exception as exc:
+                    await self.repository.fail_series_bible_projection_repair(
+                        work.run_id,
+                        failure_message=f"{type(exc).__name__}: {exc}",
+                    )
+                    logger.warning(
+                        "series bible projection repair failed run_id=%s candidate=%s "
+                        "error_type=%s attempt=%d",
+                        work.run_id,
+                        candidate.candidate_id,
+                        type(exc).__name__,
+                        _repair_attempt + 1,
+                    )
+                    if _repair_attempt == 2:
+                        raise StageValidationError(
+                            "SeriesBible biography projection repair did not pass",
+                            stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                            safe_message="系列设计未通过确定性校验，未进入分集剧本生成。",
+                        ) from exc
 
         if evidence.passed:
             if is_rebuild:
