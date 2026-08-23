@@ -1013,9 +1013,7 @@ async def test_worker_promotes_design_without_biography_coverage_at_boundary(
     assert active is not None
     assert active.status == "active"
     assert active.validation is not None and active.validation.passed
-    assert (
-        active.projections.character_biographies == "陌生人：合同角色都未出现在这份小传中。"
-    )
+    assert active.projections.character_biographies == "陌生人：合同角色都未出现在这份小传中。"
     candidates = await repository.get_run_series_bible_candidates(lease.run_id)
     assert len(candidates) == 1
     assert candidates[0].status == "active"
