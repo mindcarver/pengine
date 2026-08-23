@@ -53,7 +53,7 @@ _CONVERTIBLE_MEASURED_UNITS = {
     "小时": ("clock_duration_minutes", Decimal("60")),
     "毫米": ("length_millimeters", Decimal("1")),
     "厘米": ("length_millimeters", Decimal("10")),
-    "米": ("length_millimeters", Decimal("100")),
+    "米": ("length_millimeters", Decimal("1000")),
 }
 # A locked numeric fact is only checked where the screenplay restates it right
 # next to the fact subject, so a neighbouring character's number is never
