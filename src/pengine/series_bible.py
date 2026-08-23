@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -33,7 +32,6 @@ from pengine.continuity import (
     StableId,
     StoryContract,
     canonical_story_contract_payload,
-    character_label_base,
     render_story_contract_markdown,
     story_contract_sha256,
 )
@@ -408,54 +406,20 @@ def _schema_validation_issues(error: ValidationError) -> list[ValidationIssue]:
 def validate_series_bible(bible: SeriesBible) -> ValidationEvidence:
     """Deterministic universal plus genre-activated validation of one candidate.
 
-    Universal checks (schema, references, uniqueness, ordering, explicit
-    arithmetic, and projection consistency) always apply. Genre-activated rules
-    declared by the SeriesBible apply only when the candidate's genre activates
-    them; a general-genre idea is never rejected for missing mystery-only clues
-    or reveal mechanics.
+    Universal checks (schema) always apply. Genre-activated rules declared by
+    the SeriesBible apply only when the candidate's genre activates them; a
+    general-genre idea is never rejected for missing mystery-only clues or
+    reveal mechanics. Biography projection coverage is deliberately not checked
+    here: the constraint is enforced upstream by the outline-generation prompts,
+    and generation-time output is trusted (issue #222).
     """
     issues: list[ValidationIssue] = []
     try:
         StoryContract.model_validate(bible.content.story_contract.model_dump(mode="json"))
     except ValidationError as exc:
         issues.extend(_schema_validation_issues(exc))
-    issues.extend(_projection_issues(bible))
     issues.extend(_activated_rule_issues(bible))
     return ValidationEvidence(passed=not issues, issues=issues, validated_at=_utc_now())
-
-
-def _projection_issues(bible: SeriesBible) -> list[ValidationIssue]:
-    """Universal projection consistency: every projection belongs to one candidate.
-
-    A substantive biography projection (one that declares character definitions)
-    must cover the contract cast. Sparse or placeholder projections that declare
-    no names are treated as unspecified and are not rejected.
-    """
-    issues: list[ValidationIssue] = []
-    contract = bible.content.story_contract
-    biography = bible.content.character_biographies
-    substantive = "\n" in biography or "：" in biography or ":" in biography
-    if substantive:
-        base_counts = Counter(
-            character_label_base(character.name) for character in contract.characters
-        )
-        for character in contract.characters:
-            base = character_label_base(character.name)
-            covered = character.name in biography or (
-                bool(base)
-                and base != character.name
-                and base_counts[base] == 1
-                and base in biography
-            )
-            if not covered:
-                issues.append(
-                    ValidationIssue(
-                        code="projection_missing_biography",
-                        message="Projection does not include every contract character biography",
-                        refs=[character.character_id],
-                    )
-                )
-    return issues
 
 
 def _activated_rule_issues(bible: SeriesBible) -> list[ValidationIssue]:

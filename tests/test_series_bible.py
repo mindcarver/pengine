@@ -17,19 +17,12 @@ from test_continuity import make_contract
 from test_repository import (
     create_and_lease_initial,
     locked_outline_payload,
-    persist_succeeded_model_call,
     persist_succeeded_outline_review,
 )
 
-from pengine.agents import (
-    BiographyProjectionRepair,
-    CanonReviewerResult,
-    apply_biography_projection_repair,
-)
 from pengine.config import Settings
 from pengine.continuity import StoryContract, render_story_contract_markdown, story_contract_sha256
 from pengine.errors import DomainError
-from pengine.model_calls import ModelCallContext
 from pengine.personas import PersonaCatalog
 from pengine.repository import LeasedJob, Repository
 from pengine.schemas import CreateCreationRequest, InternalStage, PersonaSnapshot
@@ -42,7 +35,7 @@ from pengine.series_bible import (
     project_series_bible,
     validate_series_bible,
 )
-from pengine.worker import StageValidationError, Worker
+from pengine.worker import Worker
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 SNAPSHOT_HASH = "a" * 64
@@ -238,7 +231,8 @@ def test_universal_validation_rejects_broken_ordering() -> None:
         make_candidate(story_contract_payload=broken_timeline_order_payload())
 
 
-def test_universal_validation_rejects_projection_mismatch() -> None:
+def test_validation_accepts_projection_mismatch_by_doctrine() -> None:
+    """Biography coverage is enforced by generation prompts, not post-hoc (issue #222)."""
     candidate = build_series_bible(
         run_id="run-1",
         run_kind="initial",
@@ -252,131 +246,18 @@ def test_universal_validation_rejects_projection_mismatch() -> None:
         now=NOW,
     )
     evidence = validate_series_bible(candidate)
-    assert not evidence.passed
-    codes = {issue.code for issue in evidence.issues}
-    assert "projection_missing_biography" in codes
+    assert evidence.passed
+    assert {issue.code for issue in evidence.issues} == set()
 
 
-def test_biography_projection_repair_appends_only_exact_missing_targets() -> None:
-    existing = "### 林岚\n- 回乡调查旧案的主角。"
-    missing = [
-        {
-            "character_id": "lin_father",
-            "name": "林岚父亲",
-            "role": "已故父亲",
-        }
-    ]
-    repair = BiographyProjectionRepair.model_validate(
-        {
-            "stage": "generating_character_relationships",
-            "additions": [
-                {
-                    "character_id": "lin_father",
-                    "character_name": "林岚父亲",
-                    "markdown": "### 林岚父亲\n- 身份：已故父亲。",
-                }
-            ],
-        }
-    )
-
-    repaired = apply_biography_projection_repair(
-        existing,
-        repair,
-        missing_characters=missing,
-        output_language="zh-CN",
-    )
-
-    assert repaired == f"{existing}\n\n### 林岚父亲\n- 身份：已故父亲。"
-
-
-def test_biography_projection_repair_rejects_unbound_target() -> None:
-    repair = BiographyProjectionRepair.model_validate(
-        {
-            "stage": "generating_character_relationships",
-            "additions": [
-                {
-                    "character_id": "other_person",
-                    "character_name": "其他人",
-                    "markdown": "### 其他人\n- 未获授权。",
-                }
-            ],
-        }
-    )
-
-    with pytest.raises(ValueError, match="target_mismatch"):
-        apply_biography_projection_repair(
-            "### 林岚\n- 主角。",
-            repair,
-            missing_characters=[
-                {
-                    "character_id": "lin_father",
-                    "name": "林岚父亲",
-                    "role": "已故父亲",
-                }
-            ],
-            output_language="zh-CN",
-        )
-
-
-def test_projection_repair_does_not_activate_with_other_validation_issues() -> None:
+def test_projection_repair_retired_with_only_genre_rules_remaining() -> None:
     candidate = make_candidate(
         genre="mystery",
         biographies="陌生人：不属于合同角色。",
     )
     evidence = validate_series_bible(candidate)
 
-    assert {issue.code for issue in evidence.issues} == {
-        "projection_missing_biography",
-        "mystery_reveal_required",
-    }
-    assert Worker._repairable_biography_projection_targets(candidate, evidence) == []
-
-
-def test_projection_validation_matches_unique_annotated_character_label() -> None:
-    payload = make_contract_payload()
-    payload["characters"][0]["name"] = "林岚（主角）"
-    candidate = make_candidate(
-        biographies="林岚（现用名／主角）：回乡调查旧案的主角。",
-        story_contract_payload=payload,
-    )
-
-    assert validate_series_bible(candidate).passed
-
-
-def test_projection_validation_requires_exact_label_when_bases_collide() -> None:
-    payload = make_contract_payload()
-    payload["characters"][0]["name"] = "林岚（青年）"
-    payload["characters"].append(
-        {
-            "character_id": "lin_lan_elder",
-            "name": "林岚（老年）",
-            "role": "多年后的调查者",
-            "initial_known_fact_ids": [],
-        }
-    )
-    payload["timeline"][0]["participant_ids"].append("lin_lan_elder")
-    payload["knowledge_states"].append(
-        {
-            "episode_number": 1,
-            "character_id": "lin_lan_elder",
-            "known_fact_ids": [fact["fact_id"] for fact in payload["facts"]],
-        }
-    )
-    candidate = make_candidate(
-        biographies="林岚（青年）：回乡调查旧案。",
-        story_contract_payload=payload,
-    )
-
-    evidence = validate_series_bible(candidate)
-
-    assert not evidence.passed
-    missing_refs = {
-        reference
-        for issue in evidence.issues
-        if issue.code == "projection_missing_biography"
-        for reference in issue.refs
-    }
-    assert missing_refs == {"lin_lan_elder"}
+    assert {issue.code for issue in evidence.issues} == {"mystery_reveal_required"}
 
 
 def test_genre_activation_never_rejects_general_idea_for_missing_clues() -> None:
@@ -690,7 +571,10 @@ def _outline_with_missing_father_biography() -> tuple[StoryContract, dict]:
     }
 
 
-async def _approve_missing_biography_design(repository: Repository, run_id) -> dict:
+async def _approve_missing_biography_design(
+    repository: Repository,
+    run_id,
+) -> tuple[dict, str]:
     _contract, outline = _outline_with_missing_father_biography()
     payloads = {
         InternalStage.SELECTING_L0_VARIANT: {
@@ -722,51 +606,16 @@ async def _approve_missing_biography_design(repository: Repository, run_id) -> d
             ),
             now=NOW,
         )
-    return {stage: dict(payload) for stage, payload in payloads.items()}
+    return {stage: dict(payload) for stage, payload in payloads.items()}, initial_review_call_id
 
 
-class ProjectionRepairWorkflow:
-    def __init__(self, *, pass_review: bool = True) -> None:
-        self.pass_review = pass_review
-        self.repair_calls = 0
-        self.review_calls = 0
+class RetirementSentinelWorkflow:
+    """Fails the test if any repair machinery is ever invoked again (issue #222)."""
 
-    async def repair_missing_biographies(self, **kwargs):
-        self.repair_calls += 1
-        return BiographyProjectionRepair.model_validate(
-            {
-                "stage": "generating_character_relationships",
-                "additions": [
-                    {
-                        "character_id": character["character_id"],
-                        "character_name": character["name"],
-                        "markdown": (f"### {character['name']}\n- 身份：{character['role']}。"),
-                    }
-                    for character in kwargs["missing_characters"]
-                ],
-            }
-        )
-
-    async def review_repaired_series_bible(self, **_kwargs):
-        self.review_calls += 1
-        return CanonReviewerResult(
-            passed=self.pass_review,
-            evidence=("最终设计复审通过。" if self.pass_review else "补丁引入新的硬冲突。"),
-            issues=(
-                []
-                if self.pass_review
-                else [
-                    {
-                        "code": "repair_conflict",
-                        "message": "补丁引入新的硬冲突。",
-                        "contract_refs": ["lin_father"],
-                        "script_excerpt": "新增人物小传。",
-                        "contract_mutation_required": False,
-                        "repair_targets": [],
-                    }
-                ]
-            ),
-        )
+    def __getattr__(self, name: str):
+        if name in {"repair_missing_biographies", "review_repaired_series_bible"}:
+            raise AssertionError(f"retired repair method was invoked: {name}")
+        raise AttributeError(name)
 
 
 async def test_worker_sync_promotes_one_active_series_bible(tmp_path: Path) -> None:
@@ -797,146 +646,41 @@ async def test_worker_sync_promotes_one_active_series_bible(tmp_path: Path) -> N
     assert lineage is not None and lineage["active_design_epoch"] == 1
 
 
-async def test_worker_repairs_missing_biography_once_before_promotion(
+async def test_worker_promotes_design_with_missing_biographies_without_repair(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    settings, repository, worker = _make_worker(tmp_path)
+    """A contract cast member without a biography no longer blocks promotion.
+
+    The biography-coverage constraint moved into the outline-generation prompts
+    (issue #222): post-generation deterministic gating and the repair workflow
+    are retired, and generation output is trusted.
+    """
+    _settings, repository, worker = _make_worker(tmp_path)
     await repository.initialize()
     _accepted, lease = await create_and_lease(repository)
     await repository.mark_run_running(lease.run_id, now=NOW)
-    approved = await _approve_missing_biography_design(repository, lease.run_id)
-    generation_call_id = persist_succeeded_model_call(
-        repository,
-        call_id="biography-repair-generation",
-        role="generation",
-        context=ModelCallContext(
-            run_id=str(lease.run_id),
-            stage=InternalStage.GENERATING_EPISODE_OUTLINE.value,
-            operation_id="biography-repair-operation",
-        ),
-    ).call_id
-    review_call_id = persist_succeeded_model_call(
-        repository,
-        call_id="biography-repair-review",
-        role="review",
-        context=ModelCallContext(
-            run_id=str(lease.run_id),
-            stage=InternalStage.GENERATING_EPISODE_OUTLINE.value,
-            operation_id="biography-review-operation",
-        ),
-    ).call_id
-    workflow = ProjectionRepairWorkflow()
-    worker.workflow = workflow
+    approved, review_call_id = await _approve_missing_biography_design(repository, lease.run_id)
+    worker.workflow = RetirementSentinelWorkflow()
     monkeypatch.setattr(worker, "_persona_files", lambda _work: {})
-
-    async def require_call_id(**kwargs):
-        return generation_call_id if kwargs["role"] == "generation" else review_call_id
-
-    monkeypatch.setattr(worker, "_require_physical_call_id", require_call_id)
     work = await repository.get_run_work_item(lease.run_id)
 
     await worker._sync_series_bible(work, approved)
 
     active = await repository.get_run_series_bible(lease.run_id)
     assert active is not None and active.status == "active"
-    assert active.projections.character_biographies.startswith(
-        "### 林岚\n- 回乡调查旧案的主角。\n\n"
-    )
-    assert "### 林岚父亲" in active.projections.character_biographies
+    assert active.projections.character_biographies == "### 林岚\n- 回乡调查旧案的主角。"
     assert active.validation is not None and active.validation.passed
     assert active.global_review is not None
     assert active.global_review.review_call_id == review_call_id
-    assert workflow.repair_calls == 1
-    assert workflow.review_calls == 1
-
-    candidates = await repository.get_run_series_bible_candidates(lease.run_id)
-    assert len(candidates) == 2
-    invalid = next(
-        candidate for candidate in candidates if candidate.candidate_id != active.candidate_id
-    )
-    assert invalid.status == "stale"
-    assert invalid.validation is not None and not invalid.validation.passed
-    assert invalid.validation.issues[0].refs == ["lin_father"]
-    repair = await repository.get_series_bible_projection_repair(lease.run_id)
-    assert repair is not None and repair["status"] == "applied"
-    assert repair["generation_call_id"] == generation_call_id
-    assert repair["review_call_id"] == review_call_id
-    checkpoints = await repository.get_business_checkpoints(lease.run_id)
-    repaired_character = checkpoints[InternalStage.GENERATING_CHARACTER_RELATIONSHIPS]
-    assert repaired_character["character_biographies"] == active.projections.character_biographies
-    repaired_outline = checkpoints[InternalStage.GENERATING_EPISODE_OUTLINE]
-    assert repaired_outline["projection_repair"]["repaired_content_hash"] == active.content_hash
-    assert await repository.get_episode_drafts(lease.run_id) == []
-
-    restarted_work = await repository.get_run_work_item(lease.run_id)
-    await worker._sync_series_bible(restarted_work, dict(restarted_work.business_checkpoints))
-    assert workflow.repair_calls == 1
-    assert workflow.review_calls == 1
-    assert len(await repository.get_run_series_bible_candidates(lease.run_id)) == 2
-
-
-async def test_worker_fails_closed_when_biography_repair_review_rejects(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    _settings, repository, worker = _make_worker(tmp_path)
-    await repository.initialize()
-    _accepted, lease = await create_and_lease(repository)
-    await repository.mark_run_running(lease.run_id, now=NOW)
-    approved = await _approve_missing_biography_design(repository, lease.run_id)
-    generation_call_id = persist_succeeded_model_call(
-        repository,
-        call_id="rejected-biography-generation",
-        role="generation",
-        context=ModelCallContext(
-            run_id=str(lease.run_id),
-            stage=InternalStage.GENERATING_EPISODE_OUTLINE.value,
-            operation_id="rejected-biography-generation-operation",
-        ),
-    ).call_id
-    review_call_id = persist_succeeded_model_call(
-        repository,
-        call_id="rejected-biography-review",
-        role="review",
-        context=ModelCallContext(
-            run_id=str(lease.run_id),
-            stage=InternalStage.GENERATING_EPISODE_OUTLINE.value,
-            operation_id="rejected-biography-review-operation",
-        ),
-    ).call_id
-    workflow = ProjectionRepairWorkflow(pass_review=False)
-    worker.workflow = workflow
-    monkeypatch.setattr(worker, "_persona_files", lambda _work: {})
-
-    async def require_call_id(**kwargs):
-        return generation_call_id if kwargs["role"] == "generation" else review_call_id
-
-    monkeypatch.setattr(worker, "_require_physical_call_id", require_call_id)
-    work = await repository.get_run_work_item(lease.run_id)
-
-    with pytest.raises(StageValidationError):
-        await worker._sync_series_bible(work, approved)
-
-    assert await repository.get_run_series_bible(lease.run_id) is None
-    assert await repository.get_episode_drafts(lease.run_id) == []
-    repair = await repository.get_series_bible_projection_repair(lease.run_id)
-    assert repair is not None and repair["status"] == "failed"
     candidates = await repository.get_run_series_bible_candidates(lease.run_id)
     assert len(candidates) == 1
-    with pytest.raises(DomainError) as exhausted:
-        await repository.reserve_series_bible_projection_repair(
-            lease.run_id,
-            original_candidate_id=candidates[0].candidate_id,
-            target_character_ids=["lin_father"],
-            validation=candidates[0].validation,
-        )
-    assert exhausted.value.code == "series_bible_projection_repair_exhausted"
     checkpoints = await repository.get_business_checkpoints(lease.run_id)
     biographies = checkpoints[InternalStage.GENERATING_CHARACTER_RELATIONSHIPS][
         "character_biographies"
     ]
     assert biographies == "### 林岚\n- 回乡调查旧案的主角。"
+    assert await repository.get_episode_drafts(lease.run_id) == []
 
 
 async def test_worker_sync_is_idempotent_across_restart(tmp_path: Path) -> None:

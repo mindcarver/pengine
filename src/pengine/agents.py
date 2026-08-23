@@ -473,6 +473,13 @@ _STORY_ARCHITECT_PROMPT = (
     "character_biographies and relationship_logic and leave every other field null; "
     "use the approved L0 facet to establish the character and relationship pressures required "
     "by this persona; "
+    "character_biographies is the complete cast authority for the whole season: cover "
+    "every named character in the approved story outline, and also every secondary "
+    "character a full-season episode outline will plausibly need as a recurring named "
+    "participant (family members, neighbours, messengers, colleagues, the antagonist's "
+    "agents), each with exactly one biography section. The episode outline is forbidden "
+    "from adding new cast members, so an omitted biography removes that character from "
+    "the season entirely; "
     "the two fields are one mutually consistent package, so reconcile every "
     "character identity, age, alias, motive, secret, family and relationship "
     "direction, and causal logic across both before returning, and preserve only "
@@ -511,7 +518,11 @@ _EPISODE_PLANNER_PROMPT = (
     "Compile the same hard-Canon facts into "
     "story_contract. Use unique lowercase snake_case IDs "
     "and a closed cast; every relationship, timeline participant, and knowledge entry "
-    "must reference that cast. Use ISO dates/times. Numeric facts require exact decimal "
+    "must reference that cast. Every cast member must be a named character with an "
+    "existing biography section in /workspace/character_biographies.md; never declare "
+    "a new named character here, and never give a biography-less participant a "
+    "character ID — such participants stay descriptive prose mentions. Use ISO "
+    "dates/times. Numeric facts require exact decimal "
     "values and explicit units; the same literal may appear in distinct facts when their "
     "meanings differ. Timeline order must be contiguous from 1. Knowledge states are sparse "
     "cumulative snapshots: include an entry only when a character's knowledge changes; "
@@ -1403,65 +1414,6 @@ class StoryArtifactRepairPatch(StrictModel):
         if len(self.model_dump_json()) > 12_000:
             raise ValueError("Story artifact repair patch cannot exceed 12000 characters")
         return self
-
-
-class MissingBiographyAddition(StrictModel):
-    character_id: StableId
-    character_name: NonEmptyText
-    markdown: NonEmptyText = Field(
-        max_length=4_000,
-        description=(
-            "One complete Markdown biography section for exactly one missing contract "
-            "character. Do not repeat or rewrite existing biographies."
-        ),
-    )
-
-
-class BiographyProjectionRepair(StrictModel):
-    stage: Literal["generating_character_relationships"]
-    additions: list[MissingBiographyAddition] = Field(min_length=1, max_length=8)
-
-    @model_validator(mode="after")
-    def validate_unique_targets(self) -> "BiographyProjectionRepair":
-        ids = [addition.character_id for addition in self.additions]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Biography repair character IDs must be unique")
-        return self
-
-
-def apply_biography_projection_repair(
-    biographies: str,
-    repair: BiographyProjectionRepair,
-    *,
-    missing_characters: Sequence[Mapping[str, Any]],
-    output_language: OutputLanguage | None = None,
-) -> str:
-    """Append only the exact missing contract biographies authorized by validation."""
-    expected = {
-        str(character["character_id"]): str(character["name"]) for character in missing_characters
-    }
-    received = {addition.character_id: addition.character_name for addition in repair.additions}
-    if received != expected:
-        raise ValueError("biography_projection_repair_target_mismatch")
-
-    additions_by_id = {addition.character_id: addition for addition in repair.additions}
-    rendered: list[str] = []
-    for character in missing_characters:
-        character_id = str(character["character_id"])
-        addition = additions_by_id[character_id]
-        section = addition.markdown.strip()
-        if addition.character_name not in section:
-            raise ValueError("biography_projection_repair_name_missing")
-        if addition.character_name in biographies:
-            raise ValueError("biography_projection_repair_target_already_present")
-        if has_obvious_language_mismatch(
-            section,
-            output_language,
-            english_dominance_ratio=4.0,
-        ):
-            raise ValueError("biography_projection_repair_language_mismatch")
-        rendered.append(section)
-    return f"{biographies}\n\n" + "\n\n".join(rendered)
 
 
 class OutlineJsonEdit(StrictModel):
@@ -2469,7 +2421,10 @@ async def _invoke_outline_group_markdown(
             "one "
             "level-two heading `## 第N集` for every episode in the authoritative current_group "
             "range, in order, followed by that episode's complete concrete outline. Lower-level "
-            "Markdown headings are allowed inside an episode."
+            "Markdown headings are allowed inside an episode. Named recurring participants must "
+            "be characters with a biography in the approved character_biographies component; "
+            "keep biography-less participants as unnamed descriptive mentions (a courier, the "
+            "neighbour) and never assign them character IDs."
         )
         if parse_error is not None:
             instruction += (
@@ -2591,7 +2546,10 @@ async def _invoke_outline_group_sidecar(
             "Markdown. Do not return or repeat group coordinates, Markdown, readable "
             "content, or episode plans. Every fact reveal and obligation must bind the "
             "episode where it is established in the fixed Markdown. Preserve committed "
-            "IDs and declare any new named character exactly once."
+            "IDs. Never declare a new named character in character_introductions: only "
+            "characters with an approved biography in the character_biographies component "
+            "are cast-eligible, and biography-less participants stay as prose without "
+            "character IDs, timeline participant references, or knowledge states."
         )
         if output_language_contract:
             system_prompt = f"{system_prompt}\n{output_language_contract}"
@@ -8736,102 +8694,6 @@ class DeepAgentWorkflow:
     def episode_script_thread_id(thread_id: str, series_bible_candidate_id: str) -> str:
         return f"{thread_id}:episode-scripts:{series_bible_candidate_id}"
 
-    async def repair_missing_biographies(
-        self,
-        *,
-        current_biographies: str,
-        relationship_logic: str,
-        story_outline: str,
-        missing_characters: Sequence[Mapping[str, Any]],
-        contract_context: Mapping[str, Any],
-        persona_files: Mapping[str, str],
-        output_language: OutputLanguage | None,
-    ) -> BiographyProjectionRepair:
-        prompt = (
-            "Repair one deterministic SeriesBible projection failure. Return exactly one "
-            "BiographyProjectionRepair tool call. Produce one concise Markdown biography "
-            "section for every supplied missing character and no other character. Use the exact "
-            "character_id and character_name. Derive content only from the approved story "
-            "outline, current relationship logic, supplied contract context, and persona rules. "
-            "Do not invent ages, dates, amounts, motives, secrets, actions, or relationships. "
-            "Do not repeat, summarize, or rewrite any existing biography."
-        )
-        if output_language == "zh-CN":
-            prompt += " Write every biography section in Simplified Chinese."
-        response = await self.generation_model.with_structured_output(
-            BiographyProjectionRepair,
-            method="function_calling",
-        ).ainvoke(
-            [
-                {"role": "system", "content": prompt},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "current_biographies": current_biographies,
-                            "relationship_logic": relationship_logic,
-                            "story_outline": story_outline,
-                            "missing_characters": list(missing_characters),
-                            "contract_context": contract_context,
-                            "persona": {
-                                path: value
-                                for path, value in persona_files.items()
-                                if path == "/persona/l0.md"
-                                or path.endswith("/generating_character_relationships.md")
-                            },
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                },
-            ]
-        )
-        return BiographyProjectionRepair.model_validate(response)
-
-    async def review_repaired_series_bible(
-        self,
-        *,
-        original_biographies: str,
-        repaired_biographies: str,
-        target_character_ids: Sequence[str],
-        candidate: Mapping[str, Any],
-        output_language: OutputLanguage | None,
-    ) -> CanonReviewerResult:
-        prompt = (
-            "Perform the final Canon review of one deterministically repaired SeriesBible. "
-            "The only authorized delta is appending biographies for the supplied target "
-            "character IDs. Verify that the original biography prefix is byte-for-byte "
-            "unchanged, every target now has exactly one biography, no non-target character was "
-            "added, and the added text introduces no contradiction with the complete final "
-            "SeriesBible. Review the complete candidate, not merely the patch. Fail on any hard "
-            "Canon, schema, projection, relationship, fact, timeline, knowledge-state, clue, or "
-            "episode-obligation contradiction. Return structured data only."
-        )
-        if output_language == "zh-CN":
-            prompt += " Return evidence in Simplified Chinese."
-        response = await self.review_model.with_structured_output(
-            CanonReviewerResult,
-            method="function_calling",
-        ).ainvoke(
-            [
-                {"role": "system", "content": prompt},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "authorized_target_character_ids": list(target_character_ids),
-                            "original_biographies": original_biographies,
-                            "repaired_biographies": repaired_biographies,
-                            "final_series_bible": candidate,
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                },
-            ]
-        )
-        return CanonReviewerResult.model_validate(response)
-
     async def plan_quality_repair(
         self,
         *,
@@ -9206,9 +9068,13 @@ class DeepAgentWorkflow:
                 "natural screenplay-generation groups from dramatic action, reveal, time/place, "
                 "relationship turn, suspense objective, or phase boundary. Every group must "
                 "contain 1 to 4 episodes, continuously cover the season, and never cross a "
-                "review milestone. Do not use a fixed-size batching pattern. Define the core "
-                "cast, relationships, prohibitions, milestones, and group boundaries only; "
-                "supporting named characters may be introduced by their owning outline group. Do "
+                "review milestone. Do not use a fixed-size batching pattern. Define the "
+                "complete cast, relationships, prohibitions, milestones, and group boundaries "
+                "only. The approved character_biographies component is the cast authority: "
+                "declare every named character that has a biography section there — including "
+                "secondary recurring characters — and no one else; outline groups may never "
+                "introduce a new named character, so a cast member omitted here cannot appear "
+                "in the season as a continuity-bearing character. Do "
                 "not write per-episode plans, facts, timeline events, clues, obligations, or "
                 "screenplay. Keep initial_known_fact_ids empty; detailed facts are generated by "
                 "their owning outline group. Use stable lowercase snake_case IDs."

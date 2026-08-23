@@ -1659,6 +1659,57 @@ async def test_retry_run_revives_external_relay_failure_and_requeues_the_same_th
     assert resumed.thread_id == lease.thread_id
 
 
+async def test_retry_run_revives_stage_validation_failure_with_durable_outline(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    """A stage_validation_failed run keeps its approved checkpoints and can requeue.
+
+    The outline checkpoint is durable and the worker re-enters the sync through
+    the restart-recovery path, so an operator may revive the run after fixing the
+    validation cause instead of regenerating the whole outline (issue #222).
+    """
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        {
+            "stage": "selecting_l0_variant",
+            "selected_l0_variant": "主动选择",
+            "selection_rationale": "符合测试故事。",
+        },
+        now=NOW,
+    )
+    await repository.record_stage_attempt(
+        lease.run_id, InternalStage.GENERATING_STORY_OUTLINE, now=NOW
+    )
+    await repository.fail_run(
+        lease.run_id,
+        RunFailure(
+            code="stage_validation_failed",
+            message="SeriesBible biography projection repair did not pass.",
+            failed_stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            attempt_count=1,
+        ),
+        now=NOW,
+    )
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.state == "failed"
+    assert failed.initial.progress.can_retry is True
+
+    revived = await repository.retry_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-stage-validation",
+        now=NOW + timedelta(seconds=10),
+    )
+    assert revived.run_state == "queued"
+    checkpoints = await repository.get_business_checkpoints(lease.run_id)
+    assert checkpoints[InternalStage.SELECTING_L0_VARIANT]["selected_l0_variant"] == "主动选择"
+
+
 async def test_retry_run_rejects_running_and_non_external_failures(
     repository,
     persona,

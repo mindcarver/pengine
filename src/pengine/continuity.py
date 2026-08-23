@@ -55,18 +55,9 @@ _CONVERTIBLE_MEASURED_UNITS = {
     "厘米": ("length_millimeters", Decimal("10")),
     "米": ("length_millimeters", Decimal("1000")),
 }
-_CHARACTER_LABEL_QUALIFIER = re.compile(r"\s*[（(][^）)\r\n]{1,40}[）)]\s*$")
 # A locked numeric fact is only checked where the screenplay restates it right
 # next to the fact subject, so a neighbouring character's number is never
 # mistaken for this fact's value.
-
-
-def character_label_base(label: str) -> str:
-    """Return a display label without trailing role or state qualifiers."""
-    base = label.strip()
-    while match := _CHARACTER_LABEL_QUALIFIER.search(base):
-        base = base[: match.start()].rstrip()
-    return base
 
 
 class ContinuityModel(BaseModel):
