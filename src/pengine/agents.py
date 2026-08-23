@@ -9291,7 +9291,9 @@ class DeepAgentWorkflow:
             story=story,
             requirements=requirements,
             feedback=feedback,
-            approved_json=approved_json,
+            approved_json=_workspace_json(
+                _supervisor_routing_manifest(approved_checkpoints or {})
+            ),
             language_contract=output_language_contract,
         )
 
@@ -9656,6 +9658,31 @@ class DeepAgentWorkflow:
             except Exception as exc:
                 raise AgentProtocolError("Supervisor returned invalid completion output") from exc
         return _workflow_result_from_checkpoints(approved_payloads, feedback=feedback)
+
+
+def _supervisor_routing_manifest(
+    approved: Mapping[InternalStage, Any],
+) -> dict[str, Any]:
+    """Routing-only metadata for the supervisor prompt.
+
+    The supervisor delegates missing stages and must not re-delegate approved
+    ones, so it needs stage names and their top-level shape — never payload
+    content. An 80-episode outline payload (full Markdown, per-episode plans,
+    complete story contract) is hundreds of thousands of tokens; embedding it
+    in the system prompt blocks the routing call at context preflight (issue
+    #224). Content stays available to specialist subagents through
+    /workspace/approved-checkpoints.json and the canonical /workspace files.
+    """
+    manifest: dict[str, Any] = {}
+    for stage, payload in approved.items():
+        if isinstance(payload, Mapping):
+            entry: dict[str, Any] = {"keys": sorted(str(key) for key in payload)}
+            if "episode_count" in payload:
+                entry["episode_count"] = payload["episode_count"]
+            manifest[stage.value] = entry
+        else:
+            manifest[stage.value] = {"type": type(payload).__name__}
+    return manifest
 
 
 def _supervisor_prompt(
