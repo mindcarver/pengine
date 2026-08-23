@@ -110,6 +110,7 @@ from pengine.agents import (
     _successful_required_reads,
     _suffix_rewrite_feedback_for_episode,
     _supervisor_prompt,
+    _supervisor_routing_manifest,
     _validate_group_projection_repair_patch,
     _validate_outline_repair_patch_targets,
     _validate_result_language,
@@ -6727,6 +6728,49 @@ def test_supervisor_uses_canonical_workspace_as_the_only_approved_fact_source() 
     assert "Do not restate, summarize, or newly declare approved story facts" in normalized
     assert "exactly one downstream authority" in normalized
     assert "current canonical /workspace files" in normalized
+
+
+def test_supervisor_routing_manifest_excludes_payload_content() -> None:
+    """The supervisor prompt must stay routing-sized for 80-episode designs (#224)."""
+    outline_payload = {
+        "stage": "generating_episode_outline",
+        "content": "第1集 " + "很长的正文。" * 20_000,
+        "episode_count": 80,
+        "episodes": [{"episode_number": number, "plan": "情节 " * 200} for number in range(1, 81)],
+        "story_contract": {"facts": [{"fact_id": f"fact_{index}"} for index in range(500)]},
+        "script_generation_groups": [{"group_id": f"group_{index}"} for index in range(24)],
+    }
+
+    manifest = _supervisor_routing_manifest(
+        {
+            InternalStage.SELECTING_L0_VARIANT: {"selected_l0_variant": "归返"},
+            InternalStage.GENERATING_EPISODE_OUTLINE: outline_payload,
+        }
+    )
+
+    assert manifest["generating_episode_outline"] == {
+        "keys": [
+            "content",
+            "episode_count",
+            "episodes",
+            "script_generation_groups",
+            "stage",
+            "story_contract",
+        ],
+        "episode_count": 80,
+    }
+    assert manifest["selecting_l0_variant"] == {"keys": ["selected_l0_variant"]}
+    serialized = json.dumps(manifest, ensure_ascii=False)
+    assert "很长的正文" not in serialized
+    assert "情节" not in serialized
+    assert "fact_499" not in serialized
+    prompt = _supervisor_prompt(
+        story="故事",
+        requirements="八十集",
+        feedback=None,
+        approved_json=json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+    )
+    assert len(prompt) < 20_000
 
 
 @pytest.mark.asyncio
