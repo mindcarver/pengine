@@ -308,7 +308,7 @@ def persist_succeeded_outline_review(
 
 
 async def test_initialize_enables_wal_foreign_keys_and_domain_tables(repository) -> None:
-    assert SCHEMA_VERSION == 31
+    assert SCHEMA_VERSION == 32
     async with repository._connection() as connection:
         failure_columns = await (
             await connection.execute("PRAGMA table_info(outline_markdown_failures)")
@@ -377,6 +377,7 @@ async def test_schema_v24_to_v25_adds_episode_generation_windows(repository) -> 
         await connection.execute("DELETE FROM pengine_schema WHERE version = 29")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 30")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 31")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 32")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -407,6 +408,7 @@ async def test_schema_v25_to_v26_adds_script_context_audit_columns(repository) -
         await connection.execute("DELETE FROM pengine_schema WHERE version = 29")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 30")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 31")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 32")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -431,6 +433,7 @@ async def test_schema_v26_to_v27_adds_grouped_outline_tables(repository) -> None
         await connection.execute("DELETE FROM pengine_schema WHERE version = 29")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 30")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 31")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 32")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -463,6 +466,7 @@ async def test_schema_v27_to_v28_adds_plaintext_sidecar_columns(repository) -> N
         await connection.execute("DELETE FROM pengine_schema WHERE version = 29")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 30")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 31")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 32")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -526,6 +530,7 @@ async def test_schema_v28_to_v29_preserves_legacy_committed_outline_groups(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 29")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 30")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 31")
+        await connection.execute("DELETE FROM pengine_schema WHERE version = 32")
         await connection.commit()
 
     restarted = Repository(repository.database_path)
@@ -916,7 +921,7 @@ async def test_schema_v18_migrates_episode_attempts_to_cycle_zero(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
 
     await repository.initialize()
@@ -969,7 +974,7 @@ async def test_schema_v19_to_v20_adds_identity_evidence_and_pause_reason(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
 
     await repository.initialize()
@@ -2113,7 +2118,8 @@ async def test_schema_v3_migrates_legacy_quality_rejection_without_changing_draf
             DELETE FROM pengine_schema WHERE version = 20;
             DELETE FROM pengine_schema WHERE version = 21;
             DELETE FROM pengine_schema WHERE version = 22;
-                DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31);
+                DELETE FROM pengine_schema
+                WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32);
             ALTER TABLE creations DROP COLUMN output_language;
             """
         )
@@ -2981,7 +2987,7 @@ async def test_schema_v6_recovers_legacy_failed_episode_without_replacing_drafts
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
@@ -3035,7 +3041,7 @@ async def test_schema_v7_creation_is_backfilled_to_chinese_output_language(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
@@ -3088,7 +3094,7 @@ async def test_schema_v8_migration_resumes_when_column_already_exists(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.execute(
             "UPDATE creations SET output_language = NULL WHERE id = ?",
@@ -3170,7 +3176,8 @@ async def test_schema_v8_content_rejections_migrate_without_losing_rows(
             DELETE FROM pengine_schema WHERE version = 20;
             DELETE FROM pengine_schema WHERE version = 21;
             DELETE FROM pengine_schema WHERE version = 22;
-                DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31);
+                DELETE FROM pengine_schema
+                WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32);
             """
         )
         await connection.commit()
@@ -3342,7 +3349,8 @@ async def test_schema_v9_repair_limits_migrate_without_losing_pause(
             DELETE FROM pengine_schema WHERE version = 20;
             DELETE FROM pengine_schema WHERE version = 21;
             DELETE FROM pengine_schema WHERE version = 22;
-                DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31);
+                DELETE FROM pengine_schema
+                WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32);
             """
         )
         await connection.commit()
@@ -3461,7 +3469,7 @@ async def test_schema_v1_database_is_backfilled_without_losing_creation(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
@@ -3522,7 +3530,7 @@ async def test_schema_v2_database_migrates_to_current_schema_idempotently(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.execute("DROP TABLE quality_gate_rejections")
@@ -3611,7 +3619,7 @@ async def test_schema_v4_recovery_rows_gain_the_timeout_reason_without_losing_dr
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.execute("ALTER TABLE creations DROP COLUMN output_language")
         await connection.commit()
@@ -3675,7 +3683,7 @@ async def test_schema_v10_to_v11_preserves_run_progress_and_model_calls(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.commit()
 
@@ -3726,7 +3734,7 @@ async def test_schema_v20_to_v21_adds_l3_audit_columns_without_changing_old_rows
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.commit()
 
@@ -3785,7 +3793,7 @@ async def test_schema_v21_to_v22_adds_nullable_delivery_presentation(
         await connection.execute("ALTER TABLE deliveries DROP COLUMN presentation_manifest_sha256")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.commit()
 
@@ -3825,7 +3833,7 @@ async def test_schema_v17_to_v18_adds_hidden_model_call_provenance(repository) -
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.commit()
 
@@ -3857,7 +3865,7 @@ async def test_schema_v18_collision_repairs_missing_model_call_provenance(reposi
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.commit()
 
@@ -3916,7 +3924,7 @@ async def test_schema_v18_collision_repairs_missing_episode_attempt_cycles(
         await connection.execute("DELETE FROM pengine_schema WHERE version = 21")
         await connection.execute("DELETE FROM pengine_schema WHERE version = 22")
         await connection.execute(
-            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31)"
+            "DELETE FROM pengine_schema WHERE version IN (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)"
         )
         await connection.commit()
 

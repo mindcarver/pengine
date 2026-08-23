@@ -98,7 +98,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 # Failure codes an operator can fix outside Pengine (relay quota, availability,
@@ -1171,6 +1171,44 @@ CREATE INDEX IF NOT EXISTS outline_group_rejections_run
 ON outline_group_rejections(run_id, group_id, rejected_at);
 
 INSERT OR IGNORE INTO pengine_schema(version) VALUES (31);
+"""
+
+_SCHEMA_V32_PROJECTION_REPAIR_ATTEMPTS_SQL = """
+CREATE TABLE IF NOT EXISTS series_bible_projection_repairs_v32 (
+    run_id TEXT NOT NULL,
+    original_candidate_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    target_character_ids_json TEXT NOT NULL,
+    validation_json TEXT NOT NULL,
+    original_checkpoint_sha256 TEXT,
+    repaired_checkpoint_sha256 TEXT,
+    repaired_content_hash TEXT,
+    generation_call_id TEXT,
+    review_call_id TEXT,
+    failure_message TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (run_id)
+);
+
+INSERT INTO series_bible_projection_repairs_v32(
+    run_id, original_candidate_id, status, target_character_ids_json,
+    validation_json, original_checkpoint_sha256, repaired_checkpoint_sha256,
+    repaired_content_hash, generation_call_id, review_call_id,
+    failure_message, created_at, completed_at
+)
+SELECT
+    run_id, original_candidate_id, status, target_character_ids_json,
+    validation_json, original_checkpoint_sha256, repaired_checkpoint_sha256,
+    repaired_content_hash, generation_call_id, review_call_id,
+    failure_message, created_at, completed_at
+FROM series_bible_projection_repairs;
+
+DROP TABLE series_bible_projection_repairs;
+ALTER TABLE series_bible_projection_repairs_v32 RENAME TO series_bible_projection_repairs;
+
+INSERT OR IGNORE INTO pengine_schema(version) VALUES (32);
 """
 
 _SCHEMA_V27_GROUPED_OUTLINE_SQL = """
@@ -2466,6 +2504,16 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 31
+            if schema_version == 31:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.executescript(_SCHEMA_V32_PROJECTION_REPAIR_ATTEMPTS_SQL)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 32
 
     async def setup(self) -> None:
         await self.initialize()
@@ -4906,15 +4954,30 @@ class Repository:
                 raise DomainError("run_not_running", "Workflow run is not running.", 409)
             existing = await self._fetchone(
                 connection,
-                "SELECT status FROM series_bible_projection_repairs WHERE run_id = ?",
+                """
+                SELECT status, attempt_count FROM series_bible_projection_repairs
+                WHERE run_id = ?
+                """,
                 (str(run_id),),
             )
             if existing is not None:
-                raise DomainError(
-                    "series_bible_projection_repair_exhausted",
-                    "This run already consumed its SeriesBible projection repair budget.",
-                    409,
+                attempts_used = int(existing["attempt_count"] or 1)
+                if existing["status"] != "failed" or attempts_used >= 3:
+                    raise DomainError(
+                        "series_bible_projection_repair_exhausted",
+                        "This run already consumed its SeriesBible projection repair budget.",
+                        409,
+                    )
+                await connection.execute(
+                    """
+                    UPDATE series_bible_projection_repairs
+                    SET status = 'reserved', attempt_count = ?,
+                        failure_message = NULL, completed_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (attempts_used + 1, timestamp, str(run_id)),
                 )
+                return
             candidate = await self._fetchone(
                 connection,
                 """
