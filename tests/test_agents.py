@@ -6736,9 +6736,7 @@ def test_supervisor_routing_manifest_excludes_payload_content() -> None:
         "stage": "generating_episode_outline",
         "content": "第1集 " + "很长的正文。" * 20_000,
         "episode_count": 80,
-        "episodes": [
-            {"episode_number": number, "plan": "情节 " * 200} for number in range(1, 81)
-        ],
+        "episodes": [{"episode_number": number, "plan": "情节 " * 200} for number in range(1, 81)],
         "story_contract": {"facts": [{"fact_id": f"fact_{index}"} for index in range(500)]},
         "script_generation_groups": [{"group_id": f"group_{index}"} for index in range(24)],
     }

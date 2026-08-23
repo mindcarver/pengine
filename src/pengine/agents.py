@@ -9291,9 +9291,7 @@ class DeepAgentWorkflow:
             story=story,
             requirements=requirements,
             feedback=feedback,
-            approved_json=_workspace_json(
-                _supervisor_routing_manifest(approved_checkpoints or {})
-            ),
+            approved_json=_workspace_json(_supervisor_routing_manifest(approved_checkpoints or {})),
             language_contract=output_language_contract,
         )
 
