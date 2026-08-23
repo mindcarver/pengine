@@ -303,16 +303,8 @@ class StoryContract(ContinuityModel):
                 prior_knowledge[character_id] = current
         self.knowledge_states = completed_knowledge
 
-        for clue in self.clues:
-            if (
-                max(
-                    clue.introduced_episode,
-                    clue.explained_episode,
-                    clue.callback_episode or 1,
-                )
-                > self.episode_count
-            ):
-                raise ValueError("A clue lifecycle exceeds the contract episode count")
+        # Clue lifecycle episode-range checking removed: clue data is context,
+        # not a hard Canon requirement.
 
         obligations_by_episode = {
             obligation.episode_number: obligation for obligation in self.episode_obligations
@@ -702,6 +694,9 @@ def required_episode_evidence_target_ids(
     obligation = next(
         item for item in contract.episode_obligations if item.episode_number == episode_number
     )
+    # Clue lifecycle evidence is no longer a hard requirement: clue data stays
+    # in the contract for context, but missing or mismatched clue evidence
+    # must not reject an otherwise valid episode.
     return sorted(
         {
             *(
@@ -709,14 +704,6 @@ def required_episode_evidence_target_ids(
                 for fact in contract.facts
                 if fact.first_revealed_episode == episode_number
             ),
-            *(
-                clue.clue_id
-                for clue in contract.clues
-                if clue.introduced_episode == episode_number
-                or clue.explained_episode == episode_number
-                or clue.callback_episode == episode_number
-            ),
-            *obligation.required_clue_ids,
             obligation.obligation_id,
         }
     )

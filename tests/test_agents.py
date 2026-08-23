@@ -1008,7 +1008,6 @@ async def test_outline_group_review_prompt_blocks_only_on_hard_criteria() -> Non
         "direct contradiction of hard Canon",
         "group boundary or episode-range mismatch",
         "broken",
-        "impossible clue lifecycle",
         "creator-confirmed persona L4 hard rule",
     ):
         assert blocker in prompt
@@ -7249,36 +7248,6 @@ def test_evidence_contract_exposes_episode_verbatim_facts_and_rejected_issue() -
             "message": "事实值未出现",
             "script_excerpt": None,
         }
-    ]
-
-
-def test_evidence_contract_includes_required_and_callback_clues() -> None:
-    payload = _story_contract(episode_count=3).model_dump(mode="json")
-    payload["clues"] = [
-        {
-            "clue_id": "second_signature",
-            "description": "第一集揭示、第二集义务使用、第三集回扣的第二签名",
-            "introduced_episode": 1,
-            "explained_episode": 1,
-            "callback_episode": 3,
-            "introduction_is_visible_or_audible": True,
-        }
-    ]
-    payload["episode_obligations"][1]["required_clue_ids"] = ["second_signature"]
-    contract = StoryContract.model_validate(payload)
-
-    episode_two = _evidence_contract(contract, 2, phase="initial_episode_write")
-    episode_three = _evidence_contract(contract, 3, phase="initial_episode_write")
-
-    assert episode_two["required_evidence_target_ids"] == [
-        "fact_ep2",
-        "obligation_ep2",
-        "second_signature",
-    ]
-    assert episode_three["required_evidence_target_ids"] == [
-        "fact_ep3",
-        "obligation_ep3",
-        "second_signature",
     ]
 
 

@@ -24,7 +24,7 @@ creative choice into a failure. Check only the applicable hard-Canon items:
 - locked ages, elapsed durations, call participants, dates, times, typed
   numbers, units, arithmetic meanings, and chronological order;
 - formally committed knowledge states and causal facts;
-- mandatory clue lifecycle, new-information beat, and verifiable hook items;
+- new-information beat and verifiable hook items;
 - explicit prohibitions from the approved story and persona context.
 
 When the task assigns a review lens, stay within that lens but audit every
