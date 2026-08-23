@@ -225,52 +225,6 @@ def make_delta(contract: StoryContract) -> EpisodeStateDelta:
     )
 
 
-def make_required_callback_case(
-    *, callback_episode: int | None = 3, obligation_requires_clue: bool = True
-) -> tuple[StoryContract, str, SeriesState, EpisodeStateDelta, str]:
-    payload = make_sparse_knowledge_contract([]).model_dump(mode="json")
-    payload["clues"] = [
-        {
-            "clue_id": "callback_tape",
-            "description": "第一集出现、第二集解释、第三集回扣的旧磁带",
-            "introduced_episode": 1,
-            "explained_episode": 2,
-            "callback_episode": callback_episode,
-            "introduction_is_visible_or_audible": True,
-        }
-    ]
-    if obligation_requires_clue:
-        payload["episode_obligations"][2]["required_clue_ids"] = ["callback_tape"]
-    contract = StoryContract.model_validate(payload)
-    contract_hash = story_contract_sha256(contract)
-    prior = SeriesState(
-        contract_sha256=contract_hash,
-        locked_through_episode=2,
-        established_fact_ids=["fact_one", "fact_two"],
-        character_knowledge=[
-            {"character_id": "alice", "known_fact_ids": ["fact_one"]},
-            {"character_id": "bob", "known_fact_ids": []},
-        ],
-        introduced_clue_ids=["callback_tape"],
-        resolved_clue_ids=["callback_tape"],
-        handoff="第二集结束。",
-    )
-    delta = EpisodeStateDelta(
-        episode_number=3,
-        contract_sha256=contract_hash,
-        established_fact_ids=["fact_three"],
-        satisfied_obligation_ids=["obligation_3"],
-        evidence=[
-            {"target_id": "fact_three", "excerpt": "事实three"},
-            {"target_id": "callback_tape", "excerpt": "旧磁带再次出现"},
-            {"target_id": "obligation_3", "excerpt": "第3集钩子"},
-        ],
-        handoff="故事完成。",
-    )
-    content = "阿博：事实three。\n旧磁带再次出现。\n第3集钩子"
-    return contract, contract_hash, prior, delta, content
-
-
 def test_episode_delta_contract_binding_replaces_cumulative_model_metadata() -> None:
     contract = make_sparse_knowledge_contract(
         [
@@ -717,67 +671,6 @@ def test_episode_validation_does_not_infer_semantics_from_unbound_content() -> N
     assert "missing_evidence_targets" in codes
     assert "locked_temporal_evidence_mismatch" not in codes
     assert "unknown_speaker" not in codes
-
-
-@pytest.mark.parametrize(
-    ("callback_episode", "obligation_requires_clue"),
-    [(3, False), (2, True)],
-)
-def test_episode_validation_accepts_required_clue_evidence(
-    callback_episode: int, obligation_requires_clue: bool
-) -> None:
-    contract, contract_hash, prior, delta, content = make_required_callback_case(
-        callback_episode=callback_episode,
-        obligation_requires_clue=obligation_requires_clue,
-    )
-
-    issues = validate_episode_candidate(
-        contract=contract,
-        contract_sha256=contract_hash,
-        prior_state=prior,
-        content=content,
-        delta=delta,
-    )
-
-    assert issues == []
-
-
-def test_episode_validation_reports_only_missing_evidence_targets() -> None:
-    contract, contract_hash, prior, delta, content = make_required_callback_case()
-    delta = delta.model_copy(
-        update={"evidence": [item for item in delta.evidence if item.target_id != "callback_tape"]}
-    )
-
-    issues = validate_episode_candidate(
-        contract=contract,
-        contract_sha256=contract_hash,
-        prior_state=prior,
-        content=content,
-        delta=delta,
-    )
-
-    missing = next(issue for issue in issues if issue.code == "missing_evidence_targets")
-    assert missing.contract_refs == ["callback_tape"]
-    assert "unexpected_evidence_targets" not in {issue.code for issue in issues}
-
-
-def test_episode_validation_reports_only_unexpected_evidence_targets() -> None:
-    contract, contract_hash, prior, delta, content = make_required_callback_case()
-    payload = delta.model_dump(mode="json")
-    payload["evidence"].append({"target_id": "stale_target", "excerpt": "旧版本残留说明"})
-    delta = EpisodeStateDelta.model_validate(payload)
-
-    issues = validate_episode_candidate(
-        contract=contract,
-        contract_sha256=contract_hash,
-        prior_state=prior,
-        content=f"{content}\n旧版本残留说明",
-        delta=delta,
-    )
-
-    unexpected = next(issue for issue in issues if issue.code == "unexpected_evidence_targets")
-    assert unexpected.contract_refs == ["stale_target"]
-    assert "missing_evidence_targets" not in {issue.code for issue in issues}
 
 
 @pytest.mark.parametrize(

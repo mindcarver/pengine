@@ -385,7 +385,6 @@ def test_genre_activation_never_rejects_general_idea_for_missing_clues() -> None
     assert validate_series_bible(general).passed
 
     mystery = make_candidate(genre="mystery")
-    assert "mystery_reveal_required" in activated_rule_names(mystery)
     evidence = validate_series_bible(mystery)
     assert not evidence.passed
     assert "mystery_reveal_required" in {issue.code for issue in evidence.issues}

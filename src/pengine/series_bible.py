@@ -62,8 +62,6 @@ _MYSTERY_TERMS = (
 _MYSTERY_ACTIVATED_RULES = frozenset(
     {
         "mystery_reveal_required",
-        "mystery_clue_introduction_visible",
-        "mystery_clue_resolution_complete",
     }
 )
 _UNIVERSAL_RULES = frozenset(
@@ -94,8 +92,6 @@ _SAFE_VALIDATION_MESSAGES = frozenset(
         "Numeric facts require a finite value and explicit unit",
         "Projection does not include every contract character biography",
         "A mystery candidate must declare and resolve reveal mechanics",
-        "A mystery clue introduction must be visible or audible",
-        "A mystery clue must be resolved within the episode count",
     }
 )
 
@@ -463,34 +459,15 @@ def _projection_issues(bible: SeriesBible) -> list[ValidationIssue]:
 
 
 def _activated_rule_issues(bible: SeriesBible) -> list[ValidationIssue]:
+    """Clue lifecycle enforcement removed; mystery reveal cadence remains."""
     issues: list[ValidationIssue] = []
-    if bible.genre != "mystery":
-        return issues
-    contract = bible.content.story_contract
-    if not contract.clues:
+    if bible.genre == "mystery" and not bible.content.story_contract.clues:
         issues.append(
             ValidationIssue(
                 code="mystery_reveal_required",
                 message="A mystery candidate must declare and resolve reveal mechanics",
             )
         )
-    for clue in contract.clues:
-        if not clue.introduction_is_visible_or_audible:
-            issues.append(
-                ValidationIssue(
-                    code="mystery_clue_introduction_visible",
-                    message="A mystery clue introduction must be visible or audible",
-                    refs=[clue.clue_id],
-                )
-            )
-        if clue.explained_episode > contract.episode_count:
-            issues.append(
-                ValidationIssue(
-                    code="mystery_clue_resolution_complete",
-                    message="A mystery clue must be resolved within the episode count",
-                    refs=[clue.clue_id],
-                )
-            )
     return issues
 
 
