@@ -32,7 +32,7 @@ from pengine.series_bible import (
     validate_series_bible,
 )
 from pengine.series_review import active_prefix_hash, effective_milestones
-from pengine.worker import AgentProtocolError, StageValidationError, Worker, _classify_failure
+from pengine.worker import AgentProtocolError, Worker
 
 
 @pytest.fixture
@@ -968,10 +968,11 @@ async def test_worker_refuses_unauthorized_rebuild_after_automatic_budget(
     assert active_now.content_hash == active.content_hash
 
 
-async def test_worker_stops_invalid_series_bible_at_design_boundary(
+async def test_worker_promotes_design_without_biography_coverage_at_boundary(
     repository: Repository,
     tmp_path: Path,
 ) -> None:
+    """Biography coverage is prompt-enforced upstream, not a sync-boundary gate (#222)."""
     _, lease = await create_leased_run(repository)
     settings = Settings(
         persona_root=tmp_path / "personas",
@@ -985,37 +986,39 @@ async def test_worker_stops_invalid_series_bible_at_design_boundary(
             settings.snapshot_root,
         ),
     )
-    work = await repository.get_run_work_item(lease.run_id)
-    approved = {
-        InternalStage.GENERATING_STORY_OUTLINE: {"content": "完整故事梗概。"},
-        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS: {
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        {"content": "完整故事梗概。"},
+    )
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+        {
             "character_biographies": "陌生人：合同角色都未出现在这份小传中。",
             "relationship_logic": "阿丽与阿博为搭档。",
         },
-        InternalStage.SELECTING_L0_VARIANT: {"selected_l0_variant": "归返"},
-        InternalStage.GENERATING_EPISODE_OUTLINE: {
-            "content": "三集连续写作。",
-            "story_contract": three_episode_contract().model_dump(mode="json"),
-            "contract_review": {
-                "passed": True,
-                "evidence": "独立设计审查通过。",
-                "issues": [],
-            },
-        },
-    }
-
-    with pytest.raises(StageValidationError) as error:
-        await worker._sync_series_bible(work, approved)
-
-    assert error.value.stage is InternalStage.GENERATING_EPISODE_OUTLINE
-    assert _classify_failure(error.value) == (
-        "stage_validation_failed",
-        "系列设计未通过确定性校验，未进入分集剧本生成。",
     )
-    assert await repository.get_run_series_bible(lease.run_id) is None
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.SELECTING_L0_VARIANT,
+        {"selected_l0_variant": "归返"},
+    )
+    await _approve_episode_outline(repository, lease.run_id, three_episode_contract())
+    work = await repository.get_run_work_item(lease.run_id)
+
+    await worker._sync_series_bible(work, work.business_checkpoints)
+
+    active = await repository.get_run_series_bible(lease.run_id)
+    assert active is not None
+    assert active.status == "active"
+    assert active.validation is not None and active.validation.passed
+    assert (
+        active.projections.character_biographies == "陌生人：合同角色都未出现在这份小传中。"
+    )
     candidates = await repository.get_run_series_bible_candidates(lease.run_id)
     assert len(candidates) == 1
-    assert candidates[0].status == "unvalidated"
+    assert candidates[0].status == "active"
 
 
 async def test_authorized_rebuild_is_idempotent_after_crash_before_promotion(
