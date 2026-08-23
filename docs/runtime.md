@@ -177,6 +177,7 @@ L3/L4 在上述各阶段的真实文件、提示词、审核和持久化边界�
 | 整体墙钟超时 | 单个工作单元（一个大纲自然组或一集剧本）超过 `PENGINE_RUN_TIMEOUT_SECONDS`（默认 1800s；每组/每集开始时重置；阶段调用预算同点重置） | 首次进入 `auto_resuming`，从已批准检查点续跑 | 同一阶段第二次共享超时，`Continue` 或 `End` |
 | 暂时 relay/网络 | 请求开始后的连接、DNS、TLS、读取超时或重置；relay `429/502/503/504` | 首次在同一 run/thread 上进入 `auto_resuming`，遵守至少 10 秒或更长 `Retry-After` | 若同一用户阶段再次共享中断，`Continue` 或 `End` |
 | 外部 relay 终态失败 | relay HTTP 402 配额耗尽、服务不可用、relay 超时、有身份但零内容的空流（`relay_unavailable`） | 立即终态 `failed`，不自动重试 | 修复 relay（充值/换凭据等）后 `Retry` 复活同一 run，或新建任务 |
+| 确定性校验终态失败 | 阶段产物未通过确定性校验且自愈预算耗尽（`stage_validation_failed`） | 终态 `failed`；大纲等已批准检查点保持完整 | 修复校验失败原因（如 #222 移除投影门禁）后 `Retry` 复活同一 run，已批准内容不重生成 |
 | 语法正确地址但连接失败 | 主机名解析/连接失败，无法证明一定短暂 | 按受限 transport 路径计入调用预算，耗尽后失败 | 修正 relay 配置后新建任务 |
 | 配置/安全错误 | 缺 URL/key、非 loopback HTTP、证书校验失败 | 不自动降级，不切换模型 | 修正 `.env` 后重新运行 |
 | 模型身份错误 | 响应身份缺失、同时出现多个身份，或不等于配置模型及其显式允许的官方快照 | 丢弃响应，暂停为 `relay_identity_mismatch`，不自动重试 | 先核验 Relay；通过身份探测后 `Continue` |
@@ -206,7 +207,7 @@ SQLite、结构化日志和 Langfuse 都保留 Relay 实际回报的原始 `resp
 
 ### Retry
 
-只适用于因外部 relay 错误（`failure.code == relay_unavailable`，例如配额耗尽）终态失败的初稿 run。它把 failed run 转回 `queued`，沿用原 `thread_id` 和已批准业务检查点续跑；要求对应阶段仍有尝试预算。内容性拒绝、协议错误、预算耗尽和 `ended_by_user` 保持终态；失败的修订 run 继续使用相同 feedback 重排队语义。资源中的 `progress.can_retry` 标明是否可用。
+只适用于因操作员可修复错误终态失败的初稿 run：`relay_unavailable`（配额耗尽等外部 relay 错误）或 `stage_validation_failed`（确定性校验失败且原因已修复，如 #222 移除投影门禁）。它把 failed run 转回 `queued`，沿用原 `thread_id` 和已批准业务检查点续跑；要求对应阶段仍有尝试预算。内容性拒绝、协议错误、预算耗尽和 `ended_by_user` 保持终态；失败的修订 run 继续使用相同 feedback 重排队语义。资源中的 `progress.can_retry` 标明是否可用。
 
 ### Authorize repair
 

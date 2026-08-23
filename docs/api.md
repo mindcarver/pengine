@@ -39,7 +39,7 @@ Pengine 的机器接口是本地 JSON HTTP API。完整字段合同在 [`contrac
 | `POST` | `/creations/{creation_id}/runs/{run_kind}/retry-final-review` | 只重跑被拒绝的 L0/L4 最终审核 | `202 RunControlAccepted` |
 | `POST` | `/creations/{creation_id}/runs/{run_kind}/authorize-repair` | 授权一次绑定血缘的内容修复周期 | `202 RunControlAccepted` |
 | `POST` | `/creations/{creation_id}/runs/{run_kind}/end` | 结束可控制的暂停/拒绝 run | `202 RunControlAccepted` |
-| `POST` | `/creations/{creation_id}/runs/{run_kind}/retry` | 复活因外部 relay 错误终态失败的初稿 run | `202 RunControlAccepted` |
+| `POST` | `/creations/{creation_id}/runs/{run_kind}/retry` | 复活因操作员可修复错误（`relay_unavailable`、`stage_validation_failed`）终态失败的初稿 run | `202 RunControlAccepted` |
 
 其中 `{run_kind}` 只能是 `initial` 或 `revision`；`{creation_id}` 是 UUID。
 
@@ -212,7 +212,7 @@ curl --fail-with-body -X POST \
   -H 'Idempotency-Key: retry-001'
 ```
 
-只用于因**操作员可修复的外部 relay 错误**（`failure.code == relay_unavailable`，例如 HTTP 402 配额耗尽、服务不可用或 relay 超时）终态失败的初稿 run。满足条件时 run 回到 `queued`，沿用原 `thread_id` 和已批准业务检查点续跑——已批准内容不会重新生成。要求对应阶段仍有尝试预算；内容性拒绝、协议不兼容、预算耗尽和 `ended_by_user` 保持终态。失败的修订 run 不走此命令，继续使用相同 feedback 重排队语义。资源中的 `initial.progress.can_retry` 标明当前失败 run 是否可重试。
+只用于因**操作员可修复错误**终态失败的初稿 run，当前允许 `failure.code == relay_unavailable`（HTTP 402 配额耗尽、服务不可用、relay 超时等外部 relay 错误）与 `failure.code == stage_validation_failed`（确定性校验失败，且失败原因已修复，例如 #222 移除投影校验门禁后的存量失败 run）。满足条件时 run 回到 `queued`，沿用原 `thread_id` 和已批准业务检查点续跑——已批准内容不会重新生成。要求对应阶段仍有尝试预算；内容性拒绝、协议不兼容、预算耗尽和 `ended_by_user` 保持终态。失败的修订 run 不走此命令，继续使用相同 feedback 重排队语义。资源中的 `initial.progress.can_retry` 标明当前失败 run 是否可重试。
 
 ## 8. 状态值
 

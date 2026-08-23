@@ -515,7 +515,7 @@
     "/creations/{creation_id}/runs/{run_kind}/retry": {
       "post": {
         "summary": "Retry Run",
-        "description": "Revive a failed initial run whose failure was an operator-fixable relay error.\n\nOnly a terminally failed initial run whose failure code is in the external\nrelay allowlist and whose stage attempt budget is not exhausted can be\nretried. The run requeues with its original thread and approved business\ncheckpoints, so already approved content is never regenerated. A failed\nrevision run keeps its own resubmit-frozen-feedback semantics.",
+        "description": "Revive a failed initial run whose failure is operator-revivable.\n\nOnly a terminally failed initial run whose failure code is in the revivable set (relay_unavailable, or stage_validation_failed after its cause has been fixed, e.g. the #222 projection-gate removal) and whose stage attempt budget is not exhausted can be retried. The run requeues with its original thread and approved business checkpoints, so already approved content is never regenerated. A failed revision run keeps its own resubmit-frozen-feedback semantics.",
         "operationId": "retryRun",
         "parameters": [
           {
