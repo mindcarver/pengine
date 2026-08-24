@@ -728,6 +728,18 @@ main {
   transform: none;
 }
 
+.persona-card[data-supported="false"] {
+  cursor: not-allowed;
+  filter: grayscale(0.9);
+  opacity: 0.54;
+}
+
+.persona-card[data-supported="false"]:hover {
+  border-color: var(--border);
+  box-shadow: none;
+  transform: none;
+}
+
 .persona-radio {
   position: absolute;
   width: 1px;
@@ -833,6 +845,10 @@ main {
 }
 
 .persona-card[data-available="false"] .persona-availability {
+  color: var(--rust-deep);
+}
+
+.persona-card[data-supported="false"] .persona-availability {
   color: var(--rust-deep);
 }
 

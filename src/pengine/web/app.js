@@ -1,6 +1,8 @@
 "use strict";
 
 const PERSONA_ORDER = ["shouzhuo", "wuzhen", "sanfentian", "xinggui"];
+// #230：当前仅开放第一位人格，其余置灰显示“正在支持中”；恢复支持时向集合追加 id。
+const SUPPORTED_PERSONA_IDS = new Set([PERSONA_ORDER[0]]);
 const PERSONA_PROFILES = {
   shouzhuo: {
     name: "守拙",
@@ -374,15 +376,21 @@ async function loadPersonas() {
     const items = Array.isArray(payload.items) ? payload.items : [];
     state.personas = new Map(items.map((persona) => [persona.persona_id, persona]));
 
-    if (!state.personas.has(state.selectedPersonaId)) {
+    if (
+      !state.personas.has(state.selectedPersonaId) ||
+      !SUPPORTED_PERSONA_IDS.has(state.selectedPersonaId)
+    ) {
       state.selectedPersonaId = "";
     }
 
     const availableCount = PERSONA_ORDER.filter((id) => state.personas.has(id)).length;
     const missingCount = PERSONA_ORDER.length - availableCount;
+    const gatingNote = `当前仅开放第一位人格（${
+      PERSONA_PROFILES[PERSONA_ORDER[0]].name
+    }），其余正在支持中。`;
     elements["persona-status"].textContent = missingCount
-      ? `已读取 ${availableCount} 位原型人格；${missingCount} 位未被当前服务列为可选。`
-      : "四位原型人格均已由本地服务确认可用。";
+      ? `已读取 ${availableCount} 位原型人格；${missingCount} 位未被当前服务列为可选。${gatingNote}`
+      : `四位原型人格均已由本地服务确认可用。${gatingNote}`;
     setServiceState("ready", "本地服务已连接");
   } catch (error) {
     state.personas = new Map();
@@ -403,10 +411,12 @@ function renderPersonaCards() {
     const profile = PERSONA_PROFILES[personaId];
     const persona = state.personas.get(personaId);
     const available = Boolean(persona);
+    const supported = SUPPORTED_PERSONA_IDS.has(personaId);
     const label = document.createElement("label");
     label.className = "persona-card";
     label.classList.add(`persona-${personaId}`);
     label.dataset.available = String(available);
+    label.dataset.supported = String(supported);
     label.dataset.selected = String(state.selectedPersonaId === personaId);
 
     const input = document.createElement("input");
@@ -415,7 +425,7 @@ function renderPersonaCards() {
     input.name = "persona_id";
     input.value = personaId;
     input.checked = state.selectedPersonaId === personaId;
-    input.disabled = !available;
+    input.disabled = !available || !supported;
     input.setAttribute("aria-label", `${persona?.display_name || profile.name}，${profile.tag}`);
     input.addEventListener("change", () => {
       state.selectedPersonaId = personaId;
@@ -457,7 +467,11 @@ function renderPersonaCards() {
 
     const availability = document.createElement("span");
     availability.className = "persona-availability";
-    availability.textContent = available ? "● 可选择" : "○ 暂不可用";
+    availability.textContent = !supported
+      ? "◌ 正在支持中"
+      : available
+        ? "● 可选择"
+        : "○ 暂不可用";
 
     inner.append(top, title, version, bio, facts, availability);
     label.append(input, inner);
