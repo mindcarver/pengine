@@ -170,7 +170,7 @@ main {
 .hero {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(3.5rem, 0.2fr) minmax(0, 1fr) minmax(15rem, 0.32fr);
+  grid-template-columns: minmax(3.5rem, 0.2fr) minmax(0, 1fr);
   gap: clamp(1rem, 4vw, 4rem);
   max-width: 1440px;
   margin: 0 auto;
@@ -243,48 +243,6 @@ main {
   margin: 2rem 0 0;
   color: #cfc3b1;
   font-size: clamp(1rem, 1.5vw, 1.15rem);
-}
-
-.desk-note {
-  position: relative;
-  align-self: end;
-  max-width: 22rem;
-  padding: 2rem 1.6rem 1.45rem;
-  color: var(--ink);
-  background:
-    repeating-linear-gradient(
-      transparent,
-      transparent 1.65rem,
-      rgba(78, 94, 106, 0.14) 1.7rem
-    ),
-    #e8d7ad;
-  box-shadow: 9px 12px 0 rgba(0, 0, 0, 0.12);
-  transform: rotate(1.5deg);
-}
-
-.pin {
-  position: absolute;
-  top: 0.75rem;
-  left: 50%;
-  width: 0.7rem;
-  height: 0.7rem;
-  border-radius: 50%;
-  background: var(--rust);
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.35);
-}
-
-.note-label {
-  margin: 0 0 0.5rem;
-  font-weight: 700;
-}
-
-.desk-note p {
-  line-height: 1.75;
-}
-
-.hand-sign {
-  margin: 1rem 0 0;
-  text-align: right;
 }
 
 .workbench {
@@ -1769,11 +1727,6 @@ textarea:disabled {
     grid-column: 2;
   }
 
-  .desk-note {
-    grid-column: 2;
-    margin-top: 1.5rem;
-  }
-
   .workbench {
     grid-template-columns: 1fr;
   }
@@ -1866,10 +1819,6 @@ textarea:disabled {
 
   .hero-summary {
     margin-top: 1.25rem;
-  }
-
-  .desk-note {
-    margin: 2.5rem 0 0.5rem;
   }
 
   .paper-sheet {
