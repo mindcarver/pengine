@@ -1142,6 +1142,31 @@ textarea:disabled {
   font-size: 0.7rem;
 }
 
+.episode-progress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.85rem;
+  padding-top: 0.8rem;
+  border-top: 1px dashed rgba(90, 69, 45, 0.28);
+}
+
+.episode-progress p {
+  margin: 0;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+}
+
+.episode-progress span {
+  padding: 0.28rem 0.48rem;
+  border: 1px solid rgba(90, 69, 45, 0.24);
+  background: rgba(255, 255, 255, 0.35);
+  font-size: 0.7rem;
+}
+
 .model-call-panel {
   margin-top: 0.85rem;
   padding-top: 0.8rem;
