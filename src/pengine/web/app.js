@@ -134,6 +134,8 @@ const state = {
   progressRunKind: "",
   runControlBusy: false,
   workspaceView: "selection",
+  // 暂时隐藏“模型调用用量”面板（#226）；恢复展示时改为 true。
+  modelCallPanelEnabled: false,
 };
 
 const elements = {};
@@ -1027,8 +1029,12 @@ function renderProgress() {
 }
 
 function renderModelCalls(progress) {
-  const calls = progress?.model_calls;
   const panel = elements["model-call-panel"];
+  if (!state.modelCallPanelEnabled) {
+    panel.hidden = true;
+    return;
+  }
+  const calls = progress?.model_calls;
   if (!calls || calls.length === 0) {
     panel.hidden = true;
     return;
