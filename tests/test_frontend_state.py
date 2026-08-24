@@ -1945,6 +1945,143 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
+def test_persona_cards_gate_all_but_first() -> None:
+    script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
+    assertions = """
+function makeElement() {
+  const el = {
+    className: "",
+    textContent: "",
+    type: "",
+    name: "",
+    value: "",
+    checked: false,
+    disabled: false,
+    dataset: {},
+    attrs: {},
+    children: [],
+    listeners: {},
+  };
+  el.classList = {
+    add(...names) {
+      el.className = [el.className, ...names].filter(Boolean).join(" ");
+    },
+  };
+  el.setAttribute = (name, value) => {
+    el.attrs[name] = value;
+  };
+  el.removeAttribute = (name) => {
+    delete el.attrs[name];
+  };
+  el.addEventListener = (type, handler) => {
+    el.listeners[type] = handler;
+  };
+  el.append = (...nodes) => {
+    el.children.push(...nodes);
+  };
+  return el;
+}
+document.createElement = makeElement;
+const cards = [];
+Object.assign(elements, {
+  "persona-grid": {
+    replaceChildren() {
+      cards.length = 0;
+    },
+    append(card) {
+      cards.push(card);
+    },
+  },
+  "persona-status": { textContent: "" },
+  "reload-personas": { disabled: false },
+});
+state.personas = new Map(
+  PERSONA_ORDER.map((id) => [id, { persona_id: id, display_name: id, version: "1" }]),
+);
+state.selectedPersonaId = "";
+renderPersonaCards();
+if (cards.length !== PERSONA_ORDER.length) {
+  throw new Error(`expected ${PERSONA_ORDER.length} cards, received ${cards.length}`);
+}
+const findByClass = (el, cls) =>
+  el.children.find((child) => child.className === cls) ||
+  el.children.map((child) => findByClass(child, cls)).find(Boolean);
+const rows = PERSONA_ORDER.map((id, index) => ({
+  id,
+  card: cards[index],
+  input: findByClass(cards[index], "persona-radio"),
+  availability: findByClass(cards[index], "persona-availability"),
+}));
+for (const row of rows) {
+  if (!row.input) throw new Error(`${row.id} card missing radio input`);
+  if (!row.availability) throw new Error(`${row.id} card missing availability span`);
+}
+if (rows[0].input.disabled) throw new Error("first persona was disabled");
+if (rows[0].card.dataset.supported !== "true") {
+  throw new Error("first persona not marked supported");
+}
+if (rows[0].availability.textContent !== "● 可选择") {
+  throw new Error("first persona availability text changed");
+}
+for (const row of rows.slice(1)) {
+  if (!row.input.disabled) throw new Error(`${row.id} stayed selectable`);
+  if (row.card.dataset.supported !== "false") {
+    throw new Error(`${row.id} not marked unsupported`);
+  }
+  if (row.availability.textContent !== "◌ 正在支持中") {
+    throw new Error(`${row.id} availability text: ${row.availability.textContent}`);
+  }
+}
+
+apiRequest = async () => ({
+  items: PERSONA_ORDER.map((id) => ({ persona_id: id, display_name: id, version: "1" })),
+});
+setServiceState = () => {};
+state.selectedPersonaId = "wuzhen";
+await loadPersonas();
+if (state.selectedPersonaId !== "") {
+  throw new Error("residual unsupported selection survived loadPersonas");
+}
+if (!elements["persona-status"].textContent.includes("仅开放第一位人格")) {
+  throw new Error("status line missing gating note");
+}
+if (!elements["persona-status"].textContent.includes("正在支持中")) {
+  throw new Error("status line missing support-in-progress note");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{
+    addEventListener() {{}},
+    createElement() {{
+      return {{ dataset: {{}}, textContent: "", appendChild() {{}} }};
+    }},
+  }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(async () => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_story_section_navigation_preserves_hierarchy() -> None:
     root = Path(__file__).parents[1]
     script_path = root / "src" / "pengine" / "web" / "app.js"
