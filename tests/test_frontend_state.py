@@ -1636,7 +1636,7 @@ Promise.resolve(result).catch((error) => {{
     )
 
 
-def test_progress_renders_model_call_usage_panel() -> None:
+def test_progress_model_call_panel_hidden_by_default_and_renders_when_enabled() -> None:
     script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
     assertions = """
 const stageItems = USER_STAGES.map(([stage]) => ({
@@ -1732,6 +1732,17 @@ state.creation = {
   },
   revision: { state: "unavailable" },
 };
+renderProgress();
+if (!elements["model-call-panel"].hidden) {
+  throw new Error("model-call panel visible while switch disabled");
+}
+if (elements["model-call-totals"].textContent !== "") {
+  throw new Error("model-call totals rendered while switch disabled");
+}
+if (listItems.length !== 0) {
+  throw new Error("model-call list rendered while switch disabled");
+}
+state.modelCallPanelEnabled = true;
 renderProgress();
 if (elements["model-call-panel"].hidden) {
   throw new Error("model-call panel stayed hidden with durable records");
