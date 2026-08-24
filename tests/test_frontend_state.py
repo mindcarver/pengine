@@ -788,6 +788,8 @@ Object.assign(elements, {
   "continue-run": { disabled: false },
   "end-run": { disabled: false },
   "run-control-message": { textContent: "" },
+  "episode-progress": { hidden: true },
+  "episode-progress-detail": { textContent: "" },
   "model-call-panel": { hidden: true },
   "model-call-totals": { textContent: "" },
   "model-call-list": { replaceChildren() {} },
@@ -1021,6 +1023,8 @@ Object.assign(elements, {
   "continue-run": { hidden: false, disabled: false },
   "end-run": { hidden: false, disabled: false },
   "run-control-message": { textContent: "" },
+  "episode-progress": { hidden: true },
+  "episode-progress-detail": { textContent: "" },
   "model-call-panel": { hidden: true },
   "model-call-totals": { textContent: "" },
   "model-call-list": { replaceChildren() {} },
@@ -1661,6 +1665,8 @@ Object.assign(elements, {
   "continue-run": { disabled: false },
   "end-run": { disabled: false },
   "run-control-message": { textContent: "" },
+  "episode-progress": { hidden: true },
+  "episode-progress-detail": { textContent: "" },
   "model-call-panel": { hidden: true },
   "model-call-totals": { textContent: "" },
   "model-call-list": {
@@ -1785,6 +1791,125 @@ if (!elements["run-control-title"].textContent.includes("第 27 集模型身份�
 }
 if (elements["continue-run"].textContent !== "从第 27 集继续") {
   throw new Error("identity mismatch pause did not preserve the episode resume point");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{
+    addEventListener() {{}},
+    createElement() {{
+      return {{ dataset: {{}}, textContent: "", appendChild() {{}} }};
+    }},
+  }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(() => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_progress_renders_episode_progress_line() -> None:
+    script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
+    assertions = """
+const stageItems = USER_STAGES.map(([stage]) => ({
+  dataset: { stage },
+  attrs: {},
+  setAttribute(name, value) { this.attrs[name] = value; },
+  removeAttribute(name) { delete this.attrs[name]; },
+}));
+Object.assign(elements, {
+  "run-progress": { hidden: true },
+  "progress-kind": { textContent: "" },
+  "progress-title": { textContent: "" },
+  "progress-elapsed": { textContent: "" },
+  "progress-stages": { querySelectorAll() { return stageItems; } },
+  "episode-progress": { hidden: true },
+  "episode-progress-detail": { textContent: "" },
+  "review-progress": { hidden: true },
+  "review-l0": { textContent: "" },
+  "review-l4": { textContent: "" },
+  "run-controls": { hidden: true },
+  "run-control-title": { textContent: "" },
+  "run-control-description": { textContent: "" },
+  "continue-run": { disabled: false },
+  "end-run": { disabled: false },
+  "run-control-message": { textContent: "" },
+  "model-call-panel": { hidden: true },
+  "model-call-totals": { textContent: "" },
+  "model-call-list": { replaceChildren() {}, appendChild() {} },
+});
+state.workspaceView = "progress";
+state.activeVersion = "initial";
+state.activeArtifact = "direction";
+state.creation = {
+  initial: {
+    state: "running",
+    progress: {
+      current_stage: "generating_episode_scripts",
+      completed_stages: ["determining_direction"],
+      elapsed_seconds: 10,
+      recovery_state: "none",
+      recovery_reason: "none",
+      final_review: { l0: "pending", l4: "pending" },
+      can_continue: false,
+      can_end: false,
+      episodes: { total: 30, completed: 26, current: 27 },
+      model_calls: [],
+    },
+    drafts: { artifacts: [], episodes: [] },
+  },
+  revision: { state: "unavailable" },
+};
+renderProgress();
+if (elements["episode-progress"].hidden) {
+  throw new Error("episode progress stayed hidden with live episode data");
+}
+if (!elements["episode-progress-detail"].textContent.includes("第 27/30 集")) {
+  throw new Error("episode progress missing current episode");
+}
+if (!elements["episode-progress-detail"].textContent.includes("已完成 26")) {
+  throw new Error("episode progress missing completed count");
+}
+
+state.creation.initial.progress.episodes = null;
+renderProgress();
+if (!elements["episode-progress"].hidden) {
+  throw new Error("episode progress visible without episode data");
+}
+
+state.creation.initial.progress.episodes = { total: 30, completed: 5, current: null };
+renderProgress();
+if (elements["episode-progress"].hidden) {
+  throw new Error("episode progress hidden with completed-only data");
+}
+if (elements["episode-progress-detail"].textContent !== "已完成 5/30 集") {
+  throw new Error(
+    "completed-only text mismatch: " + elements["episode-progress-detail"].textContent,
+  );
+}
+
+state.creation.initial.progress.episodes = { total: 30, completed: 30, current: null };
+renderProgress();
+if (!elements["episode-progress-detail"].textContent.includes("已全部完成 30 集")) {
+  throw new Error("fully completed text mismatch");
 }
 """
     harness = f"""

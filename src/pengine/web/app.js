@@ -197,6 +197,8 @@ function cacheElements() {
     "progress-title",
     "progress-elapsed",
     "progress-stages",
+    "episode-progress",
+    "episode-progress-detail",
     "review-progress",
     "review-l0",
     "review-l4",
@@ -947,6 +949,7 @@ function renderProgress() {
     `L4 技法与价值观 · ${REVIEW_STATUS_LABELS[progress.final_review.l4]}`;
 
   renderModelCalls(progress);
+  renderEpisodeProgress(progress);
 
   const controllable = progress.can_continue || progress.can_end;
   elements["run-controls"].hidden = !controllable;
@@ -1025,6 +1028,27 @@ function renderProgress() {
   elements["end-run"].disabled = state.runControlBusy || !progress.can_end;
   if (!controllable) {
     elements["run-control-message"].textContent = "";
+  }
+}
+
+function renderEpisodeProgress(progress) {
+  const panel = elements["episode-progress"];
+  const detail = elements["episode-progress-detail"];
+  const episodes = progress?.episodes;
+  if (!episodes || !Number.isInteger(episodes.total) || episodes.total < 1) {
+    panel.hidden = true;
+    detail.textContent = "";
+    return;
+  }
+  panel.hidden = false;
+  const total = episodes.total;
+  const completed = Number.isInteger(episodes.completed) ? episodes.completed : 0;
+  if (completed >= total) {
+    detail.textContent = `已全部完成 ${total} 集`;
+  } else if (Number.isInteger(episodes.current)) {
+    detail.textContent = `第 ${episodes.current}/${total} 集 · 已完成 ${completed}`;
+  } else {
+    detail.textContent = `已完成 ${completed}/${total} 集`;
   }
 }
 
