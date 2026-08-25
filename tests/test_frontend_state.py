@@ -132,8 +132,6 @@ Object.assign(elements, {
   "failure-actions": { hidden: true },
   "run-progress": { hidden: false },
   "delivery-section": { hidden: false },
-  "series-empty": { hidden: true },
-  "series-card": { hidden: false },
   "creation-message": { textContent: "" },
   "creation-form": {
     scrollIntoView() { formScrolled = true; },
@@ -392,6 +390,7 @@ def test_workbench_uses_four_gated_creation_scenes() -> None:
     assert 'id="selection-view"' in page
     assert 'id="brief-view"' in page
     assert 'id="current-work-view"' in page
+    assert 'class="series-drawer"' not in page
     assert page.index('id="selection-view"') < page.index('id="brief-view"')
     assert page.index('id="brief-view"') < page.index('id="current-work-view"')
 
@@ -533,7 +532,6 @@ apiRequest = async (path, options) => {
   }
   return { creation_id: "new-creation-id" };
 };
-renderSeries = () => {};
 renderCreation = () => {};
 refreshCreation = async () => true;
 focusDelivery = () => { deliveryFocused = state.workspaceView === "progress"; };

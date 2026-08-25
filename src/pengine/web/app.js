@@ -170,11 +170,6 @@ function cacheElements() {
     "requirements",
     "creation-message",
     "create-button",
-    "series-empty",
-    "series-card",
-    "series-status",
-    "series-persona",
-    "series-date",
     "flow-select-writer",
     "flow-tell-story",
     "flow-create",
@@ -296,7 +291,6 @@ function bindEvents() {
   elements["end-quality-rejected-run"].addEventListener("click", () =>
     void handleQualityRejectionControl("end"),
   );
-  elements["series-card"].addEventListener("click", focusDelivery);
   for (const [id, view] of [
     ["flow-select-writer", "selection"],
     ["flow-tell-story", "brief"],
@@ -353,7 +347,6 @@ async function initialize() {
   }
   state.workspaceView = currentId ? "progress" : "selection";
   renderWorkspaceViews();
-  renderSeries();
 
   await loadPersonas();
   if (currentId) {
@@ -526,7 +519,6 @@ async function handleCreate(event) {
     writeCurrentCreationId(state.creationId);
     setWorkspaceView("progress");
     elements["creation-message"].textContent = "投递成功，正在读取真实任务状态。";
-    renderSeries();
     renderCreation();
     await refreshCreation();
     focusDelivery();
@@ -673,7 +665,6 @@ async function refreshCreation(options = {}) {
     if (options.isRestore) {
       state.workspaceView = hasReadableDelivery() ? "reading" : "progress";
     }
-    renderSeries();
     renderCreation();
 
     if (shouldPoll()) {
@@ -684,7 +675,6 @@ async function refreshCreation(options = {}) {
       clearCurrentCreationId();
       state.creationId = "";
       state.creation = null;
-      renderSeries();
       renderCreation();
       showToast("保存的作品编号在当前本地数据中不存在。");
     } else {
@@ -1329,7 +1319,6 @@ function startNewCreation() {
   state.activeEpisode = null;
   state.pendingFeedback = "";
   setWorkspaceView("selection");
-  renderSeries();
   renderCreation();
   elements["creation-message"].textContent =
     "前一次任务未自动恢复。请重新填写故事并投递新的任务。";
@@ -1956,83 +1945,6 @@ function renderRevision() {
   }
 }
 
-function renderSeries() {
-  const hasId = Boolean(state.creationId);
-  elements["series-empty"].hidden = hasId;
-  elements["series-card"].hidden = !hasId;
-  if (!hasId) {
-    return;
-  }
-
-  const status = currentSeriesStatus();
-  elements["series-status"].textContent = status.label;
-  elements["series-card"].dataset.tone = status.tone;
-  elements["series-persona"].textContent =
-    state.creation?.persona.display_name || "正在读取人格";
-
-  const createdAt = state.creation?.created_at;
-  elements["series-date"].textContent = createdAt
-    ? formatDate(createdAt)
-    : "等待服务端记录";
-  elements["series-date"].dateTime = createdAt || "";
-}
-
-function currentSeriesStatus() {
-  if (!state.creation) {
-    return { label: "读取中", tone: "waiting" };
-  }
-  if (state.creation.initial.state === "failed") {
-    return { label: "初稿失败", tone: "failed" };
-  }
-  if (state.creation.initial.state === "quality_rejected") {
-    return { label: "初稿审核未通过", tone: "failed" };
-  }
-  if (state.creation.initial.state === "ended") {
-    return { label: "初稿已结束", tone: "failed" };
-  }
-  if (state.creation.initial.state === "paused") {
-    return { label: "初稿待决定", tone: "waiting" };
-  }
-  if (["queued", "running", "auto_resuming"].includes(state.creation.initial.state)) {
-    return {
-      label:
-        state.creation.initial.state === "queued"
-          ? "初稿排队"
-          : state.creation.initial.state === "auto_resuming"
-            ? "初稿恢复中"
-            : "初稿创作中",
-      tone: "waiting",
-    };
-  }
-  if (state.creation.revision.state === "failed") {
-    return { label: "修订失败", tone: "failed" };
-  }
-  if (state.creation.revision.state === "quality_rejected") {
-    return { label: "修订审核未通过", tone: "failed" };
-  }
-  if (state.creation.revision.state === "ended") {
-    return { label: "修订已结束", tone: "failed" };
-  }
-  if (state.creation.revision.state === "paused") {
-    return { label: "修订待决定", tone: "waiting" };
-  }
-  if (["queued", "running", "auto_resuming"].includes(state.creation.revision.state)) {
-    return {
-      label:
-        state.creation.revision.state === "queued"
-          ? "修订排队"
-          : state.creation.revision.state === "auto_resuming"
-            ? "修订恢复中"
-            : "修订创作中",
-      tone: "waiting",
-    };
-  }
-  if (state.creation.revision.state === "succeeded") {
-    return { label: "修订稿已交付", tone: "ready" };
-  }
-  return { label: "初稿已交付", tone: "ready" };
-}
-
 function handleVersionClick(event) {
   const button = event.target.closest("[data-version]");
   if (!button || button.disabled) {
@@ -2469,18 +2381,4 @@ function formatElapsed(value) {
     parts.unshift(String(hours).padStart(2, "0"));
   }
   return parts.join(":");
-}
-
-function formatDate(value) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "服务端时间不可读";
-  }
-  return new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
 }
