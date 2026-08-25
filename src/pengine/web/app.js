@@ -199,6 +199,7 @@ function cacheElements() {
     "progress-elapsed",
     "progress-stages",
     "episode-progress",
+    "episode-progress-label",
     "episode-progress-detail",
     "review-progress",
     "review-l0",
@@ -1044,7 +1045,25 @@ function renderProgress() {
 
 function renderEpisodeProgress(progress) {
   const panel = elements["episode-progress"];
+  const label = elements["episode-progress-label"];
   const detail = elements["episode-progress-detail"];
+  const groups = progress?.outline_groups;
+  if (groups && (groups.committed_groups > 0 || Number.isInteger(groups.current_group))) {
+    panel.hidden = false;
+    label.textContent = "大纲组进度";
+    const parts = [`已提交 ${groups.committed_groups} 组`];
+    if (groups.committed_through_episode > 0) {
+      parts.push(`覆盖第 1–${groups.committed_through_episode} 集`);
+    }
+    if (Number.isInteger(groups.current_group)) {
+      parts.push(
+        `正在生成第 ${groups.current_group} 组（第 ${groups.current_start_episode}–${groups.current_end_episode} 集）`,
+      );
+    }
+    detail.textContent = parts.join(" · ");
+    return;
+  }
+  label.textContent = "分集进度";
   const episodes = progress?.episodes;
   if (!episodes || !Number.isInteger(episodes.total) || episodes.total < 1) {
     panel.hidden = true;

@@ -398,6 +398,14 @@ class EpisodeProgress(StrictModel):
     current: int | None = Field(default=None, ge=1)
 
 
+class OutlineGroupProgress(StrictModel):
+    committed_groups: int = Field(ge=0)
+    committed_through_episode: int = Field(ge=0)
+    current_group: int | None = Field(default=None, ge=1)
+    current_start_episode: int | None = Field(default=None, ge=1)
+    current_end_episode: int | None = Field(default=None, ge=1)
+
+
 class ModelCallUsage(StrictModel):
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
@@ -471,6 +479,7 @@ class RunProgress(StrictModel):
     ]
     final_review: FinalReviewProgress
     episodes: EpisodeProgress | None = None
+    outline_groups: OutlineGroupProgress | None = None
     model_calls: list[ModelCallSummary] = Field(default_factory=list)
     can_continue: bool
     can_end: bool
