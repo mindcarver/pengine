@@ -2290,7 +2290,7 @@ async function apiRequest(path, options = {}) {
       },
     });
   } catch {
-    throw new ApiError("无法连接本地服务，请确认 Pengine 已启动。", "network_error", 0);
+    throw new ApiError("无法连接本地服务，请确认意态短剧已启动。", "network_error", 0);
   }
 
   const contentType = response.headers.get("content-type") || "";
