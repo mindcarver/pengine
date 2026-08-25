@@ -176,7 +176,6 @@ function cacheElements() {
     "series-card",
     "series-status",
     "series-persona",
-    "series-id",
     "series-date",
     "flow-select-writer",
     "flow-tell-story",
@@ -189,10 +188,8 @@ function cacheElements() {
     "progress-scene",
     "back-to-selection",
     "brief-persona",
-    "delivery-index",
     "delivery-section",
     "delivery-title",
-    "folio-stamp",
     "run-progress",
     "progress-kind",
     "progress-title",
@@ -719,7 +716,6 @@ function renderCreation() {
   }
 
   elements["delivery-section"].hidden = false;
-  elements["folio-stamp"].textContent = `卷宗 ${shortId(state.creationId)}`;
 
   if (!state.creation) {
     renderProgress();
@@ -1982,7 +1978,6 @@ function renderSeries() {
   elements["series-card"].dataset.tone = status.tone;
   elements["series-persona"].textContent =
     state.creation?.persona.display_name || "正在读取人格";
-  elements["series-id"].textContent = `卷宗编号 ${shortId(state.creationId)}`;
 
   const createdAt = state.creation?.created_at;
   elements["series-date"].textContent = createdAt
@@ -2213,9 +2208,6 @@ function renderWorkspaceViews() {
   if (elements["delivery-title"]) {
     elements["delivery-title"].textContent =
       state.workspaceView === "reading" ? "成品阅览室" : "创作进行中";
-  }
-  if (elements["delivery-index"]) {
-    elements["delivery-index"].textContent = state.workspaceView === "reading" ? "04" : "03";
   }
   for (const [id, view, available] of flowButtons) {
     const button = elements[id];
