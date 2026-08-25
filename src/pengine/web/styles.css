@@ -488,7 +488,6 @@ main {
   font-size: 1.12rem;
 }
 
-#series-id,
 #series-date {
   color: var(--ink-soft);
   font-family: var(--mono);
@@ -967,20 +966,6 @@ textarea:disabled {
 
 .delivery-heading {
   padding-left: 2rem;
-}
-
-.folio-stamp {
-  position: relative;
-  z-index: 2;
-  flex: 0 0 auto;
-  padding: 0.35rem 0.6rem;
-  border: 2px solid rgba(115, 48, 36, 0.5);
-  color: rgba(115, 48, 36, 0.75);
-  font-family: var(--mono);
-  font-size: 0.64rem;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  transform: rotate(2deg);
 }
 
 .run-progress {
@@ -1927,11 +1912,6 @@ textarea:disabled {
   .typewriter {
     transform: scale(0.85);
     transform-origin: left center;
-  }
-
-  .folio-stamp {
-    display: inline-block;
-    margin-top: 1rem;
   }
 
   .artifact-paper {

@@ -132,7 +132,6 @@ Object.assign(elements, {
   "failure-actions": { hidden: true },
   "run-progress": { hidden: false },
   "delivery-section": { hidden: false },
-  "folio-stamp": { textContent: "" },
   "series-empty": { hidden: true },
   "series-card": { hidden: false },
   "creation-message": { textContent: "" },
@@ -427,7 +426,6 @@ Object.assign(elements, {
   "current-work-placeholder": placeholder,
   "brief-persona": { textContent: "" },
   "delivery-title": { textContent: "" },
-  "delivery-index": { textContent: "" },
 });
 
 state.creationId = "";
@@ -587,7 +585,6 @@ def test_quality_rejection_retains_workspace_and_retries_the_final_review() -> N
 const requests = [];
 Object.assign(elements, {
   "delivery-section": { hidden: true },
-  "folio-stamp": { textContent: "" },
   "task-waiting": { hidden: false },
   "failure-panel": { hidden: true },
   "result-workspace": { hidden: true },
@@ -1160,7 +1157,6 @@ const artifactButtons = [
 ];
 Object.assign(elements, {
   "delivery-section": { hidden: true },
-  "folio-stamp": { textContent: "" },
   "task-waiting": { hidden: true },
   "wait-kicker": { textContent: "" },
   "wait-title": { textContent: "" },
