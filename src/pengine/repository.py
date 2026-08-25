@@ -9869,9 +9869,7 @@ class Repository:
             current_start_episode=(
                 int(in_flight["start_episode"]) if in_flight is not None else None
             ),
-            current_end_episode=(
-                int(in_flight["end_episode"]) if in_flight is not None else None
-            ),
+            current_end_episode=(int(in_flight["end_episode"]) if in_flight is not None else None),
         )
 
     @staticmethod

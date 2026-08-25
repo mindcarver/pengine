@@ -1,15 +1,15 @@
 :root {
-  --ink: #27221d;
-  --ink-soft: #61584e;
-  --ink-faint: #887d70;
-  --paper: #eee4cf;
-  --paper-light: #f7efdd;
-  --paper-deep: #d9c8a7;
-  --desk: #24211d;
-  --desk-light: #34302a;
-  --rust: #9f3f2d;
-  --rust-deep: #733024;
-  --mustard: #d19a3c;
+  --ink: #2b2823;
+  --ink-soft: #625b51;
+  --ink-faint: #887f74;
+  --paper: #f0eadf;
+  --paper-light: #fffdf7;
+  --paper-deep: #d9cdb9;
+  --desk: #161412;
+  --desk-light: #211e1a;
+  --rust: #b24c38;
+  --rust-deep: #803a2d;
+  --mustard: #b89a6a;
   --sage: #59705f;
   --blue: #3e5966;
   --border: rgba(65, 52, 38, 0.32);
@@ -32,11 +32,12 @@ body {
   margin: 0;
   color: var(--ink);
   background:
-    radial-gradient(circle at 18% -10%, rgba(209, 154, 60, 0.18), transparent 35rem),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
-    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    radial-gradient(circle at 78% -16%, rgba(184, 154, 106, 0.14), transparent 31rem),
+    radial-gradient(circle at 7% 34%, rgba(184, 154, 106, 0.06), transparent 26rem),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.017) 1px, transparent 1px),
+    linear-gradient(rgba(255, 255, 255, 0.014) 1px, transparent 1px),
     var(--desk);
-  background-size: auto, 28px 28px, 28px 28px, auto;
+  background-size: auto, auto, 32px 32px, 32px 32px, auto;
   font-family: var(--body);
   line-height: 1.65;
 }
@@ -87,11 +88,11 @@ textarea:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 76px;
-  padding: 0.75rem clamp(1rem, 4vw, 4.5rem);
+  min-height: 72px;
+  padding: 0.75rem max(clamp(1rem, 4vw, 4.5rem), calc((100vw - 1100px) / 2));
   color: var(--paper-light);
   border-bottom: 1px solid rgba(238, 228, 207, 0.18);
-  background: rgba(24, 22, 19, 0.84);
+  background: rgba(22, 20, 18, 0.9);
 }
 
 .brand {
@@ -107,7 +108,7 @@ textarea:focus-visible {
   width: 2.55rem;
   height: 2.55rem;
   place-items: center;
-  border: 1px solid var(--mustard);
+  border: 1px solid rgba(184, 154, 106, 0.78);
   color: var(--mustard);
   font-family: var(--display);
   font-size: 1.45rem;
@@ -170,26 +171,24 @@ main {
 .hero {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(3.5rem, 0.2fr) minmax(0, 1fr);
-  gap: clamp(1rem, 4vw, 4rem);
-  max-width: 1440px;
+  grid-template-columns: minmax(2.4rem, 0.13fr) minmax(0, 1fr);
+  gap: clamp(1rem, 3vw, 2.5rem);
+  max-width: 1100px;
   margin: 0 auto;
-  padding: clamp(3.5rem, 8vw, 8rem) clamp(1rem, 5vw, 5rem) clamp(4rem, 7vw, 7rem);
+  padding: clamp(2.1rem, 4vw, 3.4rem) clamp(1rem, 2vw, 2rem) clamp(2rem, 3.5vw, 3rem);
   color: var(--paper-light);
 }
 
 .hero::before {
   position: absolute;
   z-index: -1;
-  top: 12%;
-  right: 17%;
-  width: clamp(15rem, 34vw, 32rem);
-  aspect-ratio: 1;
-  border: 1px solid rgba(209, 154, 60, 0.15);
-  border-radius: 50%;
-  box-shadow:
-    0 0 0 3.2rem rgba(209, 154, 60, 0.025),
-    0 0 0 8rem rgba(159, 63, 45, 0.025);
+  right: 2rem;
+  bottom: 0;
+  width: clamp(6rem, 18vw, 13rem);
+  height: 1px;
+  border: 0;
+  background: rgba(184, 154, 106, 0.25);
+  box-shadow: 0 0 0 0.4rem rgba(184, 154, 106, 0.025);
   content: "";
 }
 
@@ -199,7 +198,7 @@ main {
   align-items: flex-start;
   gap: 0.5rem;
   padding-top: 0.45rem;
-  color: #a99c8b;
+  color: #9e9383;
   font-family: var(--mono);
   font-size: 0.68rem;
   letter-spacing: 0.16em;
@@ -207,7 +206,7 @@ main {
 }
 
 .hero-copy {
-  max-width: 760px;
+  max-width: 700px;
 }
 
 .eyebrow {
@@ -227,7 +226,7 @@ main {
 .hero h1 {
   margin: 0;
   font-family: var(--display);
-  font-size: clamp(2.65rem, 6.5vw, 6.25rem);
+  font-size: clamp(2.65rem, 4.7vw, 4.35rem);
   font-weight: 700;
   letter-spacing: -0.06em;
   line-height: 1.04;
@@ -239,19 +238,19 @@ main {
 }
 
 .hero-summary {
-  max-width: 42rem;
-  margin: 2rem 0 0;
-  color: #cfc3b1;
+  max-width: 38rem;
+  margin: 1.5rem 0 0;
+  color: #cdc3b5;
   font-size: clamp(1rem, 1.5vw, 1.15rem);
 }
 
 .workbench {
   display: grid;
   grid-template-columns: minmax(13.5rem, 16.5rem) minmax(0, 1fr);
-  gap: clamp(1.2rem, 3vw, 2.5rem);
-  max-width: 1440px;
+  gap: clamp(1rem, 2.5vw, 2rem);
+  max-width: 1100px;
   margin: 0 auto;
-  padding: 0 clamp(1rem, 4vw, 4rem) clamp(4rem, 9vw, 9rem);
+  padding: 0 clamp(1rem, 2vw, 2rem) clamp(4rem, 9vw, 8rem);
 }
 
 .workbench-main {
@@ -368,12 +367,12 @@ main {
   align-self: start;
   min-height: 31rem;
   padding: 1.35rem;
-  border: 1px solid rgba(238, 228, 207, 0.16);
+  border: 1px solid rgba(184, 154, 106, 0.28);
   color: var(--paper);
   background:
     linear-gradient(rgba(255, 255, 255, 0.025), transparent 20%),
-    #1d1b18;
-  box-shadow: inset 0 0 0 5px rgba(0, 0, 0, 0.16);
+    #1b1916;
+  box-shadow: inset 0 0 0 5px rgba(255, 255, 255, 0.015);
 }
 
 .drawer-heading {
@@ -562,6 +561,46 @@ main {
   pointer-events: none;
 }
 
+/* 首页人格选择沿用参考页的深色编辑台，不改变任何选择或投递行为。 */
+.persona-sheet {
+  border-color: rgba(184, 154, 106, 0.34);
+  color: var(--paper-light);
+  background:
+    linear-gradient(132deg, rgba(184, 154, 106, 0.08), transparent 32%),
+    linear-gradient(rgba(255, 255, 255, 0.018), transparent 23%),
+    #1d1a17;
+  box-shadow:
+    0 0 0 1px rgba(184, 154, 106, 0.05),
+    0 22px 48px rgba(0, 0, 0, 0.24);
+}
+
+.persona-sheet::before {
+  border-color: rgba(184, 154, 106, 0.14);
+}
+
+.persona-sheet .paper-index {
+  color: rgba(184, 154, 106, 0.18);
+}
+
+.persona-sheet .section-heading {
+  margin-bottom: 2.35rem;
+  padding-bottom: 1.1rem;
+  border-bottom: 1px solid rgba(184, 154, 106, 0.23);
+}
+
+.persona-sheet .section-heading p:not(.eyebrow),
+.persona-sheet .inline-status {
+  color: #b9afa1;
+}
+
+.persona-sheet .eyebrow {
+  color: var(--mustard);
+}
+
+.persona-sheet .text-button {
+  color: #cdc1af;
+}
+
 .paper-index {
   position: absolute;
   top: 1rem;
@@ -615,17 +654,18 @@ main {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0.9rem;
+  grid-template-columns: 1.18fr 1fr 1fr;
+  grid-template-rows: repeat(2, minmax(12.5rem, 1fr));
+  gap: 1rem;
 }
 
 .persona-card {
   position: relative;
   display: grid;
-  min-height: 22rem;
-  padding: 1.1rem;
-  border: 1px solid var(--border);
-  background: rgba(247, 239, 221, 0.64);
+  min-height: 0;
+  padding: 1.35rem;
+  border: 1px solid rgba(184, 154, 106, 0.22);
+  background: rgba(34, 31, 27, 0.9);
   cursor: pointer;
   transition:
     transform 180ms ease,
@@ -642,19 +682,27 @@ main {
 }
 
 .persona-card:hover {
-  border-color: var(--persona-accent, var(--rust));
-  box-shadow: 5px 6px 0 color-mix(in srgb, var(--persona-accent, var(--rust)) 24%, transparent);
-  transform: translateY(-3px);
+  border-color: rgba(184, 154, 106, 0.62);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.25);
+  transform: translateY(-2px);
 }
 
 .persona-card[data-selected="true"] {
-  border-color: var(--persona-accent, var(--rust));
-  box-shadow: 6px 7px 0 color-mix(in srgb, var(--persona-accent, var(--rust)) 30%, transparent);
-  transform: translateY(-3px) rotate(-0.35deg);
+  border-color: var(--mustard);
+  box-shadow: 0 0 0 1px rgba(184, 154, 106, 0.18), 0 16px 34px rgba(0, 0, 0, 0.25);
+  transform: translateY(-2px);
 }
 
 .persona-card[data-selected="true"]::after {
-  border-color: color-mix(in srgb, var(--persona-accent, var(--rust)) 38%, transparent);
+  border-color: rgba(184, 154, 106, 0.3);
+}
+
+.persona-card:nth-child(1) {
+  grid-row: span 2;
+}
+
+.persona-card:nth-child(4) {
+  grid-column: span 2;
 }
 
 .persona-card.persona-shouzhuo {
@@ -680,7 +728,7 @@ main {
 }
 
 .persona-card[data-available="false"]:hover {
-  border-color: var(--border);
+  border-color: rgba(184, 154, 106, 0.22);
   box-shadow: none;
   transform: none;
 }
@@ -692,7 +740,7 @@ main {
 }
 
 .persona-card[data-supported="false"]:hover {
-  border-color: var(--border);
+  border-color: rgba(184, 154, 106, 0.22);
   box-shadow: none;
   transform: none;
 }
@@ -730,12 +778,13 @@ main {
   width: 3rem;
   height: 3rem;
   place-items: center;
-  border-radius: 50%;
-  color: var(--paper-light);
-  background: var(--persona-accent, var(--rust));
+  border: 1px solid currentColor;
+  border-radius: 0;
+  color: var(--mustard);
+  background: transparent;
   font-family: var(--display);
   font-size: 1.3rem;
-  box-shadow: inset 0 0 0 4px rgba(255, 255, 255, 0.14);
+  box-shadow: inset 0 0 0 3px rgba(184, 154, 106, 0.09);
 }
 
 .persona-tag,
@@ -747,26 +796,27 @@ main {
 
 .persona-tag {
   padding: 0.25rem 0.45rem;
-  border: 1px solid var(--persona-accent, var(--rust));
-  color: var(--persona-accent, var(--rust));
+  border-color: rgba(184, 154, 106, 0.52);
+  color: #cdb98e;
 }
 
 .persona-card h3 {
   margin: 1rem 0 0.15rem;
   font-family: var(--display);
-  font-size: 1.45rem;
+  color: var(--paper-light);
+  font-size: 1.55rem;
   line-height: 1.2;
 }
 
 .persona-version {
-  color: var(--ink-faint);
+  color: #968c7e;
   font-family: var(--mono);
   font-size: 0.62rem;
 }
 
 .persona-bio {
   margin: 0.9rem 0 1rem;
-  color: var(--ink-soft);
+  color: #d0c7ba;
   font-size: 0.84rem;
 }
 
@@ -779,11 +829,11 @@ main {
 
 .persona-facts div {
   padding-top: 0.55rem;
-  border-top: 1px solid rgba(90, 69, 45, 0.18);
+  border-top: 1px solid rgba(184, 154, 106, 0.17);
 }
 
 .persona-facts dt {
-  color: var(--rust-deep);
+  color: var(--mustard);
   font-family: var(--mono);
   font-size: 0.6rem;
   font-weight: 700;
@@ -792,13 +842,14 @@ main {
 
 .persona-facts dd {
   margin: 0.15rem 0 0;
+  color: #bcb2a4;
   font-size: 0.76rem;
   line-height: 1.5;
 }
 
 .persona-availability {
   margin-top: 0.8rem;
-  color: var(--sage);
+  color: #90ae93;
 }
 
 .persona-card[data-available="false"] .persona-availability {
@@ -1676,6 +1727,13 @@ textarea:disabled {
 @media (max-width: 1120px) {
   .persona-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: auto;
+  }
+
+  .persona-card:nth-child(1),
+  .persona-card:nth-child(4) {
+    grid-column: auto;
+    grid-row: auto;
   }
 
   .persona-card {
@@ -1799,7 +1857,7 @@ textarea:disabled {
   }
 
   .hero h1 {
-    font-size: clamp(2.65rem, 13vw, 4.1rem);
+    font-size: clamp(2.35rem, 10.2vw, 2.75rem);
   }
 
   .hero-summary {
@@ -1829,6 +1887,10 @@ textarea:disabled {
 
   .persona-grid {
     grid-template-columns: 1fr;
+  }
+
+  .persona-card {
+    min-height: 0;
   }
 
   .workspace-nav {
