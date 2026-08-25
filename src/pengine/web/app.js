@@ -162,8 +162,6 @@ function start() {
 
 function cacheElements() {
   const ids = [
-    "service-stamp",
-    "service-label",
     "reload-personas",
     "persona-grid",
     "persona-status",
@@ -366,7 +364,6 @@ async function initialize() {
 async function loadPersonas() {
   elements["reload-personas"].disabled = true;
   elements["persona-status"].textContent = "正在读取人格档案……";
-  setServiceState("idle", "正在读取人格");
 
   try {
     const payload = await apiRequest("/personas");
@@ -388,12 +385,10 @@ async function loadPersonas() {
     elements["persona-status"].textContent = missingCount
       ? `已读取 ${availableCount} 位原型人格；${missingCount} 位未被当前服务列为可选。${gatingNote}`
       : `四位原型人格均已由本地服务确认可用。${gatingNote}`;
-    setServiceState("ready", "本地服务已连接");
   } catch (error) {
     state.personas = new Map();
     state.selectedPersonaId = "";
     elements["persona-status"].textContent = formatError(error);
-    setServiceState("error", "本地服务不可达");
   } finally {
     renderPersonaCards();
     elements["reload-personas"].disabled = false;
@@ -537,7 +532,6 @@ async function handleCreate(event) {
     focusDelivery();
   } catch (error) {
     elements["creation-message"].textContent = formatError(error);
-    setServiceState("error", "请求未完成");
   } finally {
     setCreationBusy(false);
   }
@@ -679,7 +673,6 @@ async function refreshCreation(options = {}) {
     if (options.isRestore) {
       state.workspaceView = hasReadableDelivery() ? "reading" : "progress";
     }
-    setServiceState("ready", "本地服务已连接");
     renderSeries();
     renderCreation();
 
@@ -695,7 +688,6 @@ async function refreshCreation(options = {}) {
       renderCreation();
       showToast("保存的作品编号在当前本地数据中不存在。");
     } else {
-      setServiceState("error", "状态读取失败");
       showToast(formatError(error));
       if (!options.isRestore) {
         schedulePoll();
@@ -1389,7 +1381,6 @@ async function loadPresentation(kind) {
       `/creations/${encodeURIComponent(state.creationId)}/runs/${kind}/presentation`,
     );
     state.presentations[kind] = presentation;
-    setServiceState("ready", "本地服务已连接");
   } catch (error) {
     if (!state.presentations[kind] && elements["presentation-status"]) {
       elements["presentation-status"].textContent = "完整原文";
@@ -2360,11 +2351,6 @@ function setRevisionBusy(busy) {
         : lockedLabels[revisionState] || "提交全量重写";
   }
   elements["revision-form"].setAttribute("aria-busy", String(busy));
-}
-
-function setServiceState(tone, label) {
-  elements["service-stamp"].dataset.tone = tone;
-  elements["service-label"].textContent = label;
 }
 
 function showToast(message) {

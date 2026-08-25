@@ -134,36 +134,6 @@ textarea:focus-visible {
   letter-spacing: 0.12em;
 }
 
-.service-stamp {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.55rem;
-  padding: 0.45rem 0.75rem;
-  border: 1px solid rgba(238, 228, 207, 0.2);
-  color: #d9cdbb;
-  font-family: var(--mono);
-  font-size: 0.72rem;
-  letter-spacing: 0.04em;
-}
-
-.service-light {
-  width: 0.55rem;
-  height: 0.55rem;
-  border-radius: 50%;
-  background: var(--mustard);
-  box-shadow: 0 0 0 3px rgba(209, 154, 60, 0.15);
-}
-
-.service-stamp[data-tone="ready"] .service-light {
-  background: #7ca181;
-  box-shadow: 0 0 0 3px rgba(124, 161, 129, 0.14);
-}
-
-.service-stamp[data-tone="error"] .service-light {
-  background: #cb5d49;
-  box-shadow: 0 0 0 3px rgba(203, 93, 73, 0.14);
-}
-
 main {
   overflow: hidden;
 }
@@ -1840,11 +1810,6 @@ textarea:disabled {
 
   .brand small {
     display: none;
-  }
-
-  .service-stamp {
-    max-width: 9.5rem;
-    font-size: 0.6rem;
   }
 
   .hero {
