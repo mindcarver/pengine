@@ -2152,6 +2152,16 @@
               }
             ]
           },
+          "outline_groups": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OutlineGroupProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "model_calls": {
             "items": {
               "$ref": "#/components/schemas/ModelCallSummary"
@@ -2738,6 +2748,63 @@
           "completed"
         ],
         "title": "EpisodeProgress"
+      },
+      "OutlineGroupProgress": {
+        "properties": {
+          "committed_groups": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Committed Groups"
+          },
+          "committed_through_episode": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Committed Through Episode"
+          },
+          "current_group": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Group"
+          },
+          "current_start_episode": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Start Episode"
+          },
+          "current_end_episode": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current End Episode"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "committed_groups",
+          "committed_through_episode"
+        ],
+        "title": "OutlineGroupProgress"
       },
       "ModelCallUsage": {
         "properties": {

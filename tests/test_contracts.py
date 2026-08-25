@@ -268,3 +268,21 @@ def test_openapi_exposes_quality_rejection_recovery_contract() -> None:
     assert resource["revision"]["discriminator"]["mapping"]["quality_rejected"] == (
         "#/components/schemas/RevisionQualityRejected"
     )
+
+
+def test_openapi_documents_outline_group_progress() -> None:
+    schemas = json.loads((ROOT / "contracts/openapi.json").read_text())["components"]["schemas"]
+
+    outline_ref = schemas["RunProgress"]["properties"]["outline_groups"]["anyOf"][0]["$ref"]
+    assert outline_ref == "#/components/schemas/OutlineGroupProgress"
+    assert schemas["OutlineGroupProgress"]["required"] == [
+        "committed_groups",
+        "committed_through_episode",
+    ]
+    assert set(schemas["OutlineGroupProgress"]["properties"]) == {
+        "committed_groups",
+        "committed_through_episode",
+        "current_group",
+        "current_start_episode",
+        "current_end_episode",
+    }

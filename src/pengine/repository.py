@@ -49,6 +49,7 @@ from pengine.schemas import (
     InternalStage,
     ModelCallSummary,
     ModelCallUsage,
+    OutlineGroupProgress,
     PausedRun,
     PersonaSnapshot,
     QualityGateRejection,
@@ -9716,6 +9717,11 @@ class Repository:
             UUID(run["id"]),
             progress["current_episode"],
         )
+        outline_groups = (
+            await self._outline_group_progress(connection, UUID(run["id"]))
+            if current_internal is InternalStage.GENERATING_EPISODE_OUTLINE
+            else None
+        )
         model_calls = await self._model_calls(connection, UUID(run["id"]))
         return progress, RunProgress(
             current_stage=_USER_STAGE_BY_INTERNAL[current_internal],
@@ -9744,6 +9750,7 @@ class Repository:
                 ),
             ),
             episodes=episodes,
+            outline_groups=outline_groups,
             model_calls=model_calls,
             can_continue=(
                 execution_state == "paused"
@@ -9832,6 +9839,39 @@ class Repository:
             total=len(plans),
             completed=len(drafts),
             current=current,
+        )
+
+    async def _outline_group_progress(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+    ) -> OutlineGroupProgress | None:
+        cursor = await connection.execute(
+            """
+            SELECT position, start_episode, end_episode, status
+            FROM outline_generation_groups
+            WHERE run_id = ?
+            ORDER BY position
+            """,
+            (str(run_id),),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return None
+        committed = [row for row in rows if row["status"] == "committed"]
+        in_flight = next((row for row in rows if row["status"] != "committed"), None)
+        return OutlineGroupProgress(
+            committed_groups=len(committed),
+            committed_through_episode=max(
+                (int(row["end_episode"]) for row in committed), default=0
+            ),
+            current_group=int(in_flight["position"]) if in_flight is not None else None,
+            current_start_episode=(
+                int(in_flight["start_episode"]) if in_flight is not None else None
+            ),
+            current_end_episode=(
+                int(in_flight["end_episode"]) if in_flight is not None else None
+            ),
         )
 
     @staticmethod

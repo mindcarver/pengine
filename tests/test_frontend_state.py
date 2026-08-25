@@ -787,6 +787,7 @@ Object.assign(elements, {
   "end-run": { disabled: false },
   "run-control-message": { textContent: "" },
   "episode-progress": { hidden: true },
+  "episode-progress-label": { textContent: "" },
   "episode-progress-detail": { textContent: "" },
   "model-call-panel": { hidden: true },
   "model-call-totals": { textContent: "" },
@@ -1022,6 +1023,7 @@ Object.assign(elements, {
   "end-run": { hidden: false, disabled: false },
   "run-control-message": { textContent: "" },
   "episode-progress": { hidden: true },
+  "episode-progress-label": { textContent: "" },
   "episode-progress-detail": { textContent: "" },
   "model-call-panel": { hidden: true },
   "model-call-totals": { textContent: "" },
@@ -1663,6 +1665,7 @@ Object.assign(elements, {
   "end-run": { disabled: false },
   "run-control-message": { textContent: "" },
   "episode-progress": { hidden: true },
+  "episode-progress-label": { textContent: "" },
   "episode-progress-detail": { textContent: "" },
   "model-call-panel": { hidden: true },
   "model-call-totals": { textContent: "" },
@@ -1839,6 +1842,7 @@ Object.assign(elements, {
   "progress-elapsed": { textContent: "" },
   "progress-stages": { querySelectorAll() { return stageItems; } },
   "episode-progress": { hidden: true },
+  "episode-progress-label": { textContent: "" },
   "episode-progress-detail": { textContent: "" },
   "review-progress": { hidden: true },
   "review-l0": { textContent: "" },
@@ -2287,6 +2291,130 @@ const context = {{
     }},
   }},
   window: {{ setTimeout(callback) {{ callback(); }} }},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(() => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    result = subprocess.run(
+        ["node", "-e", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_progress_renders_outline_group_line_during_outline_stage() -> None:
+    script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
+    assertions = """
+const stageItems = USER_STAGES.map(([stage]) => ({
+  dataset: { stage },
+  attrs: {},
+  setAttribute(name, value) { this.attrs[name] = value; },
+  removeAttribute(name) { delete this.attrs[name]; },
+}));
+Object.assign(elements, {
+  "run-progress": { hidden: true },
+  "progress-kind": { textContent: "" },
+  "progress-title": { textContent: "" },
+  "progress-elapsed": { textContent: "" },
+  "progress-stages": { querySelectorAll() { return stageItems; } },
+  "episode-progress": { hidden: true },
+  "episode-progress-label": { textContent: "" },
+  "episode-progress-detail": { textContent: "" },
+  "review-progress": { hidden: true },
+  "review-l0": { textContent: "" },
+  "review-l4": { textContent: "" },
+  "run-controls": { hidden: true },
+  "run-control-title": { textContent: "" },
+  "run-control-description": { textContent: "" },
+  "continue-run": { disabled: false },
+  "end-run": { disabled: false },
+  "run-control-message": { textContent: "" },
+  "model-call-panel": { hidden: true },
+  "model-call-totals": { textContent: "" },
+  "model-call-list": { replaceChildren() {}, appendChild() {} },
+});
+state.workspaceView = "progress";
+state.activeVersion = "initial";
+state.activeArtifact = "direction";
+state.creation = {
+  initial: {
+    state: "running",
+    progress: {
+      current_stage: "generating_episode_outline",
+      completed_stages: ["determining_direction", "generating_story_outline"],
+      elapsed_seconds: 2400,
+      recovery_state: "none",
+      recovery_reason: "none",
+      final_review: { l0: "pending", l4: "pending" },
+      can_continue: false,
+      can_end: false,
+      episodes: null,
+      outline_groups: {
+        committed_groups: 13,
+        committed_through_episode: 36,
+        current_group: 14,
+        current_start_episode: 37,
+        current_end_episode: 38,
+      },
+      model_calls: [],
+    },
+    drafts: { artifacts: [], episodes: [] },
+  },
+  revision: { state: "unavailable" },
+};
+renderProgress();
+if (elements["episode-progress"].hidden) {
+  throw new Error("outline group progress stayed hidden during outline stage");
+}
+if (elements["episode-progress-label"].textContent !== "大纲组进度") {
+  throw new Error("outline label mismatch: " + elements["episode-progress-label"].textContent);
+}
+const outlineDetail = elements["episode-progress-detail"].textContent;
+if (!outlineDetail.includes("已提交 13 组")) throw new Error("missing committed groups");
+if (!outlineDetail.includes("覆盖第 1–36 集")) throw new Error("missing coverage");
+if (!outlineDetail.includes("正在生成第 14 组（第 37–38 集）")) {
+  throw new Error("missing current group: " + outlineDetail);
+}
+
+state.creation.initial.progress.outline_groups = null;
+renderProgress();
+if (!elements["episode-progress"].hidden) {
+  throw new Error("outline progress visible without group data");
+}
+
+state.creation.initial.progress.current_stage = "generating_episode_scripts";
+state.creation.initial.progress.episodes = { total: 38, completed: 5, current: 6 };
+renderProgress();
+if (elements["episode-progress-label"].textContent !== "分集进度") {
+  throw new Error("script stage did not restore the episode label");
+}
+if (!elements["episode-progress-detail"].textContent.includes("第 6/38 集")) {
+  throw new Error("script stage detail lost episode position");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{
+    addEventListener() {{}},
+    createElement() {{
+      return {{ dataset: {{}}, textContent: "", appendChild() {{}} }};
+    }},
+  }},
+  window: {{}},
   crypto: {{ randomUUID() {{ return "test-id"; }} }},
   console,
 }};

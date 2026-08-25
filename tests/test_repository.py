@@ -4016,3 +4016,68 @@ async def test_schema_v18_collision_repairs_missing_episode_attempt_cycles(
     assert tuple(attempt) == (0, 1)
     assert tuple(cycle) == (0, 1, 1)
     assert tuple(current) == (0,)
+
+
+async def test_run_progress_reports_outline_group_coverage(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    accepted, lease = await create_and_lease_initial(
+        repository,
+        persona,
+        creation_request,
+    )
+    await repository.record_stage_attempt(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        now=NOW + timedelta(seconds=1),
+    )
+    await repository.begin_outline_group(
+        lease.run_id,
+        group_id="g01",
+        position=1,
+        start_episode=1,
+        end_episode=3,
+        operation_id="operation-1",
+    )
+    await repository.begin_outline_group(
+        lease.run_id,
+        group_id="g02",
+        position=2,
+        start_episode=4,
+        end_episode=5,
+        operation_id="operation-2",
+    )
+    markdown = "## 第1集\n第一组大纲正文。"
+    await repository.save_outline_group_body(
+        lease.run_id,
+        group_id="g01",
+        operation_id="operation-1",
+        outline_markdown=markdown,
+        outline_markdown_sha256=hashlib.sha256(markdown.encode()).hexdigest(),
+        body_call_id="call-body-1",
+    )
+    await repository.complete_outline_group(
+        lease.run_id,
+        group_id="g01",
+        operation_id="operation-1",
+        payload={"episodes": []},
+        sidecar_call_id="call-sidecar-1",
+    )
+
+    creation = await repository.get_creation(
+        accepted.creation_id,
+        now=NOW + timedelta(seconds=30),
+    )
+    assert creation is not None
+    progress = creation.initial.progress
+    assert progress.current_stage == "generating_episode_outline"
+    assert progress.outline_groups is not None
+    assert progress.outline_groups.model_dump() == {
+        "committed_groups": 1,
+        "committed_through_episode": 3,
+        "current_group": 2,
+        "current_start_episode": 4,
+        "current_end_episode": 5,
+    }
