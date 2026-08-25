@@ -132,7 +132,6 @@ Object.assign(elements, {
   "failure-actions": { hidden: true },
   "run-progress": { hidden: false },
   "delivery-section": { hidden: false },
-  "delivery-subtitle": { textContent: "" },
   "folio-stamp": { textContent: "" },
   "series-empty": { hidden: true },
   "series-card": { hidden: false },
@@ -589,7 +588,6 @@ const requests = [];
 Object.assign(elements, {
   "delivery-section": { hidden: true },
   "folio-stamp": { textContent: "" },
-  "delivery-subtitle": { textContent: "" },
   "task-waiting": { hidden: false },
   "failure-panel": { hidden: true },
   "result-workspace": { hidden: true },
@@ -1160,7 +1158,6 @@ const artifactButtons = [
 ];
 Object.assign(elements, {
   "delivery-section": { hidden: true },
-  "delivery-subtitle": { textContent: "" },
   "folio-stamp": { textContent: "" },
   "task-waiting": { hidden: true },
   "wait-kicker": { textContent: "" },
