@@ -192,7 +192,6 @@ function cacheElements() {
     "delivery-index",
     "delivery-section",
     "delivery-title",
-    "delivery-subtitle",
     "folio-stamp",
     "run-progress",
     "progress-kind",
@@ -732,8 +731,6 @@ function renderCreation() {
   }
 
   const initial = state.creation.initial;
-  elements["delivery-subtitle"].textContent =
-    `${state.creation.persona.display_name} · 人格版本 ${state.creation.persona.version}`;
   if (requiresAttentionScene()) {
     setWorkspaceView("progress");
   } else if (shouldOpenReader()) {
