@@ -22,9 +22,9 @@ The system is a modular monolith. It binds only to loopback, serves one
 same-origin single-page workbench plus a JSON HTTP API, persists durable state
 in SQLite, and runs one embedded background worker. The worker drives a Deep
 Agents/LangGraph creative runtime through two fixed role routes that share one
-relay URL and API key: Anthropic Messages with `claude-opus-5` for generation
-and creative repair, plus a configured review model using its matching
-Anthropic, OpenAI, or DeepSeek client protocol.
+relay URL and API key: Anthropic Messages with `claude-opus-5` or
+`claude-sonnet-5` for generation and creative repair, plus a configured review
+model using its matching Anthropic, OpenAI, or DeepSeek client protocol.
 
 V1 does not include authentication, multi-user isolation, public deployment,
 operator-selectable model roles or providers, production persona authoring,
@@ -565,10 +565,10 @@ duplicate the full field contract.
   `review_model_id` are deployment configuration. The two role-specific output
   caps are optional.
 - The worker atomically constructs both process-level clients from the shared
-  URL/key: `ChatAnthropic` with exactly `claude-opus-5` for generation and
-  creative repair, and the Anthropic, OpenAI, or DeepSeek client selected by
-  `review_model_id` for review. Missing either route fails closed before workflow
-  execution; neither client is used as fallback for the other.
+  URL/key: `ChatAnthropic` with `claude-opus-5` or `claude-sonnet-5` for
+  generation and creative repair, and the Anthropic, OpenAI, or DeepSeek client
+  selected by `review_model_id` for review. Missing either route fails closed
+  before workflow execution; neither client is used as fallback for the other.
 - The relay must support the selected clients' tool-use protocols at the
   configured root. Supervisor and subagent schemas use LangChain `ToolStrategy`
   rather than provider-native structured-output extensions.
@@ -750,10 +750,10 @@ quality.
   `episode_repair`, and `story_repair`. Three review/repair agents load
   dedicated skills.
 - Two preconfigured LangChain clients share the operator-supplied relay URL/key:
-  `ChatAnthropic` with `claude-opus-5` for generation and creative repair, and a
-  review client whose Anthropic, OpenAI, or DeepSeek protocol is selected from
-  `review_model_id`. Both disable automatic retries; both routes are required
-  and neither falls back to the other.
+  `ChatAnthropic` with `claude-opus-5` or `claude-sonnet-5` for generation and
+  creative repair, and a review client whose Anthropic, OpenAI, or DeepSeek
+  protocol is selected from `review_model_id`. Both disable automatic retries;
+  both routes are required and neither falls back to the other.
 - `AsyncSqliteSaver` provides durable per-run thread checkpoints in the same
   local SQLite database. `StateBackend` provides checkpointed thread scratch.
 - V1 memory is thread-scoped only. Cross-creation writable `StoreBackend` memory

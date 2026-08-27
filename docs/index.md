@@ -58,7 +58,7 @@ Pengine 把一个自由表达的故事想法、短剧要求和一份版本化人
           ▼                          ▼                          ▼
     生成路由                     审核路由                    内容闸门
   ChatAnthropic        DeepSeek / OpenAI / Anthropic    L0 / L4 / final
-  claude-opus-5          由 review_model_id 选择
+  Opus 5 / Sonnet 5       由 review_model_id 选择
           │                          │
           └────────────── 同一 relay URL / key ──────────────┘
 </code></pre>
@@ -74,8 +74,9 @@ Pengine 把一个自由表达的故事想法、短剧要求和一份版本化人
 </div>
 
 模型 relay 共享一组 URL 和 API key，但角色路由固定分离：生成和创作修复只使用
-Anthropic Messages 的 `claude-opus-5`；审核模型允许 `deepseek-v4-flash`、`gpt-5.5`、
-`gpt-5.6-terra` 或 `claude-opus-5`，并分别选择 DeepSeek、OpenAI 或 Anthropic 客户端。
+Anthropic Messages 的 `claude-opus-5` 或 `claude-sonnet-5`；审核模型允许
+`deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、`claude-opus-5` 或
+`claude-sonnet-5`，并分别选择 DeepSeek、OpenAI 或 Anthropic 客户端。
 两类角色不互换，也不在一路失败时自动回退到另一路。
 
 当前仓库内置的四套人格包是可运行的原型数据，不等于生产人格定稿。人格源文件只读；创建任务会建立不可变快照，后续修改源目录不会改变已经创建的任务。

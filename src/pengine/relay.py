@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - exercised only without langfuse instal
     _LangfuseClient = None  # type: ignore[assignment,misc]
     _LangfuseCallbackHandler = None  # type: ignore[assignment,misc]
 
-from pengine.config import Settings
+from pengine.config import ANTHROPIC_MODEL_IDS, Settings
 from pengine.model_calls import (
     ModelCallContext,
     ModelCallRecord,
@@ -1273,7 +1273,7 @@ def build_relay_adapter(
         context_limit_tokens = settings.review_context_limit_tokens
         provider_profile_key = (
             "anthropic"
-            if model_id == "claude-opus-5"
+            if model_id in ANTHROPIC_MODEL_IDS
             else "openai"
             if model_id in {"gpt-5.5", "gpt-5.6-terra"}
             else "deepseek"
@@ -1296,7 +1296,6 @@ def build_relay_adapter(
         "api_key": settings.relay_api_key,
         "max_retries": 0,
         "timeout": settings.model_timeout_seconds,
-        "temperature": 0,
         "callbacks": [
             _ModelCallAuditHandler(
                 role=role,
@@ -1314,6 +1313,11 @@ def build_relay_adapter(
             *([handler] if (handler := _build_langfuse_handler(settings)) is not None else []),
         ],
     }
+    # Sonnet 5 rejects non-default sampling parameters. Omitting temperature lets
+    # Anthropic apply the model default while preserving deterministic overrides for
+    # the existing routes.
+    if model_id != "claude-sonnet-5":
+        common["temperature"] = 0
     if role == "review":
         if model_id in {"gpt-5.5", "gpt-5.6-terra"}:
             return RelayAdapter(
@@ -1326,7 +1330,7 @@ def build_relay_adapter(
                 provider_profile_key=provider_profile_key,
                 model_call_state=model_call_state,
             )
-        if model_id == "claude-opus-5":
+        if model_id in ANTHROPIC_MODEL_IDS:
             return RelayAdapter(
                 model=_SerialChatAnthropic(
                     **common,

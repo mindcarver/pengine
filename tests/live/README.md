@@ -2,9 +2,10 @@
 
 This test starts a real Pengine server on a random loopback port, copies no
 shared database state, and calls both configured model routes from the current
-environment or repository `.env`. Generation and creative repair are fixed to
-`claude-opus-5` over Anthropic Messages. Review may be `deepseek-v4-flash`,
-`gpt-5.5`, `gpt-5.6-terra`, or `claude-opus-5`; Pengine selects the matching
+environment or repository `.env`. Generation and creative repair use
+`claude-opus-5` or `claude-sonnet-5` over Anthropic Messages. Review may be
+`deepseek-v4-flash`, `gpt-5.5`, `gpt-5.6-terra`, `claude-opus-5`, or
+`claude-sonnet-5`; Pengine selects the matching
 DeepSeek, OpenAI, or Anthropic client. Both routes use the same
 `PENGINE_RELAY_BASE_URL` and `PENGINE_RELAY_API_KEY`. Missing either
 route fails closed; there is no single-model or cross-role fallback. The test is

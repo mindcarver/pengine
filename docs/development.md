@@ -51,9 +51,11 @@ PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 
 配置规则：
 
-- generation model 必须是 `claude-opus-5`，生成输出上限不能超过 `128000`；
+- generation model 必须是 `claude-opus-5` 或 `claude-sonnet-5`，生成输出上限不能超过
+  `128000`；Sonnet 5 不发送非默认采样参数；
 - `.env.example` 选择 `claude-opus-5`；Settings 允许的审核模型完整集合是
-  `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra` 和 `claude-opus-5`，分别走
+  `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、`claude-opus-5` 和
+  `claude-sonnet-5`，分别走
   DeepSeek、OpenAI 和 Anthropic 客户端；不能仅凭配置通过就声称 provider 能力已验证；
 - generation/review 上下文上限必须是实际验证过的 token window；没有可信上限时请求前阻断；
 - relay URL 必须使用 HTTPS，loopback relay 才允许 HTTP；
