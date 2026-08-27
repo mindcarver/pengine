@@ -22,9 +22,9 @@ Pengine V1 是一个带同源 Web 原型的本地短剧创作 Agent。它通过
 [Deep Agents](https://github.com/langchain-ai/deepagents) 与 LangGraph，
 让阶段化专业 Agent 按固定流程协作；业务状态、检查点和交付物全部落在本地
 SQLite。模型请求共用一组 relay URL 与密钥，但按角色固定为两条路由：生成与创作修复
-使用 Anthropic Messages 的 `claude-opus-5`；审核模型可配置为 `deepseek-v4-flash`、
-`gpt-5.5`、`gpt-5.6-terra` 或 `claude-opus-5`，运行时按模型选择 DeepSeek、OpenAI
-或 Anthropic 客户端协议。
+使用 Anthropic Messages 的 `claude-opus-5` 或 `claude-sonnet-5`；审核模型可配置为
+`deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、`claude-opus-5` 或
+`claude-sonnet-5`，运行时按模型选择 DeepSeek、OpenAI 或 Anthropic 客户端协议。
 
 Web 原型只服务本机单操作员，并以约 1.8 秒轮询展示后端确认的六个用户阶段进度、
 已运行时长和超时恢复操作；V1 没有身份认证、公共部署、多用户隔离、SSE /
@@ -242,15 +242,16 @@ PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localhost`、
 `127.0.0.1` 和 `::1` 可使用 HTTP。`PENGINE_RELAY_BASE_URL` 与
 `PENGINE_RELAY_API_KEY` 同时交给两个客户端；该地址必须同时接受 Anthropic Messages
-和所选审核模型对应的协议。`PENGINE_GENERATION_MODEL_ID` 必须是 `claude-opus-5`；
-`PENGINE_REVIEW_MODEL_ID` 只能是 `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`
-或 `claude-opus-5`。URL、密钥或任一模型 ID 缺失时，
+和所选审核模型对应的协议。`PENGINE_GENERATION_MODEL_ID` 必须是 `claude-opus-5` 或
+`claude-sonnet-5`；`PENGINE_REVIEW_MODEL_ID` 只能是 `deepseek-v4-flash`、`gpt-5.5`、
+`gpt-5.6-terra`、`claude-opus-5` 或 `claude-sonnet-5`。URL、密钥或任一模型 ID 缺失时，
 工作流会 fail closed，不会降级成单模型，也不会跨角色回退。
 
 生成路由通过 `ChatAnthropic` 调用 Anthropic Messages；
-`PENGINE_GENERATION_MAX_OUTPUT_TOKENS` 默认使用 Opus 5 支持的最大值 128000，且不能
-配置为更大的值。审核路由分别使用 `ChatDeepSeek`、`ChatOpenAI` 或 `ChatAnthropic`；
-DeepSeek 路径关闭 thinking，所有审核客户端都串行调用工具。未设置
+`PENGINE_GENERATION_MAX_OUTPUT_TOKENS` 默认使用 Opus 5 与 Sonnet 5 支持的最大值
+128000，且不能配置为更大的值。审核路由分别使用 `ChatDeepSeek`、`ChatOpenAI` 或
+`ChatAnthropic`；Sonnet 5 路由省略非默认采样参数，由模型使用 API 默认值。DeepSeek
+路径关闭 thinking，所有审核客户端都串行调用工具。未设置
 `PENGINE_REVIEW_MAX_OUTPUT_TOKENS` 时 Pengine 不额外添加输出上限。旧的
 `PENGINE_RELAY_ADAPTER`、`PENGINE_RELAY_MODEL_ID` 和
 `PENGINE_RELAY_MAX_OUTPUT_TOKENS` 已不再生效，设置它们不能配置或覆盖任一路由。

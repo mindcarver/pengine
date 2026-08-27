@@ -6,8 +6,10 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+ANTHROPIC_MODEL_IDS = frozenset({"claude-opus-5", "claude-sonnet-5"})
+_ALLOWED_GENERATION_MODELS = ANTHROPIC_MODEL_IDS
 _ALLOWED_REVIEW_MODELS = frozenset(
-    {"deepseek-v4-flash", "gpt-5.5", "gpt-5.6-terra", "claude-opus-5"}
+    {"deepseek-v4-flash", "gpt-5.5", "gpt-5.6-terra", *ANTHROPIC_MODEL_IDS}
 )
 
 
@@ -79,9 +81,12 @@ class Settings(BaseSettings):
 
     @field_validator("generation_model_id")
     @classmethod
-    def generation_model_must_be_opus_5(cls, value: str | None) -> str | None:
-        if value is not None and value != "claude-opus-5":
-            raise ValueError("generation_model_id must be claude-opus-5")
+    def generation_model_must_be_allowed(cls, value: str | None) -> str | None:
+        if value is not None and value not in _ALLOWED_GENERATION_MODELS:
+            raise ValueError(
+                "generation_model_id must be one of: "
+                f"{', '.join(sorted(_ALLOWED_GENERATION_MODELS))}"
+            )
         return value
 
     @field_validator("review_model_id")

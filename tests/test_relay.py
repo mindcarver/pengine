@@ -76,6 +76,21 @@ def test_build_relay_adapter_preserves_anthropic_defaults() -> None:
     assert adapter.model.max_tokens == 128_000
 
 
+def test_build_relay_adapter_uses_sonnet5_without_sampling_override() -> None:
+    adapter = build_relay_adapter(
+        _role_settings(generation_model_id="claude-sonnet-5"),
+        role="generation",
+    )
+
+    assert isinstance(adapter.model, ChatAnthropic)
+    assert adapter.model_id == "claude-sonnet-5"
+    assert adapter.provider_profile_key == "anthropic"
+    assert adapter.model.model == "claude-sonnet-5"
+    assert adapter.model.temperature is None
+    request_payload = adapter.model._get_request_payload([HumanMessage(content="ping")])
+    assert "temperature" not in request_payload
+
+
 def test_build_relay_adapter_configures_langfuse_without_sdk_environment(
     monkeypatch,
 ) -> None:
@@ -749,19 +764,23 @@ def test_build_relay_adapter_uses_openai_for_gpt55_review(max_output_tokens: int
     assert "secret-value" not in repr(adapter.model)
 
 
+@pytest.mark.parametrize("model_id", ["claude-opus-5", "claude-sonnet-5"])
 @pytest.mark.parametrize("max_output_tokens", [None, 16384])
-def test_build_relay_adapter_uses_anthropic_for_opus5_review(
+def test_build_relay_adapter_uses_anthropic_for_supported_review_models(
+    model_id: str,
     max_output_tokens: int | None,
 ) -> None:
     adapter = build_relay_adapter(
-        _role_settings(review_model_id="claude-opus-5", review_max_output_tokens=max_output_tokens),
+        _role_settings(review_model_id=model_id, review_max_output_tokens=max_output_tokens),
         role="review",
     )
 
     assert isinstance(adapter.model, ChatAnthropic)
     assert adapter.role == "review"
-    assert adapter.model_id == "claude-opus-5"
+    assert adapter.model_id == model_id
     assert adapter.provider_profile_key == "anthropic"
+    assert adapter.model.model == model_id
+    assert adapter.model.temperature == (None if model_id == "claude-sonnet-5" else 0)
 
 
 @pytest.mark.parametrize("tool_choice", ["any", "required"])

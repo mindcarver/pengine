@@ -1574,9 +1574,10 @@ async def test_unified_delivery_facts_helper_validates_seeded_run(
 
     # Seed provider-reported usage rows for both roles on this run (as the relay
     # audit would have recorded for real calls).
+    generation_model = settings.generation_model_id or "claude-opus-5"
     review_model = settings.review_model_id or "claude-opus-5"
     with sqlite3.connect(settings.database_path) as connection:
-        for role, model in (("generation", "claude-opus-5"), ("review", review_model)):
+        for role, model in (("generation", generation_model), ("review", review_model)):
             connection.execute(
                 """
                 INSERT INTO model_calls(
@@ -1620,7 +1621,7 @@ async def test_unified_delivery_facts_helper_validates_seeded_run(
     summary = _assert_unified_delivery_facts(
         settings.database_path,
         creation_id=str(accepted.creation_id),
-        generation_model_id="claude-opus-5",
+        generation_model_id=generation_model,
         review_model_id=review_model,
         evidence_dir=tmp_path / "evidence",
     )
