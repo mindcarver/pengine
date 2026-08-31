@@ -2372,6 +2372,45 @@ def _message_plaintext(response: Any, *, producer: str = "Script writer") -> str
     raise AgentProtocolError(f"{producer} omitted its plaintext result")
 
 
+_THINKING_RECOVERY_INSTRUCTION = (
+    "Your previous response placed the required deliverable inside thinking "
+    "blocks and left the visible message body empty. Respond again now with the "
+    "complete required plaintext as an ordinary text response in the message "
+    "body. Thinking blocks must never carry the deliverable."
+)
+
+
+def _is_thinking_only_response(response: Any) -> bool:
+    """Return True when a response hid its entire output in thinking blocks.
+
+    Relay configurations that inject extended thinking into Anthropic routes
+    can return the deliverable inside thinking blocks with an empty text
+    channel; without a corrective re-ask this burns a whole generation
+    attempt on an otherwise successful provider call.
+    """
+    if getattr(response, "tool_calls", None):
+        return False
+    content = getattr(response, "content", None)
+    if not isinstance(content, list):
+        return False
+    has_thinking = False
+    has_text = False
+    for block in content:
+        if isinstance(block, str):
+            has_text = has_text or bool(block.strip())
+        elif isinstance(block, Mapping):
+            block_type = block.get("type")
+            if block_type in {"thinking", "redacted_thinking"}:
+                has_thinking = True
+            elif block_type == "text" and isinstance(block.get("text"), str):
+                has_text = has_text or bool(block["text"].strip())
+    return has_thinking and not has_text
+
+
+def _thinking_recovery_message() -> dict[str, str]:
+    return {"role": "user", "content": _THINKING_RECOVERY_INSTRUCTION}
+
+
 def _outline_repair_directive(repair_feedback: str) -> str:
     """Lift the semantic review's evidence and issue messages to instruction level.
 
@@ -2464,12 +2503,13 @@ async def _invoke_outline_group_markdown(
             )
         if output_language_contract:
             instruction = f"{instruction}\n{output_language_contract}"
-        response = await model.ainvoke(
-            [
-                {"role": "system", "content": instruction},
-                {"role": "user", "content": model_input},
-            ]
-        )
+        outline_messages = [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": model_input},
+        ]
+        response = await model.ainvoke(outline_messages)
+        if _is_thinking_only_response(response):
+            response = await model.ainvoke([*outline_messages, _thinking_recovery_message()])
         response_text = _message_plaintext(response, producer="Episode planner")
         try:
             return parse_outline_group_markdown(
@@ -2704,6 +2744,8 @@ async def _invoke_script_group_text(
     nonce: str,
 ) -> ScriptGenerationGroupText:
     response = await model.ainvoke(messages)
+    if _is_thinking_only_response(response):
+        response = await model.ainvoke([*messages, _thinking_recovery_message()])
     return _parse_script_group_text(
         _message_plaintext(response),
         group_id=group_id,
@@ -7572,13 +7614,16 @@ class StageGuardMiddleware(AgentMiddleware):
                 args,
                 expected_episode_number=expected_episode_number,
             )
-        generated = await self.generate_script_group(
-            str(args["description"]),
-            group_id=group_id,
-            start_episode=expected_episode_number,
-            end_episode=end_episode,
-            window_id=window_id,
-            sidecar_context=sidecar_context,
+        generated = await _with_loop_relay_retry(
+            partial(
+                self.generate_script_group,
+                str(args["description"]),
+                group_id=group_id,
+                start_episode=expected_episode_number,
+                end_episode=end_episode,
+                window_id=window_id,
+                sidecar_context=sidecar_context,
+            )
         )
         payload = generated.model_dump(mode="json")
         return (

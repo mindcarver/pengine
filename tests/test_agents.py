@@ -696,6 +696,47 @@ async def test_outline_group_body_is_plain_markdown_without_structured_coordinat
 
 
 @pytest.mark.asyncio
+async def test_outline_group_recovers_when_body_hides_in_thinking_blocks() -> None:
+    group = ScriptGenerationGroup(
+        group_id="community_choice",
+        start_episode=7,
+        end_episode=8,
+        dramatic_unit="护士决定留下",
+        boundary_reason="选择改变后续目标",
+    )
+    compiled = CompiledOutlineContext(
+        model_input="FULL-CONTEXT-SENTINEL",
+        bundle_sha256="a" * 64,
+        manifest={"group_id": group.group_id},
+        manifest_json='{"group_id":"community_choice"}',
+        output_tokens=12_288,
+    )
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content=[
+                    "",
+                    {
+                        "type": "thinking",
+                        "thinking": "## 第7集\n\n林荷决定留下守夜。",
+                        "signature": "provider-signature",
+                    },
+                ]
+            ),
+            AIMessage(content=("## 第7集\n\n林荷决定留下守夜。\n\n## 第8集\n\n她向院长说明代价。")),
+        ]
+    )
+
+    markdown = await _invoke_outline_group_markdown(model, compiled, group=group)
+
+    assert [item.episode_number for item in markdown.episodes] == [7, 8]
+    assert len(model.model_message_batches) == 2
+    recovery_message = model.model_message_batches[1][-1]
+    assert isinstance(recovery_message, HumanMessage)
+    assert "thinking blocks" in recovery_message.content
+
+
+@pytest.mark.asyncio
 async def test_outline_group_body_normalizes_benign_heading_deviations() -> None:
     group = ScriptGenerationGroup(
         group_id="titled_group",
@@ -1898,6 +1939,68 @@ async def test_script_group_plaintext_ignores_provider_reasoning_metadata(
     )
 
     assert result.episodes[0].content == "第一集正文"
+
+
+@pytest.mark.asyncio
+async def test_script_group_recovers_when_deliverable_hides_in_thinking_blocks() -> None:
+    nonce = "e" * 32
+    plaintext = (
+        f"<<<PENGINE_EPISODE_START:{nonce}:1>>>\n第一集正文\n<<<PENGINE_EPISODE_END:{nonce}:1>>>"
+    )
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content=[
+                    "",
+                    {
+                        "type": "thinking",
+                        "thinking": "<<<PENGINE_EPISODE_START…第一集正文",
+                        "signature": "provider-signature",
+                    },
+                ]
+            ),
+            AIMessage(content=plaintext),
+        ]
+    )
+
+    result = await _invoke_script_group_text(
+        model,
+        [{"role": "user", "content": "write"}],
+        group_id="opening_unit",
+        start_episode=1,
+        end_episode=1,
+        nonce=nonce,
+    )
+
+    assert result.episodes[0].content == "第一集正文"
+    assert len(model.model_message_batches) == 2
+    recovery_message = model.model_message_batches[1][-1]
+    assert isinstance(recovery_message, HumanMessage)
+    assert "thinking blocks" in recovery_message.content
+
+
+@pytest.mark.asyncio
+async def test_script_group_raises_when_recovery_still_hides_in_thinking_blocks() -> None:
+    nonce = "d" * 32
+    thinking_only = AIMessage(
+        content=[
+            "",
+            {"type": "thinking", "thinking": "第一集正文", "signature": "provider-signature"},
+        ]
+    )
+    model = ToolCallingFakeModel(responses=[thinking_only, thinking_only.model_copy()])
+
+    with pytest.raises(AgentProtocolError, match="empty plaintext"):
+        await _invoke_script_group_text(
+            model,
+            [{"role": "user", "content": "write"}],
+            group_id="opening_unit",
+            start_episode=1,
+            end_episode=1,
+            nonce=nonce,
+        )
+
+    assert len(model.model_message_batches) == 2
 
 
 @pytest.mark.parametrize(

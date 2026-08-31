@@ -76,6 +76,18 @@ def test_build_relay_adapter_preserves_anthropic_defaults() -> None:
     assert adapter.model.max_tokens == 128_000
 
 
+def test_build_relay_adapter_disables_anthropic_extended_thinking() -> None:
+    for role in ("generation", "review"):
+        adapter = build_relay_adapter(
+            _role_settings(review_model_id="claude-opus-5"),
+            role=role,
+        )
+
+        request_payload = adapter.model._get_request_payload([HumanMessage(content="ping")])
+
+        assert request_payload["thinking"] == {"type": "disabled"}
+
+
 def test_build_relay_adapter_uses_sonnet5_without_sampling_override() -> None:
     adapter = build_relay_adapter(
         _role_settings(generation_model_id="claude-sonnet-5"),

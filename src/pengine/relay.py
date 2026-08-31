@@ -1335,6 +1335,7 @@ def build_relay_adapter(
                 model=_SerialChatAnthropic(
                     **common,
                     max_tokens=max_output_tokens,
+                    thinking={"type": "disabled"},
                 ),
                 role=role,
                 model_id=model_id,
@@ -1356,6 +1357,7 @@ def build_relay_adapter(
         model=_SerialChatAnthropic(
             **common,
             max_tokens=max_output_tokens,
+            thinking={"type": "disabled"},
             pengine_model_call_state=model_call_state,
             # The relay 408s non-streaming requests at ~300s; long generation
             # calls (episode outlines/scripts) legitimately exceed that, so
