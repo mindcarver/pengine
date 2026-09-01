@@ -88,6 +88,7 @@ class CreationListItem(StrictModel):
     persona_display_name: NonEmptyText
     initial_state: NonEmptyText
     revision_state: NonEmptyText
+    queue_position: int | None = Field(default=None, ge=1)
     story_excerpt: NonEmptyText
     created_at: datetime
     updated_at: datetime
@@ -645,6 +646,7 @@ class RepairAuthorization(StrictModel):
 
 class QueuedRun(StrictModel):
     state: Literal["queued"] = "queued"
+    queue_position: int = Field(ge=1)
     progress: RunProgress
     drafts: RunDraftSnapshot
 
@@ -722,6 +724,7 @@ class RevisionAvailable(StrictModel):
 class RevisionQueued(StrictModel):
     state: Literal["queued"] = "queued"
     feedback_locked: Literal[True] = True
+    queue_position: int = Field(ge=1)
     progress: RunProgress
     drafts: RunDraftSnapshot
 

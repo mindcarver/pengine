@@ -1947,6 +1947,11 @@
             "title": "State",
             "default": "queued"
           },
+          "queue_position": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Queue Position"
+          },
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
           },
@@ -1957,6 +1962,7 @@
         "additionalProperties": false,
         "type": "object",
         "required": [
+          "queue_position",
           "progress",
           "drafts"
         ],
@@ -2278,6 +2284,11 @@
             "title": "Feedback Locked",
             "default": true
           },
+          "queue_position": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Queue Position"
+          },
           "progress": {
             "$ref": "#/components/schemas/RunProgress"
           },
@@ -2288,6 +2299,7 @@
         "additionalProperties": false,
         "type": "object",
         "required": [
+          "queue_position",
           "progress",
           "drafts"
         ],
@@ -4823,6 +4835,18 @@
             "minLength": 1,
             "pattern": "\\S",
             "title": "Revision State"
+          },
+          "queue_position": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Queue Position"
           },
           "story_excerpt": {
             "type": "string",

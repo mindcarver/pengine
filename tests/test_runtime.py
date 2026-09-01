@@ -8,9 +8,23 @@ from test_worker import DeterministicWorkflow
 
 from pengine.api import create_app
 from pengine.config import Settings
+from pengine.main import build_app
 from pengine.personas import PersonaCatalog
 from pengine.repository import Repository
 from pengine.worker import Worker
+
+
+def test_main_builds_the_configured_number_of_isolated_worker_slots(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", worker_concurrency=5)
+
+    app = build_app(settings)
+    workers = app.state.worker.workers
+
+    assert len(workers) == 5
+    assert len({id(worker) for worker in workers}) == 5
+    assert [worker.worker_id for worker in workers] == [
+        f"pengine-slot-{index}" for index in range(1, 6)
+    ]
 
 
 async def _wait_for_state(

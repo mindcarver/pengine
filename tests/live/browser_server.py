@@ -14,11 +14,13 @@ Scenarios:
 - ``a7_context`` : an over-context request pauses at context_budget with the
                    required-versus-limit evidence.
 - ``happy_path`` : a normal unified run completes to a formal delivery.
+- ``queue``      : deterministic runs pause briefly for queue polling acceptance.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import shutil
 import sys
 import tempfile
@@ -42,6 +44,13 @@ from pengine.worker import Worker  # noqa: E402
 # The workbench only renders the four bundled persona ids; the server must serve a
 # real bundled persona so the browser can select one (Delivery #58 INT-A11).
 _BUNDLED_PERSONAS = ("shouzhuo", "wuzhen", "sanfentian", "xinggui")
+
+
+class DelayedFailureWorkflow:
+    async def execute(self, **kwargs):
+        del kwargs
+        await asyncio.sleep(20)
+        raise RuntimeError("browser queue transition completed")
 
 
 def _install_bundled_persona(persona_root: Path, persona_id: str) -> None:
@@ -73,6 +82,8 @@ def build_app(*, scenario: str, data_dir: Path, persona_root: Path):
         workflow = UnifiedWorkflow(episode_count=3, preflight_block=True)
     elif scenario == "happy_path":
         workflow = UnifiedWorkflow(episode_count=3)
+    elif scenario == "queue":
+        workflow = DelayedFailureWorkflow()
     else:
         raise ValueError(f"unknown scenario: {scenario}")
 
@@ -84,7 +95,12 @@ def build_app(*, scenario: str, data_dir: Path, persona_root: Path):
         worker_id="browser-worker",
     )
     return (
-        create_app(settings=settings, repository=repository, catalog=catalog, worker=worker),
+        create_app(
+            settings=settings,
+            repository=repository,
+            catalog=catalog,
+            worker=worker,
+        ),
         worker,
         repository,
     )

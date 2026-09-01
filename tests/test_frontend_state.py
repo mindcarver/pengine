@@ -3,6 +3,17 @@ import subprocess
 from pathlib import Path
 
 
+def test_queue_positions_are_rendered_in_detail_revision_and_library() -> None:
+    page = (Path(__file__).parents[1] / "src" / "pengine" / "web" / "index.html").read_text()
+    source = (Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js").read_text()
+
+    assert "任务已排队 · 第 ${initial.queue_position} 位" in source
+    assert "修订任务已排队 · 第 ${revision.queue_position} 位" in source
+    assert "排队第 ${item.queue_position} 位" in source
+    assert "showCreationsLibrary({ focus: false, background: true })" in source
+    assert 'id="creations-title" tabindex="-1"' in page
+
+
 def test_revision_submission_controls_are_single_use() -> None:
     script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
     assertions = """

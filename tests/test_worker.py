@@ -524,6 +524,12 @@ class PreAttemptEpisodeProtocolErrorWorkflow(DeterministicWorkflow):
         )
 
 
+class StageLessProtocolErrorWorkflow:
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        await kwargs["before_stage"](InternalStage.GENERATING_STORY_OUTLINE)
+        raise AgentProtocolError("Subagent returned invalid structured output")
+
+
 class QualityRejectedThenPassedWorkflow(DeterministicWorkflow):
     def __init__(self) -> None:
         super().__init__()
@@ -1271,6 +1277,46 @@ async def test_worker_fails_closed_when_episode_error_precedes_writer_attempt(
     assert failed.initial.failure.message == "模型未返回有效的结构化结果。"
     assert failed.initial.progress.can_continue is False
     assert failed.initial.progress.can_end is False
+
+
+@pytest.mark.asyncio
+async def test_worker_handles_stage_less_protocol_error_without_abandoning_job(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "stage-less-protocol-error",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=StageLessProtocolErrorWorkflow(),
+        worker_id="stage-less-protocol-error-worker",
+    )
+
+    assert await worker.run_once() is True
+    first_retry = await repository.get_creation(accepted.creation_id)
+    assert first_retry is not None
+    assert first_retry.initial.state == "queued"
+
+    assert await worker.run_once() is True
+    second_retry = await repository.get_creation(accepted.creation_id)
+    assert second_retry is not None
+    assert second_retry.initial.state == "queued"
+
+    assert await worker.run_once() is True
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.state == "failed"
+    assert failed.initial.failure.code == "structured_output_invalid"
+    assert failed.initial.failure.failed_stage == InternalStage.GENERATING_STORY_OUTLINE
 
 
 @pytest.mark.asyncio

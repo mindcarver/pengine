@@ -514,18 +514,31 @@ function showWorkbench() {
   elements["account-trigger"].setAttribute("aria-expanded", "false");
 }
 
-async function showCreationsLibrary() {
+async function showCreationsLibrary(options = {}) {
+  const { focus = true, background = false } = options;
   elements["account-menu"].hidden = true;
   elements["account-trigger"].setAttribute("aria-expanded", "false");
   elements["workbench-hero"].hidden = true;
   elements.workbench.hidden = true;
   elements["creations-library"].hidden = false;
-  elements["creations-status"].textContent = "正在读取你的创作卷宗……";
-  elements["creation-list"].replaceChildren();
-  elements["creations-title"].focus?.({ preventScroll: true });
+  if (!background) {
+    elements["creations-status"].textContent = "正在读取你的创作卷宗……";
+    elements["creation-list"].replaceChildren();
+  }
+  if (focus) {
+    elements["creations-title"].focus?.({ preventScroll: true });
+  }
   try {
     const payload = await apiRequest("/creations");
-    renderCreationList(Array.isArray(payload.items) ? payload.items : []);
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    renderCreationList(items);
+    if (
+      items.some(
+        (item) => item.initial_state === "queued" || item.revision_state === "queued",
+      )
+    ) {
+      scheduleLibraryPoll();
+    }
   } catch (error) {
     elements["creations-status"].textContent = formatError(error);
   }
@@ -546,8 +559,11 @@ function renderCreationList(items) {
       dateStyle: "medium",
       timeStyle: "short",
     }).format(new Date(item.updated_at));
+    const queueLabel = Number.isInteger(item.queue_position)
+      ? ` · 排队第 ${item.queue_position} 位`
+      : "";
     button.innerHTML = `
-      <span class="creation-file-meta">${escapeHtml(item.persona_display_name)} · 初稿 ${escapeHtml(item.initial_state)} · 修订 ${escapeHtml(item.revision_state)}</span>
+      <span class="creation-file-meta">${escapeHtml(item.persona_display_name)} · 初稿 ${escapeHtml(item.initial_state)} · 修订 ${escapeHtml(item.revision_state)}${escapeHtml(queueLabel)}</span>
       <strong>故事：${escapeHtml(item.story_excerpt)}</strong>
       <time datetime="${escapeHtml(item.updated_at)}">更新于 ${escapeHtml(updated)}</time>
     `;
@@ -948,9 +964,9 @@ function renderCreation() {
   if (initial.state === "queued") {
     const showWorkspace = renderWorkspace();
     showWaiting(
-      "任务已排队",
-      "编辑部已收到你的故事",
-      "本页会持续查询本地服务；已提交草稿会在下方保持可读，成品通过审核前不会开启成品阅览。",
+      `任务已排队 · 第 ${initial.queue_position} 位`,
+      "编辑部已收到你的故事；同一账户的任务会依次执行",
+      "排队序号按全局提交顺序实时更新；本页会持续查询本地服务。已提交草稿会在下方保持可读，成品通过审核前不会开启成品阅览。",
       { showWorkspace },
     );
     return;
@@ -2089,8 +2105,8 @@ function renderRevision() {
   } else if (revision.state === "queued") {
     feedbackState = "意见已冻结";
     buttonLabel = "修订已排队";
-    description = "修订任务已排队。初稿仍可浏览；本页会继续查询真实状态。";
-    message = "修订任务已排队。";
+    description = `修订任务当前排队第 ${revision.queue_position} 位。同一账户的任务会依次执行；初稿仍可浏览，本页会继续查询真实状态。`;
+    message = `修订任务已排队 · 第 ${revision.queue_position} 位。`;
   } else if (revision.state === "running") {
     feedbackState = "意见已冻结";
     buttonLabel = "修订创作中";
@@ -2382,6 +2398,16 @@ function schedulePoll() {
   state.pollTimer = window.setTimeout(() => {
     state.pollTimer = null;
     void refreshCreation();
+  }, POLL_INTERVAL_MS);
+}
+
+function scheduleLibraryPoll() {
+  stopPolling();
+  state.pollTimer = window.setTimeout(() => {
+    state.pollTimer = null;
+    if (!elements["creations-library"].hidden) {
+      void showCreationsLibrary({ focus: false, background: true });
+    }
   }, POLL_INTERVAL_MS);
 }
 

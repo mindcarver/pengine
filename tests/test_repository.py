@@ -99,6 +99,88 @@ def make_delivery(*, revised: bool = False) -> Delivery:
     )
 
 
+async def register_test_user(
+    repository: Repository,
+    username: str,
+    *,
+    now: datetime = NOW,
+):
+    return await repository.register_user(
+        username=username,
+        password_hash=f"hash-{username}",
+        session_token_sha256=f"token-{username}",
+        session_expires_at=now + timedelta(days=1),
+        now=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_account_fair_leasing_and_queue_positions(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    alice = await register_test_user(repository, "alice")
+    bob = await register_test_user(repository, "bob")
+    alice_first = await repository.create_creation(
+        "alice-first",
+        creation_request,
+        persona,
+        owner_id=alice.user_id,
+        now=NOW,
+    )
+    alice_second = await repository.create_creation(
+        "alice-second",
+        creation_request,
+        persona,
+        owner_id=alice.user_id,
+        now=NOW + timedelta(seconds=1),
+    )
+    bob_first = await repository.create_creation(
+        "bob-first",
+        creation_request,
+        persona,
+        owner_id=bob.user_id,
+        now=NOW + timedelta(seconds=2),
+    )
+
+    alice_resource = await repository.get_creation(alice_first.creation_id)
+    alice_library = await repository.list_creations(alice.user_id)
+    bob_resource = await repository.get_creation(bob_first.creation_id)
+    assert alice_resource is not None
+    assert bob_resource is not None
+    assert alice_resource.initial.state == "queued"
+    assert alice_resource.initial.queue_position == 1
+    assert alice_library.items[0].creation_id == alice_second.creation_id
+    assert alice_library.items[0].queue_position == 2
+    assert bob_resource.initial.queue_position == 3
+
+    first_lease = await repository.lease_next_job("slot-1", 30, now=NOW)
+    second_lease = await repository.lease_next_job(
+        "slot-2",
+        30,
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert first_lease is not None
+    assert second_lease is not None
+    assert first_lease.creation_id == alice_first.creation_id
+    assert second_lease.creation_id == bob_first.creation_id
+    assert (
+        await repository.lease_next_job(
+            "slot-3",
+            30,
+            now=NOW + timedelta(seconds=2),
+        )
+        is None
+    )
+
+    queued_alice = await repository.get_creation(alice_second.creation_id)
+    assert queued_alice is not None
+    assert queued_alice.initial.state == "queued"
+    assert queued_alice.initial.queue_position == 1
+
+
 async def test_record_outline_markdown_failure_persists_immutable_evidence(
     repository,
     persona,

@@ -432,7 +432,10 @@ class Worker:
                     review_context_limit_tokens=self.settings.review_context_limit_tokens,
                 )
         self._stop_event.clear()
-        self._task = asyncio.create_task(self._run_loop(), name="pengine-worker")
+        self._task = asyncio.create_task(
+            self._run_loop(),
+            name=f"pengine-worker-{self.worker_id}",
+        )
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -1450,11 +1453,7 @@ class Worker:
                 # terminal defects: consume the existing stage attempt budget
                 # (already recorded by before_stage) and auto-retry the stage
                 # from its approved checkpoints before ever failing the run.
-                failure_stage = (
-                    exc.stage
-                    if isinstance(getattr(exc, "stage", None), InternalStage)
-                    else InternalStage(work.current_stage or "loading_persona")
-                )
+                failure_stage = self._failure_stage(exc, current_stage, approved)
                 # Only retry stages that a resume will actually re-enter (not yet
                 # approved, so before_stage re-fires and the budget advances);
                 # approved-stage sync errors are deterministic and stay terminal.
@@ -2571,6 +2570,37 @@ class Worker:
             failed_stage=stage,
             attempt_count=max(1, min(3, attempt_count)),
         )
+
+
+class WorkerPool:
+    """Own a bounded set of fully isolated workflow workers."""
+
+    def __init__(self, workers: list[Worker]) -> None:
+        if not workers:
+            raise ValueError("WorkerPool requires at least one worker")
+        self.workers = workers
+
+    async def start(self) -> None:
+        started: list[Worker] = []
+        try:
+            for worker in self.workers:
+                await worker.start()
+                started.append(worker)
+        except BaseException:
+            await asyncio.gather(
+                *(worker.stop() for worker in reversed(started)),
+                return_exceptions=True,
+            )
+            raise
+
+    async def stop(self) -> None:
+        results = await asyncio.gather(
+            *(worker.stop() for worker in self.workers),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
 
 def _classify_failure(exc: Exception) -> tuple[str, str]:

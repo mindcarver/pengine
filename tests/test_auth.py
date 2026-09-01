@@ -132,6 +132,7 @@ async def test_creation_listing_and_foreign_ids_are_account_scoped(tmp_path: Pat
             )
             creation_id = created.json()["creation_id"]
             own_list = await alice.get("/creations")
+            own_detail = await alice.get(f"/creations/{creation_id}")
 
         async with AsyncClient(transport=transport, base_url="https://test") as bob:
             await bob.post(
@@ -153,6 +154,8 @@ async def test_creation_listing_and_foreign_ids_are_account_scoped(tmp_path: Pat
     assert created.status_code == 202
     assert own_list.status_code == 200
     assert [item["creation_id"] for item in own_list.json()["items"]] == [creation_id]
+    assert own_list.json()["items"][0]["queue_position"] == 1
+    assert own_detail.json()["initial"]["queue_position"] == 1
     assert foreign_get.status_code == 404
     assert foreign_control.status_code == 404
     assert foreign_get.json() == foreign_control.json()
