@@ -12259,21 +12259,18 @@ async def test_quality_review_drops_stale_script_when_canonical_payload_is_missi
 
 
 @pytest.mark.asyncio
-async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> None:
-    database = tmp_path / "checkpoints.sqlite3"
-    model = ToolCallingFakeModel(
-        responses=[
-            _tool_call(
-                "task",
-                {
-                    "description": "missing machine stage token",
-                    "subagent_type": "story_architect",
-                },
-                0,
-            )
-        ]
-    )
+@pytest.mark.parametrize(
+    "description",
+    [
+        "placeholder",
+        "占位：读取上一阶段结果摘要（无需委派，仅为内部检查）",
+    ],
+)
+async def test_missing_stage_token_returns_recoverable_routing_error_before_attempt(
+    description: str,
+) -> None:
     attempted: list[InternalStage] = []
+    handler_calls = 0
 
     async def before_stage(stage: InternalStage) -> int:
         attempted.append(stage)
@@ -12282,26 +12279,230 @@ async def test_stage_token_is_required_before_any_attempt(tmp_path: Path) -> Non
     async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
         raise AssertionError("No checkpoint may be approved")
 
-    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
-        await saver.setup()
-        workflow = _fake_workflow(
-            model=model,
-            checkpointer=saver,
-            provider_profile_key="toolcallingfakemodel",
-        )
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages={
+            InternalStage.SELECTING_L0_VARIANT,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+        },
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": description,
+                "subagent_type": "episode_planner",
+            },
+            "id": "call-placeholder",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
 
-        with pytest.raises(AgentProtocolError, match="stage token"):
-            await workflow.execute(
-                thread_id="invalid-thread",
-                story="故事",
-                requirements="要求",
-                persona_files={"/persona/project.md": "规则"},
-                before_stage=before_stage,
-                approve_stage=approve_stage,
-                **_episode_hook_kwargs()[0],
-            )
+    async def handler(_: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        raise AssertionError("The placeholder task must not enter the subagent")
+
+    result = await middleware.awrap_tool_call(request, handler)
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert json.loads(str(result.content)) == {
+        "error": "stage_token_missing",
+        "expected_stage": "generating_episode_scripts",
+        "expected_subagent_type": "script_writer",
+        "instruction": (
+            "Do not send placeholder or internal-check task calls. Retry with exactly one task "
+            "whose description starts with [stage=generating_episode_scripts] and whose "
+            "subagent_type is script_writer."
+        ),
+    }
 
     assert attempted == []
+    assert handler_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_missing_stage_token_does_not_invent_a_completed_stage() -> None:
+    async def before_stage(_: InternalStage) -> int:
+        raise AssertionError("No completed stage may be attempted")
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("No completed stage may be approved")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages={
+            InternalStage.SELECTING_L0_VARIANT,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+            InternalStage.GENERATING_EPISODE_SCRIPTS,
+        },
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {"description": "placeholder", "subagent_type": "script_writer"},
+            "id": "call-no-stage-pending",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def handler(_: ToolCallRequest) -> ToolMessage:
+        raise AssertionError("The placeholder task must not enter the subagent")
+
+    result = await middleware.awrap_tool_call(request, handler)
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert json.loads(str(result.content)) == {
+        "error": "stage_token_missing",
+        "expected_stage": None,
+        "expected_subagent_type": None,
+        "instruction": "No specialist stage is pending; do not call the task tool.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_legal_delegation_succeeds_after_recoverable_missing_stage_token() -> None:
+    attempted: list[InternalStage] = []
+    approved: list[tuple[InternalStage, dict[str, Any]]] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(stage: InternalStage, payload: dict[str, Any]) -> None:
+        approved.append((stage, payload))
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+    )
+    placeholder = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {"description": "placeholder", "subagent_type": "episode_planner"},
+            "id": "call-placeholder-before-correction",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def rejected_handler(_: ToolCallRequest) -> ToolMessage:
+        raise AssertionError("The placeholder task must not enter the subagent")
+
+    rejected = await middleware.awrap_tool_call(placeholder, rejected_handler)
+    assert isinstance(rejected, ToolMessage)
+    assert rejected.status == "error"
+
+    corrected = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=selecting_l0_variant] select the direction",
+                "subagent_type": "story_architect",
+            },
+            "id": "call-corrected-stage",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+    async def corrected_handler(request: ToolCallRequest) -> ToolMessage:
+        assert request.tool_call["args"]["description"].startswith(
+            "[stage=selecting_l0_variant] Complete only this specialist stage."
+        )
+        return ToolMessage(
+            content=(
+                '{"stage":"selecting_l0_variant","selected_l0_variant":"主动选择",'
+                '"selection_rationale":"符合测试故事"}'
+            ),
+            tool_call_id="call-corrected-stage",
+        )
+
+    await middleware.awrap_tool_call(corrected, corrected_handler)
+
+    assert attempted == [InternalStage.SELECTING_L0_VARIANT]
+    assert len(approved) == 1
+    approved_stage, approved_payload = approved[0]
+    assert approved_stage is InternalStage.SELECTING_L0_VARIANT
+    assert approved_payload["stage"] == "selecting_l0_variant"
+    assert approved_payload["selected_l0_variant"] == "主动选择"
+    assert approved_payload["selection_rationale"] == "符合测试故事"
+
+
+@pytest.mark.asyncio
+async def test_missing_stage_token_recovery_preserves_declared_stage_guards() -> None:
+    async def before_stage(_: InternalStage) -> int:
+        raise AssertionError("Rejected routing must not attempt a stage")
+
+    async def approve_stage(_: InternalStage, __: dict[str, Any]) -> None:
+        raise AssertionError("Rejected routing must not approve a stage")
+
+    middleware = StageGuardMiddleware(
+        before_stage=before_stage,
+        approve_stage=approve_stage,
+        approved_stages=set(),
+    )
+
+    def request(description: str, subagent_type: str, call_id: str) -> ToolCallRequest:
+        return ToolCallRequest(
+            tool_call={
+                "name": "task",
+                "args": {"description": description, "subagent_type": subagent_type},
+                "id": call_id,
+                "type": "tool_call",
+            },
+            tool=None,
+            state={},
+            runtime=None,
+        )
+
+    async def handler(_: ToolCallRequest) -> ToolMessage:
+        raise AssertionError("Rejected routing must not enter the subagent")
+
+    with pytest.raises(AgentProtocolError, match="unknown stage"):
+        await middleware.awrap_tool_call(
+            request("[stage=not_a_stage] invalid", "story_architect", "call-unknown-stage"),
+            handler,
+        )
+
+    with pytest.raises(AgentProtocolError, match="wrong subagent"):
+        await middleware.awrap_tool_call(
+            request(
+                "[stage=selecting_l0_variant] wrong owner",
+                "episode_planner",
+                "call-wrong-owner",
+            ),
+            handler,
+        )
+
+    out_of_order = await middleware.awrap_tool_call(
+        request(
+            "[stage=generating_story_outline] too early",
+            "story_architect",
+            "call-out-of-order",
+        ),
+        handler,
+    )
+    assert isinstance(out_of_order, ToolMessage)
+    assert out_of_order.status == "error"
+    assert json.loads(str(out_of_order.content))["error"] == "stage_out_of_order"
 
 
 @pytest.mark.asyncio

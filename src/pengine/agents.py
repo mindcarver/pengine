@@ -5782,17 +5782,6 @@ class StageGuardMiddleware(AgentMiddleware):
         args = request.tool_call.get("args", {})
         description = args.get("description")
         subagent_type = args.get("subagent_type")
-        if not isinstance(description, str):
-            raise AgentProtocolError("Subagent task omitted its stage token")
-        match = _STAGE_TOKEN.match(description)
-        if match is None:
-            raise AgentProtocolError("Subagent task omitted its stage token")
-        try:
-            stage = InternalStage(match.group(1))
-        except ValueError as exc:
-            raise AgentProtocolError("Subagent task declared an unknown stage") from exc
-        if _TASK_OWNER.get(stage) != subagent_type:
-            raise AgentProtocolError("Stage was delegated to the wrong subagent", stage=stage)
         expected_stage = next(
             (
                 candidate
@@ -5801,6 +5790,41 @@ class StageGuardMiddleware(AgentMiddleware):
             ),
             None,
         )
+        if not isinstance(description, str):
+            description = ""
+        match = _STAGE_TOKEN.match(description)
+        if match is None:
+            instruction = (
+                "No specialist stage is pending; do not call the task tool."
+                if expected_stage is None
+                else (
+                    "Do not send placeholder or internal-check task calls. Retry with exactly "
+                    f"one task whose description starts with [stage={expected_stage.value}] "
+                    f"and whose subagent_type is {_TASK_OWNER[expected_stage]}."
+                )
+            )
+            return ToolMessage(
+                content=json.dumps(
+                    {
+                        "error": "stage_token_missing",
+                        "expected_stage": expected_stage.value if expected_stage else None,
+                        "expected_subagent_type": (
+                            _TASK_OWNER[expected_stage] if expected_stage else None
+                        ),
+                        "instruction": instruction,
+                    },
+                    separators=(",", ":"),
+                ),
+                tool_call_id=request.tool_call["id"],
+                name="task",
+                status="error",
+            )
+        try:
+            stage = InternalStage(match.group(1))
+        except ValueError as exc:
+            raise AgentProtocolError("Subagent task declared an unknown stage") from exc
+        if _TASK_OWNER.get(stage) != subagent_type:
+            raise AgentProtocolError("Stage was delegated to the wrong subagent", stage=stage)
         if stage != expected_stage:
             return ToolMessage(
                 content=json.dumps(
