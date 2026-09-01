@@ -54,6 +54,7 @@ from pengine.agents import (
     EpisodeContentReplacement,
     EpisodePlannerResult,
     EpisodeReviewerResult,
+    MilestoneRejectedError,
     OutlineRepairPatch,
     QualityGateRejectedError,
     QualityReviewerResult,
@@ -2498,6 +2499,272 @@ async def test_active_series_bible_uses_compiled_direct_final_review() -> None:
     assert registered[0]["review_type"] == "final"
     assert state.context.context_bundle_sha256 is None
     assert state.context.context_manifest_json is None
+
+
+@pytest.mark.parametrize("failure_kind", ["empty", "malformed"])
+@pytest.mark.asyncio
+async def test_unavailable_structural_milestone_review_continues_next_episode(
+    failure_kind: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    contract = _story_contract(episode_count=2)
+    contract_hash = story_contract_sha256(contract)
+    generation_groups = [
+        {
+            "group_id": "episode_1",
+            "start_episode": 1,
+            "end_episode": 1,
+            "dramatic_unit": "完成第一集行动链",
+            "boundary_reason": "第一集完成里程碑",
+        },
+        {
+            "group_id": "episode_2",
+            "start_episode": 2,
+            "end_episode": 2,
+            "dramatic_unit": "完成第二集行动链",
+            "boundary_reason": "第二集完成阶段目标",
+        },
+    ]
+    summary = project_series_bible(
+        build_series_bible(
+            run_id="unavailable-review-run",
+            run_kind="initial",
+            l0_variant="主动选择",
+            genre="general",
+            story_outline="故事大纲",
+            character_biographies="人物小传",
+            relationship_logic="关系逻辑",
+            episode_outline="两集分集大纲",
+            story_contract_payload=contract.model_dump(mode="json"),
+            review_milestones=[1],
+            script_generation_groups=generation_groups,
+        ),
+        is_active=True,
+    )
+    approved_payloads = {
+        InternalStage.GENERATING_EPISODE_OUTLINE: {
+            "stage": "generating_episode_outline",
+            "content": "两集分集大纲",
+            "episode_count": 2,
+            "episodes": [
+                {"episode_number": 1, "plan": "第一集计划"},
+                {"episode_number": 2, "plan": "第二集计划"},
+            ],
+            "story_contract": contract.model_dump(mode="json"),
+            "review_milestones": [1],
+            "script_generation_groups": generation_groups,
+            "story_contract_sha256": contract_hash,
+            "story_contract_markdown": render_story_contract_markdown(contract, contract_hash),
+            "contract_review": {"passed": True, "evidence": "合同一致", "issues": []},
+            "contract_repair_rounds": 0,
+        }
+    }
+    episode_hooks, attempts = _episode_hook_kwargs()
+    review_calls = 0
+    registered: list[dict[str, Any]] = []
+
+    async def review_series_prefix(_compiled: Any) -> StructuralReviewResult:
+        nonlocal review_calls
+        review_calls += 1
+        if review_calls == 1:
+            if failure_kind == "empty":
+                raise AgentProtocolError("Structural reviewer omitted its structured result")
+            return StructuralReviewResult.model_validate(
+                {
+                    "passed": False,
+                    "category": "pass",
+                    "evidence": "畸形审查",
+                    "earliest_affected_episode": 1,
+                }
+            )
+        return StructuralReviewResult(
+            passed=True,
+            category="pass",
+            evidence="L4硬规则：通过。\nL4价值观：通过。\nL4创作建议：通过。",
+        )
+
+    async def register_series_review(**kwargs: Any) -> str:
+        registered.append(kwargs)
+        return f"review-{kwargs['episode_number']}"
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _stage: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages={
+            InternalStage.SELECTING_L0_VARIANT,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+        },
+        approved_payloads=approved_payloads,
+        series_bible=summary,
+        register_series_review=register_series_review,
+        review_series_prefix=review_series_prefix,
+        review_context_limit_tokens=100_000,
+        review_max_output_tokens=64_000,
+        **episode_hooks,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] write scripts",
+                "subagent_type": "script_writer",
+            },
+            "id": "call-unavailable-series-review",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+
+    async def handler(subagent_request: ToolCallRequest) -> ToolMessage:
+        group = json.loads(
+            subagent_request.state["files"]["/workspace/generation_group.json"]["content"]
+        )
+        start_episode = group["runtime_start_episode"]
+        end_episode = group["runtime_end_episode"]
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "stage": "generating_episode_scripts",
+                    "group_id": group["group"]["group_id"],
+                    "start_episode": start_episode,
+                    "end_episode": end_episode,
+                    "episodes": [
+                        {
+                            "stage": "generating_episode_scripts",
+                            "episode_number": episode,
+                            "content": f"事实{episode}\n钩子{episode}",
+                            "state_delta": _state_delta(contract, episode),
+                        }
+                        for episode in range(start_episode, end_episode + 1)
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-unavailable-series-review",
+        )
+
+    with caplog.at_level("WARNING"):
+        await middleware.awrap_tool_call(request, handler)
+
+    assert attempts == [1, 2]
+    assert sorted(middleware.episode_drafts) == [1, 2]
+    assert review_calls == 2
+    assert [review["episode_number"] for review in registered] == [2]
+    assert registered[0]["passed"] is True
+    assert "structural review unavailable; continuing episode generation episode=1" in caplog.text
+
+
+def test_unavailable_final_structural_review_is_not_skipped() -> None:
+    assert not StageGuardMiddleware._can_continue_after_unavailable_structural_review(
+        2,
+        2,
+        AgentProtocolError("Structural reviewer omitted its structured result"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_valid_structural_milestone_rejection_is_not_skipped() -> None:
+    contract = _story_contract()
+    contract_hash = story_contract_sha256(contract)
+    summary = project_series_bible(
+        build_series_bible(
+            run_id="valid-rejection-run",
+            run_kind="initial",
+            l0_variant="主动选择",
+            genre="general",
+            story_outline="故事大纲",
+            character_biographies="人物小传",
+            relationship_logic="关系逻辑",
+            episode_outline="第一集分集大纲",
+            story_contract_payload=contract.model_dump(mode="json"),
+            review_milestones=[1],
+        ),
+        is_active=True,
+    )
+    registered: list[dict[str, Any]] = []
+
+    async def review_series_prefix(_compiled: Any) -> StructuralReviewResult:
+        return StructuralReviewResult(
+            passed=False,
+            category="script_defect",
+            evidence=(
+                "L4硬规则：第一集违反锁定事实。\nL4价值观：未发现阻断。\nL4创作建议：未发现阻断。"
+            ),
+            earliest_affected_episode=1,
+        )
+
+    async def register_series_review(**kwargs: Any) -> str:
+        registered.append(kwargs)
+        return "review-rejected"
+
+    middleware = StageGuardMiddleware(
+        before_stage=lambda _stage: _async_one(),
+        approve_stage=lambda _stage, _payload: _async_none(),
+        approved_stages={
+            InternalStage.SELECTING_L0_VARIANT,
+            InternalStage.GENERATING_STORY_OUTLINE,
+            InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            InternalStage.GENERATING_EPISODE_OUTLINE,
+        },
+        approved_payloads={
+            InternalStage.GENERATING_EPISODE_OUTLINE: {
+                "stage": "generating_episode_outline",
+                "content": "第一集分集大纲",
+                "episode_count": 1,
+                "episodes": [{"episode_number": 1, "plan": "第一集计划"}],
+                "review_milestones": [1],
+                "story_contract": contract.model_dump(mode="json"),
+                "story_contract_sha256": contract_hash,
+                "story_contract_markdown": render_story_contract_markdown(contract, contract_hash),
+                "contract_review": {"passed": True, "evidence": "合同一致", "issues": []},
+                "contract_repair_rounds": 0,
+            }
+        },
+        series_bible=summary,
+        register_series_review=register_series_review,
+        review_series_prefix=review_series_prefix,
+        review_context_limit_tokens=100_000,
+        review_max_output_tokens=64_000,
+        **_episode_hook_kwargs()[0],
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "[stage=generating_episode_scripts] write scripts",
+                "subagent_type": "script_writer",
+            },
+            "id": "call-valid-series-rejection",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"files": {}},
+        runtime=None,
+    )
+
+    async def handler(_request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "stage": "generating_episode_scripts",
+                    "episode_number": 1,
+                    "content": "事实1\n钩子1",
+                    "state_delta": _state_delta(contract, 1),
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-valid-series-rejection",
+        )
+
+    with pytest.raises(MilestoneRejectedError):
+        await middleware.awrap_tool_call(request, handler)
+
+    assert registered[0]["passed"] is False
+    assert registered[0]["category"] == "script_defect"
 
 
 def _story_contract(

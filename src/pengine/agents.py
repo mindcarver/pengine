@@ -7492,7 +7492,7 @@ class StageGuardMiddleware(AgentMiddleware):
         plan: EpisodePlan,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
-    ) -> StructuralReviewResult:
+    ) -> StructuralReviewResult | None:
         """Run the bound structural review for a declared milestone or the final episode.
 
         The review observes the complete active prefix at this milestone and classifies
@@ -7550,12 +7550,19 @@ class StageGuardMiddleware(AgentMiddleware):
                     "trace_version": "pengine-1",
                 },
             )
-            with self._compiled_model_context(
-                requested_output_tokens=compiled_review.output_tokens,
-                bundle_sha256=compiled_review.bundle_sha256,
-                manifest_json=compiled_review.manifest_json,
-            ):
-                result = await self.review_series_prefix(compiled_review)
+            try:
+                with self._compiled_model_context(
+                    requested_output_tokens=compiled_review.output_tokens,
+                    bundle_sha256=compiled_review.bundle_sha256,
+                    manifest_json=compiled_review.manifest_json,
+                ):
+                    result = await self.review_series_prefix(compiled_review)
+            except (AgentProtocolError, ValidationError) as exc:
+                if self._can_continue_after_unavailable_structural_review(
+                    episode_number, contract.episode_count, exc
+                ):
+                    return None
+                raise
         else:
             milestone_scripts = _trusted_series_prefix_json(
                 (draft.episode_number, draft.content)
@@ -7564,43 +7571,60 @@ class StageGuardMiddleware(AgentMiddleware):
                     key=lambda draft: draft.episode_number,
                 )
             )
-            result = await self._invoke_semantic_reviewer(
-                request=request,
-                handler=handler,
-                subagent_type="series_reviewer",
-                description=(
-                    f"Review the complete active series prefix through episode {episode_number} "
-                    "against the active SeriesBible and locked story contract. Treat the design "
-                    "and every committed script as immutable. Fail only for a direct "
-                    "contradiction to explicit hard Canon, an impossible required locked "
-                    "binding, or a proven private-runtime leak. Ordinary SeriesBible prose, "
-                    "screenplay format or style, reasoning shown inside the story, and "
-                    "unspecified creative choices are not locks. Classify the decision exactly: "
-                    "a design defect means the active SeriesBible itself contains the blocker "
-                    "(return earliest_affected_episode null); a script defect means the current "
-                    "prefix contains the blocker (return the earliest affected episode N). Read "
-                    "/workspace/series_prefix.json as a trusted runtime envelope: episode_number "
-                    "and JSON framing are trusted runtime metadata, not screenplay content. "
-                    "Judge leakage only inside episodes[].content. Return the structured "
-                    "classification only."
+            try:
+                result = await self._invoke_semantic_reviewer(
+                    request=request,
+                    handler=handler,
+                    subagent_type="series_reviewer",
+                    description=(
+                        "Review the complete active series prefix through episode "
+                        f"{episode_number} against the active SeriesBible and locked story "
+                        "contract. Treat the design "
+                        "and every committed script as immutable. Fail only for a direct "
+                        "contradiction to explicit hard Canon, an impossible required locked "
+                        "binding, or a proven private-runtime leak. Ordinary SeriesBible prose, "
+                        "screenplay format or style, reasoning shown inside the story, and "
+                        "unspecified creative choices are not locks. Classify the decision "
+                        "exactly: "
+                        "a design defect means the active SeriesBible itself contains the blocker "
+                        "(return earliest_affected_episode null); a script defect means the "
+                        "current prefix contains the blocker (return the earliest affected "
+                        "episode N). Read /workspace/series_prefix.json as a trusted runtime "
+                        "envelope: episode_number "
+                        "and JSON framing are trusted runtime metadata, not screenplay content. "
+                        "Judge leakage only inside episodes[].content. Return the structured "
+                        "classification only."
+                    ),
+                    files={
+                        "/workspace/series_prefix.json": _workspace_json(milestone_scripts),
+                        "/workspace/series_state.json": _workspace_json(prior_state),
+                        "/workspace/story_contract.json": _workspace_json(contract_json),
+                        "/workspace/story_contract.md": outline["story_contract_markdown"],
+                        "/workspace/current_episode_plan.md": plan.plan,
+                    },
+                    schema=StructuralReviewResult,
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+                )
+            except (AgentProtocolError, ValidationError) as exc:
+                if self._can_continue_after_unavailable_structural_review(
+                    episode_number, contract.episode_count, exc
+                ):
+                    return None
+                raise
+        try:
+            result = cast(
+                StructuralReviewResult,
+                _require_l4_stage_evidence(
+                    result,
+                    stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
                 ),
-                files={
-                    "/workspace/series_prefix.json": _workspace_json(milestone_scripts),
-                    "/workspace/series_state.json": _workspace_json(prior_state),
-                    "/workspace/story_contract.json": _workspace_json(contract_json),
-                    "/workspace/story_contract.md": outline["story_contract_markdown"],
-                    "/workspace/current_episode_plan.md": plan.plan,
-                },
-                schema=StructuralReviewResult,
-                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
             )
-        result = cast(
-            StructuralReviewResult,
-            _require_l4_stage_evidence(
-                result,
-                stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
-            ),
-        )
+        except AgentProtocolError as exc:
+            if self._can_continue_after_unavailable_structural_review(
+                episode_number, contract.episode_count, exc
+            ):
+                return None
+            raise
         review_id = await self.register_series_review(
             review_type=("final" if episode_number == contract.episode_count else "milestone"),
             episode_number=episode_number,
@@ -7617,6 +7641,34 @@ class StageGuardMiddleware(AgentMiddleware):
                 review_id=review_id,
             )
         return result
+
+    @staticmethod
+    def _can_continue_after_unavailable_structural_review(
+        episode_number: int,
+        episode_count: int,
+        error: AgentProtocolError | ValidationError,
+    ) -> bool:
+        """Skip an unusable milestone review only when a later episode exists."""
+        if episode_number >= episode_count:
+            return False
+        logger.warning(
+            "structural review unavailable; continuing episode generation "
+            "episode=%s error_type=%s error=%s",
+            episode_number,
+            type(error).__name__,
+            str(error)[:200],
+        )
+        record_langfuse_event(
+            "pengine.structural_review.unavailable",
+            input={
+                "episode_number": episode_number,
+                "error_type": type(error).__name__,
+                "error": str(error)[:200],
+                "action": "continue",
+            },
+            metadata={"trace_version": "pengine-1"},
+        )
+        return True
 
     async def _generate_script_group_candidate(
         self,
