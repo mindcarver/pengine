@@ -203,6 +203,48 @@ def test_materialized_repair_constraints_are_story_agnostic_and_evidence_bound()
     assert all(item.constraint_id.startswith("repair_") for item in constraints)
 
 
+def test_repair_constraint_extraction_decodes_stringified_constraint_array() -> None:
+    constraint = {
+        "kind": "continuity",
+        "statement": "号码牌种类在第十集前保持未揭示",
+        "source_episode": 6,
+        "applies_from_episode": 7,
+        "applies_through_episode": 9,
+        "evidence_excerpt": "她把号码牌翻过来，折好后放进包里。",
+    }
+
+    result = RepairConstraintExtractionResult.model_validate(
+        {
+            "passed": True,
+            "evidence": "提取到一项跨集连续性约束。",
+            "constraints": json.dumps([constraint], ensure_ascii=False),
+        }
+    )
+
+    assert [item.model_dump(mode="json") for item in result.constraints] == [constraint]
+
+
+@pytest.mark.parametrize(
+    "constraints",
+    [
+        "not-json",
+        json.dumps({"kind": "continuity"}),
+        json.dumps([{"kind": "continuity"}]),
+    ],
+)
+def test_repair_constraint_extraction_rejects_unrecoverable_stringified_constraints(
+    constraints: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        RepairConstraintExtractionResult.model_validate(
+            {
+                "passed": True,
+                "evidence": "结构不可恢复。",
+                "constraints": constraints,
+            }
+        )
+
+
 def test_writer_schema_does_not_expose_runtime_repair_ledger() -> None:
     schema = ScriptWriterResult.model_json_schema()
 

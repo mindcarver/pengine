@@ -1827,6 +1827,17 @@ class RepairConstraintDraft(StrictModel):
 class RepairConstraintExtractionResult(SemanticReview):
     constraints: list[RepairConstraintDraft] = Field(default_factory=list, max_length=32)
 
+    @field_validator("constraints", mode="before")
+    @classmethod
+    def decode_json_constraints(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+        return decoded if isinstance(decoded, list) else value
+
 
 class RepairConstraintCheck(StrictModel):
     constraint_id: StableId
