@@ -2711,6 +2711,33 @@ class Repository:
         if row is None:
             raise DomainError("creation_not_found", "Creation not found.", 404)
 
+    async def _queue_position(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: UUID,
+    ) -> int:
+        row = await self._fetchone(
+            connection,
+            """
+            SELECT 1 + COUNT(*) AS position
+            FROM jobs AS queued_ahead
+            JOIN jobs AS current_job ON current_job.run_id = ?
+            WHERE queued_ahead.state = 'queued'
+              AND current_job.state = 'queued'
+              AND (
+                  queued_ahead.created_at < current_job.created_at
+                  OR (
+                      queued_ahead.created_at = current_job.created_at
+                      AND queued_ahead.id < current_job.id
+                  )
+              )
+            """,
+            (str(run_id),),
+        )
+        if row is None or int(row["position"]) < 1:
+            raise RuntimeError("Queued run is missing its queue position")
+        return int(row["position"])
+
     async def list_creations(self, user_id: UUID) -> CreationList:
         async with self._connection() as connection:
             rows = await (
@@ -2731,7 +2758,17 @@ class Repository:
                             SELECT state FROM runs
                             WHERE creation_id = creations.id AND kind = 'revision'
                             ORDER BY sequence DESC LIMIT 1
-                        ), 'unavailable') AS revision_state
+                        ), 'unavailable') AS revision_state,
+                        (
+                            SELECT id FROM runs
+                            WHERE creation_id = creations.id AND kind = 'initial'
+                            ORDER BY sequence DESC LIMIT 1
+                        ) AS initial_run_id,
+                        (
+                            SELECT id FROM runs
+                            WHERE creation_id = creations.id AND kind = 'revision'
+                            ORDER BY sequence DESC LIMIT 1
+                        ) AS revision_run_id
                     FROM creations
                     WHERE owner_id = ?
                     ORDER BY updated_at DESC, created_at DESC
@@ -2739,22 +2776,35 @@ class Repository:
                     (str(user_id),),
                 )
             ).fetchall()
-        return CreationList(
-            items=[
-                CreationListItem(
-                    creation_id=UUID(row["id"]),
-                    persona_display_name=row["persona_display_name"],
-                    initial_state=row["initial_state"],
-                    revision_state=row["revision_state"],
-                    story_excerpt=(
-                        row["story"] if len(row["story"]) <= 120 else f"{row['story'][:119]}…"
-                    ),
-                    created_at=_datetime(row["created_at"]),
-                    updated_at=_datetime(row["updated_at"]),
+            items: list[CreationListItem] = []
+            for row in rows:
+                queued_run_id = (
+                    row["revision_run_id"]
+                    if row["revision_state"] == "queued"
+                    else row["initial_run_id"]
+                    if row["initial_state"] == "queued"
+                    else None
                 )
-                for row in rows
-            ]
-        )
+                queue_position = (
+                    await self._queue_position(connection, UUID(queued_run_id))
+                    if queued_run_id is not None
+                    else None
+                )
+                items.append(
+                    CreationListItem(
+                        creation_id=UUID(row["id"]),
+                        persona_display_name=row["persona_display_name"],
+                        initial_state=row["initial_state"],
+                        revision_state=row["revision_state"],
+                        queue_position=queue_position,
+                        story_excerpt=(
+                            row["story"] if len(row["story"]) <= 120 else f"{row['story'][:119]}…"
+                        ),
+                        created_at=_datetime(row["created_at"]),
+                        updated_at=_datetime(row["updated_at"]),
+                    )
+                )
+        return CreationList(items=items)
 
     async def get_outline_season_map(self, run_id: UUID) -> dict[str, Any] | None:
         async with self._connection() as connection:
@@ -3503,11 +3553,24 @@ class Repository:
                 FROM jobs
                 JOIN runs ON runs.id = jobs.run_id
                 JOIN run_progress ON run_progress.run_id = runs.id
+                JOIN creations ON creations.id = runs.creation_id
                 WHERE jobs.state = 'queued'
                   AND jobs.available_at <= ?
                   AND runs.state IN ('queued', 'running')
                   AND run_progress.execution_state IN (
                       'queued', 'running', 'auto_resuming'
+                  )
+                  AND (
+                      creations.owner_id IS NULL
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM jobs AS active_jobs
+                          JOIN runs AS active_runs ON active_runs.id = active_jobs.run_id
+                          JOIN creations AS active_creations
+                            ON active_creations.id = active_runs.creation_id
+                          WHERE active_jobs.state = 'leased'
+                            AND active_creations.owner_id = creations.owner_id
+                      )
                   )
                 ORDER BY jobs.created_at, jobs.id
                 LIMIT 1
@@ -9716,6 +9779,7 @@ class Repository:
         match progress_row["execution_state"]:
             case "queued":
                 return QueuedRun(
+                    queue_position=await self._queue_position(connection, UUID(run["id"])),
                     progress=progress,
                     drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
                 )
@@ -9788,6 +9852,7 @@ class Repository:
         match progress_row["execution_state"]:
             case "queued":
                 return RevisionQueued(
+                    queue_position=await self._queue_position(connection, UUID(run["id"])),
                     progress=progress,
                     drafts=await self._draft_snapshot(connection, UUID(run["id"]), progress),
                 )

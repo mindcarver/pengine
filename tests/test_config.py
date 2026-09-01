@@ -52,9 +52,16 @@ def test_api_key_is_not_revealed_by_settings_repr() -> None:
 def test_role_specific_model_routes_are_required_by_default() -> None:
     settings = Settings(_env_file=None)
 
+    assert settings.worker_concurrency == 5
     assert settings.generation_max_output_tokens == 128_000
     assert settings.review_max_output_tokens is None
     assert settings.relay_configured is False
+
+
+@pytest.mark.parametrize("worker_concurrency", [0, 6])
+def test_worker_concurrency_is_bounded(worker_concurrency: int) -> None:
+    with pytest.raises(ValidationError, match="worker_concurrency"):
+        Settings(_env_file=None, worker_concurrency=worker_concurrency)
 
 
 def test_role_specific_model_routes_load_from_environment(monkeypatch) -> None:

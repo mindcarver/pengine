@@ -275,6 +275,7 @@ async def test_persona_creation_and_query_contract(tmp_path: Path) -> None:
         body = resource.json()
         assert body["initial"] == {
             "state": "queued",
+            "queue_position": 1,
             "progress": {
                 "current_stage": "determining_direction",
                 "completed_stages": [],

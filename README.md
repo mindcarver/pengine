@@ -11,7 +11,7 @@
 
 <table align="center">
   <tr>
-    <td align="center"><strong>运行</strong><br>私有服务器 · 单 Worker</td>
+    <td align="center"><strong>运行</strong><br>私有服务器 · 5 槽 Worker 池</td>
     <td align="center"><strong>接口</strong><br>仅限回环地址</td>
     <td align="center"><strong>人格</strong><br>不可变快照</td>
     <td align="center"><strong>修订</strong><br>一次提交后冻结</td>
@@ -49,7 +49,7 @@ Web 创作台通过用户名和密码建立账户，并以 7 天可撤销的安�
                     └───────────────┬─────────────────────────────┘
                                     │ 持久任务租约
 ┌──────────────┐   校验 / 快照  ┌─────▼──────────┐   调用    ┌──────────────┐
-│   人格目录    │ ────────────▶│   内嵌 Worker  │ ─────────▶│ Deep Agents  │
+│   人格目录    │ ────────────▶│  内嵌 Worker 池 │ ─────────▶│ Deep Agents  │
 └──────────────┘               └─────┬──────────┘           │ 监督 Agent   │
                                     │                       └──────┬───────┘
                                     │ 只读上下文                    │
@@ -68,12 +68,15 @@ Web 创作台通过用户名和密码建立账户，并以 7 天可撤销的安�
 | 接口服务（FastAPI） | 参数校验、幂等命令、状态、恢复操作与结果查询 |
 | 人格加载器 | 校验版本化人格包，生成内容寻址的不可变快照 |
 | 状态仓库 | 管理创作、运行、任务、反馈、检查点与交付物 |
-| 内嵌任务器 | 租约、重启恢复、阶段尝试预算、工作流调度 |
+| 内嵌 Worker 池 | 账户公平租约、重启恢复、阶段尝试预算、隔离工作流调度 |
 | Agent 编排层 | 由监督 Agent 编排同步创作 Agent 与技能化审查/修复子代理 |
 | 模型中继客户端 | 共用 URL/密钥，生成固定走 Opus；审核按配置选择 DeepSeek、OpenAI 或 Anthropic 协议 |
 
-系统采用模块化单体：一个进程、一个 Worker、一次处理一个创作任务，不依赖外部
-消息队列或远程 Agent。
+系统采用模块化单体：一个进程、最多 5 个隔离 Worker 槽并发处理创作任务，不依赖
+外部消息队列或远程 Agent。Worker 池默认通过 `PENGINE_WORKER_CONCURRENCY=5` 启用
+5 个并发槽，允许在 1–5 之间配置。同一账户最多占用 1 个运行槽，避免单个用户挤占
+全部资源；不同账户按全局提交顺序公平领取空闲槽。每个槽拥有独立的 Workflow、
+LangGraph checkpointer、模型调用状态与审计上下文。
 
 <h2 align="center">02 · Persona v3、Soul、L3 与 L4</h2>
 

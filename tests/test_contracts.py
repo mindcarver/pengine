@@ -220,6 +220,14 @@ def test_openapi_authorize_repair_description_matches_runtime() -> None:
     assert "same evidence" not in documented["description"]
 
 
+def test_queue_position_schemas_match_runtime() -> None:
+    documented = json.loads((ROOT / "contracts/openapi.json").read_text())["components"]["schemas"]
+    generated = create_app(settings=Settings()).openapi()["components"]["schemas"]
+
+    for name in ("CreationListItem", "QueuedRun", "RevisionQueued"):
+        assert documented[name] == generated[name]
+
+
 def test_pause_counts_cannot_mix_transport_and_content_recovery() -> None:
     content_pause = RunPause(
         code="content_rejected",

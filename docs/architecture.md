@@ -12,7 +12,7 @@ permalink: /architecture/
 
 ## 1. 一句话模型
 
-Pengine 是一个**私有服务器、单进程、单 Worker、SQLite 持久化、账户隔离、双角色模型路由、同源 Web + JSON API** 的模块化单体。应用仍只监听回环地址，由 HTTPS 反向代理提供浏览器入口。
+Pengine 是一个**私有服务器、单进程、5 槽 Worker 池、SQLite 持久化、账户隔离、双角色模型路由、同源 Web + JSON API** 的模块化单体。应用仍只监听回环地址，由 HTTPS 反向代理提供浏览器入口。
 
 ```text
 输入：persona_id + story + requirements
@@ -55,7 +55,7 @@ Pengine 是一个**私有服务器、单进程、单 Worker、SQLite 持久化�
        │ 查询/命令         │ 启动/停止
        ▼                  ▼
 ┌──────────────┐   ┌────────────────────┐
-│ Repository   │   │ Embedded Worker    │
+│ Repository   │   │ Embedded WorkerPool│
 │ SQLite 事务  │◀──│ lease / stage guard │
 │ 业务权威状态 │   │ invoke / recovery   │
 └──────┬───────┘   └─────────┬──────────┘
@@ -91,14 +91,20 @@ Pengine 是一个**私有服务器、单进程、单 Worker、SQLite 持久化�
 | Web 工作台 | 表单、状态轮询、只读草稿阅览、继续/授权/结束命令 | 不推断阶段、不决定审批、不执行模型 |
 | FastAPI | 参数验证、HTTP 序列化、幂等命令、稳定错误、资源查询 | 不编排创作、不解析人格正文、不决定质量 |
 | `Repository` | SQLite 事务、账户/会话、作品所有权、创建/运行/任务/检查点/交付/幂等记录、迁移 | 不拥有人格源目录，不代替 Agent 生成内容 |
-| `Worker` | 租约、重启协调、阶段尝试预算、Agent 调用、恢复分类 | 不暴露 HTTP 语义，不拥有模型厂商协议细节 |
+| `WorkerPool` / `Worker` | 有界槽、账户公平租约、重启协调、阶段尝试预算、隔离 Agent 调用、恢复分类 | 不暴露 HTTP 语义，不拥有模型厂商协议细节 |
 | `workflow_supervisor` | 在一个 Agent thread 内按顺序委派阶段 | 不直接批准业务检查点，不创建 revision entitlement |
 | 同步子 Agent | 产出结构化候选、审核证据或有界修复 | 不直接写数据库、不修改人格、不解锁已批准内容 |
 | 人格加载器 | manifest/schema/hash/结构验证、快照、只读投影、L5/L6 有界检索 | 不自动学习或写回人格 |
 | Relay 客户端 | 角色到 adapter/provider/model 的绑定、上下文预检、响应身份审计、安全错误映射 | 不决定重试策略，不在角色间回退 |
 | LangGraph checkpointer | Agent 线程、消息、计划、虚拟 scratch | 不决定公开状态、阶段次数或交付有效性 |
 
-V1 进程只运行一个 Worker，并一次处理一个创作任务。Deep Agents 和 LangGraph 是嵌入库，不是独立部署的服务；外部消息队列、分布式 Worker、缓存和远程 Agent 都不在当前边界内。
+进程内运行由 `PENGINE_WORKER_CONCURRENCY` 控制的 1–5 个 Worker 槽，生产默认 5。
+每个槽独立持有 Workflow、LangGraph saver、模型调用预算和审计上下文；SQLite 的
+原子租约保证同一任务只会被一个槽领取。调度器按全局 FIFO 查找任务，但会跳过已有
+活动租约的账户，因此每个账户最多同时运行一个任务，不同账户可并行推进。界面显示的
+排队序号是当前全局 FIFO 序号；它会随前序任务被领取或完成而实时更新，同账户任务仍
+须依次执行。Deep Agents 和 LangGraph 是嵌入库，不是独立部署的服务；外部消息队列、
+分布式 Worker、缓存和远程 Agent 都不在当前边界内。
 
 ## 3. Agent 拓扑与模型路由
 
