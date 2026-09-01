@@ -1453,11 +1453,7 @@ class Worker:
                 # terminal defects: consume the existing stage attempt budget
                 # (already recorded by before_stage) and auto-retry the stage
                 # from its approved checkpoints before ever failing the run.
-                failure_stage = (
-                    exc.stage
-                    if isinstance(getattr(exc, "stage", None), InternalStage)
-                    else InternalStage(work.current_stage or "loading_persona")
-                )
+                failure_stage = self._failure_stage(exc, current_stage, approved)
                 # Only retry stages that a resume will actually re-enter (not yet
                 # approved, so before_stage re-fires and the budget advances);
                 # approved-stage sync errors are deterministic and stay terminal.
