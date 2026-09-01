@@ -119,6 +119,8 @@ const POLL_INTERVAL_MS = 1800;
 const DEFAULT_REQUIREMENTS = "按所选人格完成一部完整短剧。";
 
 const state = {
+  user: null,
+  authMode: "login",
   personas: new Map(),
   selectedPersonaId: "",
   creation: null,
@@ -162,6 +164,33 @@ function start() {
 
 function cacheElements() {
   const ids = [
+    "auth-view",
+    "auth-form",
+    "auth-title",
+    "auth-intro",
+    "auth-username",
+    "auth-password",
+    "auth-username-error",
+    "auth-password-error",
+    "auth-message",
+    "auth-submit",
+    "auth-switch-copy",
+    "auth-switch",
+    "main-content",
+    "page-title",
+    "creations-title",
+    "account-tools",
+    "account-trigger",
+    "account-username",
+    "account-menu",
+    "open-creations",
+    "logout",
+    "creations-library",
+    "creations-status",
+    "creation-list",
+    "back-to-workbench",
+    "workbench-hero",
+    "workbench",
     "reload-personas",
     "persona-grid",
     "persona-status",
@@ -267,6 +296,12 @@ function cacheElements() {
 }
 
 function bindEvents() {
+  elements["auth-form"].addEventListener("submit", handleAuthentication);
+  elements["auth-switch"].addEventListener("click", toggleAuthMode);
+  elements["account-trigger"].addEventListener("click", toggleAccountMenu);
+  elements["open-creations"].addEventListener("click", () => void showCreationsLibrary());
+  elements.logout.addEventListener("click", () => void handleLogout());
+  elements["back-to-workbench"].addEventListener("click", showWorkbench);
   elements["reload-personas"].addEventListener("click", () => void loadPersonas());
   elements["creation-form"].addEventListener("submit", handleCreate);
   elements["revision-form"].addEventListener("submit", handleRevision);
@@ -321,6 +356,11 @@ function bindEvents() {
     if (event.key === "Escape" && !elements["revision-desk"].hidden) {
       closeRevisionDrawer();
     }
+    if (event.key === "Escape" && !elements["account-menu"].hidden) {
+      elements["account-menu"].hidden = true;
+      elements["account-trigger"].setAttribute("aria-expanded", "false");
+      elements["account-trigger"].focus();
+    }
   });
 
   window.addEventListener("beforeunload", stopPolling);
@@ -332,6 +372,18 @@ function bindEvents() {
 }
 
 async function initialize() {
+  try {
+    state.user = await apiRequest("/me");
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      showAuthentication();
+      return;
+    }
+    elements["auth-message"].textContent = formatError(error);
+    showAuthentication();
+    return;
+  }
+  showAuthenticatedWorkspace();
   const currentId = readCurrentCreationId();
   state.creationId = currentId;
   const hashPosition = readReadingHash(currentId);
@@ -351,6 +403,164 @@ async function initialize() {
   await loadPersonas();
   if (currentId) {
     await refreshCreation({ isRestore: true });
+  }
+}
+
+function showAuthentication(message = "") {
+  stopPolling();
+  state.user = null;
+  state.creation = null;
+  state.creationId = "";
+  elements["auth-view"].hidden = false;
+  elements["main-content"].hidden = true;
+  elements["account-tools"].hidden = true;
+  elements["account-menu"].hidden = true;
+  elements["account-trigger"].setAttribute("aria-expanded", "false");
+  if (message) {
+    elements["auth-message"].textContent = message;
+  }
+  window.setTimeout(() => elements["auth-username"].focus(), 0);
+}
+
+function showAuthenticatedWorkspace() {
+  elements["auth-view"].hidden = true;
+  elements["main-content"].hidden = false;
+  elements["account-tools"].hidden = false;
+  elements["account-username"].textContent = state.user.username;
+  showWorkbench();
+}
+
+function toggleAuthMode() {
+  state.authMode = state.authMode === "login" ? "register" : "login";
+  const registering = state.authMode === "register";
+  elements["auth-title"].textContent = registering ? "登记新账户" : "登录创作台";
+  elements["auth-intro"].textContent = registering
+    ? "用一个用户名和至少八位密码建立账户。"
+    : "登录后继续你的创作与修订。";
+  elements["auth-submit"].textContent = registering ? "注册并进入" : "登录";
+  elements["auth-switch-copy"].textContent = registering ? "已经有账户？" : "还没有账户？";
+  elements["auth-switch"].textContent = registering ? "登录" : "注册";
+  elements["auth-password"].autocomplete = registering ? "new-password" : "current-password";
+  elements["auth-message"].textContent = "";
+  elements["auth-username-error"].textContent = "";
+  elements["auth-password-error"].textContent = "";
+  elements["auth-username"].focus();
+}
+
+async function handleAuthentication(event) {
+  event.preventDefault();
+  const username = elements["auth-username"].value.trim();
+  const password = elements["auth-password"].value;
+  elements["auth-username-error"].textContent = username ? "" : "请输入用户名。";
+  elements["auth-password-error"].textContent =
+    password.length >= 8 ? "" : "密码至少需要八位。";
+  if (!username || password.length < 8) {
+    (username ? elements["auth-password"] : elements["auth-username"]).focus();
+    return;
+  }
+
+  elements["auth-submit"].disabled = true;
+  elements["auth-submit"].textContent = state.authMode === "register" ? "正在登记…" : "正在登录…";
+  elements["auth-message"].textContent = "";
+  try {
+    state.user = await apiRequest(`/auth/${state.authMode}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    elements["auth-password"].value = "";
+    showAuthenticatedWorkspace();
+    await loadPersonas();
+    const currentId = readCurrentCreationId();
+    state.creationId = currentId;
+    state.workspaceView = currentId ? "progress" : "selection";
+    renderCreation();
+    if (currentId) {
+      await refreshCreation({ isRestore: true });
+    }
+    elements["page-title"]?.focus?.({ preventScroll: true });
+  } catch (error) {
+    if (error instanceof ApiError && error.code === "username_taken") {
+      elements["auth-username-error"].textContent = "这个用户名已被使用。";
+      elements["auth-username"].focus();
+    } else {
+      elements["auth-message"].textContent = formatError(error);
+    }
+  } finally {
+    elements["auth-submit"].disabled = false;
+    elements["auth-submit"].textContent = state.authMode === "register" ? "注册并进入" : "登录";
+  }
+}
+
+function toggleAccountMenu() {
+  const opening = elements["account-menu"].hidden;
+  elements["account-menu"].hidden = !opening;
+  elements["account-trigger"].setAttribute("aria-expanded", String(opening));
+}
+
+async function handleLogout() {
+  try {
+    await apiRequest("/auth/logout", { method: "POST" });
+  } finally {
+    showAuthentication();
+  }
+}
+
+function showWorkbench() {
+  elements["creations-library"].hidden = true;
+  elements["workbench-hero"].hidden = false;
+  elements.workbench.hidden = false;
+  elements["account-menu"].hidden = true;
+  elements["account-trigger"].setAttribute("aria-expanded", "false");
+}
+
+async function showCreationsLibrary() {
+  elements["account-menu"].hidden = true;
+  elements["account-trigger"].setAttribute("aria-expanded", "false");
+  elements["workbench-hero"].hidden = true;
+  elements.workbench.hidden = true;
+  elements["creations-library"].hidden = false;
+  elements["creations-status"].textContent = "正在读取你的创作卷宗……";
+  elements["creation-list"].replaceChildren();
+  elements["creations-title"].focus?.({ preventScroll: true });
+  try {
+    const payload = await apiRequest("/creations");
+    renderCreationList(Array.isArray(payload.items) ? payload.items : []);
+  } catch (error) {
+    elements["creations-status"].textContent = formatError(error);
+  }
+}
+
+function renderCreationList(items) {
+  elements["creation-list"].replaceChildren();
+  if (!items.length) {
+    elements["creations-status"].textContent = "还没有创作。返回创作台，开始第一份卷宗。";
+    return;
+  }
+  elements["creations-status"].textContent = `共 ${items.length} 份创作。`;
+  for (const item of items) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "creation-file";
+    const updated = new Intl.DateTimeFormat("zh-CN", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(new Date(item.updated_at));
+    button.innerHTML = `
+      <span class="creation-file-meta">${escapeHtml(item.persona_display_name)} · 初稿 ${escapeHtml(item.initial_state)} · 修订 ${escapeHtml(item.revision_state)}</span>
+      <strong>故事：${escapeHtml(item.story_excerpt)}</strong>
+      <time datetime="${escapeHtml(item.updated_at)}">更新于 ${escapeHtml(updated)}</time>
+    `;
+    button.addEventListener("click", () => {
+      state.creationId = item.creation_id;
+      state.creation = null;
+      writeCurrentCreationId(item.creation_id);
+      state.workspaceView = "progress";
+      showWorkbench();
+      renderCreation();
+      void refreshCreation({ isRestore: true });
+    });
+    elements["creation-list"].append(button);
   }
 }
 
@@ -2207,6 +2417,9 @@ async function apiRequest(path, options = {}) {
   }
 
   if (!response.ok) {
+    if (response.status === 401 && path !== "/me" && !path.startsWith("/auth/")) {
+      showAuthentication("登录已失效，请重新登录。未提交的内容仍保留在本页。 ");
+    }
     throw new ApiError(
       typeof payload?.message === "string" ? payload.message : `请求失败（HTTP ${response.status}）。`,
       typeof payload?.code === "string" ? payload.code : `http_${response.status}`,
@@ -2214,10 +2427,22 @@ async function apiRequest(path, options = {}) {
     );
   }
 
+  if (response.status === 204) {
+    return null;
+  }
   if (payload === null) {
     throw new ApiError("本地服务返回了无法读取的响应。", "invalid_response", response.status);
   }
   return payload;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 function formatError(error) {

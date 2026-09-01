@@ -41,7 +41,12 @@ def test_openapi_exposes_creation_and_run_control_operations() -> None:
     }
 
     assert operations == {
+        ("POST", "/auth/register"),
+        ("POST", "/auth/login"),
+        ("POST", "/auth/logout"),
+        ("GET", "/me"),
         ("GET", "/personas"),
+        ("GET", "/creations"),
         ("POST", "/creations"),
         ("GET", "/creations/{creation_id}"),
         ("GET", "/creations/{creation_id}/runs/{run_kind}/presentation"),
@@ -51,6 +56,29 @@ def test_openapi_exposes_creation_and_run_control_operations() -> None:
         ("POST", "/creations/{creation_id}/runs/{run_kind}/authorize-repair"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/retry"),
+    }
+
+
+def test_openapi_auth_errors_match_runtime_contract() -> None:
+    documented = json.loads((ROOT / "contracts/openapi.json").read_text())
+    generated = create_app(settings=Settings()).openapi()
+
+    for path in ("/auth/register", "/auth/login"):
+        assert documented["paths"][path]["post"] == generated["paths"][path]["post"]
+
+    register_responses = documented["paths"]["/auth/register"]["post"]["responses"]
+    login_responses = documented["paths"]["/auth/login"]["post"]["responses"]
+    assert register_responses["409"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CommandError"
+    }
+    assert login_responses["401"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CommandError"
+    }
+    assert register_responses["422"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CommandError"
+    }
+    assert login_responses["422"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CommandError"
     }
 
 

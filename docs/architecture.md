@@ -12,7 +12,7 @@ permalink: /architecture/
 
 ## 1. 一句话模型
 
-Pengine 是一个**本地、单进程、单 Worker、SQLite 持久化、双角色模型路由、同源 Web + JSON API** 的模块化单体。
+Pengine 是一个**私有服务器、单进程、单 Worker、SQLite 持久化、账户隔离、双角色模型路由、同源 Web + JSON API** 的模块化单体。应用仍只监听回环地址，由 HTTPS 反向代理提供浏览器入口。
 
 ```text
 输入：persona_id + story + requirements
@@ -90,7 +90,7 @@ Pengine 是一个**本地、单进程、单 Worker、SQLite 持久化、双角�
 | --- | --- | --- |
 | Web 工作台 | 表单、状态轮询、只读草稿阅览、继续/授权/结束命令 | 不推断阶段、不决定审批、不执行模型 |
 | FastAPI | 参数验证、HTTP 序列化、幂等命令、稳定错误、资源查询 | 不编排创作、不解析人格正文、不决定质量 |
-| `Repository` | SQLite 事务、创建/运行/任务/检查点/交付/幂等记录、迁移 | 不拥有人格源目录，不代替 Agent 生成内容 |
+| `Repository` | SQLite 事务、账户/会话、作品所有权、创建/运行/任务/检查点/交付/幂等记录、迁移 | 不拥有人格源目录，不代替 Agent 生成内容 |
 | `Worker` | 租约、重启协调、阶段尝试预算、Agent 调用、恢复分类 | 不暴露 HTTP 语义，不拥有模型厂商协议细节 |
 | `workflow_supervisor` | 在一个 Agent thread 内按顺序委派阶段 | 不直接批准业务检查点，不创建 revision entitlement |
 | 同步子 Agent | 产出结构化候选、审核证据或有界修复 | 不直接写数据库、不修改人格、不解锁已批准内容 |
@@ -250,7 +250,7 @@ ScriptBatch(batch_id, batch_epoch)
 - API key 使用 `SecretStr`，不应提交到 Git；日志只允许安全错误和脱敏 provider 证据。
 - Agent 的虚拟路径与主机文件系统隔离；权限规则只允许需要的只读人格路径和 thread scratch。
 - Relay 会收到故事、要求、人格上下文和生成阶段需要的内容；这不是本地隐私隔离的替代物。
-- V1 没有身份认证，所以不要把服务绑定到局域网或公网。
+- V1 使用用户名密码和服务端可撤销会话隔离账户；应用仍只绑定回环地址，HTTPS 反向代理入口必须限制在受控内部网络。
 
 ## 9. 明确的非目标
 

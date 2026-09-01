@@ -31,7 +31,7 @@ def _app(tmp_path: Path):
         persona_root=persona_root,
         data_dir=tmp_path / "data",
     )
-    return create_app(settings=settings)
+    return create_app(settings=settings, authentication_enabled=False)
 
 
 @pytest.mark.asyncio
@@ -54,6 +54,8 @@ async def test_frontend_and_assets_are_served_with_run_control_openapi(
     assert page.headers["content-type"].startswith("text/html")
     assert page.headers["cache-control"] == "no-store"
     assert "<!doctype html>" in page.text.lower()
+    assert 'id="auth-form"' in page.text
+    assert 'id="creations-library"' in page.text
     assert stylesheet.status_code == 200
     assert stylesheet.headers["content-type"].startswith("text/css")
     assert stylesheet.headers["cache-control"] == "no-cache"
@@ -70,7 +72,12 @@ async def test_frontend_and_assets_are_served_with_run_control_openapi(
         if method in {"get", "post", "put", "patch", "delete"}
     }
     assert operations == {
+        ("POST", "/auth/register"),
+        ("POST", "/auth/login"),
+        ("POST", "/auth/logout"),
+        ("GET", "/me"),
         ("GET", "/personas"),
+        ("GET", "/creations"),
         ("POST", "/creations"),
         ("GET", "/creations/{creation_id}"),
         ("GET", "/creations/{creation_id}/runs/{run_kind}/presentation"),
@@ -704,7 +711,8 @@ async def test_creation_replay_survives_restart_without_persona_source(
         settings=Settings(
             persona_root=tmp_path / "personas",
             data_dir=tmp_path / "data",
-        )
+        ),
+        authentication_enabled=False,
     )
     async with (
         restarted_app.router.lifespan_context(restarted_app),
@@ -844,7 +852,7 @@ async def test_authorize_repair_design_rebuild_returns_202_never_500(
     assert paused_resource.initial.authorization.estimated_tokens == 9_000
     assert paused_resource.initial.authorization.evidence == "设计缺陷证据"
 
-    app = create_app(settings=settings, repository=repository)
+    app = create_app(settings=settings, repository=repository, authentication_enabled=False)
     async with (
         app.router.lifespan_context(app),
         AsyncClient(

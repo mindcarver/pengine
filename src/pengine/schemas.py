@@ -34,6 +34,8 @@ NonBlankPreservedText = Annotated[
     StringConstraints(min_length=1, pattern=r"\S"),
     AfterValidator(_require_non_blank),
 ]
+Username = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+Password = Annotated[str, StringConstraints(min_length=8, max_length=256)]
 
 
 class StrictModel(BaseModel):
@@ -65,6 +67,34 @@ class CreateCreationRequest(StrictModel):
     persona_id: NonEmptyText
     story: NonEmptyText
     requirements: NonEmptyText
+
+
+class RegisterRequest(StrictModel):
+    username: Username
+    password: Password
+
+
+class LoginRequest(RegisterRequest):
+    pass
+
+
+class CurrentUser(StrictModel):
+    user_id: UUID
+    username: Username
+
+
+class CreationListItem(StrictModel):
+    creation_id: UUID
+    persona_display_name: NonEmptyText
+    initial_state: NonEmptyText
+    revision_state: NonEmptyText
+    story_excerpt: NonEmptyText
+    created_at: datetime
+    updated_at: datetime
+
+
+class CreationList(StrictModel):
+    items: list[CreationListItem]
 
 
 class RevisionRequest(StrictModel):
@@ -808,6 +838,9 @@ class CommandError(StrictModel):
         "repair_authorization_stale",
         "series_bible_rebuild_exhausted",
         "service_unavailable",
+        "authentication_required",
+        "invalid_credentials",
+        "username_taken",
     ]
     message: NonEmptyText
 

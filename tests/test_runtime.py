@@ -53,6 +53,7 @@ async def test_three_interaction_runtime_flow(tmp_path: Path) -> None:
         repository=repository,
         catalog=catalog,
         worker=worker,
+        authentication_enabled=False,
     )
 
     async with (

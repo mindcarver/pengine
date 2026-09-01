@@ -11,7 +11,7 @@
 
 <table align="center">
   <tr>
-    <td align="center"><strong>运行</strong><br>本地单操作员</td>
+    <td align="center"><strong>运行</strong><br>私有服务器 · 单 Worker</td>
     <td align="center"><strong>接口</strong><br>仅限回环地址</td>
     <td align="center"><strong>人格</strong><br>不可变快照</td>
     <td align="center"><strong>修订</strong><br>一次提交后冻结</td>
@@ -26,9 +26,9 @@ SQLite。模型请求共用一组 relay URL 与密钥，但按角色固定为两
 `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、`claude-opus-5` 或
 `claude-sonnet-5`，运行时按模型选择 DeepSeek、OpenAI 或 Anthropic 客户端协议。
 
-Web 原型只服务本机单操作员，并以约 1.8 秒轮询展示后端确认的六个用户阶段进度、
-已运行时长和超时恢复操作；V1 没有身份认证、公共部署、多用户隔离、SSE /
-WebSocket 或跨项目可写记忆。
+Web 创作台通过用户名和密码建立账户，并以 7 天可撤销的安全 Cookie 隔离每个账户的作品；
+它以约 1.8 秒轮询展示后端确认的六个用户阶段进度、已运行时长和超时恢复操作。V1 仍不提供
+公开注册运营能力、团队、分享、管理员、密码找回、SSE / WebSocket 或跨项目可写记忆。
 
 > 详细的设计、架构、数据模型、接口、恢复语义和开源贡献手册见
 > [Pengine GitHub Pages](https://mindcarver.github.io/pengine/)。Pages 的源文件位于
@@ -247,6 +247,19 @@ API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localho
 `gpt-5.6-terra`、`claude-opus-5` 或 `claude-sonnet-5`。URL、密钥或任一模型 ID 缺失时，
 工作流会 fail closed，不会降级成单模型，也不会跨角色回退。
 
+### 私有服务器入口与账户迁移
+
+浏览器入口必须由同机反向代理通过 **HTTPS** 提供，代理目标保持为
+`http://127.0.0.1:8000`；不要把应用端口直接暴露到服务器网卡。登录 Cookie 固定为
+`Secure`、`HttpOnly`、`SameSite=Lax`，因此用远程浏览器直接访问 HTTP 回环代理不会形成
+有效会话。反向代理应原样转发路径、Cookie 和 `X-Forwarded-Proto`，并限制入口只对内部网络
+或现有服务器访问控制开放。
+
+从 schema v32 首次升级到 v33 会按已确认策略清空全部历史作品、运行、任务、交付、检查点和
+旧幂等记录，然后建立账户、会话与作品所有权。发布前先停止旧进程并备份
+`data/pengine.sqlite3` 及其 `-wal` / `-shm` 文件；新版本首次成功启动后再开放 HTTPS 入口。
+该迁移不会自动给历史作品认领账户，也不支持降级；回滚需恢复发布前备份。
+
 生成路由通过 `ChatAnthropic` 调用 Anthropic Messages；
 `PENGINE_GENERATION_MAX_OUTPUT_TOKENS` 默认使用 Opus 5 与 Sonnet 5 支持的最大值
 128000，且不能配置为更大的值。审核路由分别使用 `ChatDeepSeek`、`ChatOpenAI` 或
@@ -310,21 +323,29 @@ uv run pengine
 <h2 align="center">06 · 最短接口路径</h2>
 
 ```bash
+# 0. 首次使用时注册并保存会话 Cookie；已有账户改用 POST /auth/login
+curl --fail-with-body -c pengine.cookies -X POST http://127.0.0.1:8000/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"operator","password":"replace-with-a-long-password"}'
+
 # 1. 查看可用人格
-curl --fail-with-body http://127.0.0.1:8000/personas
+curl --fail-with-body -b pengine.cookies http://127.0.0.1:8000/personas
 
 # 2. 创建完整短剧
 curl --fail-with-body -X POST http://127.0.0.1:8000/creations \
+  -b pengine.cookies \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: creation-001' \
   -d '{"persona_id":"your-persona-id","story":"一个人回乡面对旧事。","requirements":"生成完整短剧。"}'
 
 # 3. 查询状态与结果
 curl --fail-with-body \
+  -b pengine.cookies \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID
 
 # 4. 初稿成功后提交唯一一次修订
 curl --fail-with-body -X POST \
+  -b pengine.cookies \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/revision \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: revision-001' \
@@ -352,20 +373,24 @@ curl --fail-with-body -X POST \
 
 ```bash
 curl --fail-with-body -X POST \
+  -b pengine.cookies \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/continue \
   -H 'Idempotency-Key: continue-001'
 
 curl --fail-with-body -X POST \
+  -b pengine.cookies \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/retry-final-review \
   -H 'Idempotency-Key: final-review-001'
 
 curl --fail-with-body -X POST \
+  -b pengine.cookies \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/authorize-repair \
   -H 'Idempotency-Key: repair-authorization-001'
 
 # 外部 relay 错误（如配额耗尽）导致的初稿终态失败，可原样重试；
 # 已批准检查点不会重新生成，详见 initial.progress.can_retry
 curl --fail-with-body -X POST \
+  -b pengine.cookies \
   http://127.0.0.1:8000/creations/REPLACE_WITH_CREATION_ID/runs/initial/retry \
   -H 'Idempotency-Key: retry-001'
 

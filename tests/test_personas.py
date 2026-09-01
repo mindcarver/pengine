@@ -581,6 +581,7 @@ def test_v3_rejects_manifest_that_declares_soul_and_legacy_layers(tmp_path: Path
         ),
         (NON_PRODUCTION_CONTENT["soul"] + ("扩" * 8_000), "soul_too_large"),
     ],
+    ids=["pending", "too-large"],
 )
 def test_v3_soul_status_and_size_fail_closed(
     tmp_path: Path,
@@ -608,6 +609,7 @@ def test_v3_soul_status_and_size_fail_closed(
             "l3_marker_invalid",
         ),
     ],
+    ids=["pending", "too-large", "invalid-owner-marker"],
 )
 def test_v3_l3_status_ownership_and_size_fail_closed(
     tmp_path: Path,

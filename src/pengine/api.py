@@ -5,11 +5,19 @@ from pathlib import Path
 from typing import Annotated, Literal, Protocol, get_args
 from uuid import UUID
 
-from fastapi import FastAPI, Header, Request, Response
+from fastapi import Cookie, Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from pengine.auth import (
+    SESSION_COOKIE,
+    SESSION_TTL,
+    hash_password,
+    new_session,
+    session_token_sha256,
+    verify_password,
+)
 from pengine.config import Settings, get_settings
 from pengine.errors import DomainError
 from pengine.personas import PersonaCatalog, PersonaPackageError
@@ -18,9 +26,13 @@ from pengine.schemas import (
     CommandError,
     CreateCreationRequest,
     CreationAccepted,
+    CreationList,
     CreationResource,
+    CurrentUser,
     DeliveryPresentation,
+    LoginRequest,
     PersonaList,
+    RegisterRequest,
     RevisionAccepted,
     RevisionRequest,
     RunControlAccepted,
@@ -58,6 +70,7 @@ def create_app(
     repository: Repository | None = None,
     catalog: PersonaCatalog | None = None,
     worker: WorkerControl | None = None,
+    authentication_enabled: bool = True,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
     resolved_repository = repository or Repository(resolved_settings.database_path)
@@ -132,9 +145,111 @@ def create_app(
             )
         )
 
+    async def resolve_current_user(
+        session_token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    ) -> CurrentUser:
+        if not authentication_enabled:
+            return CurrentUser(
+                user_id=UUID("00000000-0000-0000-0000-000000000000"),
+                username="test-user",
+            )
+        if not session_token:
+            raise DomainError("authentication_required", "请先登录。", 401)
+        user = await resolved_repository.resolve_session(session_token_sha256(session_token))
+        if user is None:
+            raise DomainError("authentication_required", "登录已失效，请重新登录。", 401)
+        return user
+
+    AuthenticatedUser = Annotated[CurrentUser, Depends(resolve_current_user)]
+
+    def scoped_key(user: CurrentUser, idempotency_key: str) -> str:
+        if not authentication_enabled:
+            return idempotency_key
+        return f"{user.user_id}:{idempotency_key}"
+
+    async def require_owner(creation_id: UUID, user: CurrentUser) -> None:
+        if authentication_enabled:
+            await resolved_repository.require_creation_owner(creation_id, user.user_id)
+
+    def set_session_cookie(response: Response, token: str) -> None:
+        response.set_cookie(
+            SESSION_COOKIE,
+            token,
+            max_age=int(SESSION_TTL.total_seconds()),
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            path="/",
+        )
+
+    @app.post(
+        "/auth/register",
+        operation_id="register",
+        response_model=CurrentUser,
+        responses={
+            409: {"description": "Username already exists", "model": CommandError},
+            422: {"description": "Request schema validation failed", "model": CommandError},
+        },
+    )
+    async def register(request: RegisterRequest, response: Response) -> CurrentUser:
+        session = new_session()
+        user = await resolved_repository.register_user(
+            username=request.username,
+            password_hash=hash_password(request.password),
+            session_token_sha256=session.token_sha256,
+            session_expires_at=session.expires_at,
+        )
+        set_session_cookie(response, session.token)
+        return user
+
+    @app.post(
+        "/auth/login",
+        operation_id="login",
+        response_model=CurrentUser,
+        responses={
+            401: {"description": "Invalid credentials", "model": CommandError},
+            422: {"description": "Request schema validation failed", "model": CommandError},
+        },
+    )
+    async def login(request: LoginRequest, response: Response) -> CurrentUser:
+        credential = await resolved_repository.get_user_credential(request.username)
+        if credential is None or not verify_password(credential.password_hash, request.password):
+            raise DomainError("invalid_credentials", "用户名或密码不正确。", 401)
+        session = new_session()
+        await resolved_repository.create_session(
+            user_id=credential.user.user_id,
+            token_sha256=session.token_sha256,
+            expires_at=session.expires_at,
+        )
+        set_session_cookie(response, session.token)
+        return credential.user
+
+    @app.post("/auth/logout", operation_id="logout", status_code=204)
+    async def logout(
+        response: Response,
+        session_token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    ) -> None:
+        if session_token:
+            await resolved_repository.revoke_session(session_token_sha256(session_token))
+        response.delete_cookie(
+            SESSION_COOKIE,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            path="/",
+        )
+
+    @app.get("/me", operation_id="getCurrentUser", response_model=CurrentUser)
+    async def get_current_user(user: AuthenticatedUser) -> CurrentUser:
+        return user
+
     @app.get("/personas", operation_id="listPersonas", response_model=PersonaList)
-    async def list_personas() -> PersonaList:
+    async def list_personas(_: AuthenticatedUser) -> PersonaList:
         return PersonaList(items=resolved_catalog.discover())
+
+    @app.get("/creations", operation_id="listCreations", response_model=CreationList)
+    async def list_creations(user: AuthenticatedUser) -> CreationList:
+        return await resolved_repository.list_creations(user.user_id)
 
     @app.post(
         "/creations",
@@ -145,9 +260,11 @@ def create_app(
     async def create_creation(
         request: CreateCreationRequest,
         idempotency_key: IdempotencyKey,
+        user: AuthenticatedUser,
     ) -> CreationAccepted:
+        key = scoped_key(user, idempotency_key)
         replay = await resolved_repository.replay_create_creation(
-            idempotency_key,
+            key,
             request,
         )
         if replay is not None:
@@ -157,9 +274,10 @@ def create_app(
             request.persona_id,
         )
         return await resolved_repository.create_creation(
-            idempotency_key=idempotency_key,
+            idempotency_key=key,
             request=request,
             persona_snapshot=snapshot.summary,
+            owner_id=user.user_id if authentication_enabled else None,
         )
 
     @app.get(
@@ -167,7 +285,8 @@ def create_app(
         operation_id="getCreation",
         response_model=CreationResource,
     )
-    async def get_creation(creation_id: UUID) -> CreationResource:
+    async def get_creation(creation_id: UUID, user: AuthenticatedUser) -> CreationResource:
+        await require_owner(creation_id, user)
         resource = await resolved_repository.get_creation(creation_id)
         if resource is None:
             raise DomainError("creation_not_found", "Creation not found.", 404)
@@ -189,7 +308,9 @@ def create_app(
     async def get_delivery_presentation(
         creation_id: UUID,
         run_kind: Literal["initial", "revision"],
+        user: AuthenticatedUser,
     ) -> DeliveryPresentation:
+        await require_owner(creation_id, user)
         return await resolved_repository.get_delivery_presentation(creation_id, run_kind)
 
     @app.post(
@@ -202,10 +323,12 @@ def create_app(
         creation_id: UUID,
         request: RevisionRequest,
         idempotency_key: IdempotencyKey,
+        user: AuthenticatedUser,
     ) -> RevisionAccepted:
+        await require_owner(creation_id, user)
         return await resolved_repository.create_or_retry_revision(
             creation_id=creation_id,
-            idempotency_key=idempotency_key,
+            idempotency_key=scoped_key(user, idempotency_key),
             request=request,
         )
 
@@ -219,11 +342,13 @@ def create_app(
         creation_id: UUID,
         run_kind: Literal["initial", "revision"],
         idempotency_key: IdempotencyKey,
+        user: AuthenticatedUser,
     ) -> RunControlAccepted:
+        await require_owner(creation_id, user)
         return await resolved_repository.continue_run(
             creation_id=creation_id,
             run_kind=run_kind,
-            idempotency_key=idempotency_key,
+            idempotency_key=scoped_key(user, idempotency_key),
         )
 
     @app.post(
@@ -254,11 +379,13 @@ def create_app(
         creation_id: UUID,
         run_kind: Literal["initial", "revision"],
         idempotency_key: IdempotencyKey,
+        user: AuthenticatedUser,
     ) -> RunControlAccepted:
+        await require_owner(creation_id, user)
         return await resolved_repository.retry_final_review(
             creation_id=creation_id,
             run_kind=run_kind,
-            idempotency_key=idempotency_key,
+            idempotency_key=scoped_key(user, idempotency_key),
         )
 
     @app.post(
@@ -285,11 +412,13 @@ def create_app(
         creation_id: UUID,
         run_kind: Literal["initial", "revision"],
         idempotency_key: IdempotencyKey,
+        user: AuthenticatedUser,
     ) -> RunControlAccepted:
+        await require_owner(creation_id, user)
         return await resolved_repository.authorize_repair(
             creation_id=creation_id,
             run_kind=run_kind,
-            idempotency_key=idempotency_key,
+            idempotency_key=scoped_key(user, idempotency_key),
         )
 
     @app.post(
@@ -302,11 +431,13 @@ def create_app(
         creation_id: UUID,
         run_kind: Literal["initial", "revision"],
         idempotency_key: IdempotencyKey,
+        user: AuthenticatedUser,
     ) -> RunControlAccepted:
+        await require_owner(creation_id, user)
         return await resolved_repository.end_run(
             creation_id=creation_id,
             run_kind=run_kind,
-            idempotency_key=idempotency_key,
+            idempotency_key=scoped_key(user, idempotency_key),
         )
 
     @app.post(
@@ -319,6 +450,7 @@ def create_app(
         creation_id: UUID,
         run_kind: Literal["initial", "revision"],
         idempotency_key: IdempotencyKey,
+        user: AuthenticatedUser,
     ) -> RunControlAccepted:
         """Revive a failed initial run whose failure was an operator-fixable relay error.
 
@@ -328,10 +460,31 @@ def create_app(
         checkpoints, so already approved content is never regenerated. A failed
         revision run keeps its own resubmit-frozen-feedback semantics.
         """
+        await require_owner(creation_id, user)
         return await resolved_repository.retry_run(
             creation_id=creation_id,
             run_kind=run_kind,
-            idempotency_key=idempotency_key,
+            idempotency_key=scoped_key(user, idempotency_key),
         )
+
+    generated_openapi = app.openapi
+
+    def openapi_with_authentication_errors() -> dict:
+        schema = generated_openapi()
+        authentication_response = {
+            "description": "Authentication required",
+            "content": {
+                "application/json": {"schema": {"$ref": "#/components/schemas/CommandError"}}
+            },
+        }
+        for path, methods in schema["paths"].items():
+            if path.startswith("/auth/"):
+                continue
+            for method, operation in methods.items():
+                if method in {"get", "post", "put", "patch", "delete"}:
+                    operation.setdefault("responses", {})["401"] = authentication_response
+        return schema
+
+    app.openapi = openapi_with_authentication_errors  # type: ignore[method-assign]
 
     return app

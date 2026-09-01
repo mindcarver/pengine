@@ -14,8 +14,8 @@
       content="意态短剧本地创作台：选择编剧人格，提交故事，并查看真实生成与修订结果。"
     >
     <title>意态短剧 · 本地创作台</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260813-2">
-    <script src="/static/app.js?v=20260813-2" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260901-1">
+    <script src="/static/app.js?v=20260901-1" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>
@@ -28,11 +28,49 @@
           <small>短剧创作 · 本地创作台</small>
         </span>
       </a>
-
+      <div class="account-tools" id="account-tools" hidden>
+        <button class="account-trigger" id="account-trigger" type="button" aria-expanded="false" aria-controls="account-menu">
+          <span id="account-username"></span><span aria-hidden="true">⌄</span>
+        </button>
+        <div class="account-menu" id="account-menu" hidden>
+          <button id="open-creations" type="button">我的创作</button>
+          <button id="logout" type="button">退出登录</button>
+        </div>
+      </div>
     </header>
 
-    <main id="main-content">
-      <section class="hero" aria-labelledby="page-title">
+    <section class="auth-stage" id="auth-view" aria-labelledby="auth-title">
+      <article class="auth-paper">
+        <p class="eyebrow">ENTRY REGISTER</p>
+        <h1 id="auth-title">登录创作台</h1>
+        <p id="auth-intro">登录后继续你的创作与修订。</p>
+        <form id="auth-form" novalidate>
+          <label for="auth-username">用户名</label>
+          <input id="auth-username" name="username" maxlength="64" autocomplete="username" required aria-describedby="auth-username-error">
+          <p class="field-error" id="auth-username-error"></p>
+          <label for="auth-password">密码</label>
+          <input id="auth-password" name="password" type="password" minlength="8" maxlength="256" autocomplete="current-password" required aria-describedby="auth-password-error">
+          <p class="field-error" id="auth-password-error"></p>
+          <p class="form-message" id="auth-message" aria-live="assertive"></p>
+          <button class="primary-button auth-submit" id="auth-submit" type="submit">登录</button>
+        </form>
+        <p class="auth-switch"><span id="auth-switch-copy">还没有账户？</span> <button class="text-button" id="auth-switch" type="button">注册</button></p>
+      </article>
+    </section>
+
+    <main id="main-content" hidden>
+      <section class="creations-library" id="creations-library" aria-labelledby="creations-title" hidden>
+        <button class="text-button" id="back-to-workbench" type="button">← 返回创作台</button>
+        <div class="library-heading">
+          <p class="eyebrow">MY CREATIONS</p>
+          <h1 id="creations-title">我的创作</h1>
+          <p>这里按最近更新时间保存你的创作卷宗。</p>
+        </div>
+        <p class="library-status" id="creations-status" aria-live="polite"></p>
+        <div class="creation-list" id="creation-list"></div>
+      </section>
+
+      <section class="hero" id="workbench-hero" aria-labelledby="page-title">
         <div class="hero-kicker">
           <span>NO. 01</span>
           <span>LOCAL EDITION</span>
@@ -44,7 +82,7 @@
         </div>
       </section>
 
-      <div class="workbench">
+      <div class="workbench" id="workbench">
         <div class="workbench-main">
           <nav class="workspace-nav flow-nav" aria-label="创作流程">
             <button
@@ -501,7 +539,7 @@
 
     <footer class="footer">
       <p>意态短剧 · 本地创作台</p>
-      <p>所有文稿来自当前本地服务；正式成品可导出，本页不提供登录或云同步。</p>
+      <p>所有文稿来自当前服务，正式成品可导出；作品只归属于当前登录账户。</p>
     </footer>
 
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

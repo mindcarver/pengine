@@ -35,9 +35,12 @@ from pengine.schemas import (
     ContentPackage,
     CreateCreationRequest,
     CreationAccepted,
+    CreationList,
+    CreationListItem,
     CreationResource,
     CreativeDirectionDraft,
     CreativeTextDraft,
+    CurrentUser,
     Delivery,
     DeliveryPresentation,
     EndedRun,
@@ -99,7 +102,7 @@ from pengine.series_review import (
     new_review_id,
 )
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
 # Failure codes an operator can resolve before reviving a terminally failed
@@ -1514,6 +1517,12 @@ class LeasedJob:
 
 
 @dataclass(frozen=True, slots=True)
+class UserCredential:
+    user: CurrentUser
+    password_hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class RunRecovery:
     run_id: UUID
     creation_id: UUID
@@ -2516,9 +2525,236 @@ class Repository:
                 else:
                     await connection.commit()
                     schema_version = 32
+            if schema_version == 32:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    account_schema = await (
+                        await connection.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+                        )
+                    ).fetchone()
+                    if account_schema is not None:
+                        # A completed v33 database may have had only its version marker
+                        # removed by repair tooling. Never repeat the destructive cutover.
+                        await connection.execute(
+                            "INSERT OR IGNORE INTO pengine_schema(version) VALUES (33)"
+                        )
+                    else:
+                        # Account ownership starts from a deliberately empty catalog.
+                        # Cascading foreign keys remove runs and every derived artifact.
+                        # These audit/repair tables intentionally have no foreign keys,
+                        # so clear them explicitly before deleting their parent rows.
+                        await connection.execute("DELETE FROM model_calls")
+                        await connection.execute("DELETE FROM series_bible_projection_repairs")
+                        await connection.execute("DELETE FROM creations")
+                        await connection.execute("DELETE FROM idempotency_records")
+                        await connection.execute(
+                            """
+                        CREATE TABLE users (
+                            id TEXT PRIMARY KEY,
+                            username TEXT NOT NULL UNIQUE,
+                            password_hash TEXT NOT NULL,
+                            created_at TEXT NOT NULL
+                        )
+                        """
+                        )
+                        await connection.execute(
+                            """
+                        CREATE TABLE sessions (
+                            id TEXT PRIMARY KEY,
+                            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            token_sha256 TEXT NOT NULL UNIQUE,
+                            created_at TEXT NOT NULL,
+                            expires_at TEXT NOT NULL,
+                            revoked_at TEXT
+                        )
+                        """
+                        )
+                        await connection.execute(
+                            "CREATE INDEX sessions_user_expiry ON sessions(user_id, expires_at)"
+                        )
+                        await connection.execute(
+                            "ALTER TABLE creations ADD COLUMN owner_id TEXT REFERENCES users(id)"
+                        )
+                        await connection.execute(
+                            "CREATE INDEX creations_owner_updated "
+                            "ON creations(owner_id, updated_at DESC)"
+                        )
+                        await connection.execute(
+                            "INSERT OR IGNORE INTO pengine_schema(version) VALUES (33)"
+                        )
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    schema_version = 33
 
     async def setup(self) -> None:
         await self.initialize()
+
+    async def register_user(
+        self,
+        *,
+        username: str,
+        password_hash: str,
+        session_token_sha256: str,
+        session_expires_at: datetime,
+        now: datetime | None = None,
+    ) -> CurrentUser:
+        timestamp = _timestamp(now or _utc_now())
+        user = CurrentUser(user_id=uuid4(), username=username)
+        try:
+            async with self._transaction() as connection:
+                await connection.execute(
+                    "INSERT INTO users(id, username, password_hash, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (str(user.user_id), user.username, password_hash, timestamp),
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO sessions(
+                        id, user_id, token_sha256, created_at, expires_at, revoked_at
+                    ) VALUES (?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        str(uuid4()),
+                        str(user.user_id),
+                        session_token_sha256,
+                        timestamp,
+                        _timestamp(session_expires_at),
+                    ),
+                )
+        except aiosqlite.IntegrityError as exc:
+            raise DomainError("username_taken", "用户名已被使用。", 409) from exc
+        return user
+
+    async def get_user_credential(self, username: str) -> UserCredential | None:
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                "SELECT id, username, password_hash FROM users WHERE username = ?",
+                (username,),
+            )
+        if row is None:
+            return None
+        return UserCredential(
+            user=CurrentUser(user_id=UUID(row["id"]), username=row["username"]),
+            password_hash=row["password_hash"],
+        )
+
+    async def create_session(
+        self,
+        *,
+        user_id: UUID,
+        token_sha256: str,
+        expires_at: datetime,
+        now: datetime | None = None,
+    ) -> None:
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            await connection.execute(
+                """
+                INSERT INTO sessions(
+                    id, user_id, token_sha256, created_at, expires_at, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, NULL)
+                """,
+                (str(uuid4()), str(user_id), token_sha256, timestamp, _timestamp(expires_at)),
+            )
+
+    async def resolve_session(
+        self,
+        token_sha256: str,
+        *,
+        now: datetime | None = None,
+    ) -> CurrentUser | None:
+        timestamp = _timestamp(now or _utc_now())
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                """
+                SELECT users.id, users.username
+                FROM sessions
+                JOIN users ON users.id = sessions.user_id
+                WHERE sessions.token_sha256 = ?
+                  AND sessions.revoked_at IS NULL
+                  AND sessions.expires_at > ?
+                """,
+                (token_sha256, timestamp),
+            )
+        if row is None:
+            return None
+        return CurrentUser(user_id=UUID(row["id"]), username=row["username"])
+
+    async def revoke_session(
+        self,
+        token_sha256: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        async with self._transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE sessions SET revoked_at = ?
+                WHERE token_sha256 = ? AND revoked_at IS NULL
+                """,
+                (_timestamp(now or _utc_now()), token_sha256),
+            )
+
+    async def require_creation_owner(self, creation_id: UUID, user_id: UUID) -> None:
+        async with self._connection() as connection:
+            row = await self._fetchone(
+                connection,
+                "SELECT 1 FROM creations WHERE id = ? AND owner_id = ?",
+                (str(creation_id), str(user_id)),
+            )
+        if row is None:
+            raise DomainError("creation_not_found", "Creation not found.", 404)
+
+    async def list_creations(self, user_id: UUID) -> CreationList:
+        async with self._connection() as connection:
+            rows = await (
+                await connection.execute(
+                    """
+                    SELECT
+                        creations.id,
+                        creations.persona_display_name,
+                        creations.story,
+                        creations.created_at,
+                        creations.updated_at,
+                        COALESCE((
+                            SELECT state FROM runs
+                            WHERE creation_id = creations.id AND kind = 'initial'
+                            ORDER BY sequence DESC LIMIT 1
+                        ), 'unavailable') AS initial_state,
+                        COALESCE((
+                            SELECT state FROM runs
+                            WHERE creation_id = creations.id AND kind = 'revision'
+                            ORDER BY sequence DESC LIMIT 1
+                        ), 'unavailable') AS revision_state
+                    FROM creations
+                    WHERE owner_id = ?
+                    ORDER BY updated_at DESC, created_at DESC
+                    """,
+                    (str(user_id),),
+                )
+            ).fetchall()
+        return CreationList(
+            items=[
+                CreationListItem(
+                    creation_id=UUID(row["id"]),
+                    persona_display_name=row["persona_display_name"],
+                    initial_state=row["initial_state"],
+                    revision_state=row["revision_state"],
+                    story_excerpt=(
+                        row["story"] if len(row["story"]) <= 120 else f"{row['story'][:119]}…"
+                    ),
+                    created_at=_datetime(row["created_at"]),
+                    updated_at=_datetime(row["updated_at"]),
+                )
+                for row in rows
+            ]
+        )
 
     async def get_outline_season_map(self, run_id: UUID) -> dict[str, Any] | None:
         async with self._connection() as connection:
@@ -2978,6 +3214,7 @@ class Repository:
         request: CreateCreationRequest,
         persona_snapshot: PersonaSnapshot,
         *,
+        owner_id: UUID | None = None,
         payload_hash: str | None = None,
         creation_id: UUID | None = None,
         thread_id: str | None = None,
@@ -3019,8 +3256,8 @@ class Repository:
                 INSERT INTO creations(
                     id, persona_id, persona_display_name, persona_version,
                     persona_snapshot_sha256, story, requirements, output_language,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, owner_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(new_creation_id),
@@ -3033,6 +3270,7 @@ class Repository:
                     output_language,
                     timestamp,
                     timestamp,
+                    str(owner_id) if owner_id is not None else None,
                 ),
             )
             await connection.execute(
