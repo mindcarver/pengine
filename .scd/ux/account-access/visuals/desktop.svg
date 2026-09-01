@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="960" viewBox="0 0 1440 960" role="img" aria-labelledby="title desc">
+  <title id="title">账户入口与我的创作桌面线框</title>
+  <desc id="desc">左侧是登录或注册的入场登记页，右侧是登录后的我的创作列表。</desc>
+  <rect width="1440" height="960" fill="#1d1a17"/>
+  <text x="72" y="72" fill="#e8dfcf" font-family="Georgia, serif" font-size="34">意态短剧</text>
+  <text x="72" y="102" fill="#b9af9f" font-family="Arial, sans-serif" font-size="16">账户入口 · 桌面低保真</text>
+  <rect x="72" y="144" width="580" height="700" rx="3" fill="#f2e9d8"/>
+  <text x="124" y="226" fill="#332d25" font-family="Georgia, serif" font-size="34">入场登记</text>
+  <text x="124" y="262" fill="#6e6457" font-family="Arial, sans-serif" font-size="17">注册后，你的每次创作都归入自己的卷宗。</text>
+  <text x="124" y="340" fill="#332d25" font-family="Arial, sans-serif" font-size="17">用户名</text>
+  <rect x="124" y="356" width="476" height="48" fill="#fffaf0" stroke="#74695b"/>
+  <text x="124" y="460" fill="#332d25" font-family="Arial, sans-serif" font-size="17">密码</text>
+  <rect x="124" y="476" width="476" height="48" fill="#fffaf0" stroke="#74695b"/>
+  <rect x="124" y="568" width="476" height="52" fill="#332d25"/>
+  <text x="362" y="601" fill="#f7f0e2" text-anchor="middle" font-family="Arial, sans-serif" font-size="18">注册并进入编辑部</text>
+  <text x="124" y="676" fill="#6e6457" font-family="Arial, sans-serif" font-size="16">已有账户？</text>
+  <text x="218" y="676" fill="#332d25" font-family="Arial, sans-serif" font-size="16" font-weight="700">登录</text>
+  <rect x="724" y="144" width="644" height="700" rx="3" fill="#f2e9d8"/>
+  <text x="776" y="222" fill="#332d25" font-family="Georgia, serif" font-size="34">我的创作</text>
+  <text x="776" y="258" fill="#6e6457" font-family="Arial, sans-serif" font-size="16">ge  ·  返回创作台  ·  退出登录</text>
+  <line x1="776" y1="294" x2="1316" y2="294" stroke="#a89d8c"/>
+  <text x="776" y="354" fill="#332d25" font-family="Arial, sans-serif" font-size="17" font-weight="700">编剧人格 · 守拙</text>
+  <text x="776" y="384" fill="#6e6457" font-family="Arial, sans-serif" font-size="15">创作中 · 2026-09-01 10:42</text>
+  <text x="776" y="420" fill="#332d25" font-family="Arial, sans-serif" font-size="16">故事：旧照里的第三个人，在雨夜重新出现……</text>
+  <text x="1268" y="388" fill="#332d25" text-anchor="end" font-family="Arial, sans-serif" font-size="16">继续 →</text>
+  <line x1="776" y1="456" x2="1316" y2="456" stroke="#c1b6a6"/>
+  <text x="776" y="516" fill="#332d25" font-family="Arial, sans-serif" font-size="17" font-weight="700">编剧人格 · 雾枕</text>
+  <text x="776" y="546" fill="#6e6457" font-family="Arial, sans-serif" font-size="15">初稿完成 · 2026-08-30 18:16</text>
+  <text x="776" y="582" fill="#332d25" font-family="Arial, sans-serif" font-size="16">故事：一封没有署名的信，被送回十五年前的车站……</text>
+  <text x="1268" y="550" fill="#332d25" text-anchor="end" font-family="Arial, sans-serif" font-size="16">阅览 →</text>
+  <line x1="776" y1="618" x2="1316" y2="618" stroke="#c1b6a6"/>
+  <text x="776" y="694" fill="#6e6457" font-family="Arial, sans-serif" font-size="15">作品标题尚不是当前数据模型的一部分；这里始终将原始故事显示为摘要。</text>
+</svg>

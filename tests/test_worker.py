@@ -369,7 +369,7 @@ class TimeoutOnceWorkflow(DeterministicWorkflow):
                 },
             )
         await kwargs["before_stage"](InternalStage.GENERATING_STORY_OUTLINE)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5)
         raise AssertionError("the workflow timeout did not cancel execution")
 
 
@@ -1035,7 +1035,7 @@ async def test_worker_auto_resumes_first_wall_clock_timeout_from_approved_checkp
     tmp_path: Path,
 ) -> None:
     settings, catalog, repository, snapshot = await _services(tmp_path)
-    settings = settings.model_copy(update={"run_timeout_seconds": 0.05})
+    settings = settings.model_copy(update={"run_timeout_seconds": 0.2})
     accepted = await repository.create_creation(
         "timeout-recovery",
         CreateCreationRequest(

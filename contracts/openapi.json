@@ -44,8 +44,36 @@
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
+          }
+        ]
       }
     },
     "/creations": {
@@ -55,6 +83,22 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
           }
         ],
         "requestBody": {
@@ -110,6 +154,70 @@
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List Creations",
+        "operationId": "listCreations",
+        "parameters": [
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreationList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
           }
         }
       }
@@ -121,6 +229,22 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/CreationId"
+          },
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
           }
         ],
         "responses": {
@@ -136,6 +260,16 @@
           },
           "404": {
             "$ref": "#/components/responses/CreationNotFound"
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
           }
         }
       }
@@ -151,6 +285,22 @@
           },
           {
             "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
           }
         ],
         "requestBody": {
@@ -212,6 +362,16 @@
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
           }
         }
       }
@@ -254,6 +414,22 @@
               "maxLength": 128,
               "title": "Idempotency-Key"
             }
+          },
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
           }
         ],
         "responses": {
@@ -282,6 +458,16 @@
           },
           "422": {
             "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
           }
         }
       }
@@ -325,6 +511,22 @@
               "maxLength": 128,
               "title": "Idempotency-Key"
             }
+          },
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
           }
         ],
         "responses": {
@@ -353,6 +555,16 @@
           },
           "422": {
             "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
           }
         }
       }
@@ -396,6 +608,22 @@
               "maxLength": 128,
               "title": "Idempotency-Key"
             }
+          },
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
           }
         ],
         "responses": {
@@ -431,6 +659,16 @@
           },
           "422": {
             "description": "Request schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
             "content": {
               "application/json": {
                 "schema": {
@@ -480,6 +718,22 @@
               "maxLength": 128,
               "title": "Idempotency-Key"
             }
+          },
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
           }
         ],
         "responses": {
@@ -508,6 +762,16 @@
           },
           "422": {
             "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
           }
         }
       }
@@ -551,6 +815,22 @@
               "maxLength": 128,
               "title": "Idempotency-Key"
             }
+          },
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
           }
         ],
         "responses": {
@@ -570,6 +850,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
                 }
               }
             }
@@ -603,6 +893,22 @@
               ],
               "type": "string",
               "title": "Run Kind"
+            }
+          },
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
             }
           }
         ],
@@ -643,6 +949,207 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/register": {
+      "post": {
+        "summary": "Register",
+        "operationId": "register",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentUser"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Username already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "summary": "Login",
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentUser"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "summary": "Logout",
+        "operationId": "logout",
+        "parameters": [
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/me": {
+      "get": {
+        "summary": "Get Current User",
+        "operationId": "getCurrentUser",
+        "parameters": [
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentUser"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
                 }
               }
             }
@@ -2311,7 +2818,10 @@
               "run_not_controllable",
               "repair_authorization_stale",
               "series_bible_rebuild_exhausted",
-              "service_unavailable"
+              "service_unavailable",
+              "authentication_required",
+              "invalid_credentials",
+              "username_taken"
             ],
             "title": "Code"
           },
@@ -4203,6 +4713,146 @@
           "level"
         ],
         "title": "StorySection"
+      },
+      "CurrentUser": {
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "User Id"
+          },
+          "username": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Username"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "user_id",
+          "username"
+        ],
+        "title": "CurrentUser"
+      },
+      "RegisterRequest": {
+        "properties": {
+          "username": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Username"
+          },
+          "password": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 8,
+            "title": "Password"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "RegisterRequest"
+      },
+      "LoginRequest": {
+        "properties": {
+          "username": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Username"
+          },
+          "password": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 8,
+            "title": "Password"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "LoginRequest"
+      },
+      "CreationList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CreationListItem"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "CreationList"
+      },
+      "CreationListItem": {
+        "properties": {
+          "creation_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Creation Id"
+          },
+          "persona_display_name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Persona Display Name"
+          },
+          "initial_state": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Initial State"
+          },
+          "revision_state": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Revision State"
+          },
+          "story_excerpt": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Story Excerpt"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "creation_id",
+          "persona_display_name",
+          "initial_state",
+          "revision_state",
+          "story_excerpt",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "CreationListItem"
       }
     }
   },

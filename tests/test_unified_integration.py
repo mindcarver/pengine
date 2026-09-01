@@ -1227,7 +1227,12 @@ async def test_int_retry_revives_relay_failed_run_without_regenerating_approved_
     assert failed.initial.progress.can_retry is True
     assert workflow.l0_approval_count == 1
 
-    app = create_app(settings=settings, repository=repository, catalog=catalog)
+    app = create_app(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        authentication_enabled=False,
+    )
     async with (
         app.router.lifespan_context(app),
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
@@ -1279,7 +1284,12 @@ async def test_int_a8_suffix_budget_exhaustion_and_one_cycle_authorization(
         workflow=workflow,
         worker_id="a8-suffix-worker",
     )
-    app = create_app(settings=settings, repository=repository, catalog=catalog)
+    app = create_app(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        authentication_enabled=False,
+    )
     async with (
         app.router.lifespan_context(app),
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
@@ -1377,7 +1387,12 @@ async def test_int_a8_design_budget_exhaustion_and_authorization_cycle(
     # repair-authorization evidence pause. The automatic budget stays consumed
     # (rebuild_count remains 1).
     cycles_before = workflow.execution_count
-    app = create_app(settings=settings, repository=repository, catalog=catalog)
+    app = create_app(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        authentication_enabled=False,
+    )
     async with (
         app.router.lifespan_context(app),
         AsyncClient(

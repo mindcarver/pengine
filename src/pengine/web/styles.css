@@ -43,7 +43,8 @@ body {
 }
 
 button,
-textarea {
+textarea,
+input {
   font: inherit;
 }
 
@@ -53,13 +54,15 @@ button {
 
 button,
 a,
-textarea {
+textarea,
+input {
   -webkit-tap-highlight-color: transparent;
 }
 
 button:focus-visible,
 a:focus-visible,
-textarea:focus-visible {
+textarea:focus-visible,
+input:focus-visible {
   outline: 3px solid var(--mustard);
   outline-offset: 3px;
 }
@@ -119,6 +122,173 @@ textarea:focus-visible {
 .brand strong,
 .brand small {
   display: block;
+}
+
+.account-tools {
+  position: relative;
+}
+
+.account-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid rgba(238, 228, 207, 0.28);
+  color: var(--paper-light);
+  background: transparent;
+  cursor: pointer;
+}
+
+.account-menu {
+  position: absolute;
+  z-index: 80;
+  top: calc(100% + 0.5rem);
+  right: 0;
+  min-width: 9rem;
+  padding: 0.35rem;
+  border: 1px solid rgba(238, 228, 207, 0.2);
+  background: var(--desk-light);
+  box-shadow: var(--shadow);
+}
+
+.account-menu button {
+  display: block;
+  width: 100%;
+  padding: 0.65rem 0.75rem;
+  border: 0;
+  color: var(--paper-light);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.account-menu button:hover,
+.account-menu button:focus-visible {
+  background: rgba(184, 154, 106, 0.16);
+}
+
+.auth-stage {
+  display: grid;
+  min-height: calc(100vh - 72px);
+  place-items: start center;
+  padding: clamp(3rem, 9vw, 7rem) 1rem;
+}
+
+.auth-paper {
+  width: min(100%, 28rem);
+  padding: clamp(1.6rem, 5vw, 3rem);
+  border: 1px solid rgba(90, 69, 45, 0.45);
+  color: var(--ink);
+  background: var(--paper-light);
+  box-shadow: 12px 14px 0 rgba(0, 0, 0, 0.2), var(--shadow);
+}
+
+.auth-paper h1,
+.library-heading h1 {
+  margin: 0;
+  font-family: var(--display);
+  font-size: clamp(2rem, 5vw, 3.1rem);
+  line-height: 1.1;
+}
+
+.auth-paper > p:not(.eyebrow),
+.library-heading > p:not(.eyebrow) {
+  color: var(--ink-soft);
+}
+
+.auth-paper form {
+  display: grid;
+  margin-top: 1.7rem;
+}
+
+.auth-paper label {
+  margin-top: 0.8rem;
+  font-weight: 700;
+}
+
+.auth-paper input {
+  width: 100%;
+  margin-top: 0.35rem;
+  padding: 0.75rem;
+  border: 1px solid rgba(72, 57, 40, 0.4);
+  border-radius: 0;
+  color: var(--ink);
+  background: #fffdf8;
+}
+
+.field-error {
+  min-height: 1.45rem;
+  margin: 0.2rem 0 0;
+  color: var(--rust-deep);
+  font-size: 0.82rem;
+}
+
+.auth-submit {
+  justify-content: center;
+  width: 100%;
+  margin-top: 0.8rem;
+}
+
+.auth-switch {
+  margin: 1.25rem 0 0;
+  text-align: center;
+}
+
+.creations-library {
+  max-width: 900px;
+  min-height: calc(100vh - 150px);
+  margin: 0 auto;
+  padding: clamp(2rem, 6vw, 5rem) clamp(1rem, 3vw, 2rem);
+  color: var(--paper-light);
+}
+
+.library-heading {
+  margin-top: 2rem;
+}
+
+.library-heading > p:not(.eyebrow),
+.library-status {
+  color: #c9beae;
+}
+
+.library-status {
+  margin: 2rem 0 1rem;
+}
+
+.creation-list {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.creation-file {
+  display: grid;
+  gap: 0.55rem;
+  width: 100%;
+  padding: 1.15rem 1.25rem;
+  border: 1px solid rgba(90, 69, 45, 0.4);
+  color: var(--ink);
+  background: var(--paper-light);
+  box-shadow: 5px 6px 0 rgba(0, 0, 0, 0.18);
+  text-align: left;
+  cursor: pointer;
+}
+
+.creation-file:hover,
+.creation-file:focus-visible {
+  border-color: var(--mustard);
+  transform: translateY(-1px);
+}
+
+.creation-file-meta,
+.creation-file time {
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+}
+
+.creation-file strong {
+  font-family: var(--display);
+  font-size: 1.08rem;
 }
 
 .brand strong {
@@ -1614,6 +1784,30 @@ textarea:disabled {
 }
 
 @media (max-width: 620px) {
+  .masthead {
+    min-height: 64px;
+  }
+
+  .brand small {
+    display: none;
+  }
+
+  .account-menu {
+    position: fixed;
+    top: 64px;
+    right: 0.75rem;
+    left: 0.75rem;
+  }
+
+  .auth-stage {
+    min-height: calc(100vh - 64px);
+    padding-top: 2rem;
+  }
+
+  .auth-paper {
+    padding: 1.4rem 1.15rem;
+  }
+
   .masthead {
     align-items: flex-start;
     padding: 0.7rem 1rem;

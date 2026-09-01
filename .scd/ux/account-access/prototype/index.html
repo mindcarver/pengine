@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>账户入口与我的创作 · 非生产原型</title>
+    <style>
+      :root { color-scheme: light; font-family: Georgia, "Noto Serif SC", serif; background: #1d1a17; color: #332d25; }
+      *, *::before, *::after { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; background: #1d1a17; }
+      main { max-width: 880px; margin: 0 auto; padding: 32px 18px 54px; }
+      .brand { color: #eee3d2; font-size: 28px; margin: 0 0 20px; }
+      .paper { background: #f2e9d8; padding: 30px; box-shadow: 0 10px 30px #0005; }
+      h1 { margin: 0 0 8px; font-size: 30px; } p { line-height: 1.6; } .muted { color: #6e6457; }
+      label { display: block; margin-top: 20px; font-family: Arial, sans-serif; font-size: 15px; }
+      input { box-sizing: border-box; width: 100%; padding: 12px; margin-top: 7px; border: 1px solid #74695b; background: #fffaf0; font-size: 16px; }
+      button, a { font: inherit; } button { border: 0; cursor: pointer; padding: 12px 16px; margin-top: 22px; background: #332d25; color: #fffaf0; }
+      .link { border: 0; background: none; color: #332d25; text-decoration: underline; padding: 0; margin: 0; }
+      .error { min-height: 24px; color: #8b2525; font-family: Arial, sans-serif; font-size: 14px; }
+      .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 22px; }
+      .toolbar button { margin: 0; } .hidden { display: none; }
+      .work { border-top: 1px solid #b6aa99; padding: 18px 0; }
+      .work strong, .work span { display: block; } .work span { margin-top: 8px; font-family: Arial, sans-serif; }
+      @media (max-width: 520px) { main { padding: 22px 14px; } .paper { padding: 24px; } h1 { font-size: 27px; } button { width: 100%; } .toolbar button { width: auto; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="brand">意态短剧 <span class="muted" style="font-size:14px">非生产交互原型</span></p>
+      <section class="paper" id="auth" aria-labelledby="auth-title">
+        <h1 id="auth-title">入场登记</h1>
+        <p class="muted" id="intro">用你的账户保存每次创作。</p>
+        <form id="auth-form">
+          <label for="username">用户名</label><input id="username" required maxlength="64">
+          <label for="password">密码</label><input id="password" type="password" required minlength="8">
+          <p class="error" id="error" role="alert"></p>
+          <button type="submit" id="submit">注册并进入编辑部</button>
+        </form>
+        <p id="switch-copy">已有账户？ <button class="link" type="button" id="switch">登录</button></p>
+      </section>
+      <section class="paper hidden" id="library" aria-labelledby="library-title">
+        <div class="toolbar"><strong id="account-name">ge</strong><button type="button" id="back">返回创作台</button><button type="button" id="logout">退出登录</button></div>
+        <h1 id="library-title" tabindex="-1">我的创作</h1>
+        <div id="works"><article class="work"><strong>编剧人格 · 守拙</strong><span class="muted">创作中 · 刚刚更新</span><span>故事：旧照里的第三个人，在雨夜重新出现……</span></article><article class="work"><strong>编剧人格 · 雾枕</strong><span class="muted">初稿完成 · 昨天</span><span>故事：一封没有署名的信，被送回十五年前的车站……</span></article></div>
+        <button type="button" id="empty">模拟空列表</button>
+      </section>
+    </main>
+    <script>
+      const auth = document.getElementById('auth'); const library = document.getElementById('library');
+      const form = document.getElementById('auth-form'); const title = document.getElementById('auth-title');
+      const intro = document.getElementById('intro'); const submit = document.getElementById('submit');
+      const switcher = document.getElementById('switch'); const copy = document.getElementById('switch-copy');
+      const error = document.getElementById('error'); const username = document.getElementById('username'); const works = document.getElementById('works');
+      let mode = 'register';
+      switcher.addEventListener('click', () => { mode = mode === 'register' ? 'login' : 'register'; error.textContent = ''; title.textContent = mode === 'login' ? '欢迎回来' : '入场登记'; intro.textContent = mode === 'login' ? '登录后继续自己的创作。' : '用你的账户保存每次创作。'; submit.textContent = mode === 'login' ? '登录' : '注册并进入编辑部'; copy.firstChild.textContent = mode === 'login' ? '还没有账户？ ' : '已有账户？ '; switcher.textContent = mode === 'login' ? '注册' : '登录'; });
+      form.addEventListener('submit', (event) => { event.preventDefault(); if (username.value.trim() === 'taken') { error.textContent = mode === 'register' ? '这个用户名已被使用。' : '用户名或密码不正确。'; username.focus(); return; } error.textContent = ''; document.getElementById('account-name').textContent = username.value.trim() || '新用户'; auth.classList.add('hidden'); library.classList.remove('hidden'); document.getElementById('library-title').focus(); });
+      document.getElementById('logout').addEventListener('click', () => { library.classList.add('hidden'); auth.classList.remove('hidden'); form.reset(); username.focus(); });
+      document.getElementById('back').addEventListener('click', () => alert('原型仅演示账户与作品库切换；真实实现会进入既有创作台。'));
+      document.getElementById('empty').addEventListener('click', () => { works.innerHTML = '<p class="muted">这里还没有创作。回到创作台开始第一份卷宗。</p>'; });
+    </script>
+  </body>
+</html>

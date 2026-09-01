@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="390" height="844" viewBox="0 0 390 844" role="img" aria-labelledby="title desc">
+  <title id="title">账户入口与账户菜单窄屏线框</title>
+  <desc id="desc">窄屏显示单列登录表单和打开后的账户菜单。</desc>
+  <rect width="390" height="844" fill="#1d1a17"/>
+  <text x="24" y="52" fill="#e8dfcf" font-family="Georgia, serif" font-size="27">意态短剧</text>
+  <rect x="20" y="88" width="350" height="536" rx="3" fill="#f2e9d8"/>
+  <text x="48" y="148" fill="#332d25" font-family="Georgia, serif" font-size="28">入场登记</text>
+  <text x="48" y="180" fill="#6e6457" font-family="Arial, sans-serif" font-size="14">用你的账户保存每次创作。</text>
+  <text x="48" y="246" fill="#332d25" font-family="Arial, sans-serif" font-size="15">用户名</text>
+  <rect x="48" y="262" width="294" height="46" fill="#fffaf0" stroke="#74695b"/>
+  <text x="48" y="360" fill="#332d25" font-family="Arial, sans-serif" font-size="15">密码</text>
+  <rect x="48" y="376" width="294" height="46" fill="#fffaf0" stroke="#74695b"/>
+  <rect x="48" y="476" width="294" height="50" fill="#332d25"/>
+  <text x="195" y="507" fill="#f7f0e2" text-anchor="middle" font-family="Arial, sans-serif" font-size="16">登录</text>
+  <text x="195" y="572" fill="#6e6457" text-anchor="middle" font-family="Arial, sans-serif" font-size="14">还没有账户？ 注册</text>
+  <rect x="20" y="664" width="350" height="142" rx="3" fill="#f2e9d8"/>
+  <text x="44" y="710" fill="#332d25" font-family="Arial, sans-serif" font-size="16" font-weight="700">ge</text>
+  <line x1="44" y1="730" x2="346" y2="730" stroke="#b6aa99"/>
+  <text x="44" y="762" fill="#332d25" font-family="Arial, sans-serif" font-size="16">我的创作</text>
+  <text x="44" y="792" fill="#6e6457" font-family="Arial, sans-serif" font-size="16">退出登录</text>
+</svg>
