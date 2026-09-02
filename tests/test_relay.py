@@ -21,6 +21,7 @@ from pengine.relay import (
     MIN_RELAY_RETRY_DELAY_SECONDS,
     RelayError,
     RelayIdentityError,
+    RelayStreamIncompleteError,
     _ModelCallAuditHandler,
     build_chat_model,
     build_relay_adapter,
@@ -323,6 +324,7 @@ async def test_anthropic_empty_stream_fails_as_relay_unavailable(monkeypatch) ->
             pass
     assert error.value.code == "relay_unavailable"
     assert "without a finish reason" in error.value.safe_message
+    assert retryable_relay_interruption(error.value) is not None
 
 
 @pytest.mark.asyncio
@@ -342,8 +344,20 @@ async def test_anthropic_partially_streamed_text_without_completion_fails_as_rel
     assert error.value.code == "relay_unavailable"
 
 
-def test_anthropic_empty_stream_is_not_an_automatic_resume_interruption() -> None:
-    """No transport/status evidence: the failure stays operator-retryable only."""
+def test_anthropic_incomplete_stream_is_a_bounded_resume_interruption() -> None:
+    """The stream-completion guard is transport evidence: it auto-recovers once.
+
+    A stream dropped without the terminal message_delta is the same provider-side
+    transport failure as upstream_stream_error, so it joins the bounded recovery
+    path instead of failing the run outright (Issue #264).
+    """
+    interruption = retryable_relay_interruption(RelayStreamIncompleteError())
+    assert interruption is not None
+    assert interruption.retry_delay_seconds == MIN_RELAY_RETRY_DELAY_SECONDS
+
+
+def test_plain_relay_unavailable_without_the_stream_guard_stays_terminal() -> None:
+    """A generic relay_unavailable (quota, unconfigured route) never auto-resumes."""
     error = RelayError(
         code="relay_unavailable",
         safe_message="The model relay closed the generation stream without a finish reason.",

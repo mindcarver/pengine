@@ -216,18 +216,12 @@ def _require_anthropic_stream_completion(completion: _AnthropicStreamCompletion)
     A completed Anthropic stream always finishes with a ``message_delta`` that
     carries the stop reason (and output usage). Neither evidence means the relay
     closed an incomplete stream — a provider-side transport failure, not a model
-    contract violation — so it maps to the operator-retryable
-    ``relay_unavailable`` code instead of ``structured_output_invalid``.
+    contract violation — so it maps to the recoverable ``relay_unavailable``
+    code instead of ``structured_output_invalid`` (Issue #264).
     """
     if completion.stop_reason_seen or completion.usage_seen:
         return
-    raise RelayError(
-        code="relay_unavailable",
-        safe_message=(
-            "The model relay closed the generation stream without a finish "
-            "reason or usage evidence."
-        ),
-    )
+    raise RelayStreamIncompleteError()
 
 
 def _deduplicate_stream_model_identity(chunk: Any, seen_model_ids: dict[str, str]) -> Any:
@@ -1069,6 +1063,28 @@ class RelayProtocolError(RelayError):
         )
 
 
+class RelayStreamIncompleteError(RelayError):
+    """Fail closed when a stream ends without protocol completion evidence.
+
+    Raised only by ``_require_anthropic_stream_completion``: the relay dropped the
+    connection mid-generation instead of delivering the terminal ``message_delta``.
+    That is a provider-side transport failure physically equivalent to
+    ``upstream_stream_error``/``RemoteProtocolError``, so it is retryable through
+    the same bounded recovery path (first interruption auto-resumes, later ones
+    pause for the operator, capped by ``MAX_STAGE_ATTEMPTS`` — Issue #264). Every
+    other ``relay_unavailable`` cause keeps its terminal classification.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            code="relay_unavailable",
+            safe_message=(
+                "The model relay closed the generation stream without a finish "
+                "reason or usage evidence."
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class _ModelDumpMapping:
     """Present Relay mapping metadata through the interface LangChain expects."""
@@ -1474,6 +1490,8 @@ def classify_relay_exception(exc: Exception) -> RelayError:
 def retryable_relay_interruption(exc: Exception) -> RetryableRelayInterruption | None:
     if _has_tls_configuration_error(exc):
         return None
+    if isinstance(exc, RelayStreamIncompleteError):
+        return RetryableRelayInterruption(_retry_delay_seconds(exc))
     if _is_retryable_transport(exc):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
     if is_relay_connection_error(exc) and any(
