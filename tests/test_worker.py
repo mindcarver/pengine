@@ -31,6 +31,7 @@ from pengine.relay import (
     RelayError,
     RelayIdentityError,
     RelayStreamIncompleteError,
+    RelayStreamStalledError,
 )
 from pengine.repository import Repository
 from pengine.schemas import (
@@ -1459,6 +1460,11 @@ async def test_ten_episode_run_resumes_without_a_writer_call_for_committed_draft
         ),
         (
             RelayStreamIncompleteError(),
+            "relay_interruption",
+            "auto_resuming",
+        ),
+        (
+            RelayStreamStalledError(reason="stall", detail="no chunk for 120s"),
             "relay_interruption",
             "auto_resuming",
         ),

@@ -5,8 +5,10 @@ import logging
 import re
 import ssl
 import threading
+import time
+from collections import deque
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from math import ceil
@@ -128,17 +130,85 @@ def _persona_event_fields(record: ModelCallRecord) -> dict[str, Any]:
     }
 
 
+@dataclass(slots=True)
+class _StreamStallWatchdog:
+    """Abort streaming generation calls whose relay stream hangs or crawls.
+
+    Production evidence (Issue #266): a degraded relay either hangs a stream
+    silently until its ~6-minute kill or trickles a few tokens per minute. Both
+    waste the full wall-clock budget. The crawl rule keeps a sliding window of
+    (arrival time, cumulative output chars); a window-spanning rate under the
+    floor means the stream is not making usable progress. Healthy streams keep
+    >=4x margin: the slowest observed healthy relay window ran ~8 chars/s while
+    the floor defaults to 2.
+    """
+
+    stall_seconds: float
+    crawl_window_seconds: float
+    crawl_min_chars_per_second: float
+    _arrival_chars: deque[tuple[float, int]] = field(default_factory=deque)
+    _cumulative_chars: int = 0
+
+    def observe(self, chunk: Any, now: float | None = None) -> None:
+        moment = now if now is not None else time.monotonic()
+        self._cumulative_chars += _stream_chunk_text_chars(chunk)
+        self._arrival_chars.append((moment, self._cumulative_chars))
+        self._require_usable_rate(moment)
+
+    def _require_usable_rate(self, now: float) -> None:
+        window = self.crawl_window_seconds
+        while self._arrival_chars and now - self._arrival_chars[0][0] > window:
+            self._arrival_chars.popleft()
+        if len(self._arrival_chars) < 2:
+            return
+        start_at, start_chars = self._arrival_chars[0]
+        span = now - start_at
+        # Judge only once the window is (nearly) full so short bursts cannot trip
+        # the floor against a denominator of a few seconds.
+        if span < window * 0.9:
+            return
+        rate = (self._cumulative_chars - start_chars) / span
+        if rate < self.crawl_min_chars_per_second:
+            raise RelayStreamStalledError(
+                reason="crawl",
+                detail=(
+                    f"output rate {rate:.2f} chars/s over {span:.0f}s is under the "
+                    f"{self.crawl_min_chars_per_second:g} chars/s floor"
+                ),
+            )
+
+
+def _stream_chunk_text_chars(chunk: Any) -> int:
+    content = getattr(getattr(chunk, "message", None), "content", None)
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    total += len(text)
+            elif isinstance(block, str):
+                total += len(block)
+        return total
+    return 0
+
+
 class _SerialChatAnthropic(ChatAnthropic):
     _pengine_model_call_state: ModelCallState | None = PrivateAttr(default=None)
+    _pengine_stream_watchdog: _StreamStallWatchdog | None = PrivateAttr(default=None)
 
     def __init__(
         self,
         *args: Any,
         pengine_model_call_state: ModelCallState | None = None,
+        pengine_stream_watchdog: _StreamStallWatchdog | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._pengine_model_call_state = pengine_model_call_state
+        self._pengine_stream_watchdog = pengine_stream_watchdog
 
     def _with_call_output_budget(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         state = self._pengine_model_call_state
@@ -178,7 +248,28 @@ class _SerialChatAnthropic(ChatAnthropic):
     async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         seen_model_ids: dict[str, str] = {}
         completion = _AnthropicStreamCompletion()
-        async for chunk in super()._astream(*args, **self._with_call_output_budget(kwargs)):
+        watchdog = self._pengine_stream_watchdog
+        if watchdog is None:
+            async for chunk in super()._astream(*args, **self._with_call_output_budget(kwargs)):
+                completion.observe(chunk)
+                yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
+            _require_anthropic_stream_completion(completion)
+            return
+        # The watchdog bounds each wait for the next chunk (first chunk and
+        # inter-chunk gaps share the stall budget) and aborts streams whose
+        # sliding-window output rate falls under the crawl floor (Issue #266).
+        stream = super()._astream(*args, **self._with_call_output_budget(kwargs))
+        while True:
+            try:
+                chunk = await asyncio.wait_for(anext(stream), timeout=watchdog.stall_seconds)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                raise RelayStreamStalledError(
+                    reason="stall",
+                    detail=f"no chunk for {watchdog.stall_seconds:g}s",
+                ) from None
+            watchdog.observe(chunk)
             completion.observe(chunk)
             yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
         _require_anthropic_stream_completion(completion)
@@ -1085,6 +1176,30 @@ class RelayStreamIncompleteError(RelayError):
         )
 
 
+class RelayStreamStalledError(RelayError):
+    """A streaming generation call stopped making usable progress.
+
+    Raised only by the :class:`_StreamStallWatchdog` on streaming generation
+    routes: the relay either delivered no chunk within the stall budget or its
+    sliding-window output rate fell under the crawl floor. Both are provider-side
+    transport degradation (Issue #266 evidence), so the error is retryable through
+    the same bounded recovery path as ``RelayStreamIncompleteError``; the partial
+    stream is discarded and never promoted.
+    """
+
+    def __init__(self, *, reason: Literal["stall", "crawl"], detail: str) -> None:
+        self.reason = reason
+        self.detail = detail
+        if reason == "stall":
+            summary = "The model relay stream stalled without delivering a chunk"
+        else:
+            summary = "The model relay stream crawled below the usable output floor"
+        super().__init__(
+            code="relay_unavailable",
+            safe_message=f"{summary} ({detail}).",
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class _ModelDumpMapping:
     """Present Relay mapping metadata through the interface LangChain expects."""
@@ -1375,6 +1490,15 @@ def build_relay_adapter(
             max_tokens=max_output_tokens,
             thinking={"type": "disabled"},
             pengine_model_call_state=model_call_state,
+            pengine_stream_watchdog=(
+                _StreamStallWatchdog(
+                    stall_seconds=settings.stream_stall_seconds,
+                    crawl_window_seconds=settings.stream_crawl_window_seconds,
+                    crawl_min_chars_per_second=settings.stream_crawl_min_chars_per_second,
+                )
+                if settings.stream_watchdog_enabled
+                else None
+            ),
             # The relay 408s non-streaming requests at ~300s; long generation
             # calls (episode outlines/scripts) legitimately exceed that, so
             # stream and aggregate. model_timeout_seconds then bounds the gap
@@ -1490,7 +1614,7 @@ def classify_relay_exception(exc: Exception) -> RelayError:
 def retryable_relay_interruption(exc: Exception) -> RetryableRelayInterruption | None:
     if _has_tls_configuration_error(exc):
         return None
-    if isinstance(exc, RelayStreamIncompleteError):
+    if isinstance(exc, (RelayStreamIncompleteError, RelayStreamStalledError)):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
     if _is_retryable_transport(exc):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))

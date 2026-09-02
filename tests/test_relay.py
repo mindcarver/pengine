@@ -1,4 +1,6 @@
+import asyncio
 import ssl
+from typing import Any
 from uuid import uuid4
 
 import anthropic
@@ -22,6 +24,7 @@ from pengine.relay import (
     RelayError,
     RelayIdentityError,
     RelayStreamIncompleteError,
+    RelayStreamStalledError,
     _ModelCallAuditHandler,
     build_chat_model,
     build_relay_adapter,
@@ -39,6 +42,7 @@ def _role_settings(
     generation_max_output_tokens: int = 128_000,
     review_model_id: str = "deepseek-v4-flash",
     review_max_output_tokens: int | None = None,
+    **stream_watchdog_overrides: Any,
 ) -> Settings:
     return Settings(
         _env_file=None,
@@ -48,6 +52,7 @@ def _role_settings(
         generation_max_output_tokens=generation_max_output_tokens,
         review_model_id=review_model_id,
         review_max_output_tokens=review_max_output_tokens,
+        **stream_watchdog_overrides,
     )
 
 
@@ -363,6 +368,124 @@ def test_plain_relay_unavailable_without_the_stream_guard_stays_terminal() -> No
         safe_message="The model relay closed the generation stream without a finish reason.",
     )
     assert retryable_relay_interruption(error) is None
+
+
+@pytest.mark.asyncio
+async def test_stream_watchdog_aborts_first_chunk_stall(monkeypatch) -> None:
+    """A stream that never delivers its first chunk is aborted, not waited out."""
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        await asyncio.sleep(0.8)
+        yield ChatGenerationChunk(message=AIMessageChunk(content="迟到"))
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(stream_stall_seconds=0.2, stream_crawl_window_seconds=5.0),
+        role="generation",
+    )
+    with pytest.raises(RelayStreamStalledError) as error:
+        async for _ in model._astream([]):
+            pass
+    assert error.value.code == "relay_unavailable"
+    assert error.value.reason == "stall"
+    assert retryable_relay_interruption(error.value) is not None
+
+
+@pytest.mark.asyncio
+async def test_stream_watchdog_aborts_inter_chunk_stall(monkeypatch) -> None:
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        yield ChatGenerationChunk(message=AIMessageChunk(content="第一块"))
+        await asyncio.sleep(0.8)
+        yield ChatGenerationChunk(message=AIMessageChunk(content="永远迟到"))
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(stream_stall_seconds=0.2, stream_crawl_window_seconds=5.0),
+        role="generation",
+    )
+    with pytest.raises(RelayStreamStalledError) as error:
+        async for _ in model._astream([]):
+            pass
+    assert error.value.reason == "stall"
+    assert retryable_relay_interruption(error.value) is not None
+
+
+@pytest.mark.asyncio
+async def test_stream_watchdog_aborts_crawl_rate(monkeypatch) -> None:
+    """A stream trickling far under the char floor is aborted once the window fills."""
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        for _ in range(40):
+            yield ChatGenerationChunk(message=AIMessageChunk(content="字"))
+            await asyncio.sleep(0.03)
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            stream_stall_seconds=2.0,
+            stream_crawl_window_seconds=0.3,
+            stream_crawl_min_chars_per_second=50.0,
+        ),
+        role="generation",
+    )
+    with pytest.raises(RelayStreamStalledError) as error:
+        async for _ in model._astream([]):
+            pass
+    assert error.value.reason == "crawl"
+    assert retryable_relay_interruption(error.value) is not None
+
+
+@pytest.mark.asyncio
+async def test_stream_watchdog_lets_healthy_stream_finish(monkeypatch) -> None:
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        for _ in range(20):
+            yield ChatGenerationChunk(message=AIMessageChunk(content="正文内容" * 5))
+            await asyncio.sleep(0.01)
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="",
+                usage_metadata={"input_tokens": 1, "output_tokens": 200, "total_tokens": 201},
+            )
+        )
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            stream_stall_seconds=1.0,
+            stream_crawl_window_seconds=0.2,
+            stream_crawl_min_chars_per_second=2.0,
+        ),
+        role="generation",
+    )
+    chunks = [chunk async for chunk in model._astream([])]
+    assert len(chunks) == 21
+
+
+@pytest.mark.asyncio
+async def test_stream_watchdog_exempts_non_streaming_review_route(monkeypatch) -> None:
+    """Review calls are non-streaming: a long single-response wait is never aborted."""
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        await asyncio.sleep(0.8)
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="审核通过",
+                usage_metadata={"input_tokens": 1, "output_tokens": 9, "total_tokens": 10},
+            )
+        )
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(review_model_id="claude-sonnet-5", stream_stall_seconds=0.2),
+        role="review",
+    )
+    chunks = [chunk async for chunk in model._astream([])]
+    assert chunks
 
 
 def test_anthropic_sync_stream_deduplicates_identical_model_identity_chunks(

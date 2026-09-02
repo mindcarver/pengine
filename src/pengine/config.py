@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     review_context_limit_tokens: int | None = Field(default=None, ge=1)
     model_timeout_seconds: float = Field(default=180.0, gt=0)
     run_timeout_seconds: float = Field(default=1800.0, gt=0)
+    # Streaming stall watchdog (Issue #266): a relay in a degraded window either
+    # hangs a stream silently until its ~6-minute kill or trickles a few tokens
+    # per minute. The watchdog aborts such generation streams early and the run
+    # recovers through the bounded relay-interruption path. Defaults keep >=4x
+    # margin against the slowest observed healthy window (~8 tok/s ≈ 8 chars/s).
+    stream_watchdog_enabled: bool = Field(default=True)
+    stream_stall_seconds: float = Field(default=120.0, gt=0)
+    stream_crawl_window_seconds: float = Field(default=90.0, gt=0)
+    stream_crawl_min_chars_per_second: float = Field(default=2.0, gt=0)
     lease_seconds: int = Field(default=60, ge=5)
     worker_poll_seconds: float = Field(default=0.25, gt=0)
     worker_concurrency: int = Field(default=5, ge=1, le=5)
