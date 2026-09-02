@@ -175,8 +175,8 @@ L3/L4 在上述各阶段的真实文件、提示词、审核和持久化边界�
 | 类别 | 例子 | 自动行为 | 操作员动作 |
 | --- | --- | --- | --- |
 | 整体墙钟超时 | 单个工作单元（一个大纲自然组或一集剧本）超过 `PENGINE_RUN_TIMEOUT_SECONDS`（默认 1800s；每组/每集开始时重置；阶段调用预算同点重置） | 首次进入 `auto_resuming`，从已批准检查点续跑 | 同一阶段第二次共享超时，`Continue` 或 `End` |
-| 暂时 relay/网络 | 请求开始后的连接、DNS、TLS、读取超时或重置；relay `429/502/503/504` | 首次在同一 run/thread 上进入 `auto_resuming`，遵守至少 10 秒或更长 `Retry-After` | 若同一用户阶段再次共享中断，`Continue` 或 `End` |
-| 外部 relay 终态失败 | relay HTTP 402 配额耗尽、服务不可用、relay 超时、有身份但零内容的空流（`relay_unavailable`） | 立即终态 `failed`，不自动重试 | 修复 relay（充值/换凭据等）后 `Retry` 复活同一 run，或新建任务 |
+| 暂时 relay/网络 | 请求开始后的连接、DNS、TLS、读取超时或重置；relay `429/502/503/504`；流式响应未送达收尾 `message_delta` 即被关闭（`RelayStreamIncompleteError`，#264） | 首次在同一 run/thread 上进入 `auto_resuming`，遵守至少 10 秒或更长 `Retry-After` | 若同一用户阶段再次共享中断，`Continue` 或 `End` |
+| 外部 relay 终态失败 | relay HTTP 402 配额耗尽、服务不可用、relay 超时（`relay_unavailable`） | 立即终态 `failed`，不自动重试 | 修复 relay（充值/换凭据等）后 `Retry` 复活同一 run，或新建任务 |
 | 确定性校验终态失败 | 阶段产物未通过确定性校验且自愈预算耗尽（`stage_validation_failed`） | 终态 `failed`；大纲等已批准检查点保持完整 | 修复校验失败原因（如 #222 移除投影门禁）后 `Retry` 复活同一 run，已批准内容不重生成 |
 | 语法正确地址但连接失败 | 主机名解析/连接失败，无法证明一定短暂 | 按受限 transport 路径计入调用预算，耗尽后失败 | 修正 relay 配置后新建任务 |
 | 配置/安全错误 | 缺 URL/key、非 loopback HTTP、证书校验失败 | 不自动降级，不切换模型 | 修正 `.env` 后重新运行 |

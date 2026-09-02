@@ -26,7 +26,12 @@ from pengine.agents import (
 from pengine.config import Settings
 from pengine.model_calls import ModelCallContext, ModelCallState
 from pengine.personas import PersonaCatalog
-from pengine.relay import PreflightBlockedError, RelayError, RelayIdentityError
+from pengine.relay import (
+    PreflightBlockedError,
+    RelayError,
+    RelayIdentityError,
+    RelayStreamIncompleteError,
+)
 from pengine.repository import Repository
 from pengine.schemas import (
     ContentPackage,
@@ -1449,6 +1454,11 @@ async def test_ten_episode_run_resumes_without_a_writer_call_for_committed_draft
         (GraphRecursionError("recursion exhausted"), "graph_recursion_limit", "failed"),
         (
             httpx.RemoteProtocolError("relay protocol mismatch"),
+            "relay_interruption",
+            "auto_resuming",
+        ),
+        (
+            RelayStreamIncompleteError(),
             "relay_interruption",
             "auto_resuming",
         ),
