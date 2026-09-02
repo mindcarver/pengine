@@ -149,6 +149,17 @@ class _StreamStallWatchdog:
     _arrival_chars: deque[tuple[float, int]] = field(default_factory=deque)
     _cumulative_chars: int = 0
 
+    def reset(self) -> None:
+        """Drop all window state so one call's throughput never pollutes the next.
+
+        The watchdog rides on a model instance reused across calls; without this
+        reset, a previous call's trickling tail plus the inter-call gap become the
+        denominator of the next call's first crawl check and abort it instantly
+        (Issue #268).
+        """
+        self._arrival_chars.clear()
+        self._cumulative_chars = 0
+
     def observe(self, chunk: Any, now: float | None = None) -> None:
         moment = now if now is not None else time.monotonic()
         self._cumulative_chars += _stream_chunk_text_chars(chunk)
@@ -258,6 +269,9 @@ class _SerialChatAnthropic(ChatAnthropic):
         # The watchdog bounds each wait for the next chunk (first chunk and
         # inter-chunk gaps share the stall budget) and aborts streams whose
         # sliding-window output rate falls under the crawl floor (Issue #266).
+        # Window state is per-call: a previous call's tail must never count
+        # against this one (Issue #268).
+        watchdog.reset()
         stream = super()._astream(*args, **self._with_call_output_budget(kwargs))
         while True:
             try:

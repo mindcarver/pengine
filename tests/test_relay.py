@@ -466,6 +466,55 @@ async def test_stream_watchdog_lets_healthy_stream_finish(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_watchdog_window_does_not_leak_across_calls(monkeypatch) -> None:
+    """A previous call's trickling tail must not abort the next healthy call.
+
+    Regression for Issue #268: the watchdog rides on a reused model instance, so
+    without a per-call reset its sliding window spans the previous call's tail
+    plus the inter-call gap and the fresh call's first small chunk lands under
+    the crawl floor instantly (2-4s aborts observed in production).
+    """
+    call_no = {"n": 0}
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        call_no["n"] += 1
+        if call_no["n"] == 1:
+            for _ in range(5):
+                yield ChatGenerationChunk(message=AIMessageChunk(content="健康内容" * 20))
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.35)
+            yield ChatGenerationChunk(message=AIMessageChunk(content="尾"))
+        else:
+            yield ChatGenerationChunk(message=AIMessageChunk(content="新"))
+            await asyncio.sleep(0.05)
+            yield ChatGenerationChunk(message=AIMessageChunk(content="的"))
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="",
+                usage_metadata={"input_tokens": 1, "output_tokens": 100, "total_tokens": 101},
+            )
+        )
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            stream_stall_seconds=3.0,
+            stream_crawl_window_seconds=0.4,
+            stream_crawl_min_chars_per_second=2.0,
+        ),
+        role="generation",
+    )
+    first = [chunk async for chunk in model._astream([])]
+    assert len(first) == 7
+    # Gap inside (0.9 * window, window]: the previous tail entry is still in the
+    # sliding window when the next call starts.
+    await asyncio.sleep(0.37)
+    second = [chunk async for chunk in model._astream([])]
+    assert len(second) == 3
+
+
+@pytest.mark.asyncio
 async def test_stream_watchdog_exempts_non_streaming_review_route(monkeypatch) -> None:
     """Review calls are non-streaming: a long single-response wait is never aborted."""
 
