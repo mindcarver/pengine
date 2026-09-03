@@ -12637,7 +12637,17 @@ async def test_missing_stage_token_returns_recoverable_routing_error_before_atte
 
 
 @pytest.mark.asyncio
-async def test_missing_stage_token_does_not_invent_a_completed_stage() -> None:
+@pytest.mark.parametrize(
+    ("description", "subagent_type"),
+    [
+        ("placeholder", "script_writer"),
+        ("[stage=generating_episode_scripts] write scripts again", "story_architect"),
+    ],
+)
+async def test_completed_workflow_rejects_repeated_task_without_entering_subagent(
+    description: str,
+    subagent_type: str,
+) -> None:
     async def before_stage(_: InternalStage) -> int:
         raise AssertionError("No completed stage may be attempted")
 
@@ -12658,7 +12668,7 @@ async def test_missing_stage_token_does_not_invent_a_completed_stage() -> None:
     request = ToolCallRequest(
         tool_call={
             "name": "task",
-            "args": {"description": "placeholder", "subagent_type": "script_writer"},
+            "args": {"description": description, "subagent_type": subagent_type},
             "id": "call-no-stage-pending",
             "type": "tool_call",
         },
@@ -12674,10 +12684,13 @@ async def test_missing_stage_token_does_not_invent_a_completed_stage() -> None:
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
     assert json.loads(str(result.content)) == {
-        "error": "stage_token_missing",
+        "error": "workflow_already_complete",
         "expected_stage": None,
         "expected_subagent_type": None,
-        "instruction": "No specialist stage is pending; do not call the task tool.",
+        "instruction": (
+            "No specialist stage is pending. Return WorkflowCompletion now and do not call the "
+            "task tool."
+        ),
     }
 
 
@@ -13079,6 +13092,66 @@ async def test_out_of_order_stage_is_rejected_without_attempt_and_can_recover(
             InternalStage.GENERATING_EPISODE_OUTLINE,
             InternalStage.GENERATING_EPISODE_SCRIPTS,
         ]
+    assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
+    assert attempted == [
+        stage for stage in expected if stage is not InternalStage.GENERATING_EPISODE_SCRIPTS
+    ]
+    assert approved == expected
+
+
+@pytest.mark.asyncio
+async def test_completed_workflow_recovers_from_repeated_task_with_wrong_owner(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    completion_index = _index_of_tool_call(responses, "WorkflowCompletion")
+    responses.insert(
+        completion_index,
+        _tool_call(
+            "task",
+            {
+                "description": "[stage=generating_episode_scripts] write scripts again",
+                "subagent_type": "story_architect",
+            },
+            999,
+        ),
+    )
+    attempted: list[InternalStage] = []
+    approved: list[InternalStage] = []
+
+    async def before_stage(stage: InternalStage) -> int:
+        attempted.append(stage)
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        workflow = _fake_workflow(
+            model=ToolCallingFakeModel(responses=responses),
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+        )
+
+        result = await workflow.execute(
+            thread_id="completed-workflow-repeated-task-thread",
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+            **_episode_hook_kwargs()[0],
+        )
+
+    expected = [
+        InternalStage.SELECTING_L0_VARIANT,
+        InternalStage.GENERATING_STORY_OUTLINE,
+        InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        InternalStage.GENERATING_EPISODE_SCRIPTS,
+    ]
     assert result.content_package.episode_scripts == "第 1 集\n事实1\n钩子1"
     assert attempted == [
         stage for stage in expected if stage is not InternalStage.GENERATING_EPISODE_SCRIPTS
