@@ -8129,9 +8129,10 @@ class StageGuardMiddleware(AgentMiddleware):
                     "aliases, roles, generic labels, or colon-form lines. Use each episode's "
                     "evidence_contract component and perform an exact-set self-check: "
                     "no extra or duplicate target IDs and every excerpt verbatim in content. "
-                    "Only that episode's required_verbatim_facts require fact.value to appear "
-                    "contiguously verbatim in content. "
-                    "All other facts are semantic-only. Use the established_facts component: "
+                    "That episode's required_verbatim_facts are the facts it must reveal: "
+                    "convey each fact's meaning naturally with no word-for-word requirement "
+                    "(Issue #279). "
+                    "Use the established_facts component: "
                     "every entry was committed in an "
                     "earlier episode and must stay consistent with its locked value in this "
                     "episode; when restating a numeric fact the number must exactly match "
@@ -8655,12 +8656,11 @@ class StageGuardMiddleware(AgentMiddleware):
                         }
                     )
                     repair_description += (
-                        " Verbatim fact repair is mandatory. Use the exact fact IDs from "
+                        " A reviewer flagged those facts: use the exact fact IDs from "
                         "issue.contract_refs: "
                         f"{json.dumps(verbatim_fact_references, ensure_ascii=False)}. "
-                        "For each matching required_verbatim_facts item, restore its exact "
-                        "fact.value as one contiguous substring in content; facts not listed "
-                        "there remain semantic-only."
+                        "Make sure each listed fact's meaning is clearly expressed in the "
+                        "screenplay; wording is free (Issue #279)."
                     )
                 repair_window_id = (
                     await self.begin_generation_group(
