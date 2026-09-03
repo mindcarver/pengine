@@ -20,6 +20,7 @@ import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import SystemMessage
 from langchain_core.outputs import LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
@@ -54,6 +55,8 @@ from pengine.model_calls import (
 from pengine.observability import record_model_call_event
 
 _AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
+# Prompt-cache write floor: blocks under Anthropic's 1024-token minimum never hit.
+_PROMPT_CACHE_MIN_SYSTEM_CHARS = 4_000
 # Bare and OpenRouter-prefixed Claude slugs share one Anthropic route: the
 # OpenRouter Anthropic-compatible endpoint speaks the native Messages protocol.
 _ANTHROPIC_ROUTE_MODEL_IDS = ANTHROPIC_MODEL_IDS | OPENROUTER_ANTHROPIC_MODEL_IDS
@@ -223,17 +226,54 @@ def _stream_chunk_text_chars(chunk: Any) -> int:
 class _SerialChatAnthropic(ChatAnthropic):
     _pengine_model_call_state: ModelCallState | None = PrivateAttr(default=None)
     _pengine_stream_watchdog: _StreamStallWatchdog | None = PrivateAttr(default=None)
+    _pengine_prompt_cache_enabled: bool = PrivateAttr(default=False)
 
     def __init__(
         self,
         *args: Any,
         pengine_model_call_state: ModelCallState | None = None,
         pengine_stream_watchdog: _StreamStallWatchdog | None = None,
+        pengine_prompt_cache_enabled: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._pengine_model_call_state = pengine_model_call_state
         self._pengine_stream_watchdog = pengine_stream_watchdog
+        self._pengine_prompt_cache_enabled = pengine_prompt_cache_enabled
+
+    def _with_prompt_cache(self, args: tuple[Any, ...]) -> tuple[Any, ...]:
+        """Wrap the leading system prompt into an ephemeral-cached text block.
+
+        The system prompt carries the persona soul/L3 payload verbatim and is
+        byte-identical across every call of a run, so one breakpoint at its end
+        lets Anthropic-side prompt caching skip the repeated full prefill
+        (Issue #275). The rewrite happens at the dispatch boundary only; the
+        LangGraph checkpoint keeps storing the original string message.
+        """
+        if not self._pengine_prompt_cache_enabled or not args:
+            return args
+        messages = args[0]
+        if not isinstance(messages, (list, tuple)) or not messages:
+            return args
+        first = messages[0]
+        # Block-list system messages are passed through untouched: callers that
+        # tag their own breakpoints win, and idempotence is guaranteed.
+        if not isinstance(first, SystemMessage) or not isinstance(first.content, str):
+            return args
+        # Anthropic only caches blocks at or above 1024 tokens; a short system
+        # prompt would pay the 1.25x write premium on every call with no hit.
+        if len(first.content) < _PROMPT_CACHE_MIN_SYSTEM_CHARS:
+            return args
+        tagged = SystemMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": first.content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        )
+        return ([tagged, *messages[1:]], *args[1:])
 
     def _with_call_output_budget(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         state = self._pengine_model_call_state
@@ -265,17 +305,27 @@ class _SerialChatAnthropic(ChatAnthropic):
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
         seen_model_ids: dict[str, str] = {}
         completion = _AnthropicStreamCompletion()
-        for chunk in super()._stream(*args, **self._with_call_output_budget(kwargs)):
+        for chunk in super()._stream(
+            *self._with_prompt_cache(args), **self._with_call_output_budget(kwargs)
+        ):
             completion.observe(chunk)
             yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
         _require_anthropic_stream_completion(completion)
+
+    def _generate(self, *args: Any, **kwargs: Any) -> Any:
+        return super()._generate(*self._with_prompt_cache(args), **kwargs)
+
+    async def _agenerate(self, *args: Any, **kwargs: Any) -> Any:
+        return await super()._agenerate(*self._with_prompt_cache(args), **kwargs)
 
     async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         seen_model_ids: dict[str, str] = {}
         completion = _AnthropicStreamCompletion()
         watchdog = self._pengine_stream_watchdog
         if watchdog is None:
-            async for chunk in super()._astream(*args, **self._with_call_output_budget(kwargs)):
+            async for chunk in super()._astream(
+                *self._with_prompt_cache(args), **self._with_call_output_budget(kwargs)
+            ):
                 completion.observe(chunk)
                 yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
             _require_anthropic_stream_completion(completion)
@@ -286,7 +336,9 @@ class _SerialChatAnthropic(ChatAnthropic):
         # Window state is per-call: a previous call's tail must never count
         # against this one (Issue #268).
         watchdog.reset()
-        stream = super()._astream(*args, **self._with_call_output_budget(kwargs))
+        stream = super()._astream(
+            *self._with_prompt_cache(args), **self._with_call_output_budget(kwargs)
+        )
         while True:
             try:
                 chunk = await asyncio.wait_for(anext(stream), timeout=watchdog.stall_seconds)
@@ -1495,6 +1547,7 @@ def build_relay_adapter(
                     **common,
                     max_tokens=max_output_tokens,
                     thinking={"type": "disabled"},
+                    pengine_prompt_cache_enabled=settings.prompt_cache_enabled,
                 ),
                 role=role,
                 model_id=model_id,
@@ -1518,6 +1571,7 @@ def build_relay_adapter(
             max_tokens=max_output_tokens,
             thinking={"type": "disabled"},
             pengine_model_call_state=model_call_state,
+            pengine_prompt_cache_enabled=settings.prompt_cache_enabled,
             pengine_stream_watchdog=(
                 _StreamStallWatchdog(
                     stall_seconds=settings.stream_stall_seconds,

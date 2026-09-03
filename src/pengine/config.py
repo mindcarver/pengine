@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     review_context_limit_tokens: int | None = Field(default=None, ge=1)
     model_timeout_seconds: float = Field(default=180.0, gt=0)
     run_timeout_seconds: float = Field(default=1800.0, gt=0)
+    # Tag the stable system prefix of Anthropic-route requests with an ephemeral
+    # cache_control breakpoint: cache hits cut prefill TTFB to seconds, price the
+    # cached input at 0.1x, and — on the relay's rotating upstream pool — skip the
+    # cold-prefill path where its stalls live. Misses pay a 1.25x cache-write
+    # premium on the tagged block.
+    prompt_cache_enabled: bool = Field(default=True)
     # Streaming stall watchdog (Issue #266): a relay in a degraded window either
     # hangs a stream silently until its ~6-minute kill or trickles a few tokens
     # per minute. The watchdog aborts such generation streams early and the run
