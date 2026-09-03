@@ -10,7 +10,7 @@ import pytest
 from anthropic.types import RawMessageDeltaEvent
 from langchain_anthropic import ChatAnthropic
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
@@ -134,6 +134,88 @@ def test_build_relay_adapter_omits_sampling_override_for_openrouter_sonnet5() ->
     assert adapter.model.temperature is None
     request_payload = adapter.model._get_request_payload([HumanMessage(content="ping")])
     assert "temperature" not in request_payload
+
+
+_LONG_SYSTEM = "世界观设定与人物小传。" * 600  # 5,400 chars, above the cache floor
+
+
+def test_prompt_cache_tags_long_system_prompt_in_request_payload() -> None:
+    adapter = build_relay_adapter(_role_settings(), role="generation")
+    original = [SystemMessage(content=_LONG_SYSTEM), HumanMessage(content="写第一集")]
+
+    tagged_args = adapter.model._with_prompt_cache((original,))
+    out_messages = tagged_args[0]
+    payload = adapter.model._get_request_payload(list(out_messages))
+
+    system = payload["system"]
+    assert isinstance(system, list) and len(system) == 1
+    assert system[0]["text"] == _LONG_SYSTEM
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
+    # The rewrite is dispatch-only: trailing messages and count are preserved.
+    assert len(out_messages) == 2
+    assert out_messages[1] == original[1]
+
+
+def test_prompt_cache_leaves_short_system_prompt_untagged() -> None:
+    adapter = build_relay_adapter(_role_settings(), role="generation")
+    messages = [SystemMessage(content="你是编剧助手。"), HumanMessage(content="ping")]
+
+    tagged_args = adapter.model._with_prompt_cache((messages,))
+
+    assert tagged_args[0][0].content == "你是编剧助手。"
+
+
+def test_prompt_cache_is_idempotent_for_block_system_messages() -> None:
+    adapter = build_relay_adapter(_role_settings(), role="generation")
+    block_system = SystemMessage(
+        content=[{"type": "text", "text": _LONG_SYSTEM, "cache_control": {"type": "ephemeral"}}]
+    )
+    messages = [block_system, HumanMessage(content="ping")]
+
+    tagged_args = adapter.model._with_prompt_cache((messages,))
+
+    assert tagged_args[0][0] is block_system
+
+
+def test_prompt_cache_skips_messages_without_leading_system() -> None:
+    adapter = build_relay_adapter(_role_settings(), role="generation")
+    messages = [HumanMessage(content=_LONG_SYSTEM), HumanMessage(content="ping")]
+
+    tagged_args = adapter.model._with_prompt_cache((messages,))
+
+    assert tagged_args[0] == messages
+
+
+def test_prompt_cache_setting_off_disables_tagging() -> None:
+    adapter = build_relay_adapter(
+        _role_settings(prompt_cache_enabled=False),
+        role="generation",
+    )
+    messages = [SystemMessage(content=_LONG_SYSTEM), HumanMessage(content="ping")]
+
+    tagged_args = adapter.model._with_prompt_cache((messages,))
+
+    assert tagged_args[0][0].content == _LONG_SYSTEM
+
+
+def test_prompt_cache_applies_on_non_streaming_generate(monkeypatch) -> None:
+    adapter = build_relay_adapter(
+        _role_settings(review_model_id="claude-opus-5"),
+        role="review",
+    )
+    captured: list[Any] = []
+
+    def fake_generate(self: ChatAnthropic, *args: Any, **kwargs: Any) -> Any:
+        captured.extend(args[0])
+        raise RuntimeError("intercepted before provider dispatch")
+
+    monkeypatch.setattr(ChatAnthropic, "_generate", fake_generate)
+    messages = [SystemMessage(content=_LONG_SYSTEM), HumanMessage(content="ping")]
+
+    with pytest.raises(RuntimeError, match="intercepted"):
+        adapter.model._generate(messages)
+
+    assert captured[0].content[0]["cache_control"] == {"type": "ephemeral"}
 
 
 def test_build_relay_adapter_configures_langfuse_without_sdk_environment(
