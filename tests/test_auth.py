@@ -177,28 +177,28 @@ async def test_delete_creation_is_account_scoped(tmp_path: Path) -> None:
         app.router.lifespan_context(app),
         AsyncClient(transport=transport, base_url="https://test") as alice,
     ):
-            await alice.post(
+        await alice.post(
+            "/auth/register",
+            json={"username": "alice", "password": "correct-horse"},
+        )
+        created = await alice.post(
+            "/creations",
+            headers={"Idempotency-Key": "scoped-delete"},
+            json=request,
+        )
+        creation_id = created.json()["creation_id"]
+
+        async with AsyncClient(transport=transport, base_url="https://test") as anonymous:
+            anonymous_delete = await anonymous.delete(f"/creations/{creation_id}")
+
+        async with AsyncClient(transport=transport, base_url="https://test") as bob:
+            await bob.post(
                 "/auth/register",
-                json={"username": "alice", "password": "correct-horse"},
+                json={"username": "bob", "password": "correct-horse"},
             )
-            created = await alice.post(
-                "/creations",
-                headers={"Idempotency-Key": "scoped-delete"},
-                json=request,
-            )
-            creation_id = created.json()["creation_id"]
+            foreign_delete = await bob.delete(f"/creations/{creation_id}")
 
-            async with AsyncClient(transport=transport, base_url="https://test") as anonymous:
-                anonymous_delete = await anonymous.delete(f"/creations/{creation_id}")
-
-            async with AsyncClient(transport=transport, base_url="https://test") as bob:
-                await bob.post(
-                    "/auth/register",
-                    json={"username": "bob", "password": "correct-horse"},
-                )
-                foreign_delete = await bob.delete(f"/creations/{creation_id}")
-
-            still_listed = await alice.get("/creations")
+        still_listed = await alice.get("/creations")
 
     assert anonymous_delete.status_code == 401
     assert anonymous_delete.json()["code"] == "authentication_required"

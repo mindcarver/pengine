@@ -77,16 +77,17 @@ def test_openapi_documents_creation_deletion() -> None:
         delete["responses"]["409"]["content"]["application/json"]["example"]["code"]
         == "creation_not_deletable"
     )
-    assert delete["responses"]["401"] == (
-        generated["paths"]["/creations/{creation_id}"]["get"]["responses"]["401"]
+    assert (
+        delete["responses"]["401"]
+        == (generated["paths"]["/creations/{creation_id}"]["get"]["responses"]["401"])
     )
 
-    documented_codes = documented["components"]["schemas"]["CommandError"]["properties"][
-        "code"
-    ]["enum"]
-    generated_codes = generated["components"]["schemas"]["CommandError"]["properties"][
-        "code"
-    ]["enum"]
+    documented_codes = documented["components"]["schemas"]["CommandError"]["properties"]["code"][
+        "enum"
+    ]
+    generated_codes = generated["components"]["schemas"]["CommandError"]["properties"]["code"][
+        "enum"
+    ]
     assert documented_codes == generated_codes
     assert "creation_not_deletable" in documented_codes
 

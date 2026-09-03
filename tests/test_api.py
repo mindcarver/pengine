@@ -834,9 +834,7 @@ async def test_delete_creation_guards_active_work_and_removes_every_artifact(
             # LangGraph's AsyncSqliteSaver only creates its tables once a run
             # has been processed; simulate that state before the deletion.
             thread_row = await (
-                await connection.execute(
-                    "SELECT thread_id FROM runs WHERE id = ?", (run_id,)
-                )
+                await connection.execute("SELECT thread_id FROM runs WHERE id = ?", (run_id,))
             ).fetchone()
             thread_id = thread_row["thread_id"]
             await connection.executescript(
