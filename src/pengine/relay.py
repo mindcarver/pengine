@@ -70,12 +70,8 @@ _RESPONSE_MODEL_ID_EQUIVALENTS = MappingProxyType(
         # OpenRouter echoes the provider-prefixed slug on its Anthropic-compat
         # route; the bare slug covers relays that strip the prefix. Populated
         # from live-call evidence (Issue #271).
-        "anthropic/claude-opus-5": frozenset(
-            {"anthropic/claude-opus-5", "claude-opus-5"}
-        ),
-        "anthropic/claude-sonnet-5": frozenset(
-            {"anthropic/claude-sonnet-5", "claude-sonnet-5"}
-        ),
+        "anthropic/claude-opus-5": frozenset({"anthropic/claude-opus-5", "claude-opus-5"}),
+        "anthropic/claude-sonnet-5": frozenset({"anthropic/claude-sonnet-5", "claude-sonnet-5"}),
     }
 )
 # Uvicorn owns the runtime log handlers. This child logger keeps the safe model-call

@@ -14,9 +14,10 @@ OPENROUTER_ANTHROPIC_MODEL_IDS = frozenset(
     f"anthropic/{model_id}" for model_id in ANTHROPIC_MODEL_IDS
 )
 _ALLOWED_GENERATION_MODELS = ANTHROPIC_MODEL_IDS | OPENROUTER_ANTHROPIC_MODEL_IDS
-_ALLOWED_REVIEW_MODELS = frozenset(
-    {"deepseek-v4-flash", "gpt-5.5", "gpt-5.6-terra", *ANTHROPIC_MODEL_IDS}
-) | OPENROUTER_ANTHROPIC_MODEL_IDS
+_ALLOWED_REVIEW_MODELS = (
+    frozenset({"deepseek-v4-flash", "gpt-5.5", "gpt-5.6-terra", *ANTHROPIC_MODEL_IDS})
+    | OPENROUTER_ANTHROPIC_MODEL_IDS
+)
 
 
 class Settings(BaseSettings):
