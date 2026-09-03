@@ -7,10 +7,16 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ANTHROPIC_MODEL_IDS = frozenset({"claude-opus-5", "claude-sonnet-5"})
-_ALLOWED_GENERATION_MODELS = ANTHROPIC_MODEL_IDS
+# OpenRouter's Anthropic-compatible endpoint (base_url https://openrouter.ai/api)
+# addresses Claude models with an ``anthropic/`` slug prefix. The prefixed slugs
+# ride the same _SerialChatAnthropic route, so they share the anthropic profile.
+OPENROUTER_ANTHROPIC_MODEL_IDS = frozenset(
+    f"anthropic/{model_id}" for model_id in ANTHROPIC_MODEL_IDS
+)
+_ALLOWED_GENERATION_MODELS = ANTHROPIC_MODEL_IDS | OPENROUTER_ANTHROPIC_MODEL_IDS
 _ALLOWED_REVIEW_MODELS = frozenset(
     {"deepseek-v4-flash", "gpt-5.5", "gpt-5.6-terra", *ANTHROPIC_MODEL_IDS}
-)
+) | OPENROUTER_ANTHROPIC_MODEL_IDS
 
 
 class Settings(BaseSettings):

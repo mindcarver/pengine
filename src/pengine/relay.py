@@ -35,7 +35,11 @@ except ImportError:  # pragma: no cover - exercised only without langfuse instal
     _LangfuseClient = None  # type: ignore[assignment,misc]
     _LangfuseCallbackHandler = None  # type: ignore[assignment,misc]
 
-from pengine.config import ANTHROPIC_MODEL_IDS, Settings
+from pengine.config import (
+    ANTHROPIC_MODEL_IDS,
+    OPENROUTER_ANTHROPIC_MODEL_IDS,
+    Settings,
+)
 from pengine.model_calls import (
     ModelCallContext,
     ModelCallRecord,
@@ -50,6 +54,11 @@ from pengine.model_calls import (
 from pengine.observability import record_model_call_event
 
 _AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
+# Bare and OpenRouter-prefixed Claude slugs share one Anthropic route: the
+# OpenRouter Anthropic-compatible endpoint speaks the native Messages protocol.
+_ANTHROPIC_ROUTE_MODEL_IDS = ANTHROPIC_MODEL_IDS | OPENROUTER_ANTHROPIC_MODEL_IDS
+# Sonnet 5 rejects non-default sampling parameters on both spellings.
+_TEMPERATURE_OMITTED_MODEL_IDS = frozenset({"claude-sonnet-5", "anthropic/claude-sonnet-5"})
 _RESPONSE_MODEL_ID_EQUIVALENTS = MappingProxyType(
     {
         "gpt-5.5": frozenset({"gpt-5.5", "gpt-5.5-2026-04-23"}),
@@ -58,6 +67,15 @@ _RESPONSE_MODEL_ID_EQUIVALENTS = MappingProxyType(
         # (verified 2026-08-21: /models advertises deepseek-v4-flash only and
         # requesting -0731 directly returns model-not-found).
         "deepseek-v4-flash": frozenset({"deepseek-v4-flash", "deepseek-v4-flash-0731"}),
+        # OpenRouter echoes the provider-prefixed slug on its Anthropic-compat
+        # route; the bare slug covers relays that strip the prefix. Populated
+        # from live-call evidence (Issue #271).
+        "anthropic/claude-opus-5": frozenset(
+            {"anthropic/claude-opus-5", "claude-opus-5"}
+        ),
+        "anthropic/claude-sonnet-5": frozenset(
+            {"anthropic/claude-sonnet-5", "claude-sonnet-5"}
+        ),
     }
 )
 # Uvicorn owns the runtime log handlers. This child logger keeps the safe model-call
@@ -1418,7 +1436,7 @@ def build_relay_adapter(
         context_limit_tokens = settings.review_context_limit_tokens
         provider_profile_key = (
             "anthropic"
-            if model_id in ANTHROPIC_MODEL_IDS
+            if model_id in _ANTHROPIC_ROUTE_MODEL_IDS
             else "openai"
             if model_id in {"gpt-5.5", "gpt-5.6-terra"}
             else "deepseek"
@@ -1461,7 +1479,7 @@ def build_relay_adapter(
     # Sonnet 5 rejects non-default sampling parameters. Omitting temperature lets
     # Anthropic apply the model default while preserving deterministic overrides for
     # the existing routes.
-    if model_id != "claude-sonnet-5":
+    if model_id not in _TEMPERATURE_OMITTED_MODEL_IDS:
         common["temperature"] = 0
     if role == "review":
         if model_id in {"gpt-5.5", "gpt-5.6-terra"}:
@@ -1475,7 +1493,7 @@ def build_relay_adapter(
                 provider_profile_key=provider_profile_key,
                 model_call_state=model_call_state,
             )
-        if model_id in ANTHROPIC_MODEL_IDS:
+        if model_id in _ANTHROPIC_ROUTE_MODEL_IDS:
             return RelayAdapter(
                 model=_SerialChatAnthropic(
                     **common,
