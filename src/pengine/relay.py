@@ -296,7 +296,7 @@ class _SerialChatAnthropic(ChatAnthropic):
                 chunk = await asyncio.wait_for(anext(stream), timeout=watchdog.stall_seconds)
             except StopAsyncIteration:
                 break
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 raise RelayStreamStalledError(
                     reason="stall",
                     detail=f"no chunk for {watchdog.stall_seconds:g}s",
