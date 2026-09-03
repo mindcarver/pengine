@@ -2806,6 +2806,98 @@ class Repository:
                 )
         return CreationList(items=items)
 
+    async def delete_creation(self, creation_id: UUID) -> None:
+        """Delete one creation together with every stored run artifact.
+
+        Refuses while any run of the creation still has queued or leased work,
+        because the worker would otherwise keep writing rows for a deleted
+        run. Paused, ended, failed, and succeeded runs hold no lease and
+        delete safely.
+        """
+        async with self._transaction() as connection:
+            existing = await self._fetchone(
+                connection,
+                "SELECT 1 FROM creations WHERE id = ?",
+                (str(creation_id),),
+            )
+            if existing is None:
+                raise DomainError("creation_not_found", "Creation not found.", 404)
+            active = await self._fetchone(
+                connection,
+                """
+                SELECT 1
+                FROM jobs
+                JOIN runs ON runs.id = jobs.run_id
+                WHERE runs.creation_id = ?
+                  AND jobs.state IN ('queued', 'leased')
+                LIMIT 1
+                """,
+                (str(creation_id),),
+            )
+            if active is not None:
+                raise DomainError(
+                    "creation_not_deletable",
+                    "The creation still has queued or running work.",
+                    409,
+                )
+            # frozen_revisions.succeeded_run_id and the projection-repair
+            # candidate reference lack ON DELETE CASCADE, and model_calls
+            # carries no foreign key, so these must go before the runs.
+            await connection.execute(
+                "DELETE FROM frozen_revisions WHERE creation_id = ?",
+                (str(creation_id),),
+            )
+            await connection.execute(
+                """
+                DELETE FROM series_bible_projection_repairs
+                WHERE run_id IN (SELECT id FROM runs WHERE creation_id = ?)
+                """,
+                (str(creation_id),),
+            )
+            await connection.execute(
+                """
+                DELETE FROM model_calls
+                WHERE creation_id = ?
+                   OR run_id IN (SELECT id FROM runs WHERE creation_id = ?)
+                """,
+                (str(creation_id), str(creation_id)),
+            )
+            # LangGraph's AsyncSqliteSaver keeps thread-scoped checkpoints in
+            # the same database file, with no foreign key back to the runs.
+            # The tables only exist once a worker has processed a run.
+            thread_ids = [
+                row["thread_id"]
+                for row in await (
+                    await connection.execute(
+                        "SELECT thread_id FROM runs WHERE creation_id = ?",
+                        (str(creation_id),),
+                    )
+                ).fetchall()
+            ]
+            if thread_ids:
+                saver_tables = {
+                    row["name"]
+                    for row in await (
+                        await connection.execute(
+                            """
+                            SELECT name FROM sqlite_master
+                            WHERE type = 'table' AND name IN ('checkpoints', 'writes')
+                            """
+                        )
+                    ).fetchall()
+                }
+                placeholders = ",".join("?" * len(thread_ids))
+                for table in ("checkpoints", "writes"):
+                    if table in saver_tables:
+                        await connection.execute(
+                            f"DELETE FROM {table} WHERE thread_id IN ({placeholders})",
+                            thread_ids,
+                        )
+            await connection.execute(
+                "DELETE FROM creations WHERE id = ?",
+                (str(creation_id),),
+            )
+
     async def get_outline_season_map(self, run_id: UUID) -> dict[str, Any] | None:
         async with self._connection() as connection:
             row = await self._fetchone(

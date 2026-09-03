@@ -80,6 +80,7 @@ async def test_frontend_and_assets_are_served_with_run_control_openapi(
         ("GET", "/creations"),
         ("POST", "/creations"),
         ("GET", "/creations/{creation_id}"),
+        ("DELETE", "/creations/{creation_id}"),
         ("GET", "/creations/{creation_id}/runs/{run_kind}/presentation"),
         ("POST", "/creations/{creation_id}/revision"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
@@ -737,6 +738,231 @@ async def test_creation_replay_survives_restart_without_persona_source(
         )
         assert conflict.status_code == 409
         assert conflict.json()["code"] == "idempotency_conflict"
+
+
+@pytest.mark.asyncio
+async def test_delete_creation_guards_active_work_and_removes_every_artifact(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client,
+    ):
+        accepted = await client.post(
+            "/creations",
+            headers={"Idempotency-Key": "delete-flow"},
+            json={
+                "persona_id": "test-persona",
+                "story": "一个人回乡面对旧事。",
+                "requirements": "生成完整短剧。",
+            },
+        )
+        creation_id = accepted.json()["creation_id"]
+
+        guarded = await client.delete(f"/creations/{creation_id}")
+        still_readable = await client.get(f"/creations/{creation_id}")
+
+        repository = app.state.repository
+        async with repository._connection() as connection:
+            run_row = await (
+                await connection.execute(
+                    "SELECT id FROM runs WHERE creation_id = ?", (str(creation_id),)
+                )
+            ).fetchone()
+            run_id = run_row["id"]
+            # Move the queued run into a terminal state so no queued or leased
+            # job remains, then seed the tables whose cleanup is not covered by
+            # the creation's ON DELETE CASCADE.
+            await connection.execute(
+                """
+                UPDATE runs
+                SET state = 'failed',
+                    failure_code = 'ended_by_user',
+                    failure_message = 'The operator ended the paused workflow run.',
+                    failed_stage = 'generating_story_outline',
+                    failure_attempt_count = 1
+                WHERE id = ?
+                """,
+                (run_id,),
+            )
+            await connection.execute(
+                """
+                UPDATE run_progress
+                SET execution_state = 'failed'
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            )
+            await connection.execute(
+                "UPDATE jobs SET state = 'failed' WHERE run_id = ?",
+                (run_id,),
+            )
+            await connection.execute(
+                """
+                INSERT INTO frozen_revisions(
+                    creation_id, feedback, feedback_sha256, succeeded_run_id, frozen_at
+                ) VALUES (?, '加强结尾行动。', ?, ?, '2026-09-03T00:00:00Z')
+                """,
+                (str(creation_id), "0" * 64, run_id),
+            )
+            await connection.execute(
+                """
+                INSERT INTO series_bible_projection_repairs(
+                    run_id, original_candidate_id, status,
+                    target_character_ids_json, validation_json, created_at
+                ) VALUES (?, 'candidate-1', 'failed', '[]', '{}', '2026-09-03T00:00:00Z')
+                """,
+                (run_id,),
+            )
+            await connection.execute(
+                """
+                INSERT INTO model_calls(
+                    call_id, run_id, creation_id, role, adapter, provider, model,
+                    requested_at, preflight, status, usage_status, outcome,
+                    estimated_input_tokens, estimated_output_tokens, estimated_total_tokens
+                ) VALUES (
+                    'call-delete-1', ?, ?, 'assistant', 'relay', 'anthropic', 'model',
+                    '2026-09-03T00:00:00Z', 'ok', 'succeeded', 'reported', 'ok', 1, 1, 2
+                )
+                """,
+                (run_id, str(creation_id)),
+            )
+            # LangGraph's AsyncSqliteSaver only creates its tables once a run
+            # has been processed; simulate that state before the deletion.
+            thread_row = await (
+                await connection.execute("SELECT thread_id FROM runs WHERE id = ?", (run_id,))
+            ).fetchone()
+            thread_id = thread_row["thread_id"]
+            await connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    thread_id TEXT NOT NULL,
+                    checkpoint_ns TEXT NOT NULL DEFAULT '',
+                    checkpoint_id TEXT NOT NULL,
+                    parent_checkpoint_id TEXT,
+                    type TEXT,
+                    checkpoint BLOB,
+                    metadata BLOB,
+                    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+                );
+                CREATE TABLE IF NOT EXISTS writes (
+                    thread_id TEXT NOT NULL,
+                    checkpoint_ns TEXT NOT NULL DEFAULT '',
+                    checkpoint_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    idx INTEGER NOT NULL,
+                    channel TEXT NOT NULL,
+                    type TEXT,
+                    value BLOB,
+                    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+                );
+                INSERT INTO checkpoints(thread_id, checkpoint_id, checkpoint)
+                VALUES ('leftover-thread', 'ck-left', x'00');
+                INSERT INTO writes(thread_id, checkpoint_id, task_id, idx, channel)
+                VALUES ('leftover-thread', 'ck-left', 'task-1', 0, 'channel');
+                """
+            )
+            await connection.execute(
+                """
+                INSERT INTO checkpoints(thread_id, checkpoint_id, checkpoint)
+                VALUES (?, 'ck-1', x'00')
+                """,
+                (thread_id,),
+            )
+            await connection.execute(
+                """
+                INSERT INTO writes(thread_id, checkpoint_id, task_id, idx, channel)
+                VALUES (?, 'ck-1', 'task-1', 0, 'channel')
+                """,
+                (thread_id,),
+            )
+            await connection.commit()
+
+        deleted = await client.delete(f"/creations/{creation_id}")
+        missing = await client.get(f"/creations/{creation_id}")
+        listed = await client.get("/creations")
+        repeat_delete = await client.delete(f"/creations/{creation_id}")
+
+        async with repository._connection() as connection:
+            creation_row = await (
+                await connection.execute(
+                    "SELECT 1 FROM creations WHERE id = ?", (str(creation_id),)
+                )
+            ).fetchone()
+            run_scoped_tables = await (
+                await connection.execute(
+                    r"""
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name NOT LIKE 'sqlite_%'
+                      AND name NOT LIKE '%\_v%' ESCAPE '\'
+                      AND EXISTS (
+                          SELECT 1 FROM pragma_table_info(name)
+                          WHERE pragma_table_info.name = 'run_id'
+                      )
+                    """
+                )
+            ).fetchall()
+            leftovers = []
+            for table in run_scoped_tables:
+                count = await (
+                    await connection.execute(
+                        f"SELECT COUNT(*) FROM {table['name']} WHERE run_id = ?",
+                        (run_id,),
+                    )
+                ).fetchone()
+                if count[0]:
+                    leftovers.append(table["name"])
+            frozen_left = await (
+                await connection.execute(
+                    "SELECT COUNT(*) FROM frozen_revisions WHERE creation_id = ?",
+                    (str(creation_id),),
+                )
+            ).fetchone()
+            model_call_left = await (
+                await connection.execute(
+                    "SELECT COUNT(*) FROM model_calls WHERE creation_id = ?",
+                    (str(creation_id),),
+                )
+            ).fetchone()
+            checkpoint_left = await (
+                await connection.execute(
+                    "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            ).fetchone()
+            checkpoint_writes_left = await (
+                await connection.execute(
+                    "SELECT COUNT(*) FROM writes WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            ).fetchone()
+            foreign_checkpoint_kept = await (
+                await connection.execute(
+                    "SELECT COUNT(*) FROM checkpoints WHERE thread_id = 'leftover-thread'"
+                )
+            ).fetchone()
+
+    assert guarded.status_code == 409
+    assert guarded.json()["code"] == "creation_not_deletable"
+    assert still_readable.status_code == 200
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "creation_not_found"
+    assert listed.json() == {"items": []}
+    assert repeat_delete.status_code == 404
+    assert creation_row is None
+    assert leftovers == []
+    assert frozen_left[0] == 0
+    assert model_call_left[0] == 0
+    assert checkpoint_left[0] == 0
+    assert checkpoint_writes_left[0] == 0
+    assert foreign_checkpoint_kept[0] == 1
 
 
 @pytest.mark.asyncio

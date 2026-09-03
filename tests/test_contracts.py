@@ -49,6 +49,7 @@ def test_openapi_exposes_creation_and_run_control_operations() -> None:
         ("GET", "/creations"),
         ("POST", "/creations"),
         ("GET", "/creations/{creation_id}"),
+        ("DELETE", "/creations/{creation_id}"),
         ("GET", "/creations/{creation_id}/runs/{run_kind}/presentation"),
         ("POST", "/creations/{creation_id}/revision"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/continue"),
@@ -57,6 +58,38 @@ def test_openapi_exposes_creation_and_run_control_operations() -> None:
         ("POST", "/creations/{creation_id}/runs/{run_kind}/end"),
         ("POST", "/creations/{creation_id}/runs/{run_kind}/retry"),
     }
+
+
+def test_openapi_documents_creation_deletion() -> None:
+    documented = json.loads((ROOT / "contracts/openapi.json").read_text())
+    generated = create_app(settings=Settings()).openapi()
+    delete = documented["paths"]["/creations/{creation_id}"]["delete"]
+
+    assert delete["operationId"] == "deleteCreation"
+    assert delete["summary"] == "Delete Creation"
+    assert delete["parameters"][0] == {"$ref": "#/components/parameters/CreationId"}
+    assert delete["responses"]["204"] == {"description": "Successful Response"}
+    assert delete["responses"]["404"] == {"$ref": "#/components/responses/CreationNotFound"}
+    assert delete["responses"]["409"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CommandError"
+    }
+    assert (
+        delete["responses"]["409"]["content"]["application/json"]["example"]["code"]
+        == "creation_not_deletable"
+    )
+    assert (
+        delete["responses"]["401"]
+        == (generated["paths"]["/creations/{creation_id}"]["get"]["responses"]["401"])
+    )
+
+    documented_codes = documented["components"]["schemas"]["CommandError"]["properties"]["code"][
+        "enum"
+    ]
+    generated_codes = generated["components"]["schemas"]["CommandError"]["properties"]["code"][
+        "enum"
+    ]
+    assert documented_codes == generated_codes
+    assert "creation_not_deletable" in documented_codes
 
 
 def test_openapi_auth_errors_match_runtime_contract() -> None:

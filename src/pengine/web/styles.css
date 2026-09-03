@@ -291,6 +291,57 @@ input:focus-visible {
   font-size: 1.08rem;
 }
 
+.creation-file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.6rem;
+  align-items: stretch;
+}
+
+.creation-file-row .creation-file {
+  min-width: 0;
+}
+
+.creation-delete {
+  padding: 0 1rem;
+  border: 1px solid rgba(90, 69, 45, 0.4);
+  color: var(--ink-soft);
+  background: var(--paper-light);
+  box-shadow: 5px 6px 0 rgba(0, 0, 0, 0.18);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+}
+
+.creation-delete:hover,
+.creation-delete:focus-visible {
+  border-color: var(--rust);
+  color: var(--rust);
+}
+
+.creation-delete.confirming {
+  border-color: var(--rust-deep);
+  color: var(--paper-light);
+  background: var(--rust);
+}
+
+.creation-delete:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+@media (max-width: 620px) {
+  .creation-file-row {
+    grid-template-columns: 1fr;
+  }
+
+  .creation-delete {
+    width: 100%;
+    padding: 0.55rem 1rem;
+  }
+}
+
 .brand strong {
   font-family: var(--mono);
   font-size: 1rem;
