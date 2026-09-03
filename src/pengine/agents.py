@@ -5803,25 +5803,37 @@ class StageGuardMiddleware(AgentMiddleware):
         )
         if not isinstance(description, str):
             description = ""
+        if expected_stage is None:
+            return ToolMessage(
+                content=json.dumps(
+                    {
+                        "error": "workflow_already_complete",
+                        "expected_stage": None,
+                        "expected_subagent_type": None,
+                        "instruction": (
+                            "No specialist stage is pending. Return WorkflowCompletion now and "
+                            "do not call the task tool."
+                        ),
+                    },
+                    separators=(",", ":"),
+                ),
+                tool_call_id=request.tool_call["id"],
+                name="task",
+                status="error",
+            )
         match = _STAGE_TOKEN.match(description)
         if match is None:
             instruction = (
-                "No specialist stage is pending; do not call the task tool."
-                if expected_stage is None
-                else (
-                    "Do not send placeholder or internal-check task calls. Retry with exactly "
-                    f"one task whose description starts with [stage={expected_stage.value}] "
-                    f"and whose subagent_type is {_TASK_OWNER[expected_stage]}."
-                )
+                "Do not send placeholder or internal-check task calls. Retry with exactly "
+                f"one task whose description starts with [stage={expected_stage.value}] "
+                f"and whose subagent_type is {_TASK_OWNER[expected_stage]}."
             )
             return ToolMessage(
                 content=json.dumps(
                     {
                         "error": "stage_token_missing",
-                        "expected_stage": expected_stage.value if expected_stage else None,
-                        "expected_subagent_type": (
-                            _TASK_OWNER[expected_stage] if expected_stage else None
-                        ),
+                        "expected_stage": expected_stage.value,
+                        "expected_subagent_type": _TASK_OWNER[expected_stage],
                         "instruction": instruction,
                     },
                     separators=(",", ":"),
