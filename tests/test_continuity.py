@@ -592,7 +592,7 @@ def test_story_fact_rejects_verbatim_for_non_text_kind() -> None:
         StoryContract.model_validate(payload)
 
 
-def test_episode_validation_requires_only_explicit_verbatim_text() -> None:
+def test_episode_validation_never_requires_verbatim_text() -> None:
     payload = make_contract(
         numeric_facts=[
             {
@@ -628,9 +628,10 @@ def test_episode_validation_requires_only_explicit_verbatim_text() -> None:
         content=semantic_content,
         delta=make_delta(verbatim_contract),
     )
-    missing = next(issue for issue in missing_issues if issue.code == "verbatim_fact_missing")
-    assert missing.contract_refs == ["locked_phrase"]
-    assert "原始措辞" in missing.message
+    # Issue #279: even verbatim=true facts are no longer enforced word-for-word.
+    # A paraphrased rendering conveys the same meaning and must pass the
+    # deterministic layer; semantic consistency is owned by the episode reviewer.
+    assert "verbatim_fact_missing" not in {issue.code for issue in missing_issues}
 
     hit_issues = validate_episode_candidate(
         contract=verbatim_contract,

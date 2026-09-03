@@ -7340,8 +7340,9 @@ def test_generation_prompts_require_cross_artifact_consistency() -> None:
     )
     assert "Capture explicitly locked or formally committed aliases" in _EPISODE_PLANNER_PROMPT
     assert "Knowledge states are sparse cumulative snapshots" in _EPISODE_PLANNER_PROMPT
-    assert "verbatim=true only when" in _EPISODE_PLANNER_PROMPT
-    assert "Do not infer verbatim=true from quotation marks" in _EPISODE_PLANNER_PROMPT
+    # Issue #279: facts are never locked word-for-word anymore.
+    assert "Always leave verbatim=false" in _EPISODE_PLANNER_PROMPT
+    assert "no fact is required to appear word-for-word" in _EPISODE_PLANNER_PROMPT
     assert "aliases, pronouns, ages, elapsed durations, call participants" in (
         _EPISODE_PLANNER_PROMPT
     )
@@ -7410,7 +7411,8 @@ def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> 
     assert "exact-set self-check" in _SCRIPT_WRITER_PROMPT
     assert "required_evidence_target_ids" in _SCRIPT_WRITER_PROMPT
     assert "required_verbatim_facts" in _SCRIPT_WRITER_PROMPT
-    assert "all other facts require semantic consistency only" in _SCRIPT_WRITER_PROMPT
+    # Issue #279: no word-for-word requirement; facts ride on semantics.
+    assert "no fact requires word-for-word appearance" in _SCRIPT_WRITER_PROMPT
     assert "call participants" in _SCRIPT_WRITER_PROMPT
     assert "complete non-null state_delta" not in _SCRIPT_WRITER_PROMPT
     assert "Do not return JSON, a tool call, state_delta" in _SCRIPT_WRITER_PROMPT
@@ -7423,7 +7425,6 @@ def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> 
     assert "/workspace/speaker_contract.json" not in _EPISODE_REPAIR_PROMPT
     assert "/workspace/evidence_contract.json" in _EPISODE_REPAIR_PROMPT
     assert "evidence_coverage_mismatch" in _EPISODE_REPAIR_PROMPT
-    assert "issue.contract_refs" in _EPISODE_REPAIR_PROMPT
     assert "no extras" in _EPISODE_REPAIR_PROMPT
     assert "no duplicates" in _EPISODE_REPAIR_PROMPT
     assert "unknown_speaker" in _EPISODE_REPAIR_PROMPT
@@ -7434,8 +7435,23 @@ def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> 
     assert "state_delta" in _EPISODE_REPAIR_PROMPT
     assert "/workspace/suffix_rewrite_review.json" in _EPISODE_REPAIR_PROMPT
     assert "locked story contract priority" in _EPISODE_REPAIR_PROMPT
-    assert "verbatim_fact_missing" in _EPISODE_REPAIR_PROMPT
+    # Issue #279: word-for-word fact enforcement is gone from the repair loop;
+    # the fact list remains as semantic guidance only.
+    assert "verbatim_fact_missing" not in _EPISODE_REPAIR_PROMPT
     assert "required_verbatim_facts" in _EPISODE_REPAIR_PROMPT
+
+
+def test_no_runtime_instruction_requires_word_for_word_facts() -> None:
+    """Guards the inline runtime texts too, not only the module-level prompts.
+
+    The first review round of Issue #279 caught a leftover 'contiguously
+    verbatim' sentence inside the _write_episodes runtime description that
+    contradicted the relaxed system prompts.
+    """
+    source = Path(__file__).resolve().parents[1].joinpath("src", "pengine", "agents.py")
+    agents_source = source.read_text(encoding="utf-8")
+    assert "contiguously verbatim" not in agents_source
+    assert "restore its exact" not in agents_source
 
 
 def test_story_outline_episode_section_error_provides_safe_actionable_feedback() -> None:
@@ -7605,13 +7621,12 @@ def test_reviewer_prompts_keep_project_as_a_boundary_not_a_style_gate() -> None:
         assert _PROJECT_INLINE_MARKER not in prompt
 
 
-def test_l4_reviewer_prompt_only_locks_explicit_verbatim_facts() -> None:
+def test_l4_reviewer_prompt_reviews_facts_semantically() -> None:
     assert "/workspace/story_contract.json" in _QUALITY_REVIEWER_PROMPT
-    assert "only when that fact has verbatim=true" in _QUALITY_REVIEWER_PROMPT
-    assert "kind=text" in _QUALITY_REVIEWER_PROMPT
-    assert "quotation marks" in _QUALITY_REVIEWER_PROMPT
-    assert "subject or predicate" in _QUALITY_REVIEWER_PROMPT
-    assert "semantic consistency only" in _QUALITY_REVIEWER_PROMPT
+    # Issue #279: word-for-word fact enforcement is retired; semantics only.
+    assert "Always leave verbatim=false" not in _QUALITY_REVIEWER_PROMPT
+    assert "reviewed for semantic " in _QUALITY_REVIEWER_PROMPT
+    assert "no fact is rejected for word-for-word wording" in _QUALITY_REVIEWER_PROMPT
 
 
 def test_internal_runtime_leak_policy_requires_unambiguous_source_evidence() -> None:
