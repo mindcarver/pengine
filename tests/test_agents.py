@@ -7413,19 +7413,6 @@ def test_story_outline_allows_phase_headings_that_reference_episode_ranges() -> 
     assert "required_verbatim_facts" in _SCRIPT_WRITER_PROMPT
     # Issue #279: no word-for-word requirement; facts ride on semantics.
     assert "no fact requires word-for-word appearance" in _SCRIPT_WRITER_PROMPT
-
-
-def test_no_runtime_instruction_requires_word_for_word_facts() -> None:
-    """Guards the inline runtime texts too, not only the module-level prompts.
-
-    The first review round of Issue #279 caught a leftover 'contiguously
-    verbatim' sentence inside the _write_episodes runtime description that
-    contradicted the relaxed system prompts.
-    """
-    source = Path(__file__).resolve().parents[1].joinpath("src", "pengine", "agents.py")
-    agents_source = source.read_text(encoding="utf-8")
-    assert "contiguously verbatim" not in agents_source
-    assert "restore its exact" not in agents_source
     assert "call participants" in _SCRIPT_WRITER_PROMPT
     assert "complete non-null state_delta" not in _SCRIPT_WRITER_PROMPT
     assert "Do not return JSON, a tool call, state_delta" in _SCRIPT_WRITER_PROMPT
@@ -7452,6 +7439,19 @@ def test_no_runtime_instruction_requires_word_for_word_facts() -> None:
     # the fact list remains as semantic guidance only.
     assert "verbatim_fact_missing" not in _EPISODE_REPAIR_PROMPT
     assert "required_verbatim_facts" in _EPISODE_REPAIR_PROMPT
+
+
+def test_no_runtime_instruction_requires_word_for_word_facts() -> None:
+    """Guards the inline runtime texts too, not only the module-level prompts.
+
+    The first review round of Issue #279 caught a leftover 'contiguously
+    verbatim' sentence inside the _write_episodes runtime description that
+    contradicted the relaxed system prompts.
+    """
+    source = Path(__file__).resolve().parents[1].joinpath("src", "pengine", "agents.py")
+    agents_source = source.read_text(encoding="utf-8")
+    assert "contiguously verbatim" not in agents_source
+    assert "restore its exact" not in agents_source
 
 
 def test_story_outline_episode_section_error_provides_safe_actionable_feedback() -> None:
