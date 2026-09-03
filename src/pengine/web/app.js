@@ -133,6 +133,7 @@ const state = {
   presentationLoading: { initial: false, revision: false },
   readingPositions: readReadingPositions(),
   pollTimer: null,
+  libraryNotice: "",
   loadingCreation: false,
   pendingFeedback: "",
   progressRunKind: "",
@@ -522,6 +523,8 @@ async function showCreationsLibrary(options = {}) {
   elements.workbench.hidden = true;
   elements["creations-library"].hidden = false;
   if (!background) {
+    // 后台轮询只刷新数据不覆盖提示；用户主动打开时才清掉上一条通知。
+    state.libraryNotice = "";
     elements["creations-status"].textContent = "正在读取你的创作卷宗……";
     elements["creation-list"].replaceChildren();
   }
@@ -546,12 +549,17 @@ async function showCreationsLibrary(options = {}) {
 
 function renderCreationList(items) {
   elements["creation-list"].replaceChildren();
-  if (!items.length) {
+  if (state.libraryNotice) {
+    elements["creations-status"].textContent = state.libraryNotice;
+  } else if (!items.length) {
     elements["creations-status"].textContent = "还没有创作。返回创作台，开始第一份卷宗。";
     return;
+  } else {
+    elements["creations-status"].textContent = `共 ${items.length} 份创作。`;
   }
-  elements["creations-status"].textContent = `共 ${items.length} 份创作。`;
   for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "creation-file-row";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "creation-file";
@@ -576,8 +584,90 @@ function renderCreationList(items) {
       renderCreation();
       void refreshCreation({ isRestore: true });
     });
-    elements["creation-list"].append(button);
+    row.append(button, createCreationDeleteButton(item));
+    elements["creation-list"].append(row);
   }
+}
+
+function createCreationDeleteButton(item) {
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.className = "creation-delete";
+  const restingLabel = `删除故事：${item.story_excerpt}`;
+  const confirmLabel = `确认删除故事：${item.story_excerpt}`;
+  deleteButton.textContent = "删除";
+  deleteButton.setAttribute("aria-label", restingLabel);
+  let confirming = false;
+  let confirmTimer = 0;
+  const restConfirm = () => {
+    if (deleteButton.disabled) {
+      return;
+    }
+    confirming = false;
+    window.clearTimeout(confirmTimer);
+    deleteButton.classList.remove("confirming");
+    deleteButton.setAttribute("aria-label", restingLabel);
+    deleteButton.textContent = "删除";
+  };
+  deleteButton.addEventListener("blur", restConfirm);
+  deleteButton.addEventListener("click", () => {
+    if (deleteButton.disabled) {
+      return;
+    }
+    if (!confirming) {
+      confirming = true;
+      deleteButton.classList.add("confirming");
+      deleteButton.setAttribute("aria-label", confirmLabel);
+      deleteButton.textContent = "确认删除？";
+      confirmTimer = window.setTimeout(restConfirm, 5000);
+      return;
+    }
+    window.clearTimeout(confirmTimer);
+    confirming = false;
+    void deleteCreation(item.creation_id, deleteButton);
+  });
+  return deleteButton;
+}
+
+async function deleteCreation(creationId, deleteButton) {
+  deleteButton.disabled = true;
+  deleteButton.textContent = "正在删除……";
+  try {
+    await apiRequest(`/creations/${encodeURIComponent(creationId)}`, {
+      method: "DELETE",
+    });
+    if (state.creationId === creationId) {
+      resetDeletedCreation();
+    }
+    await showCreationsLibrary({ focus: false, background: true });
+    state.libraryNotice = "该创作卷宗已删除。";
+    elements["creations-status"].textContent = state.libraryNotice;
+    elements["creations-title"].focus?.({ preventScroll: true });
+  } catch (error) {
+    deleteButton.disabled = false;
+    deleteButton.classList.remove("confirming");
+    deleteButton.textContent = "删除";
+    state.libraryNotice =
+      error instanceof ApiError && error.code === "creation_not_deletable"
+        ? "该创作还有排队或进行中的初稿/修订，请先结束运行再删除。"
+        : `删除失败：${formatError(error)}`;
+    elements["creations-status"].textContent = state.libraryNotice;
+    deleteButton.focus?.({ preventScroll: true });
+  }
+}
+
+function resetDeletedCreation() {
+  stopPolling();
+  clearCurrentCreationId();
+  state.creationId = "";
+  state.creation = null;
+  state.activeVersion = "initial";
+  state.activeArtifact = "story_outline";
+  state.activeDraftRunKind = "";
+  state.activeEpisode = null;
+  state.pendingFeedback = "";
+  setWorkspaceView("selection");
+  renderCreation();
 }
 
 async function loadPersonas() {

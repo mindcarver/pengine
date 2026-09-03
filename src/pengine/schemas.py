@@ -833,6 +833,7 @@ class CommandError(StrictModel):
         "persona_not_found",
         "persona_package_unavailable",
         "creation_not_found",
+        "creation_not_deletable",
         "presentation_not_available",
         "idempotency_conflict",
         "revision_not_allowed",

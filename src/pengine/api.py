@@ -292,6 +292,22 @@ def create_app(
             raise DomainError("creation_not_found", "Creation not found.", 404)
         return resource
 
+    @app.delete(
+        "/creations/{creation_id}",
+        operation_id="deleteCreation",
+        status_code=204,
+        responses={
+            404: {"description": "Creation not found", "model": CommandError},
+            409: {
+                "description": "The creation still has queued or running work",
+                "model": CommandError,
+            },
+        },
+    )
+    async def delete_creation(creation_id: UUID, user: AuthenticatedUser) -> None:
+        await require_owner(creation_id, user)
+        await resolved_repository.delete_creation(creation_id)
+
     @app.get(
         "/creations/{creation_id}/runs/{run_kind}/presentation",
         operation_id="getDeliveryPresentation",

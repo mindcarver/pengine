@@ -14,6 +14,136 @@ def test_queue_positions_are_rendered_in_detail_revision_and_library() -> None:
     assert 'id="creations-title" tabindex="-1"' in page
 
 
+def test_library_delete_requires_confirmation_and_resets_open_creation() -> None:
+    script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
+    assertions = """
+function freshButton() {
+  const button = {
+    type: "", textContent: "", disabled: false,
+    classes: new Set(), attributes: {}, handlers: {}, focusCalls: [],
+  };
+  button.classList = {
+    add: (name) => button.classes.add(name),
+    remove: (name) => button.classes.delete(name),
+  };
+  button.setAttribute = (name, value) => { button.attributes[name] = value; };
+  button.addEventListener = (name, handler) => {
+    (button.handlers[name] = button.handlers[name] || []).push(handler);
+  };
+  button.click = () => { for (const handler of button.handlers.click || []) handler(); };
+  button.blur = () => { for (const handler of button.handlers.blur || []) handler(); };
+  button.focus = (options) => { button.focusCalls.push(options); };
+  return button;
+}
+
+let deleteButton = freshButton();
+document.createElement = () => deleteButton;
+let deletedPaths = [];
+let deleteResult = null;
+let libraryRefreshes = 0;
+let pollingStopped = 0;
+let workspaceViews = [];
+apiRequest = async (path, options = {}) => {
+  if (options.method !== "DELETE") throw new Error("unexpected request");
+  deletedPaths.push(path);
+  if (deleteResult) throw deleteResult;
+  return null;
+};
+showCreationsLibrary = async () => { libraryRefreshes += 1; };
+stopPolling = () => { pollingStopped += 1; };
+clearCurrentCreationId = () => {};
+setWorkspaceView = (view) => { workspaceViews.push(view); };
+renderCreation = () => {};
+Object.assign(elements, {
+  "creations-status": { textContent: "" },
+  "creations-title": { focus() {} },
+});
+state.creationId = "creation-1";
+
+const item = { creation_id: "creation-1", story_excerpt: "回乡" };
+const button = createCreationDeleteButton(item);
+
+if (button.textContent !== "删除" || button.attributes["aria-label"] !== "删除故事：回乡") {
+  throw new Error("resting delete button was not labeled");
+}
+
+button.click();
+if (deletedPaths.length) throw new Error("delete fired without confirmation");
+if (button.textContent !== "确认删除？") throw new Error("confirm state was not shown");
+if (!button.classes.has("confirming")) throw new Error("confirm state was not styled");
+if (button.attributes["aria-label"] !== "确认删除故事：回乡") {
+  throw new Error("confirm aria-label was not updated");
+}
+
+button.click();
+if (JSON.stringify(deletedPaths) !== '["/creations/creation-1"]') {
+  throw new Error(`unexpected delete paths: ${deletedPaths}`);
+}
+if (!button.disabled || button.textContent !== "正在删除……") {
+  throw new Error("in-flight state was not shown");
+}
+for (let i = 0; i < 10; i += 1) await Promise.resolve();
+if (libraryRefreshes !== 1) throw new Error("library was not refreshed after deletion");
+if (elements["creations-status"].textContent !== "该创作卷宗已删除。") {
+  throw new Error("success status was not announced");
+}
+if (pollingStopped !== 1) throw new Error("open creation polling was not stopped");
+if (state.creationId !== "") throw new Error("deleted creation stayed open");
+if (workspaceViews[workspaceViews.length - 1] !== "selection") {
+  throw new Error("workbench did not fall back to selection");
+}
+
+deleteButton = freshButton();
+deleteResult = new ApiError("busy", "creation_not_deletable", 409);
+const guarded = createCreationDeleteButton({ creation_id: "creation-2", story_excerpt: "城里" });
+guarded.click();
+guarded.click();
+for (let i = 0; i < 10; i += 1) await Promise.resolve();
+if (elements["creations-status"].textContent
+  !== "该创作还有排队或进行中的初稿/修订，请先结束运行再删除。") {
+  throw new Error("guard error was not humanized");
+}
+if (guarded.disabled || guarded.textContent !== "删除") {
+  throw new Error("guarded button did not return to resting state");
+}
+
+const cancelled = createCreationDeleteButton({ creation_id: "creation-3", story_excerpt: "山里" });
+cancelled.click();
+cancelled.blur();
+if (cancelled.textContent !== "删除" || cancelled.classes.has("confirming")) {
+  throw new Error("blur did not cancel the pending confirmation");
+}
+cancelled.click();
+if (deletedPaths.length !== 2) throw new Error("blur-cancalled button deleted immediately");
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}} }},
+  window: {{ setTimeout: () => 0, clearTimeout: () => {{}} }},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(async () => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_revision_submission_controls_are_single_use() -> None:
     script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
     assertions = """

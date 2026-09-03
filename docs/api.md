@@ -33,6 +33,7 @@ Pengine 的机器接口是本地 JSON HTTP API。完整字段合同在 [`contrac
 | `GET` | `/personas` | 返回当前有效可选人格包 | `200 PersonaList` |
 | `POST` | `/creations` | 排队一轮初稿全流程 | `202 CreationAccepted` |
 | `GET` | `/creations/{creation_id}` | 查询初稿、修订状态、进度、草稿、证据和交付 | `200 CreationResource` |
+| `DELETE` | `/creations/{creation_id}` | 删除整个创作及其全部运行数据 | `204 无正文` |
 | `GET` | `/creations/{creation_id}/runs/{run_kind}/presentation` | 把指定 run 的正式交付读成结构化成品投影 | `200 DeliveryPresentation` |
 | `POST` | `/creations/{creation_id}/revision` | 冻结并排队唯一修订，或重排队相同反馈的失败修订 | `202 RevisionAccepted` |
 | `POST` | `/creations/{creation_id}/runs/{run_kind}/continue` | 继续暂停的初稿/修订 run | `202 RunControlAccepted` |
@@ -138,6 +139,15 @@ curl --fail-with-body \
 ```
 
 只读端点，把一个 `succeeded` run 的正式交付投影成结构化阅览视图：五类产物（故事大纲、人物小传、关系逻辑、分集大纲、分集剧本）各自返回 `structured` 或 `source` 模式，整体 `status` 汇总为 `complete`、`partial` 或 `source`。投影按唯一锚点切分，锚点不唯一或乱序时该产物降级为原文模式，不会猜测结构。端点不暴露草稿、不改变状态；请求的 run 尚无正式交付时返回 `409 presentation_not_available`。设计来源见 [`.scd/designs/deliverable-presentation-read-model.md`](https://github.com/mindcarver/pengine/blob/main/.scd/designs/deliverable-presentation-read-model.md)。
+
+### 删除创作
+
+```bash
+curl --fail-with-body -X DELETE \
+  http://127.0.0.1:8000/creations/018f6d49-2e10-7b21-8f40-5f5162b9d181
+```
+
+成功返回 `204` 且无正文。删除会连带走该创作的全部初稿/修订运行数据（run、进度、草稿、交付、冻结反馈与模型调用记录），不可恢复。该创作仍有排队或正在执行的作业时返回 `409 creation_not_deletable`；需要先等待完成或结束运行后再删除。
 
 ## 6. 修订
 

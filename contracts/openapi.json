@@ -272,6 +272,63 @@
             }
           }
         }
+      },
+      "delete": {
+        "operationId": "deleteCreation",
+        "summary": "Delete Creation",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CreationId"
+          },
+          {
+            "name": "pengine_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pengine Session"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "$ref": "#/components/responses/CreationNotFound"
+          },
+          "409": {
+            "description": "The creation still has queued or running work",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                },
+                "example": {
+                  "code": "creation_not_deletable",
+                  "message": "The creation still has queued or running work."
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/creations/{creation_id}/revision": {
@@ -2823,6 +2880,7 @@
               "persona_not_found",
               "persona_package_unavailable",
               "creation_not_found",
+              "creation_not_deletable",
               "presentation_not_available",
               "idempotency_conflict",
               "revision_not_allowed",
