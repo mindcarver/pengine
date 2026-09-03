@@ -829,7 +829,7 @@ def test_model_call_audit_accepts_openrouter_anthropic_identity(
 
     handler.on_llm_end(response, run_id=uuid4())
 
-    assert f"requested_model_id=anthropic/claude-sonnet-5" in caplog.text
+    assert "requested_model_id=anthropic/claude-sonnet-5" in caplog.text
     assert f"response_model_id={response_model}" in caplog.text
     assert f"identity_match={identity_match}" in caplog.text
 
