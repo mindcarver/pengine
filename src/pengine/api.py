@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -43,6 +45,7 @@ IdempotencyKey = Annotated[
     Header(alias="Idempotency-Key", min_length=1, max_length=128),
 ]
 _WEB_ROOT = Path(__file__).with_name("web")
+logger = logging.getLogger(__name__)
 
 # The bounded, browser-displayable CommandError codes that the API may return.
 # Any DomainError raised by a route must map onto this contract so a defect can
@@ -109,6 +112,24 @@ def create_app(
             response.headers["Cache-Control"] = "no-store"
         elif request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache"
+        return response
+
+    @app.middleware("http")
+    async def log_commands(request: Request, call_next) -> Response:
+        # Uvicorn's access log lacks timing and is drowned out by GET polling;
+        # only the state-changing commands (create/continue/end/retry) matter for
+        # reconstructing what an operator did to a run.
+        if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+            return await call_next(request)
+        started = time.monotonic()
+        response = await call_next(request)
+        logger.info(
+            "command %s %s status=%s duration=%.2fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            time.monotonic() - started,
+        )
         return response
 
     @app.get("/", include_in_schema=False)

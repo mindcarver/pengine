@@ -1,5 +1,8 @@
+import copy
+
 import uvicorn
 from fastapi import FastAPI
+from uvicorn.config import LOGGING_CONFIG
 
 from pengine.api import create_app
 from pengine.config import Settings, get_settings
@@ -34,6 +37,18 @@ def build_app(settings: Settings | None = None) -> FastAPI:
 app = build_app()
 
 
+def build_log_config(level: str) -> dict:
+    """Uvicorn's default config only routes its own loggers; ``pengine.*`` INFO lines
+    (run started/failed, relay recovery, repair loops) were silently dropped."""
+    config = copy.deepcopy(LOGGING_CONFIG)
+    config["formatters"]["default"]["fmt"] = "%(asctime)s %(levelprefix)s %(message)s"
+    config["formatters"]["access"]["fmt"] = (
+        '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
+    config["loggers"]["pengine"] = {"handlers": ["default"], "level": level, "propagate": False}
+    return config
+
+
 def run() -> None:
     settings = get_settings()
     uvicorn.run(
@@ -41,4 +56,5 @@ def run() -> None:
         host=settings.host,
         port=settings.port,
         log_level="info",
+        log_config=build_log_config(settings.log_level),
     )
