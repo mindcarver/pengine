@@ -865,6 +865,9 @@ def test_model_call_audit_rejects_unapproved_or_ambiguous_openrouter_identity(
 
     with pytest.raises(RelayIdentityError, match="identity did not match"):
         handler.on_llm_end(response, run_id=uuid4())
+
+
+def test_model_call_audit_enforces_the_review_budget_before_dispatch() -> None:
     state = ModelCallState()
     state.context.stage = "generating_character_relationships"
     handler = _ModelCallAuditHandler(
