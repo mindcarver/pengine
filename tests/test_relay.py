@@ -109,6 +109,33 @@ def test_build_relay_adapter_uses_sonnet5_without_sampling_override() -> None:
     assert "temperature" not in request_payload
 
 
+@pytest.mark.parametrize("model_id", ["anthropic/claude-opus-5", "anthropic/claude-sonnet-5"])
+def test_build_relay_adapter_routes_openrouter_anthropic_slugs(model_id: str) -> None:
+    adapter = build_relay_adapter(
+        _role_settings(generation_model_id=model_id),
+        role="generation",
+    )
+
+    assert isinstance(adapter.model, ChatAnthropic)
+    assert adapter.model_id == model_id
+    assert adapter.provider_profile_key == "anthropic"
+    assert adapter.model.model == model_id
+    assert adapter.model.anthropic_api_url == "https://relay.example/v1"
+    request_payload = adapter.model._get_request_payload([HumanMessage(content="ping")])
+    assert request_payload["thinking"] == {"type": "disabled"}
+
+
+def test_build_relay_adapter_omits_sampling_override_for_openrouter_sonnet5() -> None:
+    adapter = build_relay_adapter(
+        _role_settings(generation_model_id="anthropic/claude-sonnet-5"),
+        role="generation",
+    )
+
+    assert adapter.model.temperature is None
+    request_payload = adapter.model._get_request_payload([HumanMessage(content="ping")])
+    assert "temperature" not in request_payload
+
+
 def test_build_relay_adapter_configures_langfuse_without_sdk_environment(
     monkeypatch,
 ) -> None:
@@ -772,6 +799,74 @@ def test_model_call_audit_rejects_unapproved_or_ambiguous_gpt55_identity(
         handler.on_llm_end(response, run_id=uuid4())
 
 
+@pytest.mark.parametrize(
+    ("response_model", "identity_match"),
+    [
+        ("anthropic/claude-sonnet-5", "exact"),
+        ("claude-sonnet-5", "explicit_equivalent"),
+    ],
+)
+def test_model_call_audit_accepts_openrouter_anthropic_identity(
+    response_model: str,
+    identity_match: str,
+    caplog,
+) -> None:
+    """OpenRouter echoes the provider-prefixed slug; bare slugs cover prefix-stripping relays."""
+    caplog.set_level("INFO", logger="uvicorn.error.pengine.model_calls")
+    handler = _ModelCallAuditHandler(role="generation", model_id="anthropic/claude-sonnet-5")
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="通过",
+                        response_metadata={"model": response_model},
+                    )
+                )
+            ]
+        ]
+    )
+
+    handler.on_llm_end(response, run_id=uuid4())
+
+    assert "requested_model_id=anthropic/claude-sonnet-5" in caplog.text
+    assert f"response_model_id={response_model}" in caplog.text
+    assert f"identity_match={identity_match}" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "response_models",
+    [
+        [],
+        ["anthropic/claude-opus-5"],
+        ["claude-opus-5"],
+        ["anthropic/claude-sonnet-5:extended"],
+        ["claude-sonnet-4-5"],
+        ["anthropic/claude-sonnet-5", "claude-sonnet-5"],
+    ],
+)
+def test_model_call_audit_rejects_unapproved_or_ambiguous_openrouter_identity(
+    response_models: list[str],
+) -> None:
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="untrusted",
+                        response_metadata={"model_name": model_id} if model_id else {},
+                    )
+                )
+                for model_id in (response_models or [""])
+            ]
+        ]
+    )
+    handler = _ModelCallAuditHandler(role="generation", model_id="anthropic/claude-sonnet-5")
+
+    with pytest.raises(RelayIdentityError, match="identity did not match"):
+        handler.on_llm_end(response, run_id=uuid4())
+
+
 def test_model_call_audit_enforces_the_review_budget_before_dispatch() -> None:
     state = ModelCallState()
     state.context.stage = "generating_character_relationships"
@@ -962,7 +1057,15 @@ def test_build_relay_adapter_uses_openai_for_gpt55_review(max_output_tokens: int
     assert "secret-value" not in repr(adapter.model)
 
 
-@pytest.mark.parametrize("model_id", ["claude-opus-5", "claude-sonnet-5"])
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "anthropic/claude-opus-5",
+        "anthropic/claude-sonnet-5",
+    ],
+)
 @pytest.mark.parametrize("max_output_tokens", [None, 16384])
 def test_build_relay_adapter_uses_anthropic_for_supported_review_models(
     model_id: str,
@@ -978,7 +1081,7 @@ def test_build_relay_adapter_uses_anthropic_for_supported_review_models(
     assert adapter.model_id == model_id
     assert adapter.provider_profile_key == "anthropic"
     assert adapter.model.model == model_id
-    assert adapter.model.temperature == (None if model_id == "claude-sonnet-5" else 0)
+    assert adapter.model.temperature == (None if model_id.endswith("claude-sonnet-5") else 0)
 
 
 @pytest.mark.parametrize("tool_choice", ["any", "required"])

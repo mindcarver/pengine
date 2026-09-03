@@ -105,7 +105,10 @@ def test_both_model_roles_are_required(
     [
         ("generation_model_id", "deepseek-v4-pro"),
         ("generation_model_id", "claude-haiku-4-5"),
+        ("generation_model_id", "anthropic/claude-haiku-4-5"),
+        ("generation_model_id", "openrouter/auto"),
         ("review_model_id", "claude-haiku-4-5"),
+        ("review_model_id", "anthropic/deepseek-v4-flash"),
     ],
 )
 def test_unsupported_role_models_are_rejected(field: str, value: str) -> None:
@@ -113,7 +116,10 @@ def test_unsupported_role_models_are_rejected(field: str, value: str) -> None:
         Settings(_env_file=None, **{field: value})
 
 
-@pytest.mark.parametrize("model_id", ["claude-opus-5", "claude-sonnet-5"])
+@pytest.mark.parametrize(
+    "model_id",
+    ["claude-opus-5", "claude-sonnet-5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5"],
+)
 def test_generation_model_accepts_supported_anthropic_models(model_id: str) -> None:
     settings = Settings(_env_file=None, generation_model_id=model_id)
     assert settings.generation_model_id == model_id
@@ -127,6 +133,8 @@ def test_generation_model_accepts_supported_anthropic_models(model_id: str) -> N
         "gpt-5.6-terra",
         "claude-opus-5",
         "claude-sonnet-5",
+        "anthropic/claude-opus-5",
+        "anthropic/claude-sonnet-5",
     ],
 )
 def test_review_model_accepts_allowed_models(model_id: str) -> None:
