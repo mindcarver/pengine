@@ -890,15 +890,9 @@ def validate_episode_candidate(
                 )
             )
 
-    for fact in contract.facts:
-        if fact.first_revealed_episode == episode and fact.verbatim and fact.value not in content:
-            issues.append(
-                _issue(
-                    "verbatim_fact_missing",
-                    f"逐字锁定事实 {fact.fact_id} 的值 {fact.value!r} 未逐字出现在本集剧本中",
-                    [fact.fact_id],
-                )
-            )
+    # Verbatim fact enforcement was removed (Issue #279): story-contract facts are
+    # checked for semantic consistency by the episode reviewer instead. The
+    # verbatim flag stays in the schema for backward-compatible reads only.
 
     for fact in contract.facts:
         if fact.kind not in _TEMPORAL_KINDS or fact.first_revealed_episode != episode:

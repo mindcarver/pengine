@@ -530,11 +530,9 @@ _EPISODE_PLANNER_PROMPT = (
     "clue must first be visible or audible, with introduction no later than explanation "
     "or callback. Include exactly one obligation and hook per episode; its "
     "new_information_fact_ids must exactly equal all facts whose first_revealed_episode "
-    "is that episode. Set a fact's verbatim=true only when the user request or an approved "
-    "upstream artifact explicitly requires its text value to appear contiguously word-for-word "
-    "in the screenplay. Do not infer verbatim=true from quotation marks, kind=text, the value "
-    "field, or words such as 原文 in subject or predicate. Non-text facts must never have "
-    "verbatim=true; leave verbatim=false otherwise. Also declare script_generation_groups "
+    "is that episode. Always leave verbatim=false: fact values are enforced by semantic "
+    "review, and no fact is required to appear word-for-word in the screenplay "
+    "(Issue #279). Also declare script_generation_groups "
     "as the authoritative screenplay-generation units. Group episodes by one coherent "
     "dramatic action, setup-development-payoff chain, continuous time/place, or shared "
     "suspense objective; cut a group before or after a major reveal, time jump, relationship "
@@ -572,10 +570,9 @@ _SCRIPT_WRITER_PROMPT = _with_internal_runtime_leak_policy(
     "perform an exact-set self-check: the screenplay must contain concrete verbatim evidence for "
     "every item in required_evidence_target_ids assigned to that episode, with no evidence "
     "borrowed from an earlier or later episode. "
-    "Only facts listed in required_verbatim_facts require their fact.value to appear as one "
-    "contiguous verbatim substring in content; all other facts require semantic consistency "
-    "only. Do not infer a verbatim requirement from kind=text, quotation marks, the value "
-    "field, or wording such as 原文 in subject or predicate. "
+    "Treat required_verbatim_facts as the facts this episode must reveal: convey each "
+    "fact's meaning naturally in the screenplay; no fact requires word-for-word appearance "
+    "(Issue #279). "
     "Use the established_facts component: every entry was committed in an earlier "
     "episode and must stay consistent with its locked value in this episode; when restating "
     "a numeric fact the number must exactly match fact.value. "
@@ -612,10 +609,9 @@ _EPISODE_REPAIR_PROMPT = (
     "that directly conflicts with explicit hard Canon. Resolve the narrative identity conflict "
     "without normalizing screenplay notation. An alias, occupational title, generic or "
     "descriptive label, or colon-form line is not an unknown character by itself. Keep the "
-    "screenplay and state_delta mutually consistent. When "
-    "the review contains verbatim_fact_missing issues, use each issue.contract_refs entry to "
-    "find the matching required_verbatim_facts item and restore its exact fact.value as a "
-    "contiguous substring in content. Do not impose exact wording on facts not listed there. "
+    "screenplay and state_delta mutually consistent. When required_verbatim_facts is "
+    "non-empty, convey each listed fact's meaning naturally in the rewritten screenplay; "
+    "no fact requires word-for-word appearance (Issue #279). "
     "When /workspace/suffix_rewrite_review.json is present, read it as the read-only bound "
     "rewrite "
     "cause, fix every conflict named in every review evidence entry, give the locked story "
@@ -638,11 +634,9 @@ _QUALITY_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "only L4 craft, and do not reselect "
     "or reopen L0. For a revision's accepting_l4 gate, itemize "
     "every frozen feedback item. For accepting_l4, story_contract.json is authoritative "
-    "for exact fact wording: reject a fact for not appearing contiguously word-for-word "
-    "only when that fact has verbatim=true. kind=text, the value field, quotation marks, "
-    "or words such as 原文 in subject or predicate do not create a machine-executable "
-    "verbatim requirement. Facts without verbatim=true must be reviewed for semantic "
-    "consistency only. A rejection must identify a direct conflict with a user requirement, an "
+    "for fact meaning: all facts, including kind=text facts, are reviewed for semantic "
+    "consistency only, and no fact is rejected for word-for-word wording (Issue #279). "
+    "A rejection must identify a direct conflict with a user requirement, an "
     "applicable explicit persona gate rule, locked Contract or SeriesBible data, a frozen "
     "revision-feedback item, or the output/schema protocol. Ordinary screenplay format, style, "
     "or matters of taste are not sufficient reasons to set passed=false. At accepting_l4, only "
@@ -661,9 +655,9 @@ _QUALITY_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
 
 _EPISODE_REVIEWER_PROMPT = _with_internal_runtime_leak_policy(
     "Treat explicit contract facts and prior state as immutable and unspecified creative "
-    "details as free. Only a story_contract fact with verbatim=true requires its value to "
-    "appear contiguously word-for-word; all other facts, including kind=text facts, are "
-    "reviewed for semantic consistency only. Only an internal-runtime leak that meets the "
+    "details as free. All story_contract facts, including kind=text facts, are reviewed "
+    "for semantic consistency only; no fact requires word-for-word appearance "
+    "(Issue #279). Only an internal-runtime leak that meets the "
     "policy's provenance and evidence standard is blocking. Screenplay formatting and "
     "story-world subject matter named in the policy are never defects on their own. "
     "/workspace/series_prefix.json is a trusted runtime envelope: episode_number and JSON "
@@ -1125,7 +1119,7 @@ def _evidence_contract(
             "extra_targets": "not_allowed",
             "excerpt": "must_appear_verbatim_in_content",
             "verbatim_fact_value": (
-                "only_required_verbatim_facts_must_appear_contiguously_in_content"
+                "required_verbatim_facts_convey_their_fact_meaning_no_word_for_word_required"
             ),
         },
         "rule_text": [
@@ -1134,8 +1128,9 @@ def _evidence_contract(
             "Use every required target exactly once; do not add targets from an earlier or "
             "later episode.",
             "Every evidence excerpt must appear verbatim in the episode content.",
-            "Only required_verbatim_facts[].value must appear contiguously and verbatim in the "
-            "episode content; all other facts are checked for semantic consistency only.",
+            "Required_verbatim_facts are the facts this episode must reveal; convey each "
+            "fact's meaning naturally, and every fact is checked for semantic consistency "
+            "only (Issue #279).",
         ],
         "rejected_issues": [issue.model_dump(mode="json") for issue in (rejected_issues or [])],
     }
