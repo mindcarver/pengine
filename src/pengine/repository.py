@@ -2862,6 +2862,37 @@ class Repository:
                 """,
                 (str(creation_id), str(creation_id)),
             )
+            # LangGraph's AsyncSqliteSaver keeps thread-scoped checkpoints in
+            # the same database file, with no foreign key back to the runs.
+            # The tables only exist once a worker has processed a run.
+            thread_ids = [
+                row["thread_id"]
+                for row in await (
+                    await connection.execute(
+                        "SELECT thread_id FROM runs WHERE creation_id = ?",
+                        (str(creation_id),),
+                    )
+                ).fetchall()
+            ]
+            if thread_ids:
+                saver_tables = {
+                    row["name"]
+                    for row in await (
+                        await connection.execute(
+                            """
+                            SELECT name FROM sqlite_master
+                            WHERE type = 'table' AND name IN ('checkpoints', 'writes')
+                            """
+                        )
+                    ).fetchall()
+                }
+                placeholders = ",".join("?" * len(thread_ids))
+                for table in ("checkpoints", "writes"):
+                    if table in saver_tables:
+                        await connection.execute(
+                            f"DELETE FROM {table} WHERE thread_id IN ({placeholders})",
+                            thread_ids,
+                        )
             await connection.execute(
                 "DELETE FROM creations WHERE id = ?",
                 (str(creation_id),),

@@ -831,6 +831,57 @@ async def test_delete_creation_guards_active_work_and_removes_every_artifact(
                 """,
                 (run_id, str(creation_id)),
             )
+            # LangGraph's AsyncSqliteSaver only creates its tables once a run
+            # has been processed; simulate that state before the deletion.
+            thread_row = await (
+                await connection.execute(
+                    "SELECT thread_id FROM runs WHERE id = ?", (run_id,)
+                )
+            ).fetchone()
+            thread_id = thread_row["thread_id"]
+            await connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    thread_id TEXT NOT NULL,
+                    checkpoint_ns TEXT NOT NULL DEFAULT '',
+                    checkpoint_id TEXT NOT NULL,
+                    parent_checkpoint_id TEXT,
+                    type TEXT,
+                    checkpoint BLOB,
+                    metadata BLOB,
+                    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+                );
+                CREATE TABLE IF NOT EXISTS writes (
+                    thread_id TEXT NOT NULL,
+                    checkpoint_ns TEXT NOT NULL DEFAULT '',
+                    checkpoint_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    idx INTEGER NOT NULL,
+                    channel TEXT NOT NULL,
+                    type TEXT,
+                    value BLOB,
+                    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+                );
+                INSERT INTO checkpoints(thread_id, checkpoint_id, checkpoint)
+                VALUES ('leftover-thread', 'ck-left', x'00');
+                INSERT INTO writes(thread_id, checkpoint_id, task_id, idx, channel)
+                VALUES ('leftover-thread', 'ck-left', 'task-1', 0, 'channel');
+                """
+            )
+            await connection.execute(
+                """
+                INSERT INTO checkpoints(thread_id, checkpoint_id, checkpoint)
+                VALUES (?, 'ck-1', x'00')
+                """,
+                (thread_id,),
+            )
+            await connection.execute(
+                """
+                INSERT INTO writes(thread_id, checkpoint_id, task_id, idx, channel)
+                VALUES (?, 'ck-1', 'task-1', 0, 'channel')
+                """,
+                (thread_id,),
+            )
             await connection.commit()
 
         deleted = await client.delete(f"/creations/{creation_id}")
@@ -880,6 +931,23 @@ async def test_delete_creation_guards_active_work_and_removes_every_artifact(
                     (str(creation_id),),
                 )
             ).fetchone()
+            checkpoint_left = await (
+                await connection.execute(
+                    "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            ).fetchone()
+            checkpoint_writes_left = await (
+                await connection.execute(
+                    "SELECT COUNT(*) FROM writes WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            ).fetchone()
+            foreign_checkpoint_kept = await (
+                await connection.execute(
+                    "SELECT COUNT(*) FROM checkpoints WHERE thread_id = 'leftover-thread'"
+                )
+            ).fetchone()
 
     assert guarded.status_code == 409
     assert guarded.json()["code"] == "creation_not_deletable"
@@ -894,6 +962,9 @@ async def test_delete_creation_guards_active_work_and_removes_every_artifact(
     assert leftovers == []
     assert frozen_left[0] == 0
     assert model_call_left[0] == 0
+    assert checkpoint_left[0] == 0
+    assert checkpoint_writes_left[0] == 0
+    assert foreign_checkpoint_kept[0] == 1
 
 
 @pytest.mark.asyncio
