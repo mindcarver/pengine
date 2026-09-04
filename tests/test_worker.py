@@ -457,6 +457,41 @@ class EpisodeArithmeticErrorOnceWorkflow(DeterministicWorkflow):
         )
 
 
+class ApprovedStageRoutingErrorOnceWorkflow(DeterministicWorkflow):
+    """A supervisor routing slip that declares an already-approved stage
+    after one episode is committed must pause continuably, not fail."""
+
+    def __init__(self) -> None:
+        super().__init__(episode_count=2)
+        self.calls = 0
+        self.retry_drafts: list[int] = []
+
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        self.calls += 1
+        if self.calls > 1:
+            self.retry_drafts = [draft.episode_number for draft in kwargs["episode_drafts"]]
+            return await super().execute(**kwargs)
+
+        before_episode = kwargs["before_episode"]
+        assert before_episode is not None
+
+        async def misroute_on_second_episode(plan: EpisodePlan) -> int:
+            attempt = await before_episode(plan)
+            if plan.episode_number == 2:
+                raise AgentProtocolError(
+                    "Stage was delegated to the wrong subagent",
+                    stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+                )
+            return attempt
+
+        return await super().execute(
+            **{
+                **kwargs,
+                "before_episode": misroute_on_second_episode,
+            }
+        )
+
+
 class EpisodeConnectionErrorWorkflow(DeterministicWorkflow):
     def __init__(self, provider: str = "anthropic") -> None:
         super().__init__()
@@ -1250,6 +1285,51 @@ async def test_worker_pauses_arithmetic_error_and_resumes_only_failed_episode(
         ).fetchone()
     assert row is not None
     assert await repository.get_episode_attempt_counts(UUID(row["id"])) == {1: 1, 2: 2}
+
+
+@pytest.mark.asyncio
+async def test_worker_pauses_routing_flake_declaring_approved_stage_after_episodes(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "approved-stage-routing-flake",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = ApprovedStageRoutingErrorOnceWorkflow()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="approved-stage-routing-flake-worker",
+    )
+
+    assert await worker.run_once() is True
+    paused = await repository.get_creation(accepted.creation_id)
+    assert paused is not None
+    assert paused.initial.state == "paused"
+    assert paused.initial.pause.code == "episode_error"
+    assert paused.initial.pause.episode_number == 2
+    assert "无效的结构化结果" in paused.initial.pause.message
+    assert paused.initial.progress.can_continue is True
+    assert [draft.episode_number for draft in paused.initial.drafts.episodes] == [1]
+
+    await repository.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-approved-stage-routing-flake",
+    )
+    assert await worker.run_once() is True
+    completed = await repository.get_creation(accepted.creation_id)
+    assert completed is not None
+    assert completed.initial.state == "succeeded"
+    assert workflow.retry_drafts == [1]
 
 
 @pytest.mark.asyncio

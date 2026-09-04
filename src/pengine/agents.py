@@ -5841,8 +5841,35 @@ class StageGuardMiddleware(AgentMiddleware):
             stage = InternalStage(match.group(1))
         except ValueError as exc:
             raise AgentProtocolError("Subagent task declared an unknown stage") from exc
-        if _TASK_OWNER.get(stage) != subagent_type:
-            raise AgentProtocolError("Stage was delegated to the wrong subagent", stage=stage)
+        owner = _TASK_OWNER.get(stage)
+        if owner != subagent_type:
+            # A supervisor routing slip is a stochastic model flake, not a
+            # protocol violation: it must stay correctable in-turn so a run
+            # with committed episodes can never be terminal-killed by it.
+            if owner is None:
+                instruction = (
+                    f"{stage.value} is not delegated to a subagent. Do not call the "
+                    "task tool for it."
+                )
+            else:
+                instruction = (
+                    f"Retry the identical task with subagent_type={owner} and a "
+                    f"description that starts with [stage={stage.value}]."
+                )
+            return ToolMessage(
+                content=json.dumps(
+                    {
+                        "error": "wrong_subagent",
+                        "expected_stage": stage.value,
+                        "expected_subagent_type": owner,
+                        "instruction": instruction,
+                    },
+                    separators=(",", ":"),
+                ),
+                tool_call_id=request.tool_call["id"],
+                name="task",
+                status="error",
+            )
         if stage != expected_stage:
             return ToolMessage(
                 content=json.dumps(
