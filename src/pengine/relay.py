@@ -1179,6 +1179,12 @@ _TOOL_PROTOCOL_REJECTION = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# A pool-variant upstream rejecting standard Anthropic requests with a
+# "<field path>: Field required" complaint (observed with "thinking" on the
+# rotating relay pool, 2026-09-04): the identical request succeeds on other
+# draws, so the rejection is upstream variance, not a defect in this request.
+_FIELD_REQUIRED_REJECTION = re.compile(r"\bfield required\b", re.IGNORECASE)
+
 
 def _is_generic_upstream_failure(failure: _ProviderFailure | None) -> bool:
     """Recognize the relay's content-free wrapper for an upstream outage."""
@@ -1187,6 +1193,22 @@ def _is_generic_upstream_failure(failure: _ProviderFailure | None) -> bool:
         and failure.http_status == 400
         and failure.provider_code == "upstream_error"
         and failure.detail.casefold() == "upstream request failed"
+    )
+
+
+def _is_upstream_field_rejection(failure: _ProviderFailure | None) -> bool:
+    """Recognize a pool-variant upstream demanding extra request fields.
+
+    The rotating relay pool routes identical requests to different upstream
+    variants; a variant that answers a standard, previously-successful request
+    with ``<path>: Field required`` (e.g. ``thinking``) is a bad draw, not a
+    defect in the request. Retrying lands on another draw, bounded by the
+    shared relay-interruption auto-resume budget.
+    """
+    return (
+        failure is not None
+        and failure.http_status == 400
+        and _FIELD_REQUIRED_REJECTION.search(failure.detail) is not None
     )
 
 
@@ -1709,6 +1731,8 @@ def retryable_relay_interruption(exc: Exception) -> RetryableRelayInterruption |
     if _is_upstream_stream_error(exc):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
     if _is_generic_upstream_failure(_extract_provider_failure(exc)):
+        return RetryableRelayInterruption(_retry_delay_seconds(exc))
+    if _is_upstream_field_rejection(_extract_provider_failure(exc)):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
     return None
 

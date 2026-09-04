@@ -1894,6 +1894,38 @@ async def test_retry_run_revives_external_relay_failure_and_requeues_the_same_th
     assert resumed.thread_id == lease.thread_id
 
 
+async def test_retry_run_revives_relay_rejected_failure_after_pool_variance(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    """A relay_rejected 400 from a bad rotating-pool draw must leave the run
+    operator-retryable: the identical request succeeds on other draws."""
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.fail_run(
+        lease.run_id,
+        RunFailure(
+            code="relay_rejected",
+            message="The model relay rejected the request (HTTP 400).",
+            failed_stage=InternalStage.GENERATING_CHARACTER_RELATIONSHIPS,
+            attempt_count=1,
+        ),
+        now=NOW,
+    )
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.state == "failed"
+    assert failed.initial.progress.can_retry is True
+
+    revived = await repository.retry_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-relay-rejected",
+        now=NOW + timedelta(seconds=10),
+    )
+    assert revived.run_state == "queued"
+
+
 async def test_retry_run_revives_stage_validation_failure_with_durable_outline(
     repository,
     persona,

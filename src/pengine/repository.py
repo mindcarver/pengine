@@ -108,7 +108,12 @@ MAX_EPISODE_ATTEMPTS = 3
 # Failure codes an operator can resolve before reviving a terminally failed
 # initial run: relay quota/availability, or a deterministic stage failure whose
 # cause was fixed (the run re-enters through its approved checkpoints).
-RETRYABLE_FAILURE_CODES = frozenset({"relay_unavailable", "stage_validation_failed"})
+# relay_rejected stays revivable: the rotating relay pool can reject a
+# standard request from one upstream draw while other draws accept it, so an
+# operator Retry after such a failure must never force a full restart.
+RETRYABLE_FAILURE_CODES = frozenset(
+    {"relay_unavailable", "relay_rejected", "stage_validation_failed"}
+)
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
 
 _EXTENDED_REPAIR_STAGES = frozenset(
