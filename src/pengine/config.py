@@ -1,6 +1,7 @@
 from functools import lru_cache
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator
@@ -69,6 +70,14 @@ class Settings(BaseSettings):
     # retaining a bounded total for the whole script stage.
     script_stage_model_call_total_limit: int = Field(default=192, ge=1)
     script_stage_review_call_total_limit: int = Field(default=128, ge=1)
+    # Content-review strictness tier. "standard" keeps every quality gate
+    # blocking (paid repair rounds, content_rejected pauses). "mvp" trades
+    # polish for throughput: per-episode deterministic continuity issues and
+    # non-final milestone rejections become advisory (recorded, never
+    # blocking), and outline-group semantic review is skipped entirely.
+    # Structural integrity checks (schema, hashes, ordering, protocol
+    # self-repair) and the binding final review stay enforcing in both tiers.
+    content_review_tier: Literal["standard", "mvp"] = "standard"
     # Optional agent observability via a self-hosted Langfuse instance.
     # Disabled by default so pengine runs unchanged when tracing is off.
     langfuse_enabled: bool = Field(default=False)

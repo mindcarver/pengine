@@ -430,6 +430,7 @@ class Worker:
                     generation_max_output_tokens=self.settings.generation_max_output_tokens,
                     review_max_output_tokens=self.settings.review_max_output_tokens,
                     review_context_limit_tokens=self.settings.review_context_limit_tokens,
+                    content_review_tier=self.settings.content_review_tier,
                 )
         self._stop_event.clear()
         self._task = asyncio.create_task(

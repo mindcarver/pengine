@@ -81,6 +81,19 @@ def test_role_specific_model_routes_load_from_environment(monkeypatch) -> None:
     assert settings.relay_configured is True
 
 
+def test_content_review_tier_defaults_to_standard_and_loads_from_environment(
+    monkeypatch,
+) -> None:
+    assert Settings(_env_file=None).content_review_tier == "standard"
+
+    monkeypatch.setenv("PENGINE_CONTENT_REVIEW_TIER", "mvp")
+    assert Settings(_env_file=None).content_review_tier == "mvp"
+
+    monkeypatch.setenv("PENGINE_CONTENT_REVIEW_TIER", "loose")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
 @pytest.mark.parametrize(
     ("generation_model_id", "review_model_id"),
     [(None, "deepseek-v4-flash"), ("claude-opus-5", None)],

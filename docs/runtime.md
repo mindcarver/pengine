@@ -194,6 +194,8 @@ SQLite、结构化日志和 Langfuse 都保留 Relay 实际回报的原始 `resp
 | L0/L4 最终拒绝 | 质量闸门返回 rejected | `quality_rejected`，不重跑前面内容 | `retry-final-review` 只重跑同一最终审核，或结束 |
 | checkpoint/图执行故障 | thread checkpoint 缺失、递归上限、未知内部错误 | `failed`，不把未验证 thread 内容升级为批准内容 | 保留错误和证据，修复运行环境后新建/重试适用命令 |
 
+内容审查强度分档（`PENGINE_CONTENT_REVIEW_TIER`，默认 `standard`）：`standard` 全部质量门保持阻断；`mvp` 档以打磨换吞吐——逐集确定性连续性偏差与非终审结构里程碑拒审降为 advisory（证据保留在审查记录里，不再触发付费修复轮或 `content_rejected` 暂停），大纲组语义审查整体跳过（省一次 review 调用/组）。两档都始终强制：结构完整性校验（schema/哈希/顺序/协议自愈）、关卡证据标签本地校验，以及与交付绑定的终审。
+
 普通阶段和受保护子调用有最多三次尝试边界；第四次调用会在模型请求前被拒绝。Relay 恢复次数、阶段尝试次数和内容修复次数是不同预算，不能相互挪用。
 
 这组三次“业务尝试”也不等同于模型调用预算：调用预算按角色和阶段统计，剧本阶段还按
