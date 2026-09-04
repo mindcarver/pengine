@@ -710,16 +710,18 @@ def build_episode_lock(
     semantic_review: SemanticReview,
     repair_rounds: int,
     repair_constraints: list[RepairConstraint] | None = None,
+    enforce_continuity: bool = True,
 ) -> EpisodeLock:
-    issues = validate_episode_candidate(
-        contract=contract,
-        contract_sha256=contract_sha256,
-        prior_state=prior_state,
-        content=content,
-        delta=delta,
-    )
-    if issues:
-        raise ContinuityViolation(issues)
+    if enforce_continuity:
+        issues = validate_episode_candidate(
+            contract=contract,
+            contract_sha256=contract_sha256,
+            prior_state=prior_state,
+            content=content,
+            delta=delta,
+        )
+        if issues:
+            raise ContinuityViolation(issues)
     episode_number = delta.episode_number
     knowledge = {
         item.character_id: set(item.known_fact_ids) for item in prior_state.character_knowledge

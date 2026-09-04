@@ -5692,6 +5692,7 @@ class StageGuardMiddleware(AgentMiddleware):
         get_series_review_boundary: SeriesReviewBoundaryRetriever | None = None,
         review_context_limit_tokens: int | None = None,
         review_max_output_tokens: int | None = None,
+        content_review_tier: str = "standard",
     ) -> None:
         self.before_stage = before_stage
         self.approve_stage = approve_stage
@@ -5735,6 +5736,7 @@ class StageGuardMiddleware(AgentMiddleware):
         self.get_series_review_boundary = get_series_review_boundary
         self.review_context_limit_tokens = review_context_limit_tokens
         self.review_max_output_tokens = review_max_output_tokens
+        self.content_review_tier = content_review_tier
 
     @contextmanager
     def _repair_round_context(self, repair_round: int | None):
@@ -6738,7 +6740,16 @@ class StageGuardMiddleware(AgentMiddleware):
                             )
                             repair_mode = "sidecar"
                             continue
-                        group_review = await review_group(compiled, parsed)
+                        if self.content_review_tier == "mvp":
+                            # MVP tier: skip the paid outline-group semantic review
+                            # entirely; protocol assembly/reference checks above
+                            # still enforce structural integrity.
+                            group_review = SemanticReview(
+                                passed=True,
+                                evidence="MVP 档：跳过大纲组语义审查，结构装配与引用校验仍然强制。",
+                            )
+                        else:
+                            group_review = await review_group(compiled, parsed)
                         if group_review.passed:
                             break
                         if review_repair_rounds >= 2:
@@ -7679,6 +7690,12 @@ class StageGuardMiddleware(AgentMiddleware):
             earliest_affected_episode=result.earliest_affected_episode,
         )
         if not result.passed:
+            if self.content_review_tier == "mvp" and episode_number != contract.episode_count:
+                # MVP tier: non-final milestone rejections are advisory. The
+                # failed review stays registered above for provenance, but the
+                # pass continues instead of triggering paid suffix rewrites or
+                # design rebuilds. The binding final review still enforces.
+                return result
             raise MilestoneRejectedError(
                 category=result.category,
                 evidence=result.evidence,
@@ -8515,6 +8532,17 @@ class StageGuardMiddleware(AgentMiddleware):
                         )
                     )
                 review = _merge_episode_review_results(deterministic_issues, semantic_reviews)
+                if not review.passed and self.content_review_tier == "mvp":
+                    # MVP tier: continuity deviations are advisory. The issues stay
+                    # recorded in the review evidence, but the candidate commits
+                    # without paid repair rounds or a content_rejected pause.
+                    review = review.model_copy(
+                        update={
+                            "passed": True,
+                            "evidence": f"[mvp-advisory] {review.evidence}",
+                            "issues": [],
+                        }
+                    )
                 if review.passed:
                     if suffix_feedback is not None and plan.episode_number < contract.episode_count:
                         additions = await self._extract_repair_constraints(
@@ -8538,6 +8566,7 @@ class StageGuardMiddleware(AgentMiddleware):
                             semantic_review=review,
                             repair_rounds=repair_rounds,
                             repair_constraints=repair_constraint_ledger,
+                            enforce_continuity=self.content_review_tier != "mvp",
                         )
                     except ContinuityViolation as exc:
                         raise AgentProtocolError(
@@ -8847,6 +8876,7 @@ class DeepAgentWorkflow:
     review_max_output_tokens: int | None = None
     review_context_limit_tokens: int | None = None
     grouped_outline_enabled: bool = True
+    content_review_tier: str = "standard"
 
     def __post_init__(self) -> None:
         register_pengine_harness_profile(self.generation_provider_profile_key)
@@ -9758,6 +9788,7 @@ class DeepAgentWorkflow:
                     get_series_review_boundary=get_series_review_boundary,
                     review_context_limit_tokens=self.review_context_limit_tokens,
                     review_max_output_tokens=self.review_max_output_tokens,
+                    content_review_tier=self.content_review_tier,
                 ),
                 ToolAllowlistMiddleware(
                     _SUPERVISOR_TOOL_ALLOWLIST,

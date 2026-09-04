@@ -1343,3 +1343,36 @@ def test_valid_episode_lock_folds_exact_knowledge_and_hashes() -> None:
         "meeting_time",
     ]
     assert episode_lock.repair_rounds == 1
+
+
+def test_build_episode_lock_enforce_continuity_flag_gates_advisory_mode() -> None:
+    contract = make_contract()
+    contract_hash = story_contract_sha256(contract)
+    prior_state = initial_series_state(contract, contract_hash)
+    delta = make_delta(contract)
+    broken_evidence = [
+        item.model_copy(update={"excerpt": "从未出现在任何剧本中的证据原文"})
+        if index == 0
+        else item
+        for index, item in enumerate(delta.evidence)
+    ]
+    broken = delta.model_copy(update={"evidence": broken_evidence})
+    lock_args = {
+        "contract": contract,
+        "contract_sha256": contract_hash,
+        "prior_state": prior_state,
+        "content": "林岚：今天的风很大。",
+        "delta": broken,
+        "semantic_review": SemanticReview(passed=True, evidence="确定性逐集校验通过。"),
+        "repair_rounds": 0,
+    }
+
+    with pytest.raises(ContinuityViolation):
+        build_episode_lock(**lock_args)
+
+    # The MVP review tier commits such candidates with the issues recorded in
+    # the merged review evidence instead of raising past the caller.
+    lock = build_episode_lock(**lock_args, enforce_continuity=False)
+    assert lock.episode_number == 1
+    assert lock.series_state.locked_through_episode == 1
+    assert lock.series_state_sha256

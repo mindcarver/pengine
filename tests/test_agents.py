@@ -530,6 +530,7 @@ def _fake_workflow(
     recursion_limit: int = 80,
     provider_profile_key: str = "toolcallingfakemodel",
     model_call_state: ModelCallState | None = None,
+    content_review_tier: str = "standard",
 ) -> DeepAgentWorkflow:
     workflow_type = _ProvenanceFakeWorkflow if model_call_state is not None else DeepAgentWorkflow
     kwargs = dict(
@@ -540,6 +541,7 @@ def _fake_workflow(
         generation_provider_profile_key=provider_profile_key,
         review_provider_profile_key=provider_profile_key,
         grouped_outline_enabled=False,
+        content_review_tier=content_review_tier,
     )
     if model_call_state is not None:
         return workflow_type(**kwargs, model_call_state=model_call_state)
@@ -10698,6 +10700,62 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
         assert tool_names == {"read_file", "calculate_arithmetic", "ScriptWriterResult"}
         for hidden_tool in ("ls", "glob", "grep", "write_todos", "write_file", "edit_file"):
             assert not _prompt_mentions_tool(system_prompt, hidden_tool)
+
+
+@pytest.mark.asyncio
+async def test_mvp_review_tier_commits_episode_with_advisory_continuity_issues(
+    tmp_path: Path,
+) -> None:
+    """MVP tier: the same missing-evidence candidate commits without repair rounds."""
+    database = tmp_path / "checkpoints.sqlite3"
+    responses = _successful_responses()
+    writer_index = _index_of_tool_call(responses, "ScriptGenerationGroupSidecar", occurrence=1)
+    writer_payload = copy.deepcopy(responses[writer_index].tool_calls[0]["args"])
+    sidecar_episode = writer_payload["episodes"][0]
+    sidecar_episode["state_delta"]["evidence"] = [
+        item
+        for item in sidecar_episode["state_delta"]["evidence"]
+        if item["target_id"] != "fact_ep1"
+    ]
+    responses[writer_index] = _tool_call(
+        "ScriptGenerationGroupSidecar", writer_payload, writer_index
+    )
+    approved: list[InternalStage] = []
+    episode_hooks, episode_attempts = _episode_hook_kwargs()
+
+    async def before_stage(_: InternalStage) -> int:
+        return 1
+
+    async def approve_stage(stage: InternalStage, _: dict[str, Any]) -> None:
+        approved.append(stage)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        model = ToolCallingFakeModel(responses=responses)
+        workflow = _fake_workflow(
+            model=model,
+            checkpointer=saver,
+            provider_profile_key="toolcallingfakemodel",
+            content_review_tier="mvp",
+        )
+        await workflow.execute(
+            thread_id="mvp-advisory-episode-thread",
+            story="故事",
+            requirements="要求",
+            persona_files={"/persona/project.md": "规则"},
+            before_stage=before_stage,
+            approve_stage=approve_stage,
+            **episode_hooks,
+        )
+
+    # The episode commits on the first pass despite the missing evidence
+    # target: no repair subagent runs, and the script stage approves.
+    assert episode_attempts == [1]
+    assert InternalStage.GENERATING_EPISODE_SCRIPTS in approved
+    assert not any(
+        "/skills/continuity-repair/SKILL.md" in system_prompt
+        for system_prompt in model.model_system_prompts
+    )
 
 
 @pytest.mark.asyncio
