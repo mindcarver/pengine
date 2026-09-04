@@ -16,8 +16,7 @@ permalink: /development/
 
 - Python `>=3.12,<3.13`；
 - [`uv`](https://docs.astral.sh/uv/)；
-- 若执行真实模型路径，需要一个能同时接受 Anthropic Messages 生成路由和所选审核
-  模型协议的 relay；
+- 若执行真实模型路径，需要 OpenRouter 或一个能接受所选生成与审核模型协议的 relay；
 - 若启用可选 Langfuse tracing，需要 Docker Compose 和本地 Langfuse 服务。
 
 ```bash
@@ -36,13 +35,14 @@ PENGINE_PERSONA_ROOT=./personas
 PENGINE_DATA_DIR=./data
 PENGINE_HOST=127.0.0.1
 PENGINE_PORT=8000
-PENGINE_RELAY_BASE_URL=https://relay.example/v1
+PENGINE_RELAY_BASE_URL=https://openrouter.ai/api/v1
 PENGINE_RELAY_API_KEY=replace-me
-PENGINE_GENERATION_MODEL_ID=claude-opus-5
-PENGINE_REVIEW_MODEL_ID=claude-opus-5
+PENGINE_GENERATION_MODEL_ID=z-ai/glm-5.3-flash
+PENGINE_REVIEW_MODEL_ID=deepseek/deepseek-v4-flash
 PENGINE_GENERATION_MAX_OUTPUT_TOKENS=128000
-PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS=200000
-PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS=64000
+PENGINE_REVIEW_MAX_OUTPUT_TOKENS=128000
+PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS=1048576
+PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS=1048576
 PENGINE_STAGE_MODEL_CALL_LIMIT=48
 PENGINE_STAGE_REVIEW_CALL_LIMIT=32
 PENGINE_SCRIPT_STAGE_MODEL_CALL_TOTAL_LIMIT=192
@@ -51,12 +51,12 @@ PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 
 配置规则：
 
-- generation model 必须是 `claude-opus-5` 或 `claude-sonnet-5`，生成输出上限不能超过
-  `128000`；Sonnet 5 不发送非默认采样参数；
-- `.env.example` 选择 `claude-opus-5`；Settings 允许的审核模型完整集合是
-  `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、`claude-opus-5` 和
-  `claude-sonnet-5`，分别走
-  DeepSeek、OpenAI 和 Anthropic 客户端；不能仅凭配置通过就声称 provider 能力已验证；
+- `.env.example` 默认使用 OpenRouter 的 `z-ai/glm-5.3-flash` 生成与
+  `deepseek/deepseek-v4-flash` 审核；两个完整 slug 都允许用于任一角色并走
+  OpenAI-compatible Chat Completions；GLM 保留强制推理，DeepSeek 关闭推理；
+- 兼容白名单仍保留 `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、
+  `claude-opus-5`、`claude-sonnet-5` 及既有 OpenRouter Claude slug；不能仅凭配置通过
+  就声称 provider 能力已验证；
 - generation/review 上下文上限必须是实际验证过的 token window；没有可信上限时请求前阻断；
 - relay URL 必须使用 HTTPS，loopback relay 才允许 HTTP；
 - URL、key、任一角色模型缺失时，服务可以启动，但真实模型工作流不会静默降级；

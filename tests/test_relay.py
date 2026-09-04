@@ -136,6 +136,204 @@ def test_build_relay_adapter_omits_sampling_override_for_openrouter_sonnet5() ->
     assert "temperature" not in request_payload
 
 
+@pytest.mark.parametrize(
+    ("model_id", "expected_extra_body"),
+    [
+        ("z-ai/glm-5.3-flash", None),
+        ("deepseek/deepseek-v4-flash", {"reasoning": {"enabled": False}}),
+    ],
+)
+@pytest.mark.parametrize("role", ["generation", "review"])
+def test_build_relay_adapter_routes_openrouter_chat_completions_models(
+    model_id: str,
+    expected_extra_body: dict[str, Any] | None,
+    role: str,
+) -> None:
+    settings = _role_settings(
+        generation_model_id=model_id,
+        review_model_id=model_id,
+        review_max_output_tokens=32_000,
+    )
+
+    adapter = build_relay_adapter(settings, role=role)
+
+    assert isinstance(adapter.model, ChatOpenAI)
+    assert not isinstance(adapter.model, ChatDeepSeek)
+    assert adapter.model_id == model_id
+    assert adapter.provider_profile_key == "openrouter"
+    assert adapter.model.model_name == model_id
+    assert adapter.model.openai_api_base == "https://relay.example/v1"
+    assert adapter.model.extra_body == expected_extra_body
+    assert adapter.model.streaming is (role == "generation")
+
+
+def test_openrouter_glm_requires_serial_tool_calls() -> None:
+    class ProbeTool(BaseModel):
+        value: str
+
+    adapter = build_relay_adapter(
+        _role_settings(generation_model_id="z-ai/glm-5.3-flash"),
+        role="generation",
+    )
+
+    bound = adapter.model.bind_tools([ProbeTool], tool_choice="any")
+
+    assert bound.kwargs["tool_choice"] == "required"
+    assert bound.kwargs["parallel_tool_calls"] is False
+
+
+def test_openrouter_deepseek_uses_auto_for_mixed_tool_strategy() -> None:
+    class WorkTool(BaseModel):
+        value: str
+
+    class ResultTool(BaseModel):
+        value: str
+
+    adapter = build_relay_adapter(
+        _role_settings(generation_model_id="deepseek/deepseek-v4-flash"),
+        role="generation",
+    )
+
+    bound = adapter.model.bind_tools([WorkTool, ResultTool], tool_choice="required")
+
+    assert bound.kwargs["tool_choice"] == "auto"
+    assert bound.kwargs["parallel_tool_calls"] is False
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ["z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash"],
+)
+def test_openrouter_generation_uses_call_specific_output_budget(model_id: str) -> None:
+    state = ModelCallState()
+    state.context.requested_output_tokens = 20_480
+    adapter = build_relay_adapter(
+        _role_settings(generation_model_id=model_id),
+        role="generation",
+        model_call_state=state,
+    )
+
+    assert adapter.model._with_call_output_budget({})["max_tokens"] == 20_480
+
+
+@pytest.mark.parametrize(
+    ("requested_model", "response_model", "accepted"),
+    [
+        ("z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash", True),
+        ("z-ai/glm-5.3-flash", "glm-5.3-flash", False),
+        ("deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash", True),
+        ("deepseek/deepseek-v4-flash", "deepseek-v4-flash", False),
+    ],
+)
+def test_openrouter_model_identity_requires_the_exact_provider_slug(
+    requested_model: str,
+    response_model: str,
+    accepted: bool,
+) -> None:
+    handler = _ModelCallAuditHandler(role="generation", model_id=requested_model)
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(
+                        content="ok",
+                        response_metadata={"model": response_model},
+                    )
+                )
+            ]
+        ]
+    )
+
+    if accepted:
+        handler.on_llm_end(response, run_id=uuid4())
+    else:
+        with pytest.raises(RelayIdentityError, match="identity did not match"):
+            handler.on_llm_end(response, run_id=uuid4())
+
+
+@pytest.mark.asyncio
+async def test_openrouter_generation_stream_uses_the_stall_watchdog(monkeypatch) -> None:
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        await asyncio.sleep(0.8)
+        yield ChatGenerationChunk(message=AIMessageChunk(content="迟到"))
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="z-ai/glm-5.3-flash",
+            stream_stall_seconds=0.2,
+            stream_crawl_window_seconds=5.0,
+        ),
+        role="generation",
+    )
+
+    with pytest.raises(RelayStreamStalledError, match="stream stalled"):
+        async for _ in model._astream([]):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_deduplicates_repeated_finish_identity(monkeypatch) -> None:
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        for _ in range(2):
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(content=""),
+                generation_info={
+                    "finish_reason": "tool_calls",
+                    "model_name": "z-ai/glm-5.3-flash",
+                },
+            )
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(generation_model_id="z-ai/glm-5.3-flash"),
+        role="generation",
+    )
+
+    chunks = [chunk async for chunk in model._astream([])]
+    combined = chunks[0] + chunks[1]
+
+    assert combined.generation_info["model_name"] == "z-ai/glm-5.3-flash"
+    assert combined.generation_info["finish_reason"] == "tool_calls"
+
+
+def test_stream_watchdog_waits_for_measurable_output_before_crawl() -> None:
+    watchdog = relay_module._StreamStallWatchdog(
+        stall_seconds=120,
+        crawl_window_seconds=90,
+        crawl_min_chars_per_second=2,
+    )
+    hidden_reasoning = ChatGenerationChunk(message=AIMessageChunk(content=""))
+
+    for moment in range(0, 101, 10):
+        watchdog.observe(hidden_reasoning, now=float(moment))
+
+    watchdog.observe(
+        ChatGenerationChunk(message=AIMessageChunk(content="正文开始")),
+        now=110.0,
+    )
+
+
+def test_stream_progress_counts_tool_arguments_and_exposed_reasoning() -> None:
+    tool_chunk = ChatGenerationChunk(
+        message=AIMessageChunk(
+            content="",
+            tool_call_chunks=[{"name": "Probe", "args": '{"value":"OK"}', "id": "1"}],
+        )
+    )
+    reasoning_chunk = ChatGenerationChunk(
+        message=AIMessageChunk(
+            content="",
+            additional_kwargs={"reasoning_content": "正在验证"},
+        )
+    )
+
+    assert relay_module._stream_chunk_text_chars(tool_chunk) == len('{"value":"OK"}')
+    assert relay_module._stream_chunk_text_chars(reasoning_chunk) == len("正在验证")
+
+
 _LONG_SYSTEM = "世界观设定与人物小传。" * 600  # 5,400 chars, above the cache floor
 
 

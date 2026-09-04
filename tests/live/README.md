@@ -2,11 +2,12 @@
 
 This test starts a real Pengine server on a random loopback port, copies no
 shared database state, and calls both configured model routes from the current
-environment or repository `.env`. Generation and creative repair use
-`claude-opus-5` or `claude-sonnet-5` over Anthropic Messages. Review may be
-`deepseek-v4-flash`, `gpt-5.5`, `gpt-5.6-terra`, `claude-opus-5`, or
-`claude-sonnet-5`; Pengine selects the matching
-DeepSeek, OpenAI, or Anthropic client. Both routes use the same
+environment or repository `.env`. The default OpenRouter pair uses
+`z-ai/glm-5.3-flash` for generation and creative repair, and
+`deepseek/deepseek-v4-flash` for review, over OpenAI-compatible Chat Completions.
+Both OpenRouter slugs may be assigned to either role. Existing Claude, GPT, and
+native DeepSeek routes remain compatibility options. Pengine selects the matching
+OpenRouter, DeepSeek, OpenAI, or Anthropic client. Both routes use the same
 `PENGINE_RELAY_BASE_URL` and `PENGINE_RELAY_API_KEY`. Missing either
 route fails closed; there is no single-model or cross-role fallback. The test is
 deliberately skipped unless explicitly enabled because it makes billable model
@@ -15,14 +16,14 @@ requests and can take a long time.
 Required model settings are:
 
 ```dotenv
-PENGINE_RELAY_BASE_URL=https://your-relay.example/v1
+PENGINE_RELAY_BASE_URL=https://openrouter.ai/api/v1
 PENGINE_RELAY_API_KEY=replace-with-your-key
-PENGINE_GENERATION_MODEL_ID=claude-opus-5
-PENGINE_REVIEW_MODEL_ID=claude-opus-5
+PENGINE_GENERATION_MODEL_ID=z-ai/glm-5.3-flash
+PENGINE_REVIEW_MODEL_ID=deepseek/deepseek-v4-flash
 ```
 
-The review value above is an example matching `.env.example`, not the only
-accepted review model. The selected relay route must support the matching tool
+The values above match `.env.example`, but each role also accepts the documented
+compatibility models. The selected relay route must support the matching tool
 protocol and report that exact model identity.
 
 `PENGINE_RELAY_ADAPTER`, `PENGINE_RELAY_MODEL_ID`, and

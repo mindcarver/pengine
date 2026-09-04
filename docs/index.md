@@ -73,10 +73,10 @@ Pengine 把一个自由表达的故事想法、短剧要求和一份版本化人
 <strong>这不是公共 SaaS。</strong> V1 只绑定回环地址，面向单个本地操作员；没有认证、多用户隔离、公共部署、流式传输、远程队列、跨创作可写记忆、任务列表/导出/删除 API，也不会把主机文件系统暴露给 Agent。
 </div>
 
-模型 relay 共享一组 URL 和 API key，但角色路由固定分离：生成和创作修复只使用
-Anthropic Messages 的 `claude-opus-5` 或 `claude-sonnet-5`；审核模型允许
-`deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、`claude-opus-5` 或
-`claude-sonnet-5`，并分别选择 DeepSeek、OpenAI 或 Anthropic 客户端。
+模型 relay 共享一组 URL 和 API key，但角色路由固定分离。默认经 OpenRouter 使用
+`z-ai/glm-5.3-flash` 生成、`deepseek/deepseek-v4-flash` 审核；两者都走
+OpenAI-compatible Chat Completions。Claude、GPT 与原生 DeepSeek 路由暂时保留兼容，
+但任一路由失败都不会自动回退到另一模型。
 两类角色不互换，也不在一路失败时自动回退到另一路。
 
 当前仓库内置的四套人格包是可运行的原型数据，不等于生产人格定稿。人格源文件只读；创建任务会建立不可变快照，后续修改源目录不会改变已经创建的任务。
@@ -89,8 +89,8 @@ Anthropic Messages 的 `claude-opus-5` 或 `claude-sonnet-5`；审核模型允�
 
 ## 最短启动路径
 
-环境要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及同时支持 Anthropic
-Messages 生成路由和所选审核模型协议的 relay。
+环境要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及 OpenRouter 或同时
+支持所选生成与审核模型协议的 relay。
 
 ```bash
 uv sync --locked --all-groups

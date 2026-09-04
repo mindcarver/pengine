@@ -21,10 +21,10 @@
 Pengine V1 是一个带同源 Web 原型的本地短剧创作 Agent。它通过
 [Deep Agents](https://github.com/langchain-ai/deepagents) 与 LangGraph，
 让阶段化专业 Agent 按固定流程协作；业务状态、检查点和交付物全部落在本地
-SQLite。模型请求共用一组 relay URL 与密钥，但按角色固定为两条路由：生成与创作修复
-使用 Anthropic Messages 的 `claude-opus-5` 或 `claude-sonnet-5`；审核模型可配置为
-`deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、`claude-opus-5` 或
-`claude-sonnet-5`，运行时按模型选择 DeepSeek、OpenAI 或 Anthropic 客户端协议。
+SQLite。模型请求共用一组 relay URL 与密钥，但按角色固定为两条路由。OpenRouter 是默认
+入口：生成与创作修复使用 `z-ai/glm-5.3-flash`，审核使用
+`deepseek/deepseek-v4-flash`；两者都走 OpenAI-compatible Chat Completions。现有 Claude、
+GPT 与原生 DeepSeek 路由暂时保留为兼容选项，不参与静默回退。
 
 Web 创作台通过用户名和密码建立账户，并以 7 天可撤销的安全 Cookie 隔离每个账户的作品；
 它以约 1.8 秒轮询展示后端确认的六个用户阶段进度、已运行时长和超时恢复操作。V1 仍不提供
@@ -58,7 +58,7 @@ Web 创作台通过用户名和密码建立账户，并以 7 天可撤销的安�
                               └─────────────┘             └───────┬────────┘
                                                                   │
                                                            ┌──────▼──────┐
-                                                           │ 双协议模型中继│
+                                                           │ 多协议模型中继│
                                                            └─────────────┘
 ```
 
@@ -70,7 +70,7 @@ Web 创作台通过用户名和密码建立账户，并以 7 天可撤销的安�
 | 状态仓库 | 管理创作、运行、任务、反馈、检查点与交付物 |
 | 内嵌 Worker 池 | 账户公平租约、重启恢复、阶段尝试预算、隔离工作流调度 |
 | Agent 编排层 | 由监督 Agent 编排同步创作 Agent 与技能化审查/修复子代理 |
-| 模型中继客户端 | 共用 URL/密钥，生成固定走 Opus；审核按配置选择 DeepSeek、OpenAI 或 Anthropic 协议 |
+| 模型中继客户端 | 共用 URL/密钥，默认通过 OpenRouter 分别绑定 GLM 生成与 DeepSeek 审核；兼容旧协议路由 |
 
 系统采用模块化单体：一个进程、最多 5 个隔离 Worker 槽并发处理创作任务，不依赖
 外部消息队列或远程 Agent。Worker 池默认通过 `PENGINE_WORKER_CONCURRENCY=5` 启用
@@ -209,8 +209,8 @@ Skill 只加载到对应审查或修复子代理，不作为监督 Agent 的全�
 
 <h2 align="center">05 · 快速启动</h2>
 
-要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及一个能以同一组 URL／密钥
-同时提供 Anthropic Messages 生成路由和所选审核协议的 relay。
+要求：Python `3.12`、[`uv`](https://docs.astral.sh/uv/)，以及 OpenRouter 或一个能以
+同一组 URL／密钥同时提供所选生成与审核协议的 relay。
 仓库内置四套人格包。守拙的 L0、Soul、L3 与 L4 已按确认资料接入；雾枕、三分甜和星轨仍是临时原型。
 四套人格都投影同一组 Pengine 默认产品参数：6 集、每集约 2 分钟、2—3 场。这些默认值不是任何创作者的剧本观，用户明确要求或锁定生产参数优先。
 
@@ -226,16 +226,16 @@ PENGINE_PERSONA_ROOT=./personas
 PENGINE_DATA_DIR=./data
 PENGINE_HOST=127.0.0.1
 PENGINE_PORT=8000
-PENGINE_RELAY_BASE_URL=https://your-relay.example/v1
+PENGINE_RELAY_BASE_URL=https://openrouter.ai/api/v1
 PENGINE_RELAY_API_KEY=replace-with-your-key
-PENGINE_GENERATION_MODEL_ID=claude-opus-5
-PENGINE_REVIEW_MODEL_ID=claude-opus-5
+PENGINE_GENERATION_MODEL_ID=z-ai/glm-5.3-flash
+PENGINE_REVIEW_MODEL_ID=deepseek/deepseek-v4-flash
 PENGINE_GENERATION_MAX_OUTPUT_TOKENS=128000
-# PENGINE_REVIEW_MAX_OUTPUT_TOKENS=...
+PENGINE_REVIEW_MAX_OUTPUT_TOKENS=128000
 # 已验证的上下文窗口（tokens）。预检会把完整序列化请求 + 保留输出与此上限比较；
 # 未设置时 fail closed，任何真实模型请求都不会发出。
-PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS=200000
-PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS=64000
+PENGINE_GENERATION_CONTEXT_LIMIT_TOKENS=1048576
+PENGINE_REVIEW_CONTEXT_LIMIT_TOKENS=1048576
 PENGINE_STAGE_MODEL_CALL_LIMIT=48
 PENGINE_STAGE_REVIEW_CALL_LIMIT=32
 PENGINE_SCRIPT_STAGE_MODEL_CALL_TOTAL_LIMIT=192
@@ -244,11 +244,11 @@ PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 
 API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localhost`、
 `127.0.0.1` 和 `::1` 可使用 HTTP。`PENGINE_RELAY_BASE_URL` 与
-`PENGINE_RELAY_API_KEY` 同时交给两个客户端；该地址必须同时接受 Anthropic Messages
-和所选审核模型对应的协议。`PENGINE_GENERATION_MODEL_ID` 必须是 `claude-opus-5` 或
-`claude-sonnet-5`；`PENGINE_REVIEW_MODEL_ID` 只能是 `deepseek-v4-flash`、`gpt-5.5`、
-`gpt-5.6-terra`、`claude-opus-5` 或 `claude-sonnet-5`。URL、密钥或任一模型 ID 缺失时，
-工作流会 fail closed，不会降级成单模型，也不会跨角色回退。
+`PENGINE_RELAY_API_KEY` 同时交给两个客户端；该地址必须接受所选模型对应的协议。默认
+OpenRouter 组合是 generation=`z-ai/glm-5.3-flash`、review=
+`deepseek/deepseek-v4-flash`。两个 OpenRouter slug 也都可用于任一角色。兼容模型仍包括
+Claude、GPT 和原生 DeepSeek 的既有白名单。URL、密钥或任一模型 ID 缺失时，工作流会
+fail closed，不会降级成单模型，也不会跨角色回退。
 
 ### 私有服务器入口与账户迁移
 
@@ -263,11 +263,10 @@ API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localho
 `data/pengine.sqlite3` 及其 `-wal` / `-shm` 文件；新版本首次成功启动后再开放 HTTPS 入口。
 该迁移不会自动给历史作品认领账户，也不支持降级；回滚需恢复发布前备份。
 
-生成路由通过 `ChatAnthropic` 调用 Anthropic Messages；
-`PENGINE_GENERATION_MAX_OUTPUT_TOKENS` 默认使用 Opus 5 与 Sonnet 5 支持的最大值
-128000，且不能配置为更大的值。审核路由分别使用 `ChatDeepSeek`、`ChatOpenAI` 或
-`ChatAnthropic`；Sonnet 5 路由省略非默认采样参数，由模型使用 API 默认值。DeepSeek
-路径关闭 thinking，所有审核客户端都串行调用工具。未设置
+OpenRouter 的 GLM 与 DeepSeek 路由通过 `ChatOpenAI` 调用 Chat Completions，生成调用
+保持流式传输、逐调用输出预算和停滞看门狗。GLM 保留端点要求的推理；OpenRouter
+DeepSeek 路由关闭 reasoning。兼容路由继续分别使用 `ChatDeepSeek`、`ChatOpenAI` 或
+`ChatAnthropic`；Sonnet 5 路由省略非默认采样参数。所有客户端都串行调用工具。未设置
 `PENGINE_REVIEW_MAX_OUTPUT_TOKENS` 时 Pengine 不额外添加输出上限。旧的
 `PENGINE_RELAY_ADAPTER`、`PENGINE_RELAY_MODEL_ID` 和
 `PENGINE_RELAY_MAX_OUTPUT_TOKENS` 已不再生效，设置它们不能配置或覆盖任一路由。

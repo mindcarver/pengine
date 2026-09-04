@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover - exercised only without langfuse instal
 from pengine.config import (
     ANTHROPIC_MODEL_IDS,
     OPENROUTER_ANTHROPIC_MODEL_IDS,
+    OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS,
     Settings,
 )
 from pengine.model_calls import (
@@ -54,7 +55,9 @@ from pengine.model_calls import (
 )
 from pengine.observability import record_model_call_event
 
-_AUTO_TOOL_CHOICE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
+_AUTO_TOOL_CHOICE_MODELS = frozenset(
+    {"deepseek-v4-flash", "deepseek-v4-pro", "deepseek/deepseek-v4-flash"}
+)
 # Prompt-cache write floor: blocks under Anthropic's 1024-token minimum never hit.
 _PROMPT_CACHE_MIN_SYSTEM_CHARS = 4_000
 # Bare and OpenRouter-prefixed Claude slugs share one Anthropic route: the
@@ -165,6 +168,7 @@ class _StreamStallWatchdog:
     crawl_min_chars_per_second: float
     _arrival_chars: deque[tuple[float, int]] = field(default_factory=deque)
     _cumulative_chars: int = 0
+    _visible_output_started: bool = False
 
     def reset(self) -> None:
         """Drop all window state so one call's throughput never pollutes the next.
@@ -176,12 +180,22 @@ class _StreamStallWatchdog:
         """
         self._arrival_chars.clear()
         self._cumulative_chars = 0
+        self._visible_output_started = False
 
     def observe(self, chunk: Any, now: float | None = None) -> None:
         moment = now if now is not None else time.monotonic()
-        self._cumulative_chars += _stream_chunk_text_chars(chunk)
+        observed_chars = _stream_chunk_text_chars(chunk)
+        if observed_chars and not self._visible_output_started:
+            # OpenRouter reasoning models can emit heartbeat/reasoning chunks before
+            # LangChain exposes any visible text or tool arguments. Start the crawl
+            # window at the first measurable output; the separate stall timeout still
+            # bounds every wait for the next provider chunk before then.
+            self._arrival_chars.clear()
+            self._visible_output_started = True
+        self._cumulative_chars += observed_chars
         self._arrival_chars.append((moment, self._cumulative_chars))
-        self._require_usable_rate(moment)
+        if self._visible_output_started:
+            self._require_usable_rate(moment)
 
     def _require_usable_rate(self, now: float) -> None:
         window = self.crawl_window_seconds
@@ -207,11 +221,12 @@ class _StreamStallWatchdog:
 
 
 def _stream_chunk_text_chars(chunk: Any) -> int:
-    content = getattr(getattr(chunk, "message", None), "content", None)
+    message = getattr(chunk, "message", None)
+    content = getattr(message, "content", None)
+    total = 0
     if isinstance(content, str):
-        return len(content)
-    if isinstance(content, list):
-        total = 0
+        total += len(content)
+    elif isinstance(content, list):
         for block in content:
             if isinstance(block, dict):
                 text = block.get("text")
@@ -219,7 +234,30 @@ def _stream_chunk_text_chars(chunk: Any) -> int:
                     total += len(text)
             elif isinstance(block, str):
                 total += len(block)
-        return total
+    tool_call_chunks = getattr(message, "tool_call_chunks", None)
+    if isinstance(tool_call_chunks, list):
+        for tool_call in tool_call_chunks:
+            arguments = (
+                tool_call.get("args")
+                if isinstance(tool_call, dict)
+                else getattr(tool_call, "args", None)
+            )
+            if isinstance(arguments, str):
+                total += len(arguments)
+    additional = getattr(message, "additional_kwargs", None)
+    if isinstance(additional, dict):
+        for key in ("reasoning_content", "reasoning", "reasoning_details"):
+            total += _nested_string_chars(additional.get(key))
+    return total
+
+
+def _nested_string_chars(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, Mapping):
+        return sum(_nested_string_chars(item) for item in value.values())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return sum(_nested_string_chars(item) for item in value)
     return 0
 
 
@@ -309,7 +347,7 @@ class _SerialChatAnthropic(ChatAnthropic):
             *self._with_prompt_cache(args), **self._with_call_output_budget(kwargs)
         ):
             completion.observe(chunk)
-            yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
+            yield _deduplicate_stream_terminal_metadata(chunk, seen_model_ids)
         _require_anthropic_stream_completion(completion)
 
     def _generate(self, *args: Any, **kwargs: Any) -> Any:
@@ -327,7 +365,7 @@ class _SerialChatAnthropic(ChatAnthropic):
                 *self._with_prompt_cache(args), **self._with_call_output_budget(kwargs)
             ):
                 completion.observe(chunk)
-                yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
+                yield _deduplicate_stream_terminal_metadata(chunk, seen_model_ids)
             _require_anthropic_stream_completion(completion)
             return
         # The watchdog bounds each wait for the next chunk (first chunk and
@@ -351,7 +389,7 @@ class _SerialChatAnthropic(ChatAnthropic):
                 ) from None
             watchdog.observe(chunk)
             completion.observe(chunk)
-            yield _deduplicate_stream_model_identity(chunk, seen_model_ids)
+            yield _deduplicate_stream_terminal_metadata(chunk, seen_model_ids)
         _require_anthropic_stream_completion(completion)
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
@@ -395,25 +433,30 @@ def _require_anthropic_stream_completion(completion: _AnthropicStreamCompletion)
     raise RelayStreamIncompleteError()
 
 
-def _deduplicate_stream_model_identity(chunk: Any, seen_model_ids: dict[str, str]) -> Any:
-    """Prevent identical stream identity evidence from being string-concatenated.
+def _deduplicate_stream_terminal_metadata(chunk: Any, seen_values: dict[str, str]) -> Any:
+    """Prevent repeated terminal metadata from being string-concatenated.
 
     LangChain concatenates repeated string response metadata while aggregating chunks.
-    A relay that repeats the same Anthropic ``message_start`` would therefore turn
-    ``claude-opus-5`` into ``claude-opus-5claude-opus-5``. Drop only an exact duplicate
-    from a later chunk; differing values remain and fail the downstream identity gate.
+    Some relays repeat Anthropic ``message_start`` or OpenAI-compatible terminal chunks,
+    which would turn one model identity or finish reason into a duplicated string. Drop
+    only exact duplicates from later chunks; differing identities remain and fail the
+    downstream identity gate.
     """
-    metadata = getattr(getattr(chunk, "message", None), "response_metadata", None)
-    if not isinstance(metadata, dict):
-        return chunk
-    for key in ("model", "model_name"):
-        value = metadata.get(key)
-        if not isinstance(value, str) or not value:
+    evidence_maps = (
+        getattr(getattr(chunk, "message", None), "response_metadata", None),
+        getattr(chunk, "generation_info", None),
+    )
+    for evidence in evidence_maps:
+        if not isinstance(evidence, dict):
             continue
-        if seen_model_ids.get(key) == value:
-            metadata.pop(key)
-        else:
-            seen_model_ids[key] = value
+        for key in ("model", "model_name", "finish_reason"):
+            value = evidence.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            if seen_values.get(key) == value:
+                evidence.pop(key)
+            else:
+                seen_values[key] = value
     return chunk
 
 
@@ -431,7 +474,64 @@ class _SerialChatDeepSeek(ChatDeepSeek):
 
 
 class _SerialChatOpenAI(ChatOpenAI):
+    _pengine_model_call_state: ModelCallState | None = PrivateAttr(default=None)
+    _pengine_stream_watchdog: _StreamStallWatchdog | None = PrivateAttr(default=None)
+
+    def __init__(
+        self,
+        *args: Any,
+        pengine_model_call_state: ModelCallState | None = None,
+        pengine_stream_watchdog: _StreamStallWatchdog | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._pengine_model_call_state = pengine_model_call_state
+        self._pengine_stream_watchdog = pengine_stream_watchdog
+
+    def _with_call_output_budget(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        state = self._pengine_model_call_state
+        if state is None or state.context.requested_output_tokens is None:
+            return kwargs
+        configured = self.max_tokens
+        requested = state.context.requested_output_tokens
+        return {**kwargs, "max_tokens": min(configured, requested) if configured else requested}
+
+    def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        seen_model_ids: dict[str, str] = {}
+        for chunk in super()._stream(*args, **self._with_call_output_budget(kwargs)):
+            yield _deduplicate_stream_terminal_metadata(chunk, seen_model_ids)
+
+    async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        seen_model_ids: dict[str, str] = {}
+        watchdog = self._pengine_stream_watchdog
+        stream = super()._astream(*args, **self._with_call_output_budget(kwargs))
+        if watchdog is None:
+            async for chunk in stream:
+                yield _deduplicate_stream_terminal_metadata(chunk, seen_model_ids)
+            return
+        watchdog.reset()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(anext(stream), timeout=watchdog.stall_seconds)
+            except StopAsyncIteration:
+                break
+            except TimeoutError:
+                raise RelayStreamStalledError(
+                    reason="stall",
+                    detail=f"no chunk for {watchdog.stall_seconds:g}s",
+                ) from None
+            watchdog.observe(chunk)
+            yield _deduplicate_stream_terminal_metadata(chunk, seen_model_ids)
+
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
+        tool_choice = kwargs.get("tool_choice")
+        if (
+            self.model_name in _AUTO_TOOL_CHOICE_MODELS
+            and len(tools) > 1
+            and isinstance(tool_choice, str)
+            and tool_choice in {"any", "required"}
+        ):
+            kwargs["tool_choice"] = "auto"
         kwargs["parallel_tool_calls"] = False
         return super().bind_tools(tools, **kwargs)
 
@@ -1499,18 +1599,19 @@ def build_relay_adapter(
         model_id = settings.generation_model_id
         max_output_tokens = settings.generation_max_output_tokens
         context_limit_tokens = settings.generation_context_limit_tokens
-        provider_profile_key = "anthropic"
     else:
         model_id = settings.review_model_id
         max_output_tokens = settings.review_max_output_tokens
         context_limit_tokens = settings.review_context_limit_tokens
-        provider_profile_key = (
-            "anthropic"
-            if model_id in _ANTHROPIC_ROUTE_MODEL_IDS
-            else "openai"
-            if model_id in {"gpt-5.5", "gpt-5.6-terra"}
-            else "deepseek"
-        )
+    provider_profile_key = (
+        "anthropic"
+        if model_id in _ANTHROPIC_ROUTE_MODEL_IDS
+        else "openrouter"
+        if model_id in OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS
+        else "openai"
+        if model_id in {"gpt-5.5", "gpt-5.6-terra"}
+        else "deepseek"
+    )
     if not settings.relay_base_url or not settings.relay_api_key or not model_id:
         raise RelayError(
             code="relay_unavailable",
@@ -1552,11 +1653,16 @@ def build_relay_adapter(
     if model_id not in _TEMPERATURE_OMITTED_MODEL_IDS:
         common["temperature"] = 0
     if role == "review":
-        if model_id in {"gpt-5.5", "gpt-5.6-terra"}:
+        if model_id in {"gpt-5.5", "gpt-5.6-terra"} | OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS:
             return RelayAdapter(
                 model=_SerialChatOpenAI(
                     **common,
                     max_tokens=max_output_tokens,
+                    extra_body=(
+                        {"reasoning": {"enabled": False}}
+                        if model_id == "deepseek/deepseek-v4-flash"
+                        else None
+                    ),
                 ),
                 role=role,
                 model_id=model_id,
@@ -1587,6 +1693,34 @@ def build_relay_adapter(
             provider_profile_key=provider_profile_key,
             model_call_state=model_call_state,
         )
+    stream_watchdog = (
+        _StreamStallWatchdog(
+            stall_seconds=settings.stream_stall_seconds,
+            crawl_window_seconds=settings.stream_crawl_window_seconds,
+            crawl_min_chars_per_second=settings.stream_crawl_min_chars_per_second,
+        )
+        if settings.stream_watchdog_enabled
+        else None
+    )
+    if model_id in OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS:
+        return RelayAdapter(
+            model=_SerialChatOpenAI(
+                **common,
+                max_tokens=max_output_tokens,
+                extra_body=(
+                    {"reasoning": {"enabled": False}}
+                    if model_id == "deepseek/deepseek-v4-flash"
+                    else None
+                ),
+                pengine_model_call_state=model_call_state,
+                pengine_stream_watchdog=stream_watchdog,
+                streaming=True,
+            ),
+            role=role,
+            model_id=model_id,
+            provider_profile_key=provider_profile_key,
+            model_call_state=model_call_state,
+        )
     return RelayAdapter(
         model=_SerialChatAnthropic(
             **common,
@@ -1594,15 +1728,7 @@ def build_relay_adapter(
             thinking={"type": "disabled"},
             pengine_model_call_state=model_call_state,
             pengine_prompt_cache_enabled=settings.prompt_cache_enabled,
-            pengine_stream_watchdog=(
-                _StreamStallWatchdog(
-                    stall_seconds=settings.stream_stall_seconds,
-                    crawl_window_seconds=settings.stream_crawl_window_seconds,
-                    crawl_min_chars_per_second=settings.stream_crawl_min_chars_per_second,
-                )
-                if settings.stream_watchdog_enabled
-                else None
-            ),
+            pengine_stream_watchdog=stream_watchdog,
             # The relay 408s non-streaming requests at ~300s; long generation
             # calls (episode outlines/scripts) legitimately exceed that, so
             # stream and aggregate. model_timeout_seconds then bounds the gap
