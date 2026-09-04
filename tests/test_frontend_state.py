@@ -14,6 +14,122 @@ def test_queue_positions_are_rendered_in_detail_revision_and_library() -> None:
     assert 'id="creations-title" tabindex="-1"' in page
 
 
+def test_library_selection_is_scoped_to_the_selected_creation() -> None:
+    script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
+    assertions = """
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+const requests = new Map();
+apiRequest = (path) => {
+  const request = deferred();
+  requests.set(path, request);
+  return request.promise;
+};
+stopPolling = () => {};
+showWorkbench = () => {};
+renderCreation = () => {};
+readReadingHash = () => null;
+writeCurrentCreationId = () => {};
+
+const formalRun = (marker) => ({
+  state: "succeeded",
+  result: { content_package: { story_outline: marker } },
+});
+const resource = (marker) => ({
+  marker,
+  initial: formalRun(marker),
+  revision: { state: "unavailable" },
+});
+
+state.creationId = "creation-a";
+state.creation = null;
+state.loadingCreationId = "";
+state.presentations = { initial: { marker: "cached-a" }, revision: null };
+state.presentationLoading = { initial: "", revision: "" };
+state.readingPositions = {};
+
+const staleDetail = refreshCreation({ isRestore: true });
+if (!requests.has("/creations/creation-a")) throw new Error("first detail was not requested");
+const selectedDetail = openCreationFromLibrary("creation-b");
+if (!requests.has("/creations/creation-b")) throw new Error("selected detail was not requested");
+if (state.presentations.initial !== null) {
+  throw new Error("previous delivery cache survived switch");
+}
+
+requests.get("/creations/creation-a").resolve(resource("a"));
+await staleDetail;
+if (state.creation?.marker === "a") throw new Error("stale detail replaced selected creation");
+
+requests.get("/creations/creation-b").resolve(resource("b"));
+await selectedDetail;
+if (state.creationId !== "creation-b" || state.creation?.marker !== "b") {
+  throw new Error("selected creation detail was not rendered");
+}
+
+state.workspaceView = "progress";
+state.creationId = "creation-a";
+state.creation = resource("a");
+state.presentations = { initial: null, revision: null };
+state.presentationLoading = { initial: "", revision: "" };
+const stalePresentation = loadPresentation("initial");
+const stalePresentationPath = "/creations/creation-a/runs/initial/presentation";
+if (!requests.has(stalePresentationPath)) throw new Error("first presentation was not requested");
+
+state.creationId = "creation-b";
+state.creation = resource("b");
+state.presentations = { initial: null, revision: null };
+state.presentationLoading = { initial: "", revision: "" };
+const selectedPresentation = loadPresentation("initial");
+const selectedPresentationPath = "/creations/creation-b/runs/initial/presentation";
+if (!requests.has(selectedPresentationPath)) {
+  throw new Error("selected presentation was not requested");
+}
+
+requests.get(stalePresentationPath).resolve({ marker: "presentation-a" });
+await stalePresentation;
+if (state.presentations.initial !== null) {
+  throw new Error("stale presentation replaced selected delivery");
+}
+
+requests.get(selectedPresentationPath).resolve({ marker: "presentation-b" });
+await selectedPresentation;
+if (state.presentations.initial?.marker !== "presentation-b") {
+  throw new Error("selected presentation was not retained");
+}
+"""
+    harness = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(script_path))}, "utf8");
+const context = {{
+  document: {{ addEventListener() {{}} }},
+  window: {{}},
+  crypto: {{ randomUUID() {{ return "test-id"; }} }},
+  console,
+}};
+const result = vm.runInNewContext(
+  source + "\\n(async () => {{" + {json.dumps(assertions)} + "}})()",
+  context,
+);
+Promise.resolve(result).catch((error) => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+
+    result = subprocess.run(
+        ["node", "-e", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_library_delete_requires_confirmation_and_resets_open_creation() -> None:
     script_path = Path(__file__).parents[1] / "src" / "pengine" / "web" / "app.js"
     assertions = """

@@ -130,11 +130,11 @@ const state = {
   activeDraftRunKind: "",
   activeEpisode: null,
   presentations: { initial: null, revision: null },
-  presentationLoading: { initial: false, revision: false },
+  presentationLoading: { initial: "", revision: "" },
   readingPositions: readReadingPositions(),
   pollTimer: null,
   libraryNotice: "",
-  loadingCreation: false,
+  loadingCreationId: "",
   pendingFeedback: "",
   progressRunKind: "",
   runControlBusy: false,
@@ -575,18 +575,37 @@ function renderCreationList(items) {
       <strong>故事：${escapeHtml(item.story_excerpt)}</strong>
       <time datetime="${escapeHtml(item.updated_at)}">更新于 ${escapeHtml(updated)}</time>
     `;
-    button.addEventListener("click", () => {
-      state.creationId = item.creation_id;
-      state.creation = null;
-      writeCurrentCreationId(item.creation_id);
-      state.workspaceView = "progress";
-      showWorkbench();
-      renderCreation();
-      void refreshCreation({ isRestore: true });
-    });
+    button.addEventListener("click", () => void openCreationFromLibrary(item.creation_id));
     row.append(button, createCreationDeleteButton(item));
     elements["creation-list"].append(row);
   }
+}
+
+async function openCreationFromLibrary(creationId) {
+  stopPolling();
+  state.creationId = creationId;
+  state.creation = null;
+  const hashPosition = readReadingHash(creationId);
+  state.activeVersion =
+    hashPosition?.version || state.readingPositions[`${creationId}:activeVersion`] || "initial";
+  state.activeArtifact =
+    hashPosition?.artifact ||
+    state.readingPositions[`${creationId}:${state.activeVersion}:activeArtifact`] ||
+    "story_outline";
+  if (hashPosition?.itemId) {
+    state.readingPositions[`${creationId}:${state.activeVersion}:${state.activeArtifact}`] =
+      hashPosition.itemId;
+  }
+  state.activeDraftRunKind = "";
+  state.activeEpisode = null;
+  state.presentations = { initial: null, revision: null };
+  state.presentationLoading = { initial: "", revision: "" };
+  state.pendingFeedback = "";
+  writeCurrentCreationId(creationId);
+  state.workspaceView = "progress";
+  showWorkbench();
+  renderCreation();
+  await refreshCreation({ isRestore: true });
 }
 
 function createCreationDeleteButton(item) {
@@ -830,7 +849,7 @@ async function handleCreate(event) {
     state.activeDraftRunKind = "";
     state.activeEpisode = null;
     state.presentations = { initial: null, revision: null };
-    state.presentationLoading = { initial: false, revision: false };
+    state.presentationLoading = { initial: "", revision: "" };
     state.pendingFeedback = "";
     writeCurrentCreationId(state.creationId);
     setWorkspaceView("progress");
@@ -964,18 +983,20 @@ async function handleQualityRejectionControl(action) {
 }
 
 async function refreshCreation(options = {}) {
-  if (!state.creationId || state.loadingCreation) {
+  const creationId = state.creationId;
+  if (!creationId || state.loadingCreationId === creationId) {
     return false;
   }
 
-  state.loadingCreation = true;
+  state.loadingCreationId = creationId;
   stopPolling();
   let refreshed = false;
 
   try {
-    const resource = await apiRequest(
-      `/creations/${encodeURIComponent(state.creationId)}`,
-    );
+    const resource = await apiRequest(`/creations/${encodeURIComponent(creationId)}`);
+    if (state.creationId !== creationId) {
+      return false;
+    }
     state.creation = resource;
     refreshed = true;
     if (options.isRestore) {
@@ -987,6 +1008,9 @@ async function refreshCreation(options = {}) {
       schedulePoll();
     }
   } catch (error) {
+    if (state.creationId !== creationId) {
+      return false;
+    }
     if (error instanceof ApiError && error.status === 404) {
       clearCurrentCreationId();
       state.creationId = "";
@@ -1000,7 +1024,9 @@ async function refreshCreation(options = {}) {
       }
     }
   } finally {
-    state.loadingCreation = false;
+    if (state.loadingCreationId === creationId) {
+      state.loadingCreationId = "";
+    }
   }
   return refreshed;
 }
@@ -1668,25 +1694,32 @@ function selectedRun() {
 }
 
 async function loadPresentation(kind) {
+  const creationId = state.creationId;
   const run = kind === "revision" ? state.creation?.revision : state.creation?.initial;
   if (
-    !state.creationId ||
+    !creationId ||
     !isFormalRun(run) ||
     state.presentations[kind] ||
-    state.presentationLoading[kind]
+    state.presentationLoading[kind] === creationId
   ) {
     return;
   }
-  state.presentationLoading[kind] = true;
+  state.presentationLoading[kind] = creationId;
   if (!state.presentations[kind] && elements["presentation-status"]) {
     elements["presentation-status"].textContent = "正在整理";
   }
   try {
     const presentation = await apiRequest(
-      `/creations/${encodeURIComponent(state.creationId)}/runs/${kind}/presentation`,
+      `/creations/${encodeURIComponent(creationId)}/runs/${kind}/presentation`,
     );
+    if (state.creationId !== creationId) {
+      return;
+    }
     state.presentations[kind] = presentation;
   } catch (error) {
+    if (state.creationId !== creationId) {
+      return;
+    }
     if (!state.presentations[kind] && elements["presentation-status"]) {
       elements["presentation-status"].textContent = "完整原文";
     }
@@ -1694,8 +1727,14 @@ async function loadPresentation(kind) {
       showToast(`成品目录读取失败：${formatError(error)}`);
     }
   } finally {
-    state.presentationLoading[kind] = false;
-    if (state.workspaceView === "reading" && state.activeVersion === kind) {
+    if (state.presentationLoading[kind] === creationId) {
+      state.presentationLoading[kind] = "";
+    }
+    if (
+      state.creationId === creationId &&
+      state.workspaceView === "reading" &&
+      state.activeVersion === kind
+    ) {
       renderArtifact();
     }
   }
