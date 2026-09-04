@@ -1365,6 +1365,28 @@ def test_specific_http_400_request_failures_remain_terminal(
     assert retryable_relay_interruption(error) is None
 
 
+def test_classify_relay_exception_400_field_required_is_retryable_upstream_variance() -> None:
+    """A pool-variant upstream rejecting a standard request with "<path>: Field
+    required" (e.g. thinking) stays relay_rejected but is retryable: the same
+    request succeeds on other rotating-pool draws."""
+    request = httpx.Request("POST", "https://relay.example/v1/messages")
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "messages.0.content.0.thinking: Field required",
+        },
+    }
+    response = httpx.Response(400, request=request, json=body)
+    error = anthropic.BadRequestError("bad", response=response, body=body)
+
+    mapped = classify_relay_exception(error)
+
+    assert mapped.http_status == 400
+    assert mapped.code == "relay_rejected"
+    assert retryable_relay_interruption(error) is not None
+
+
 def test_classify_relay_exception_400_tool_protocol_keeps_incompatible() -> None:
     """A provider 400 that does reject the tool protocol stays relay_incompatible,
     but now carries the precise status and truthful provider detail."""
