@@ -12819,15 +12819,20 @@ async def test_missing_stage_token_recovery_preserves_declared_stage_guards() ->
             handler,
         )
 
-    with pytest.raises(AgentProtocolError, match="wrong subagent"):
-        await middleware.awrap_tool_call(
-            request(
-                "[stage=selecting_l0_variant] wrong owner",
-                "episode_planner",
-                "call-wrong-owner",
-            ),
-            handler,
-        )
+    wrong_owner = await middleware.awrap_tool_call(
+        request(
+            "[stage=selecting_l0_variant] wrong owner",
+            "episode_planner",
+            "call-wrong-owner",
+        ),
+        handler,
+    )
+    assert isinstance(wrong_owner, ToolMessage)
+    assert wrong_owner.status == "error"
+    wrong_owner_payload = json.loads(str(wrong_owner.content))
+    assert wrong_owner_payload["error"] == "wrong_subagent"
+    assert wrong_owner_payload["expected_stage"] == "selecting_l0_variant"
+    assert wrong_owner_payload["expected_subagent_type"] == "story_architect"
 
     out_of_order = await middleware.awrap_tool_call(
         request(

@@ -1480,11 +1480,12 @@ class Worker:
                         str(exc)[:200],
                     )
                     return
-                # Preserve the pre-existing recoverable-episode pause path.
-                if (
-                    failure_stage is InternalStage.GENERATING_EPISODE_SCRIPTS
-                    and await self._pause_recoverable_episode_error(work, failure_stage, exc)
-                ):
+                # Preserve the pre-existing recoverable-episode pause path. A
+                # protocol flake raised while replaying an already-approved
+                # stage (e.g. a supervisor routing slip after Continue) must
+                # not terminal-kill a run that already holds committed
+                # episodes; the helper pauses the current episode instead.
+                if await self._pause_recoverable_episode_error(work, failure_stage, exc):
                     return
                 failure = await self._safe_failure(work.run_id, failure_stage, exc)
                 await self.repository.fail_run(work.run_id, failure)
@@ -1717,7 +1718,11 @@ class Worker:
         stage: InternalStage,
         exc: Exception,
     ) -> bool:
-        if stage is not InternalStage.GENERATING_EPISODE_SCRIPTS or isinstance(
+        # Gate on durable script progress, not on the exception's declared
+        # stage: a flake surfacing during an approved-stage replay (outline
+        # or earlier) still leaves the remaining episodes as the unit of
+        # retry, so a mid-season run is continuable instead of terminal.
+        if isinstance(
             exc,
             (
                 CheckpointUnavailableError,
@@ -1732,12 +1737,25 @@ class Worker:
         ):
             return False
         refreshed = await self.repository.get_run_work_item(work.run_id)
+        if not refreshed.episode_drafts:
+            return False
         episode_number = len(refreshed.episode_drafts) + 1
         if episode_number > len(refreshed.episode_plans):
             return False
         attempts = await self.repository.get_episode_attempt_counts(work.run_id)
         attempt_count = attempts.get(episode_number, 0)
-        if attempt_count == 0 or attempt_count >= 3:
+        if attempt_count == 0:
+            # A flake before the writer's first recorded attempt (for example
+            # a supervisor routing slip on resume) still consumes one attempt,
+            # mirroring the scripts-stage failure accounting in _safe_failure.
+            try:
+                attempt_count = await self.repository.record_episode_attempt(
+                    work.run_id,
+                    episode_number,
+                )
+            except DomainError:
+                return False
+        if attempt_count >= 3:
             return False
         safe_message = _episode_error_message(exc)
         await self.repository.pause_episode_error(
@@ -1746,10 +1764,11 @@ class Worker:
             safe_message=safe_message,
         )
         logger.warning(
-            "episode execution paused run_id=%s creation_id=%s episode=%s "
+            "episode execution paused run_id=%s creation_id=%s stage=%s episode=%s "
             "error_type=%s error=%s safe_message=%s",
             work.run_id,
             work.creation_id,
+            stage.value,
             episode_number,
             type(exc).__name__,
             str(exc),
