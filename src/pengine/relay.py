@@ -207,6 +207,8 @@ class _StreamStallWatchdog:
 
 
 def _stream_chunk_text_chars(chunk: Any) -> int:
+    # Structured-output calls stream their payload as tool-argument JSON
+    # (``input_json_delta.partial_json``), not ``text``; both count as progress.
     content = getattr(getattr(chunk, "message", None), "content", None)
     if isinstance(content, str):
         return len(content)
@@ -214,9 +216,10 @@ def _stream_chunk_text_chars(chunk: Any) -> int:
         total = 0
         for block in content:
             if isinstance(block, dict):
-                text = block.get("text")
-                if isinstance(text, str):
-                    total += len(text)
+                for key in ("text", "partial_json"):
+                    value = block.get(key)
+                    if isinstance(value, str):
+                        total += len(value)
             elif isinstance(block, str):
                 total += len(block)
         return total
@@ -734,12 +737,16 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         )
         _MODEL_CALL_LOGGER.info(
             "model_call event=end role=%s requested_model_id=%s response_model_id=%s "
-            "identity_match=%s call_id=%s usage_status=%s finish_reason=%s",
+            "identity_match=%s call_id=%s stage=%s episode=%s duration=%ss "
+            "usage_status=%s finish_reason=%s",
             self.role,
             self.model_id,
             sorted_response_model_ids[0],
             identity_match,
             physical_call_id,
+            record.stage if record is not None else "none",
+            record.episode_number if record is not None else "none",
+            round(record.duration_seconds or 0.0, 1) if record is not None else "none",
             usage_status_from(tokens) if record is not None else "unavailable",
             finish_reason,
         )
@@ -789,14 +796,20 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 repair_round=repair_round,
             )
         _MODEL_CALL_LOGGER.warning(
-            "model_call event=error role=%s requested_model_id=%s call_id=%s "
-            "error_type=%s http_status=%s provider_error_code=%s redacted_response=%s",
+            "model_call event=error role=%s requested_model_id=%s call_id=%s stage=%s "
+            "episode=%s duration=%ss error_code=%s error_type=%s http_status=%s "
+            "provider_error_code=%s message=%s redacted_response=%s",
             self.role,
             self.model_id,
             physical_call_id,
+            record.stage if record is not None else "none",
+            record.episode_number if record is not None else "none",
+            round(record.duration_seconds or 0.0, 1) if record is not None else "none",
+            mapped_error.code,
             type(error).__name__,
             http_status if http_status is not None else "none",
             provider_error_code if provider_error_code is not None else "none",
+            mapped_error.safe_message,
             _truncate(redacted_body, 300) if redacted_body else "none",
         )
 

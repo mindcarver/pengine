@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
+import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict
@@ -463,10 +465,17 @@ class Worker:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                # Frame locations only: exception messages and source lines may
+                # carry request data, so they stay out of logs (see
+                # test_background_worker_recovers_after_transient_iteration_failure).
                 logger.error(
-                    "worker iteration failed worker_id=%s error_type=%s",
+                    "worker iteration failed worker_id=%s error_type=%s trace=%s",
                     self.worker_id,
                     type(exc).__name__,
+                    "; ".join(
+                        f"{frame.filename}:{frame.lineno}:{frame.name}"
+                        for frame in traceback.extract_tb(exc.__traceback__)
+                    ),
                 )
                 worked = False
             if worked:
@@ -775,6 +784,8 @@ class Worker:
                             "The durable workflow checkpoint is missing."
                         )
 
+                stage_started_at: dict[InternalStage, float] = {}
+
                 async def before_stage(stage: InternalStage) -> int:
                     nonlocal current_stage
                     current_stage = stage
@@ -783,6 +794,13 @@ class Worker:
                         model_call_state.context.episode_number = None
                         model_call_state.context.operation_id = new_operation_id()
                     attempt = await self.repository.record_stage_attempt(work.run_id, stage)
+                    stage_started_at[stage] = time.monotonic()
+                    logger.info(
+                        "stage started run_id=%s stage=%s attempt=%s",
+                        work.run_id,
+                        stage.value,
+                        attempt,
+                    )
                     open_stage_observation(stage, attempt)
                     return attempt
 
@@ -820,6 +838,13 @@ class Worker:
                     )
                     approved[stage] = approved_payload
                     close_stage_observation(status="approved")
+                    started = stage_started_at.pop(stage, None)
+                    logger.info(
+                        "stage approved run_id=%s stage=%s duration=%s",
+                        work.run_id,
+                        stage.value,
+                        f"{time.monotonic() - started:.1f}s" if started is not None else "unknown",
+                    )
                     if stage is InternalStage.GENERATING_EPISODE_OUTLINE:
                         await self._sync_series_bible(work, approved)
                         if model_call_state is not None:
@@ -842,10 +867,17 @@ class Worker:
                         model_call_state.context.episode_number = plan.episode_number
                         if new_operation:
                             model_call_state.context.operation_id = new_operation_id()
-                    return await self.repository.record_episode_attempt(
+                    attempt = await self.repository.record_episode_attempt(
                         work.run_id,
                         plan.episode_number,
                     )
+                    logger.info(
+                        "episode started run_id=%s episode=%s attempt=%s",
+                        work.run_id,
+                        plan.episode_number,
+                        attempt,
+                    )
+                    return attempt
 
                 async def load_outline_season_map() -> Mapping[str, Any] | None:
                     return await self.repository.get_outline_season_map(work.run_id)
@@ -1659,6 +1691,7 @@ class Worker:
                     failure.failed_stage.value,
                     failure.code,
                     _exception_type_chain(exc),
+                    exc_info=exc,
                 )
             finally:
                 close_stage_observation(status="failed")

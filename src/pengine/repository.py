@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -105,6 +106,7 @@ from pengine.series_review import (
 SCHEMA_VERSION = 33
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
+logger = logging.getLogger(__name__)
 # Failure codes an operator can resolve before reviving a terminally failed
 # initial run: relay quota/availability, or a deterministic stage failure whose
 # cause was fixed (the run re-enters through its approved checkpoints).
@@ -4734,6 +4736,18 @@ class Repository:
                 if timeout_count == 1
                 else "paused"
             )
+            logger.warning(
+                "episode interruption run_id=%s episode=%s reason=%s attempt_count=%s/%s "
+                "attempt_cycle=%s timeout_count=%s next_state=%s",
+                run_id,
+                episode_number,
+                recovery_reason,
+                attempt_count,
+                MAX_EPISODE_ATTEMPTS,
+                attempt_cycle,
+                timeout_count,
+                next_state,
+            )
             await connection.execute(
                 """
                 INSERT INTO episode_timeouts(run_id, episode_number, timeout_count, updated_at)
@@ -8245,6 +8259,18 @@ class Repository:
                 else "paused"
             )
             elapsed_seconds = self._elapsed_seconds(progress, current)
+            logger.warning(
+                "run interruption run_id=%s stage=%s reason=%s attempt_count=%s/%s "
+                "timeout_count=%s grouped_outline_resume=%s next_state=%s",
+                run_id,
+                stage.value,
+                recovery_reason,
+                attempt_count,
+                MAX_STAGE_ATTEMPTS,
+                timeout_count,
+                grouped_outline_resume,
+                next_state,
+            )
             if next_state == "failed":
                 await self._mark_attempts_exhausted(
                     connection,

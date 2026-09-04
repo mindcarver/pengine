@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     data_dir: Path = Path("data")
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
+    log_level: str = "INFO"
     relay_base_url: str | None = None
     relay_api_key: SecretStr | None = None
     generation_model_id: str | None = None

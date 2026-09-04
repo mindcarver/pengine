@@ -575,6 +575,50 @@ async def test_stream_watchdog_lets_healthy_stream_finish(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_watchdog_counts_tool_call_json_as_progress(monkeypatch) -> None:
+    """A healthy structured-output stream must not be judged as crawling.
+
+    Every generation call uses ``with_structured_output``/``bind_tools``, so the
+    model's text arrives as ``input_json_delta`` blocks with ``partial_json`` and
+    no ``text`` field. Counting only ``text`` made every long tool stream read as
+    0.00 chars/s and abort once the crawl window filled (~82s in production).
+    """
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        for _ in range(40):
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content=[
+                        {"type": "input_json_delta", "partial_json": '{"大纲":"内容"}', "index": 0}
+                    ],
+                    tool_call_chunks=[
+                        {"index": 0, "id": None, "name": None, "args": '{"大纲":"内容"}'}
+                    ],
+                )
+            )
+            await asyncio.sleep(0.01)
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content=[],
+                usage_metadata={"input_tokens": 1, "output_tokens": 200, "total_tokens": 201},
+            )
+        )
+
+    monkeypatch.setattr(ChatAnthropic, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            stream_stall_seconds=1.0,
+            stream_crawl_window_seconds=0.2,
+            stream_crawl_min_chars_per_second=2.0,
+        ),
+        role="generation",
+    )
+    chunks = [chunk async for chunk in model._astream([])]
+    assert len(chunks) == 41
+
+
+@pytest.mark.asyncio
 async def test_stream_watchdog_window_does_not_leak_across_calls(monkeypatch) -> None:
     """A previous call's trickling tail must not abort the next healthy call.
 
