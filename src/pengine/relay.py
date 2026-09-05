@@ -827,17 +827,22 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
             )
             if self.state is not None:
                 self.state.remember_succeeded(record)
+        response_model_id = (
+            sorted_response_model_ids[0] if sorted_response_model_ids else "unreported"
+        )
         identity_match = (
             "exact"
-            if sorted_response_model_ids[0].casefold() == self.model_id.casefold()
+            if response_model_id.casefold() == self.model_id.casefold()
             else "explicit_equivalent"
+            if sorted_response_model_ids
+            else "unreported_openrouter"
         )
         _MODEL_CALL_LOGGER.info(
             "model_call event=end role=%s requested_model_id=%s response_model_id=%s "
             "identity_match=%s call_id=%s usage_status=%s finish_reason=%s",
             self.role,
             self.model_id,
-            sorted_response_model_ids[0],
+            response_model_id,
             identity_match,
             physical_call_id,
             usage_status_from(tokens) if record is not None else "unavailable",
@@ -1055,6 +1060,10 @@ def _response_model_identity_matches(
     requested_model_id: str,
     response_model_ids: set[str],
 ) -> bool:
+    if not response_model_ids and requested_model_id in OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS:
+        # OpenRouter chat-completions streams occasionally end without terminal model
+        # metadata. Absence is not misrouting; a present-but-wrong identity still fails.
+        return True
     if len(response_model_ids) != 1:
         return False
     requested = requested_model_id.casefold()
