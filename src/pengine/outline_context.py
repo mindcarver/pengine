@@ -29,7 +29,7 @@ from pengine.schemas import EpisodePlan
 from pengine.series_bible import ScriptGenerationGroup, validate_script_generation_groups
 
 OUTLINE_CONTEXT_SCHEMA_VERSION = 1
-SEASON_MAP_OUTPUT_TOKENS = 24_576
+SEASON_MAP_OUTPUT_TOKENS = 49_152
 OUTLINE_GROUP_OUTPUT_BASE_TOKENS = 4_096
 OUTLINE_GROUP_OUTPUT_TOKENS_PER_EPISODE = 4_096
 
