@@ -783,6 +783,39 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         response_model_ids = _response_model_ids(response)
         sorted_response_model_ids = sorted(response_model_ids)
         tokens, finish_reason = extract_provider_usage(response)
+        if (
+            not response_model_ids
+            and finish_reason is None
+            and not tokens
+            and self.model_id in OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS
+        ):
+            # OpenRouter sometimes drops a big stream with a clean EOF: no content
+            # events, no terminal model identity, no usage. LangChain surfaces that
+            # as a "successful" empty response; treat it as the transport failure it
+            # physically is and recover it through the same bounded path as the
+            # Anthropic incomplete stream instead of flowing an empty payload on.
+            incomplete = RelayStreamIncompleteError()
+            if record is not None:
+                self._finalize(
+                    record,
+                    status="failed",
+                    outcome="failure",
+                    tokens=tokens,
+                    finish_reason=finish_reason,
+                    error_code=incomplete.code,
+                    error_type="RelayStreamIncompleteError",
+                    safe_message=incomplete.safe_message,
+                    response_model_ids=sorted_response_model_ids,
+                    sequence=sequence,
+                    repair_round=repair_round,
+                )
+            _MODEL_CALL_LOGGER.error(
+                "model_call event=degenerate_empty_stream role=%s requested_model_id=%s call_id=%s",
+                self.role,
+                self.model_id,
+                physical_call_id,
+            )
+            raise incomplete from None
         if not _response_model_identity_matches(self.model_id, response_model_ids):
             identity_error = RelayIdentityError(
                 role=self.role,
