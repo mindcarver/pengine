@@ -1694,12 +1694,18 @@ def build_relay_adapter(
     # the existing routes.
     if model_id not in _TEMPERATURE_OMITTED_MODEL_IDS:
         common["temperature"] = 0
+    # langchain-openai's per-chunk timer defaults to 120s and does not count
+    # OpenRouter's SSE comment heartbeats, so a cold prefill longer than the
+    # default is killed mid-stream. Keep this ceiling at or above both the
+    # request timeout and the stall watchdog so those bounds always bind first.
+    chunk_timeout = max(settings.model_timeout_seconds, settings.stream_stall_seconds)
     if role == "review":
         if model_id in {"gpt-5.5", "gpt-5.6-terra"} | OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS:
             return RelayAdapter(
                 model=_SerialChatOpenAI(
                     **common,
                     max_tokens=max_output_tokens,
+                    stream_chunk_timeout=chunk_timeout,
                     extra_body=(
                         {"reasoning": {"enabled": False}}
                         if model_id == "deepseek/deepseek-v4-flash"
@@ -1749,6 +1755,7 @@ def build_relay_adapter(
             model=_SerialChatOpenAI(
                 **common,
                 max_tokens=max_output_tokens,
+                stream_chunk_timeout=chunk_timeout,
                 extra_body=(
                     {"reasoning": {"enabled": False}}
                     if model_id == "deepseek/deepseek-v4-flash"
