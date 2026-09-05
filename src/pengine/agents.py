@@ -5987,6 +5987,7 @@ class StageGuardMiddleware(AgentMiddleware):
                         args,
                     )
                 except (OutlineContextError, ValidationError) as exc:
+                    logger.warning("grouped outline validation failed: %s", exc)
                     raise AgentProtocolError(
                         "Grouped episode-outline validation failed",
                         stage=stage,
