@@ -123,9 +123,9 @@ Pengine 是一个**私有服务器、单进程、5 槽 Worker 池、SQLite 持�
 角色绑定由运行时建立，不能用环境变量把审核角色切换成生成角色。当前配置合同是：
 
 ```text
-generation = ChatOpenAI    / OpenRouter / z-ai/glm-5.3-flash 或 deepseek/deepseek-v4-flash
+generation = ChatOpenAI    / OpenRouter / deepseek/deepseek-v4-flash（默认）或 z-ai/glm-5.3-flash
            | ChatAnthropic / Anthropic Messages / claude-opus-5 或 claude-sonnet-5（兼容）
-review     = ChatOpenAI    / OpenRouter / deepseek/deepseek-v4-flash 或 z-ai/glm-5.3-flash
+review     = ChatOpenAI    / OpenRouter / deepseek/deepseek-v4-flash（默认）或 z-ai/glm-5.3-flash
            | ChatDeepSeek  / deepseek-v4-flash
           | ChatOpenAI    / gpt-5.5 或 gpt-5.6-terra
            | ChatAnthropic / claude-opus-5 或 claude-sonnet-5（兼容）

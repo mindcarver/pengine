@@ -74,9 +74,9 @@ Pengine 把一个自由表达的故事想法、短剧要求和一份版本化人
 </div>
 
 模型 relay 共享一组 URL 和 API key，但角色路由固定分离。默认经 OpenRouter 使用
-`z-ai/glm-5.3-flash` 生成、`deepseek/deepseek-v4-flash` 审核；两者都走
-OpenAI-compatible Chat Completions。Claude、GPT 与原生 DeepSeek 路由暂时保留兼容，
-但任一路由失败都不会自动回退到另一模型。
+单一模型 `deepseek/deepseek-v4-flash` 同时承担生成与审核；走
+OpenAI-compatible Chat Completions。Claude、GPT、原生 DeepSeek 与 GLM 路由暂时保留
+兼容，但任一路由失败都不会自动回退到另一模型。
 两类角色不互换，也不在一路失败时自动回退到另一路。
 
 当前仓库内置的四套人格包是可运行的原型数据，不等于生产人格定稿。人格源文件只读；创建任务会建立不可变快照，后续修改源目录不会改变已经创建的任务。

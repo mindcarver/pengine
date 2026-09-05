@@ -2,9 +2,9 @@
 
 This test starts a real Pengine server on a random loopback port, copies no
 shared database state, and calls both configured model routes from the current
-environment or repository `.env`. The default OpenRouter pair uses
-`z-ai/glm-5.3-flash` for generation and creative repair, and
-`deepseek/deepseek-v4-flash` for review, over OpenAI-compatible Chat Completions.
+environment or repository `.env`. The default OpenRouter setup uses the single
+model `deepseek/deepseek-v4-flash` for generation, creative repair, and review,
+over OpenAI-compatible Chat Completions.
 Both OpenRouter slugs may be assigned to either role. Existing Claude, GPT, and
 native DeepSeek routes remain compatibility options. Pengine selects the matching
 OpenRouter, DeepSeek, OpenAI, or Anthropic client. Both routes use the same
@@ -18,7 +18,7 @@ Required model settings are:
 ```dotenv
 PENGINE_RELAY_BASE_URL=https://openrouter.ai/api/v1
 PENGINE_RELAY_API_KEY=replace-with-your-key
-PENGINE_GENERATION_MODEL_ID=z-ai/glm-5.3-flash
+PENGINE_GENERATION_MODEL_ID=deepseek/deepseek-v4-flash
 PENGINE_REVIEW_MODEL_ID=deepseek/deepseek-v4-flash
 ```
 

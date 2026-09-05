@@ -21,10 +21,10 @@
 Pengine V1 是一个带同源 Web 原型的本地短剧创作 Agent。它通过
 [Deep Agents](https://github.com/langchain-ai/deepagents) 与 LangGraph，
 让阶段化专业 Agent 按固定流程协作；业务状态、检查点和交付物全部落在本地
-SQLite。模型请求共用一组 relay URL 与密钥，但按角色固定为两条路由。OpenRouter 是默认
-入口：生成与创作修复使用 `z-ai/glm-5.3-flash`，审核使用
-`deepseek/deepseek-v4-flash`；两者都走 OpenAI-compatible Chat Completions。现有 Claude、
-GPT 与原生 DeepSeek 路由暂时保留为兼容选项，不参与静默回退。
+SQLite。模型请求共用一组 relay URL 与密钥，但按角色固定路由。OpenRouter 是默认
+入口：生成、创作修复与审核统一使用单一模型 `deepseek/deepseek-v4-flash`，走
+OpenAI-compatible Chat Completions。现有 Claude、GPT、原生 DeepSeek 与
+`z-ai/glm-5.3-flash` 路由暂时保留为兼容选项，不参与静默回退。
 
 Web 创作台通过用户名和密码建立账户，并以 7 天可撤销的安全 Cookie 隔离每个账户的作品；
 它以约 1.8 秒轮询展示后端确认的六个用户阶段进度、已运行时长和超时恢复操作。V1 仍不提供
@@ -228,7 +228,7 @@ PENGINE_HOST=127.0.0.1
 PENGINE_PORT=8000
 PENGINE_RELAY_BASE_URL=https://openrouter.ai/api/v1
 PENGINE_RELAY_API_KEY=replace-with-your-key
-PENGINE_GENERATION_MODEL_ID=z-ai/glm-5.3-flash
+PENGINE_GENERATION_MODEL_ID=deepseek/deepseek-v4-flash
 PENGINE_REVIEW_MODEL_ID=deepseek/deepseek-v4-flash
 PENGINE_GENERATION_MAX_OUTPUT_TOKENS=128000
 PENGINE_REVIEW_MAX_OUTPUT_TOKENS=128000
@@ -245,8 +245,8 @@ PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localhost`、
 `127.0.0.1` 和 `::1` 可使用 HTTP。`PENGINE_RELAY_BASE_URL` 与
 `PENGINE_RELAY_API_KEY` 同时交给两个客户端；该地址必须接受所选模型对应的协议。默认
-OpenRouter 组合是 generation=`z-ai/glm-5.3-flash`、review=
-`deepseek/deepseek-v4-flash`。两个 OpenRouter slug 也都可用于任一角色。兼容模型仍包括
+OpenRouter 组合是单一模型 `deepseek/deepseek-v4-flash` 同时承担 generation 与
+review。两个 OpenRouter slug 也都可用于任一角色。兼容模型仍包括
 Claude、GPT 和原生 DeepSeek 的既有白名单。URL、密钥或任一模型 ID 缺失时，工作流会
 fail closed，不会降级成单模型，也不会跨角色回退。
 

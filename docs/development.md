@@ -37,7 +37,7 @@ PENGINE_HOST=127.0.0.1
 PENGINE_PORT=8000
 PENGINE_RELAY_BASE_URL=https://openrouter.ai/api/v1
 PENGINE_RELAY_API_KEY=replace-me
-PENGINE_GENERATION_MODEL_ID=z-ai/glm-5.3-flash
+PENGINE_GENERATION_MODEL_ID=deepseek/deepseek-v4-flash
 PENGINE_REVIEW_MODEL_ID=deepseek/deepseek-v4-flash
 PENGINE_GENERATION_MAX_OUTPUT_TOKENS=128000
 PENGINE_REVIEW_MAX_OUTPUT_TOKENS=128000
@@ -51,9 +51,9 @@ PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 
 配置规则：
 
-- `.env.example` 默认使用 OpenRouter 的 `z-ai/glm-5.3-flash` 生成与
-  `deepseek/deepseek-v4-flash` 审核；两个完整 slug 都允许用于任一角色并走
-  OpenAI-compatible Chat Completions；GLM 保留强制推理，DeepSeek 关闭推理；
+- `.env.example` 默认使用 OpenRouter 的单一模型 `deepseek/deepseek-v4-flash`
+  同时承担生成与审核；两个完整 slug（含 `z-ai/glm-5.3-flash`）都允许用于任一角色
+  并走 OpenAI-compatible Chat Completions；GLM 保留强制推理，DeepSeek 关闭推理；
 - 兼容白名单仍保留 `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、
   `claude-opus-5`、`claude-sonnet-5` 及既有 OpenRouter Claude slug；不能仅凭配置通过
   就声称 provider 能力已验证；
