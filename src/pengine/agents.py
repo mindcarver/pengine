@@ -538,7 +538,11 @@ _EPISODE_PLANNER_PROMPT = (
     "suspense objective; cut a group before or after a major reveal, time jump, relationship "
     "turn, or phase ending. Every group must contain 1 to 4 contiguous episodes, all groups "
     "must cover the complete season exactly once, and no group may cross a declared review "
-    "milestone. Give each group a stable lowercase snake_case group_id plus a concrete "
+    "milestone. Declare review_milestones as an empty list unless this season strictly "
+    "requires a mid-season structural review: the final-episode completion review is "
+    "scheduled automatically and must never be declared, and every declared milestone "
+    "must coincide with a group boundary — the group containing that episode must end "
+    "exactly at it. Give each group a stable lowercase snake_case group_id plus a concrete "
     "dramatic_unit and boundary_reason. Do not mechanically group by a fixed episode count. "
     "Keep content as the readable per-episode dramatic outline only: do not add a separate "
     "generation-batch table, generation-group heading, or competing boundary declaration "
@@ -5983,7 +5987,7 @@ class StageGuardMiddleware(AgentMiddleware):
                     raise AgentProtocolError(
                         "Grouped episode-outline validation failed",
                         stage=stage,
-                        safe_message="分集大纲分组上下文或生成结果未通过确定性校验。",
+                        safe_message=f"分集大纲分组上下文或生成结果未通过确定性校验：{exc}。",
                     ) from exc
             else:
                 result, payload = await self._generate_locked_outline(
