@@ -2595,7 +2595,17 @@ async def _invoke_outline_group_sidecar(
             "IDs. Never declare a new named character in character_introductions: only "
             "characters with an approved biography in the character_biographies component "
             "are cast-eligible, and biography-less participants stay as prose without "
-            "character IDs, timeline participant references, or knowledge states."
+            "character IDs, timeline participant references, or knowledge states. "
+            "character_introductions may only register a named character that first "
+            "appears inside this group's fixed Markdown and is absent from "
+            "continuity_registry.known_characters; a character_id or name already listed "
+            "in known_characters must never be redeclared there, so the list is usually "
+            "empty, and a group-introduced character declares knowledge through "
+            "knowledge_states instead of initial_known_fact_ids. Emit exactly one "
+            "episode_obligation per episode of the group range, and for each episode "
+            "its new_information_fact_ids must equal, as an exact set, every fact_id "
+            "whose first_revealed_episode is that episode: no fact may be added, "
+            "dropped, or moved to another episode's obligation."
         )
         if output_language_contract:
             system_prompt = f"{system_prompt}\n{output_language_contract}"
