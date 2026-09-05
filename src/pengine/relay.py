@@ -786,7 +786,7 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
         if (
             not response_model_ids
             and finish_reason is None
-            and not tokens
+            and usage_status_from(tokens) == "unavailable"
             and self.model_id in OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS
         ):
             # OpenRouter sometimes drops a big stream with a clean EOF: no content
