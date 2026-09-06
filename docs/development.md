@@ -234,6 +234,13 @@ Issue / 设计说明
 - **错误信息要透传**。把底层 `ValidationError` 的字段细节吞成通用文案（如
   "未通过确定性校验"）会让运维与修复环都失去目标；`safe_message` 与日志都应携带
   `{exc}` 原文（AgentProtocolError / internal_error 均适用）。
+- **传输层隐形重试**。交互式 coding agent（Codex `stream_max_retries` 默认 5）对
+  "首 token 前死亡"的流式调用做带退避的整请求透明重发，用户只看到转圈——这是它们
+  "怎么接中转都不中断"的核心。pengine 在 `_SerialChatOpenAI._astream` 内实现了等价
+  层（`PENGINE_STREAM_MAX_RETRIES`，默认 2）：仅重试未交付任何输出的失败（stall /
+  零 chunk 干净 EOF），部分输出已到达消费者后绝不重试，业务层确定性不受影响、也不
+  占阶段尝试预算。上游侧参照：DeepSeek 官方 API 以 keep-alive 注释 + 30 分钟宽限
+  维持慢流，聚合路由器的处理窗则短得多——慢流对哑代理中转通常无害。
 - **模型档位决定 schema 纪律**。flash 档在 9 人 cast 的转录任务上反复违反唯一性约束，
   pro 档一次通过；重结构化阶段考虑用高档模型（分阶段路由），轻阶段用 flash 控制成本。
 

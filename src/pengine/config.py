@@ -72,6 +72,12 @@ class Settings(BaseSettings):
     stream_stall_seconds: float = Field(default=120.0, gt=0)
     stream_crawl_window_seconds: float = Field(default=90.0, gt=0)
     stream_crawl_min_chars_per_second: float = Field(default=2.0, gt=0)
+    # Codex-style transport retry for generation streams (its stream_max_retries
+    # defaults to 5): a stream that dies before delivering any visible output is
+    # a transient upstream roll — transparently resend the whole request with
+    # jittered exponential backoff instead of escalating to the bounded stage
+    # budget. Retries never fire once partial output has reached the consumer.
+    stream_max_retries: int = Field(default=2, ge=0, le=8)
     lease_seconds: int = Field(default=60, ge=5)
     worker_poll_seconds: float = Field(default=0.25, gt=0)
     worker_concurrency: int = Field(default=5, ge=1, le=5)

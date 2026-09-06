@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import random
 import re
 import ssl
 import threading
@@ -481,17 +482,20 @@ class _SerialChatDeepSeek(ChatDeepSeek):
 class _SerialChatOpenAI(ChatOpenAI):
     _pengine_model_call_state: ModelCallState | None = PrivateAttr(default=None)
     _pengine_stream_watchdog: _StreamStallWatchdog | None = PrivateAttr(default=None)
+    _pengine_stream_max_retries: int = PrivateAttr(default=0)
 
     def __init__(
         self,
         *args: Any,
         pengine_model_call_state: ModelCallState | None = None,
         pengine_stream_watchdog: _StreamStallWatchdog | None = None,
+        pengine_stream_max_retries: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._pengine_model_call_state = pengine_model_call_state
         self._pengine_stream_watchdog = pengine_stream_watchdog
+        self._pengine_stream_max_retries = pengine_stream_max_retries
 
     def _with_call_output_budget(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         state = self._pengine_model_call_state
@@ -506,7 +510,7 @@ class _SerialChatOpenAI(ChatOpenAI):
         for chunk in super()._stream(*args, **self._with_call_output_budget(kwargs)):
             yield _deduplicate_stream_terminal_metadata(chunk, seen_model_ids)
 
-    async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+    async def _astream_single_attempt(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         seen_model_ids: dict[str, str] = {}
         watchdog = self._pengine_stream_watchdog
         stream = super()._astream(*args, **self._with_call_output_budget(kwargs))
@@ -527,6 +531,43 @@ class _SerialChatOpenAI(ChatOpenAI):
                 ) from None
             watchdog.observe(chunk)
             yield _deduplicate_stream_terminal_metadata(chunk, seen_model_ids)
+
+    async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        # Codex-style transport retry (its stream_max_retries defaults to 5):
+        # a stream that dies before delivering any visible output is a transient
+        # upstream roll of the provider dice, so transparently resend the whole
+        # request with jittered exponential backoff instead of escalating to the
+        # workflow layer's bounded stage budget. Once any chunk has been yielded
+        # the consumer already holds partial output, so retries are off and the
+        # failure propagates unchanged — business determinism is preserved.
+        for attempt in range(self._pengine_stream_max_retries + 1):
+            delivered = False
+            exhausted_cleanly = False
+            retryable = False
+            try:
+                async for chunk in self._astream_single_attempt(*args, **kwargs):
+                    delivered = True
+                    yield chunk
+                exhausted_cleanly = True
+            except RelayStreamStalledError:
+                if delivered or attempt >= self._pengine_stream_max_retries:
+                    raise
+                retryable = True
+            if exhausted_cleanly and delivered:
+                return
+            if exhausted_cleanly and not delivered:
+                # Zero chunks with a clean end is the silent-upstream-drop
+                # signature; a resend is the only fix (no heartbeat can resume
+                # it) and the audit callback still fails the logical call if
+                # every attempt comes back empty.
+                retryable = attempt < self._pengine_stream_max_retries
+                if not retryable:
+                    return
+            if retryable:
+                delay = min(10.0, 2.0 * (2**attempt)) * (0.5 + random.random() / 2)
+                await asyncio.sleep(delay)
+                continue
+        return
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
         tool_choice = kwargs.get("tool_choice")
@@ -1778,6 +1819,7 @@ def build_relay_adapter(
                 extra_body=_openrouter_extra_body(model_id, settings),
                 pengine_model_call_state=model_call_state,
                 pengine_stream_watchdog=stream_watchdog,
+                pengine_stream_max_retries=settings.stream_max_retries,
                 streaming=True,
             ),
             role=role,

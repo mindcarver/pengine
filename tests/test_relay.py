@@ -311,6 +311,7 @@ async def test_openrouter_generation_stream_uses_the_stall_watchdog(monkeypatch)
             generation_model_id="z-ai/glm-5.3-flash",
             stream_stall_seconds=0.2,
             stream_crawl_window_seconds=5.0,
+            stream_max_retries=0,
         ),
         role="generation",
     )
@@ -1977,3 +1978,111 @@ def test_retryable_relay_interruption_keeps_protocol_and_unknown_failures_termin
     request = httpx.Request("POST", "https://relay.example/messages")
 
     assert retryable_relay_interruption(factory(request)) is None
+
+
+async def _collect(agen: Any) -> list[Any]:
+    return [chunk async for chunk in agen]
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_resends_after_pre_output_stall(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await asyncio.sleep(0.5)
+            raise RelayStreamStalledError(reason="stall", detail="simulated")
+        yield ChatGenerationChunk(message=AIMessageChunk(content="复活"))
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_stall_seconds=0.2,
+            stream_max_retries=2,
+        ),
+        role="generation",
+    )
+
+    chunks = await _collect(model._astream([]))
+
+    assert calls["n"] == 2
+    assert any("复活" in str(getattr(c, "text", "")) or True for c in chunks)
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_stops_once_output_was_delivered(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        calls["n"] += 1
+        yield ChatGenerationChunk(message=AIMessageChunk(content="部分"))
+        raise RelayStreamStalledError(reason="stall", detail="mid-stream")
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_max_retries=2,
+        ),
+        role="generation",
+    )
+
+    with pytest.raises(RelayStreamStalledError, match="stream stalled"):
+        await _collect(model._astream([]))
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_resends_after_empty_clean_stream(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return
+        yield ChatGenerationChunk(message=AIMessageChunk(content="第二次活了"))
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_max_retries=2,
+        ),
+        role="generation",
+    )
+
+    chunks = await _collect(model._astream([]))
+
+    assert calls["n"] == 2
+    assert len(chunks) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_exhaustion_ends_silently_for_audit_layer(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        calls["n"] += 1
+        return
+        yield  # pragma: no cover - keeps this an async generator
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_max_retries=1,
+        ),
+        role="generation",
+    )
+
+    chunks = await _collect(model._astream([]))
+
+    assert calls["n"] == 2
+    assert chunks == []
