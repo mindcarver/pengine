@@ -1660,6 +1660,12 @@ class Worker:
                     failure.code,
                     _exception_type_chain(exc),
                 )
+                if failure.code == "internal_error":
+                    logger.exception(
+                        "internal_error detail run_id=%s stage=%s",
+                        work.run_id,
+                        failure_stage,
+                    )
             finally:
                 close_stage_observation(status="failed")
                 # The audit handler dispatches SQLite writes to a writer thread so it
