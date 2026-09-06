@@ -536,9 +536,16 @@ _EPISODE_PLANNER_PROMPT = (
     "as the authoritative screenplay-generation units. Group episodes by one coherent "
     "dramatic action, setup-development-payoff chain, continuous time/place, or shared "
     "suspense objective; cut a group before or after a major reveal, time jump, relationship "
-    "turn, or phase ending. Every group must contain 1 to 4 contiguous episodes, all groups "
-    "must cover the complete season exactly once, and no group may cross a declared review "
-    "milestone. Give each group a stable lowercase snake_case group_id plus a concrete "
+    "turn, or phase ending. Every group must contain 1 to 4 contiguous episodes — a group "
+    "of five or more always fails validation — and all groups must cover the complete "
+    "season exactly once, with no group crossing a declared review milestone. For a "
+    "20-episode season the coarsest legal partition is five groups of four "
+    "(1-4, 5-8, 9-12, 13-16, 17-20); more, smaller cuts are always allowed. "
+    "Declare review_milestones as an empty list unless this season strictly "
+    "requires a mid-season structural review: the final-episode completion review is "
+    "scheduled automatically and must never be declared, and every declared milestone "
+    "must coincide with a group boundary — the group containing that episode must end "
+    "exactly at it. Give each group a stable lowercase snake_case group_id plus a concrete "
     "dramatic_unit and boundary_reason. Do not mechanically group by a fixed episode count. "
     "Keep content as the readable per-episode dramatic outline only: do not add a separate "
     "generation-batch table, generation-group heading, or competing boundary declaration "
@@ -2595,7 +2602,17 @@ async def _invoke_outline_group_sidecar(
             "IDs. Never declare a new named character in character_introductions: only "
             "characters with an approved biography in the character_biographies component "
             "are cast-eligible, and biography-less participants stay as prose without "
-            "character IDs, timeline participant references, or knowledge states."
+            "character IDs, timeline participant references, or knowledge states. "
+            "character_introductions may only register a named character that first "
+            "appears inside this group's fixed Markdown and is absent from "
+            "continuity_registry.known_characters; a character_id or name already listed "
+            "in known_characters must never be redeclared there, so the list is usually "
+            "empty, and a group-introduced character declares knowledge through "
+            "knowledge_states instead of initial_known_fact_ids. Emit exactly one "
+            "episode_obligation per episode of the group range, and for each episode "
+            "its new_information_fact_ids must equal, as an exact set, every fact_id "
+            "whose first_revealed_episode is that episode: no fact may be added, "
+            "dropped, or moved to another episode's obligation."
         )
         if output_language_contract:
             system_prompt = f"{system_prompt}\n{output_language_contract}"
@@ -5970,10 +5987,11 @@ class StageGuardMiddleware(AgentMiddleware):
                         args,
                     )
                 except (OutlineContextError, ValidationError) as exc:
+                    logger.warning("grouped outline validation failed: %s", exc)
                     raise AgentProtocolError(
                         "Grouped episode-outline validation failed",
                         stage=stage,
-                        safe_message="分集大纲分组上下文或生成结果未通过确定性校验。",
+                        safe_message=f"分集大纲分组上下文或生成结果未通过确定性校验：{exc}。",
                     ) from exc
             else:
                 result, payload = await self._generate_locked_outline(
