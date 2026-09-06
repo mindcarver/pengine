@@ -247,9 +247,9 @@ API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localho
 `PENGINE_RELAY_API_KEY` 同时交给两个客户端；该地址必须接受所选模型对应的协议。默认
 OpenRouter 组合是单一模型 `deepseek/deepseek-v4-flash` 同时承担 generation 与
 review。两个 OpenRouter slug 也都可用于任一角色。可选 `PENGINE_OPENROUTER_PROVIDER`
-把 OpenRouter 请求硬钉到单一上游供应商（provider.order + allow_fallbacks:false），
-避免大冷 prefill 调用在多家上游间抽签、撞上路由器的空闲上限（Issue #285）；留空保持
-默认负载均衡。兼容模型仍包括
+（逗号分隔的供应商列表）通过 provider.order 让大冷 prefill 调用优先走实测快的上游、
+避免撞路由器空闲上限（Issue #285）；回退保持开启，兼容性抖动时退回默认路由而非
+404；留空保持默认负载均衡。兼容模型仍包括
 Claude、GPT 和原生 DeepSeek 的既有白名单。URL、密钥或任一模型 ID 缺失时，工作流会
 fail closed，不会降级成单模型，也不会跨角色回退。
 

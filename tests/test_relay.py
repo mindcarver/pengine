@@ -172,13 +172,13 @@ def test_build_relay_adapter_routes_openrouter_chat_completions_models(
     [
         (
             "z-ai/glm-5.3-flash",
-            {"provider": {"order": ["deepinfra"], "allow_fallbacks": False}},
+            {"provider": {"order": ["deepinfra"]}},
         ),
         (
             "deepseek/deepseek-v4-flash",
             {
                 "reasoning": {"enabled": False},
-                "provider": {"order": ["deepinfra"], "allow_fallbacks": False},
+                "provider": {"order": ["deepinfra"]},
             },
         ),
     ],
@@ -210,7 +210,7 @@ def test_openrouter_provider_whitelist_keeps_order_and_spaces_out() -> None:
 
     assert adapter.model.extra_body == {
         "reasoning": {"enabled": False},
-        "provider": {"order": ["deepinfra", "novita", "alibaba"], "allow_fallbacks": False},
+        "provider": {"order": ["deepinfra", "novita", "alibaba"]},
     }
 
 

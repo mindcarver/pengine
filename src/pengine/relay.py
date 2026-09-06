@@ -1636,16 +1636,16 @@ def _openrouter_extra_body(model_id: str, settings: Settings) -> dict[str, Any] 
     if model_id == "deepseek/deepseek-v4-flash":
         extra["reasoning"] = {"enabled": False}
     if settings.openrouter_provider:
-        # Hard-pin this request to a vetted provider whitelist: unpinned routing
-        # gambles large cold-prefill calls across ~15 upstreams, and the slow
-        # ones queue for minutes until the router's idle ceiling kills the
-        # stream before any content chunk arrives (Issue #285). A short ordered
-        # list tolerates single-provider routing-table flaps; allow_fallbacks
-        # stays false so the price roulette never resumes.
+        # Prefer vetted fast upstreams without leaving the pool: unpinned routing
+        # gambles large cold-prefill calls across ~15 upstreams, and some choke
+        # silently on big agent histories until the router's idle ceiling kills
+        # the stream (Issue #285). An ordered preference puts the fast ones
+        # first; fallbacks stay enabled so tool-compatibility flaps degrade to
+        # default routing instead of 404 — hard pinning proved too brittle.
         providers = [
             item.strip() for item in settings.openrouter_provider.split(",") if item.strip()
         ]
-        extra["provider"] = {"order": providers, "allow_fallbacks": False}
+        extra["provider"] = {"order": providers}
     return extra or None
 
 
