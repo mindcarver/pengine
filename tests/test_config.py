@@ -123,7 +123,6 @@ def test_both_model_roles_are_required(
         ("generation_model_id", "anthropic/claude-haiku-4-5"),
         ("generation_model_id", "openrouter/auto"),
         ("review_model_id", "claude-haiku-4-5"),
-        ("review_model_id", "deepseek/deepseek-v4-pro"),
         ("review_model_id", "anthropic/deepseek-v4-flash"),
     ],
 )
@@ -137,6 +136,7 @@ def test_unsupported_role_models_are_rejected(field: str, value: str) -> None:
     [
         "z-ai/glm-5.3-flash",
         "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
         "claude-opus-5",
         "claude-sonnet-5",
         "anthropic/claude-opus-5",
@@ -154,6 +154,7 @@ def test_generation_model_accepts_supported_models(model_id: str) -> None:
         "deepseek-v4-flash",
         "z-ai/glm-5.3-flash",
         "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
         "gpt-5.5",
         "gpt-5.6-terra",
         "claude-opus-5",

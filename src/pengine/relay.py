@@ -56,7 +56,12 @@ from pengine.model_calls import (
 from pengine.observability import record_model_call_event
 
 _AUTO_TOOL_CHOICE_MODELS = frozenset(
-    {"deepseek-v4-flash", "deepseek-v4-pro", "deepseek/deepseek-v4-flash"}
+    {
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
+    }
 )
 # Prompt-cache write floor: blocks under Anthropic's 1024-token minimum never hit.
 _PROMPT_CACHE_MIN_SYSTEM_CHARS = 4_000
