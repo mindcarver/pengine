@@ -54,6 +54,7 @@ PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 - `.env.example` 默认使用 OpenRouter 的单一模型 `deepseek/deepseek-v4-flash`
   同时承担生成与审核；两个完整 slug（含 `z-ai/glm-5.3-flash`）都允许用于任一角色
   并走 OpenAI-compatible Chat Completions；GLM 保留强制推理，DeepSeek 关闭推理；
+- 可选 `PENGINE_OPENROUTER_PROVIDER`（如 `deepinfra`）把 OpenRouter 请求硬钉到单一上游供应商（provider.order + allow_fallbacks:false）：大冷 prefill 调用不再在 ~15 家上游间抽签，慢家的多分钟排队不会在首 token 前被路由器空闲上限掐断（Issue #285）；留空保持默认负载均衡；
 - 兼容白名单仍保留 `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、
   `claude-opus-5`、`claude-sonnet-5` 及既有 OpenRouter Claude slug；不能仅凭配置通过
   就声称 provider 能力已验证；

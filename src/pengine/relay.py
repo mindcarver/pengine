@@ -1631,6 +1631,22 @@ def build_relay_routes(
     )
 
 
+def _openrouter_extra_body(model_id: str, settings: Settings) -> dict[str, Any] | None:
+    extra: dict[str, Any] = {}
+    if model_id == "deepseek/deepseek-v4-flash":
+        extra["reasoning"] = {"enabled": False}
+    if settings.openrouter_provider:
+        # Hard-pin this request to one upstream provider: unpinned routing
+        # gambles large cold-prefill calls across ~15 upstreams, and the slow
+        # ones queue for minutes until the router's idle ceiling kills the
+        # stream before any content chunk arrives (Issue #285).
+        extra["provider"] = {
+            "order": [settings.openrouter_provider],
+            "allow_fallbacks": False,
+        }
+    return extra or None
+
+
 def build_relay_adapter(
     settings: Settings,
     *,
@@ -1706,11 +1722,7 @@ def build_relay_adapter(
                     **common,
                     max_tokens=max_output_tokens,
                     stream_chunk_timeout=chunk_timeout,
-                    extra_body=(
-                        {"reasoning": {"enabled": False}}
-                        if model_id == "deepseek/deepseek-v4-flash"
-                        else None
-                    ),
+                    extra_body=_openrouter_extra_body(model_id, settings),
                 ),
                 role=role,
                 model_id=model_id,
@@ -1756,11 +1768,7 @@ def build_relay_adapter(
                 **common,
                 max_tokens=max_output_tokens,
                 stream_chunk_timeout=chunk_timeout,
-                extra_body=(
-                    {"reasoning": {"enabled": False}}
-                    if model_id == "deepseek/deepseek-v4-flash"
-                    else None
-                ),
+                extra_body=_openrouter_extra_body(model_id, settings),
                 pengine_model_call_state=model_call_state,
                 pengine_stream_watchdog=stream_watchdog,
                 streaming=True,

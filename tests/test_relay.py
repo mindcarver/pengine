@@ -167,6 +167,39 @@ def test_build_relay_adapter_routes_openrouter_chat_completions_models(
     assert adapter.model.streaming is (role == "generation")
 
 
+@pytest.mark.parametrize(
+    ("model_id", "expected_extra_body"),
+    [
+        (
+            "z-ai/glm-5.3-flash",
+            {"provider": {"order": ["deepinfra"], "allow_fallbacks": False}},
+        ),
+        (
+            "deepseek/deepseek-v4-flash",
+            {
+                "reasoning": {"enabled": False},
+                "provider": {"order": ["deepinfra"], "allow_fallbacks": False},
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("role", ["generation", "review"])
+def test_openrouter_provider_pin_adds_routing_preference(
+    model_id: str,
+    expected_extra_body: dict[str, Any] | None,
+    role: str,
+) -> None:
+    settings = _role_settings(
+        generation_model_id=model_id,
+        review_model_id=model_id,
+        openrouter_provider="deepinfra",
+    )
+
+    adapter = build_relay_adapter(settings, role=role)
+
+    assert adapter.model.extra_body == expected_extra_body
+
+
 def test_openrouter_glm_requires_serial_tool_calls() -> None:
     class ProbeTool(BaseModel):
         value: str
