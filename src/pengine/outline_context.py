@@ -327,6 +327,74 @@ def assemble_outline_group_result(
         raise OutlineGroupAssemblyError(evidence, sidecar=sidecar) from error
 
 
+def drop_identical_group_registrations(
+    prior_groups: Sequence[EpisodeOutlineGroupResult],
+    candidate: EpisodeOutlineGroupResult,
+) -> EpisodeOutlineGroupResult:
+    """Deterministically drop exact re-declarations before reference validation.
+
+    Models sometimes re-emit a prior group's fact or clue verbatim. An entry
+    whose ID and full content are identical to a committed (or earlier
+    in-group) entry carries no new information, so dropping it — and removing
+    its ID from the obligations that reveal it — is semantics-preserving and
+    avoids spending a bounded repair round on a pure duplicate. A conflicting
+    re-declaration (same ID, different content) is kept and still fails the
+    reference validation, taking the error-feedback repair path instead.
+    """
+    known_facts: dict[str, str] = {}
+    known_clues: dict[str, str] = {}
+    for group in prior_groups:
+        for fact in group.facts:
+            known_facts[fact.fact_id] = fact.model_dump_json()
+        for clue in group.clues:
+            known_clues[clue.clue_id] = clue.model_dump_json()
+    dropped_fact_ids: set[str] = set()
+    seen_facts: dict[str, str] = {}
+    kept_facts = []
+    for fact in candidate.facts:
+        canonical = fact.model_dump_json()
+        if seen_facts.get(fact.fact_id) == canonical or known_facts.get(fact.fact_id) == canonical:
+            dropped_fact_ids.add(fact.fact_id)
+            continue
+        seen_facts[fact.fact_id] = canonical
+        kept_facts.append(fact)
+    dropped_clue_ids: set[str] = set()
+    seen_clues: dict[str, str] = {}
+    kept_clues = []
+    for clue in candidate.clues:
+        canonical = clue.model_dump_json()
+        if seen_clues.get(clue.clue_id) == canonical or known_clues.get(clue.clue_id) == canonical:
+            dropped_clue_ids.add(clue.clue_id)
+            continue
+        seen_clues[clue.clue_id] = canonical
+        kept_clues.append(clue)
+    if not dropped_fact_ids and not dropped_clue_ids:
+        return candidate
+    if not kept_facts:
+        # Dropping everything would trip the facts min-length before the
+        # reference validator could name the real problem; leave it untouched.
+        return candidate
+    payload = candidate.model_dump(mode="json")
+    payload["facts"] = [fact.model_dump(mode="json") for fact in kept_facts]
+    payload["clues"] = [clue.model_dump(mode="json") for clue in kept_clues]
+    # Obligations reference facts by ID: only strip references whose fact has
+    # no remaining copy at all (an intra-group duplicate keeps its first copy,
+    # so its obligations stay valid untouched).
+    fully_dropped_fact_ids = dropped_fact_ids - {fact.fact_id for fact in kept_facts}
+    payload["episode_obligations"] = [
+        {
+            **obligation,
+            "new_information_fact_ids": [
+                fact_id
+                for fact_id in obligation["new_information_fact_ids"]
+                if fact_id not in fully_dropped_fact_ids
+            ],
+        }
+        for obligation in payload["episode_obligations"]
+    ]
+    return EpisodeOutlineGroupResult.model_validate(payload)
+
+
 def validate_outline_group_references(
     season_map: OutlineSeasonMap,
     prior_groups: Sequence[EpisodeOutlineGroupResult],

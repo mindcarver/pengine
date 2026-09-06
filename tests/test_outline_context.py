@@ -11,6 +11,7 @@ from pengine.outline_context import (
     assemble_outline_group_result,
     compile_outline_group_context,
     compile_season_map_context,
+    drop_identical_group_registrations,
     outline_group_output_tokens,
     parse_outline_group_markdown,
     validate_outline_group_references,
@@ -594,3 +595,34 @@ def test_group_output_budget_scales_with_the_natural_group_size() -> None:
         )
         == 12_000
     )
+
+
+def test_drop_identical_group_registrations_removes_verbatim_duplicates() -> None:
+    season_map = make_season_map(episode_count=6)
+    prior = [make_group(season_map.script_generation_groups[0])]
+    payload = make_group(season_map.script_generation_groups[1]).model_dump(mode="json")
+    payload["facts"] = [payload["facts"][0], *payload["facts"]]
+    candidate = EpisodeOutlineGroupResult.model_validate(payload)
+
+    with pytest.raises(OutlineContextError, match="duplicate fact ID"):
+        validate_outline_group_references(season_map, prior, candidate)
+
+    deduped = drop_identical_group_registrations(prior, candidate)
+
+    assert len(deduped.facts) == len(candidate.facts) - 1
+    validate_outline_group_references(season_map, prior, deduped)
+
+
+def test_drop_identical_group_registrations_keeps_conflicting_redeclaration() -> None:
+    season_map = make_season_map(episode_count=6)
+    prior = [make_group(season_map.script_generation_groups[0])]
+    payload = make_group(season_map.script_generation_groups[1]).model_dump(mode="json")
+    conflicting = {**payload["facts"][0], "value": "与首次揭示不同的值"}
+    payload["facts"] = [payload["facts"][0], conflicting, *payload["facts"][1:]]
+    candidate = EpisodeOutlineGroupResult.model_validate(payload)
+
+    untouched = drop_identical_group_registrations(prior, candidate)
+
+    assert [fact.fact_id for fact in untouched.facts] == [fact.fact_id for fact in candidate.facts]
+    with pytest.raises(OutlineContextError, match="duplicate fact ID"):
+        validate_outline_group_references(season_map, prior, untouched)

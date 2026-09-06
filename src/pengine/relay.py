@@ -56,7 +56,12 @@ from pengine.model_calls import (
 from pengine.observability import record_model_call_event
 
 _AUTO_TOOL_CHOICE_MODELS = frozenset(
-    {"deepseek-v4-flash", "deepseek-v4-pro", "deepseek/deepseek-v4-flash"}
+    {
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
+    }
 )
 # Prompt-cache write floor: blocks under Anthropic's 1024-token minimum never hit.
 _PROMPT_CACHE_MIN_SYSTEM_CHARS = 4_000
@@ -1631,6 +1636,24 @@ def build_relay_routes(
     )
 
 
+def _openrouter_extra_body(model_id: str, settings: Settings) -> dict[str, Any] | None:
+    extra: dict[str, Any] = {}
+    if model_id == "deepseek/deepseek-v4-flash":
+        extra["reasoning"] = {"enabled": False}
+    if settings.openrouter_provider:
+        # Prefer vetted fast upstreams without leaving the pool: unpinned routing
+        # gambles large cold-prefill calls across ~15 upstreams, and some choke
+        # silently on big agent histories until the router's idle ceiling kills
+        # the stream (Issue #285). An ordered preference puts the fast ones
+        # first; fallbacks stay enabled so tool-compatibility flaps degrade to
+        # default routing instead of 404 — hard pinning proved too brittle.
+        providers = [
+            item.strip() for item in settings.openrouter_provider.split(",") if item.strip()
+        ]
+        extra["provider"] = {"order": providers}
+    return extra or None
+
+
 def build_relay_adapter(
     settings: Settings,
     *,
@@ -1706,11 +1729,7 @@ def build_relay_adapter(
                     **common,
                     max_tokens=max_output_tokens,
                     stream_chunk_timeout=chunk_timeout,
-                    extra_body=(
-                        {"reasoning": {"enabled": False}}
-                        if model_id == "deepseek/deepseek-v4-flash"
-                        else None
-                    ),
+                    extra_body=_openrouter_extra_body(model_id, settings),
                 ),
                 role=role,
                 model_id=model_id,
@@ -1756,11 +1775,7 @@ def build_relay_adapter(
                 **common,
                 max_tokens=max_output_tokens,
                 stream_chunk_timeout=chunk_timeout,
-                extra_body=(
-                    {"reasoning": {"enabled": False}}
-                    if model_id == "deepseek/deepseek-v4-flash"
-                    else None
-                ),
+                extra_body=_openrouter_extra_body(model_id, settings),
                 pengine_model_call_state=model_call_state,
                 pengine_stream_watchdog=stream_watchdog,
                 streaming=True,

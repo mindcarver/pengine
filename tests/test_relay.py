@@ -167,6 +167,53 @@ def test_build_relay_adapter_routes_openrouter_chat_completions_models(
     assert adapter.model.streaming is (role == "generation")
 
 
+@pytest.mark.parametrize(
+    ("model_id", "expected_extra_body"),
+    [
+        (
+            "z-ai/glm-5.3-flash",
+            {"provider": {"order": ["deepinfra"]}},
+        ),
+        (
+            "deepseek/deepseek-v4-flash",
+            {
+                "reasoning": {"enabled": False},
+                "provider": {"order": ["deepinfra"]},
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("role", ["generation", "review"])
+def test_openrouter_provider_pin_adds_routing_preference(
+    model_id: str,
+    expected_extra_body: dict[str, Any] | None,
+    role: str,
+) -> None:
+    settings = _role_settings(
+        generation_model_id=model_id,
+        review_model_id=model_id,
+        openrouter_provider="deepinfra",
+    )
+
+    adapter = build_relay_adapter(settings, role=role)
+
+    assert adapter.model.extra_body == expected_extra_body
+
+
+def test_openrouter_provider_whitelist_keeps_order_and_spaces_out() -> None:
+    settings = _role_settings(
+        generation_model_id="deepseek/deepseek-v4-flash",
+        openrouter_provider=" deepinfra , novita ,, alibaba ",
+    )
+
+    adapter = build_relay_adapter(settings, role="generation")
+
+    assert adapter.model.extra_body == {
+        "reasoning": {"enabled": False},
+        "provider": {"order": ["deepinfra", "novita", "alibaba"]},
+    }
+
+
 def test_openrouter_glm_requires_serial_tool_calls() -> None:
     class ProbeTool(BaseModel):
         value: str

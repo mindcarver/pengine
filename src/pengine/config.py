@@ -15,7 +15,7 @@ OPENROUTER_ANTHROPIC_MODEL_IDS = frozenset(
     f"anthropic/{model_id}" for model_id in ANTHROPIC_MODEL_IDS
 )
 OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS = frozenset(
-    {"z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash"}
+    {"z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"}
 )
 _ALLOWED_GENERATION_MODELS = (
     ANTHROPIC_MODEL_IDS | OPENROUTER_ANTHROPIC_MODEL_IDS | OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS
@@ -48,6 +48,15 @@ class Settings(BaseSettings):
     review_context_limit_tokens: int | None = Field(default=None, ge=1)
     model_timeout_seconds: float = Field(default=180.0, gt=0)
     run_timeout_seconds: float = Field(default=1800.0, gt=0)
+    # Prefer specific OpenRouter upstreams (comma-separated provider slugs,
+    # e.g. "novita,alibaba") via request-level provider.order, with fallbacks
+    # left enabled. Unpinned routing gambles every large cold-prefill call
+    # across ~15 upstreams where some choke silently on big agent histories
+    # until the router's idle ceiling kills the stream (Issue #285); the
+    # ordered preference puts vetted fast providers first while tool-
+    # compatibility flaps still degrade to default routing instead of 404.
+    # Empty keeps OpenRouter's default price-weighted load balancing.
+    openrouter_provider: str = ""
     # Tag the stable system prefix of Anthropic-route requests with an ephemeral
     # cache_control breakpoint: cache hits cut prefill TTFB to seconds, price the
     # cached input at 0.1x, and — on the relay's rotating upstream pool — skip the
