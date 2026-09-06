@@ -480,6 +480,27 @@ class _SerialChatDeepSeek(ChatDeepSeek):
         return super().bind_tools(tools, **kwargs)
 
 
+def _chunk_carries_output(chunk: Any) -> bool:
+    """Whether a stream chunk carries consumer-visible output.
+
+    Degenerate upstream drops can still emit role/finish/usage marker chunks
+    with no textual content; those do not count as delivered output for the
+    transparent-retry decision, so an empty stream stays eligible for a full
+    resend while any real content (text or tool-call fragments) disables it.
+    """
+    message = getattr(chunk, "message", None)
+    if message is None:
+        return False
+    content = getattr(message, "content", None)
+    if isinstance(content, str) and content:
+        return True
+    if isinstance(content, list) and content:
+        return True
+    if getattr(message, "tool_call_chunks", None):
+        return True
+    return bool(getattr(message, "tool_calls", None))
+
+
 class _SerialChatOpenAI(ChatOpenAI):
     _pengine_model_call_state: ModelCallState | None = PrivateAttr(default=None)
     _pengine_stream_watchdog: _StreamStallWatchdog | None = PrivateAttr(default=None)
@@ -547,7 +568,7 @@ class _SerialChatOpenAI(ChatOpenAI):
             retryable = False
             try:
                 async for chunk in self._astream_single_attempt(*args, **kwargs):
-                    delivered = True
+                    delivered = delivered or _chunk_carries_output(chunk)
                     yield chunk
                 exhausted_cleanly = True
             except (RelayStreamStalledError, APIError):
