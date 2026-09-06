@@ -14,6 +14,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Sys
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
+from openai import APIError
 from pydantic import BaseModel, SecretStr
 
 import pengine.relay as relay_module
@@ -2013,6 +2014,32 @@ async def test_stream_retry_resends_after_pre_output_stall(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_stream_retry_absorbs_pre_output_api_error(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise APIError("connection reset", request=None, body=None)
+        yield ChatGenerationChunk(message=AIMessageChunk(content="重试后成功"))
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_max_retries=2,
+        ),
+        role="generation",
+    )
+
+    chunks = await _collect(model._astream([]))
+
+    assert calls["n"] == 2
+    assert len(chunks) == 1
+
+
 async def test_stream_retry_stops_once_output_was_delivered(monkeypatch) -> None:
     calls = {"n": 0}
 

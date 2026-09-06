@@ -25,6 +25,7 @@ from langchain_core.messages import SystemMessage
 from langchain_core.outputs import LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
+from openai import APIError
 from pydantic import PrivateAttr
 
 try:
@@ -549,7 +550,11 @@ class _SerialChatOpenAI(ChatOpenAI):
                     delivered = True
                     yield chunk
                 exhausted_cleanly = True
-            except RelayStreamStalledError:
+            except (RelayStreamStalledError, APIError):
+                # APIError pre-output is a transport-level death (reset, TLS,
+                # relay 5xx with no status surfaced) — the same transient roll
+                # Codex absorbs; deterministic 4xx simply fail again and the
+                # final attempt still propagates for the workflow classifier.
                 if delivered or attempt >= self._pengine_stream_max_retries:
                     raise
                 retryable = True
