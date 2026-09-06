@@ -82,6 +82,7 @@ from pengine.outline_context import (
     compile_outline_group_context,
     compile_outline_group_sidecar_context,
     compile_season_map_context,
+    drop_identical_group_registrations,
     normalize_outline_group_markdown,
     parse_outline_group_markdown,
     validate_outline_group_references,
@@ -6725,6 +6726,11 @@ class StageGuardMiddleware(AgentMiddleware):
                             repair_mode = "sidecar"
                             continue
                         try:
+                            # Exact re-declarations of committed facts/clues are
+                            # deterministic no-ops: drop them (and their obligation
+                            # references) before reference validation instead of
+                            # burning a bounded repair round on a pure duplicate.
+                            parsed = drop_identical_group_registrations(committed, parsed)
                             validate_outline_group_references(season_map, committed, parsed)
                         except OutlineContextError as error:
                             if protocol_repair_rounds >= 2:
@@ -9297,16 +9303,43 @@ class DeepAgentWorkflow:
             )
             if output_language_contract:
                 prompt = f"{prompt}\n{output_language_contract}"
-            response = await self.generation_model.with_structured_output(
+            structured = self.generation_model.with_structured_output(
                 OutlineSeasonMap,
                 method="function_calling",
-            ).ainvoke(
-                [
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": compiled.model_input},
-                ]
             )
-            return OutlineSeasonMap.model_validate(response).model_dump(mode="json")
+            base_messages = [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": compiled.model_input},
+            ]
+            # A blind requeue regenerates the same deterministic context and
+            # repeats the same violation, so feed the validator's own error
+            # text back to the model for a bounded targeted repair instead.
+            validation_error: Exception | None = None
+            for _attempt in range(3):
+                if validation_error is None:
+                    messages = base_messages
+                else:
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{compiled.model_input}\n\n"
+                                "上一次 OutlineSeasonMap 未通过确定性校验，逐字错误如下；"
+                                "重新生成完整结果并修正该错误，不要改动与错误无关的部分：\n"
+                                f"{validation_error}"
+                            ),
+                        },
+                    ]
+                try:
+                    response = await structured.ainvoke(messages)
+                    return OutlineSeasonMap.model_validate(response).model_dump(mode="json")
+                except ValidationError as exc:
+                    validation_error = exc
+            raise cast(Exception, validation_error)
 
         async def generate_outline_group(
             compiled: CompiledOutlineContext,

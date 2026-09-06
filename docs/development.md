@@ -216,3 +216,27 @@ Issue / 设计说明
 - [ ] 新增的敏感 fixture 未进入仓库；
 - [ ] CI 与 Pages workflow 的权限最小化；
 - [ ] build、测试和实际浏览器验收证据已记录。
+
+## 10. 结构化输出的校验与修复模式（Issue #285 实战经验）
+
+模型的结构化输出只是候选。跨字段约束（角色名/事实 ID 唯一、义务与事实集精确对应、
+引用闭合）**无法**靠 JSON Schema、约束解码或 `response_format` 保证——它们只能保证
+语法正确；语义约束必须生成后用确定性校验器把关。这一层的工程经验：
+
+- **修复环必须回喂错误原文**（Instructor 模式）。校验失败后"盲重跑"在确定性上下文上
+  会复现同一个错误（实测 flash 同错三连败）；把校验器的逐字错误（含字段名）附进重试
+  请求，模型一修即过。season map（`generate_outline_season_map`）与大纲组 sidecar
+  （`bounded_current_group_repair`）都走这条路径。
+- **纯重复先确定性去重**。同 ID 且全量内容一致的重复条目（如同一 fact 在组内列了两
+  次）是语义空操作，用 `drop_identical_group_registrations` 直接丢弃（并只在 fact
+  完全无剩余拷贝时才清理义务引用），不要浪费有界修复轮次。同 ID 不同内容是真冲突，
+  保留给错误回喂环处理。
+- **错误信息要透传**。把底层 `ValidationError` 的字段细节吞成通用文案（如
+  "未通过确定性校验"）会让运维与修复环都失去目标；`safe_message` 与日志都应携带
+  `{exc}` 原文（AgentProtocolError / internal_error 均适用）。
+- **模型档位决定 schema 纪律**。flash 档在 9 人 cast 的转录任务上反复违反唯一性约束，
+  pro 档一次通过；重结构化阶段考虑用高档模型（分阶段路由），轻阶段用 flash 控制成本。
+
+失败分类速查：`structured_output_invalid`（带错误原文，可反馈修复）→
+`content_rejected`（有界修复耗尽，可 continue）→ `attempts_exhausted`（阶段预算耗尽，
+终态）；`internal_error` 意味着异常逃逸出修复环，属于缺陷，应修环而不是调模型。
