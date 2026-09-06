@@ -48,12 +48,14 @@ class Settings(BaseSettings):
     review_context_limit_tokens: int | None = Field(default=None, ge=1)
     model_timeout_seconds: float = Field(default=180.0, gt=0)
     run_timeout_seconds: float = Field(default=1800.0, gt=0)
-    # Hard-pin OpenRouter chat-completions routing to a single upstream provider
-    # slug (request-level provider.order with allow_fallbacks=false). Unpinned
-    # routing gambles every large cold-prefill call across ~15 upstreams, and the
-    # slow ones queue for minutes until the router's idle ceiling kills the
-    # stream before any content chunk (Issue #285). Empty keeps OpenRouter's
-    # default price-weighted load balancing.
+    # Hard-pin OpenRouter chat-completions routing to an ordered provider
+    # whitelist (comma-separated slugs, e.g. "deepinfra,novita,alibaba"):
+    # request-level provider.order with allow_fallbacks=false. Unpinned
+    # routing gambles every large cold-prefill call across ~15 upstreams, and
+    # the slow ones queue for minutes until the router's idle ceiling kills the
+    # stream before any content chunk (Issue #285). A short list tolerates
+    # single-provider routing-table flaps; empty keeps OpenRouter's default
+    # price-weighted load balancing.
     openrouter_provider: str = ""
     # Tag the stable system prefix of Anthropic-route requests with an ephemeral
     # cache_control breakpoint: cache hits cut prefill TTFB to seconds, price the

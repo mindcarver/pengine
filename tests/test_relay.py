@@ -200,6 +200,20 @@ def test_openrouter_provider_pin_adds_routing_preference(
     assert adapter.model.extra_body == expected_extra_body
 
 
+def test_openrouter_provider_whitelist_keeps_order_and_spaces_out() -> None:
+    settings = _role_settings(
+        generation_model_id="deepseek/deepseek-v4-flash",
+        openrouter_provider=" deepinfra , novita ,, alibaba ",
+    )
+
+    adapter = build_relay_adapter(settings, role="generation")
+
+    assert adapter.model.extra_body == {
+        "reasoning": {"enabled": False},
+        "provider": {"order": ["deepinfra", "novita", "alibaba"], "allow_fallbacks": False},
+    }
+
+
 def test_openrouter_glm_requires_serial_tool_calls() -> None:
     class ProbeTool(BaseModel):
         value: str

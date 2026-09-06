@@ -1636,14 +1636,16 @@ def _openrouter_extra_body(model_id: str, settings: Settings) -> dict[str, Any] 
     if model_id == "deepseek/deepseek-v4-flash":
         extra["reasoning"] = {"enabled": False}
     if settings.openrouter_provider:
-        # Hard-pin this request to one upstream provider: unpinned routing
+        # Hard-pin this request to a vetted provider whitelist: unpinned routing
         # gambles large cold-prefill calls across ~15 upstreams, and the slow
         # ones queue for minutes until the router's idle ceiling kills the
-        # stream before any content chunk arrives (Issue #285).
-        extra["provider"] = {
-            "order": [settings.openrouter_provider],
-            "allow_fallbacks": False,
-        }
+        # stream before any content chunk arrives (Issue #285). A short ordered
+        # list tolerates single-provider routing-table flaps; allow_fallbacks
+        # stays false so the price roulette never resumes.
+        providers = [
+            item.strip() for item in settings.openrouter_provider.split(",") if item.strip()
+        ]
+        extra["provider"] = {"order": providers, "allow_fallbacks": False}
     return extra or None
 
 
