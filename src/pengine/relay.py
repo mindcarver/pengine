@@ -1941,6 +1941,18 @@ def classify_relay_exception(exc: Exception) -> RelayError:
     separately by ``retryable_relay_interruption`` (e.g. HTTP 408 provider timeout is
     classified as ``relay_unavailable`` but recoverable — Issue #52 graph revision 10).
     """
+    if isinstance(exc, json.JSONDecodeError):
+        # An upstream answered a non-streaming call with a non-JSON body (seen:
+        # SSE-shaped responses through the aggregator). That upstream is
+        # deterministically bad for this request shape, but the pool re-rolls
+        # on retry, so classify it as a recoverable transport failure.
+        return RelayError(
+            code="relay_unavailable",
+            safe_message=(
+                "The model relay returned a non-JSON response body "
+                f"({exc.msg} at line {exc.lineno})."
+            ),
+        )
     failure = _extract_provider_failure(exc)
     status = failure.http_status if failure is not None else None
     if status is not None:
@@ -2009,6 +2021,10 @@ def retryable_relay_interruption(exc: Exception) -> RetryableRelayInterruption |
     if _has_tls_configuration_error(exc):
         return None
     if isinstance(exc, (RelayStreamIncompleteError, RelayStreamStalledError)):
+        return RetryableRelayInterruption(_retry_delay_seconds(exc))
+    if isinstance(exc, json.JSONDecodeError):
+        # Non-JSON body on a non-streaming call: the serving upstream is bad
+        # for this shape, but a retry re-rolls the provider pool.
         return RetryableRelayInterruption(_retry_delay_seconds(exc))
     if _is_retryable_transport(exc):
         return RetryableRelayInterruption(_retry_delay_seconds(exc))

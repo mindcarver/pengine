@@ -2180,3 +2180,14 @@ async def test_warm_prompt_cache_disabled_is_a_noop(monkeypatch) -> None:
     monkeypatch.setattr(model, "async_client", FakeCompletions())
 
     assert await model.warm_prompt_cache([{"role": "user", "content": "u"}]) is None
+
+
+def test_non_json_body_classifies_as_recoverable_relay_interruption() -> None:
+    import json as jsonlib
+
+    exc = jsonlib.JSONDecodeError("Expecting value", "data: x\n" * 200, 1100)
+
+    classified = classify_relay_exception(exc)
+    assert classified.code == "relay_unavailable"
+    assert "non-JSON" in classified.safe_message
+    assert retryable_relay_interruption(exc) is not None
