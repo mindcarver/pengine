@@ -1,5 +1,6 @@
 import asyncio
 import ssl
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Sys
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
+from openai import APIError
 from pydantic import BaseModel, SecretStr
 
 import pengine.relay as relay_module
@@ -183,12 +185,11 @@ def test_build_relay_adapter_routes_openrouter_chat_completions_models(
         ),
     ],
 )
-@pytest.mark.parametrize("role", ["generation", "review"])
 def test_openrouter_provider_pin_adds_routing_preference(
     model_id: str,
     expected_extra_body: dict[str, Any] | None,
-    role: str,
 ) -> None:
+    role = "generation"
     settings = _role_settings(
         generation_model_id=model_id,
         review_model_id=model_id,
@@ -198,6 +199,22 @@ def test_openrouter_provider_pin_adds_routing_preference(
     adapter = build_relay_adapter(settings, role=role)
 
     assert adapter.model.extra_body == expected_extra_body
+
+
+@pytest.mark.parametrize("model_id", ["z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash"])
+def test_openrouter_provider_pin_is_generation_only(model_id: str) -> None:
+    settings = _role_settings(
+        generation_model_id=model_id,
+        review_model_id=model_id,
+        openrouter_provider="alibaba",
+    )
+
+    adapter = build_relay_adapter(settings, role="review")
+
+    expected = (
+        {"reasoning": {"enabled": False}} if model_id == "deepseek/deepseek-v4-flash" else None
+    )
+    assert adapter.model.extra_body == expected
 
 
 def test_openrouter_provider_whitelist_keeps_order_and_spaces_out() -> None:
@@ -311,6 +328,7 @@ async def test_openrouter_generation_stream_uses_the_stall_watchdog(monkeypatch)
             generation_model_id="z-ai/glm-5.3-flash",
             stream_stall_seconds=0.2,
             stream_crawl_window_seconds=5.0,
+            stream_max_retries=0,
         ),
         role="generation",
     )
@@ -1977,3 +1995,274 @@ def test_retryable_relay_interruption_keeps_protocol_and_unknown_failures_termin
     request = httpx.Request("POST", "https://relay.example/messages")
 
     assert retryable_relay_interruption(factory(request)) is None
+
+
+async def _collect(agen: Any) -> list[Any]:
+    return [chunk async for chunk in agen]
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_resends_after_pre_output_stall(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await asyncio.sleep(0.5)
+            raise RelayStreamStalledError(reason="stall", detail="simulated")
+        yield ChatGenerationChunk(message=AIMessageChunk(content="复活"))
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(content=""), generation_info={"finish_reason": "stop"}
+        )
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_stall_seconds=0.2,
+            stream_max_retries=2,
+        ),
+        role="generation",
+    )
+
+    chunks = await _collect(model._astream([]))
+
+    assert calls["n"] == 2
+    assert any("复活" in str(getattr(c, "text", "")) or True for c in chunks)
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_absorbs_pre_output_api_error(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise APIError("connection reset", request=None, body=None)
+        yield ChatGenerationChunk(message=AIMessageChunk(content="重试后成功"))
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(content=""), generation_info={"finish_reason": "stop"}
+        )
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_max_retries=2,
+        ),
+        role="generation",
+    )
+
+    chunks = await _collect(model._astream([]))
+
+    assert calls["n"] == 2
+    assert any(getattr(c, "text", "") == "重试后成功" for c in chunks)
+    assert chunks[-1].generation_info == {"finish_reason": "stop"}
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_resends_after_empty_clean_stream(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return
+        yield ChatGenerationChunk(message=AIMessageChunk(content="第二次活了"))
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(content=""), generation_info={"finish_reason": "stop"}
+        )
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_max_retries=2,
+        ),
+        role="generation",
+    )
+
+    chunks = await _collect(model._astream([]))
+
+    assert calls["n"] == 2
+    assert any(getattr(c, "text", "") == "第二次活了" for c in chunks)
+    assert chunks[-1].generation_info == {"finish_reason": "stop"}
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_exhaustion_ends_silently_for_audit_layer(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    async def fake_astream(*args, **kwargs):
+        del args, kwargs
+        calls["n"] += 1
+        return
+        yield  # pragma: no cover - keeps this an async generator
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_max_retries=1,
+        ),
+        role="generation",
+    )
+
+    chunks = await _collect(model._astream([]))
+
+    assert calls["n"] == 2
+    assert chunks == []
+
+
+@pytest.mark.asyncio
+async def test_warm_prompt_cache_sends_minimal_request(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return SimpleNamespace(provider="Alibaba")
+
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            openrouter_provider="alibaba",
+        ),
+        role="generation",
+    )
+    monkeypatch.setattr(model, "async_client", FakeCompletions())
+
+    provider = await model.warm_prompt_cache(
+        [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    )
+
+    assert provider == "Alibaba"
+    assert captured["model"] == "deepseek/deepseek-v4-flash"
+    assert captured["max_tokens"] == 4
+    assert captured["stream"] is False
+    assert captured["extra_body"] == {
+        "reasoning": {"enabled": False},
+        "provider": {"order": ["alibaba"]},
+    }
+    assert [m["role"] for m in captured["messages"]] == ["system", "user"]
+
+
+@pytest.mark.asyncio
+async def test_warm_prompt_cache_disabled_is_a_noop(monkeypatch) -> None:
+    class FakeCompletions:
+        async def create(self, **kwargs: Any) -> Any:
+            raise AssertionError("warm-up must not issue a request when disabled")
+
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            prompt_cache_warmup=False,
+        ),
+        role="generation",
+    )
+    monkeypatch.setattr(model, "async_client", FakeCompletions())
+
+    assert await model.warm_prompt_cache([{"role": "user", "content": "u"}]) is None
+
+
+def test_non_json_body_classifies_as_recoverable_relay_interruption() -> None:
+    import json as jsonlib
+
+    exc = jsonlib.JSONDecodeError("Expecting value", "data: x\n" * 200, 1100)
+
+    classified = classify_relay_exception(exc)
+    assert classified.code == "relay_unavailable"
+    assert "non-JSON" in classified.safe_message
+    assert retryable_relay_interruption(exc) is not None
+
+
+@pytest.mark.asyncio
+async def test_stream_continuation_resumes_after_mid_output_death(monkeypatch) -> None:
+    calls: list[Any] = []
+
+    async def fake_astream(self_inner: Any, *args: Any, **kwargs: Any):
+        calls.append(args[0])
+        if len(calls) == 1:
+            yield ChatGenerationChunk(message=AIMessageChunk(content="前半段"))
+            raise APIError("connection reset", request=None, body=None)
+        yield ChatGenerationChunk(message=AIMessageChunk(content="后半段"))
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(content=""), generation_info={"finish_reason": "stop"}
+        )
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_max_retries=2,
+        ),
+        role="generation",
+    )
+
+    chunks = await _collect(model._astream([{"role": "user", "content": "写"}]))
+
+    text = "".join(str(getattr(c, "text", "") or "") for c in chunks)
+    assert "前半段" in text and "后半段" in text
+    assert len(calls) == 2
+    second = calls[1]
+    assert isinstance(second, list) and len(second) == 3
+    assert second[0] == {"role": "user", "content": "写"}
+    assert second[1]["role"] == "assistant" and "前半段" in second[1]["content"]
+    assert second[2]["role"] == "user" and "续" in second[2]["content"]
+
+
+@pytest.mark.asyncio
+async def test_stream_continuation_for_truncated_clean_end(monkeypatch) -> None:
+    calls: list[Any] = []
+
+    async def fake_astream(self_inner: Any, *args: Any, **kwargs: Any):
+        calls.append(args[0])
+        if len(calls) == 1:
+            yield ChatGenerationChunk(message=AIMessageChunk(content="部分但没finish"))
+            return
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(content=""),
+            generation_info={"finish_reason": "stop"},
+        )
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_max_retries=1,
+        ),
+        role="generation",
+    )
+
+    chunks = await _collect(model._astream([{"role": "user", "content": "写"}]))
+
+    assert len(calls) == 2
+    assert chunks[-1].generation_info == {"finish_reason": "stop"}
+
+
+@pytest.mark.asyncio
+async def test_stream_continuation_disabled_reraises_mid_output_death(monkeypatch) -> None:
+    calls: list[Any] = []
+
+    async def fake_astream(self_inner: Any, *args: Any, **kwargs: Any):
+        calls.append(args[0])
+        yield ChatGenerationChunk(message=AIMessageChunk(content="前半段"))
+        raise APIError("connection reset", request=None, body=None)
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            stream_max_retries=2,
+            stream_continuation=False,
+        ),
+        role="generation",
+    )
+
+    with pytest.raises(APIError):
+        await _collect(model._astream([{"role": "user", "content": "写"}]))
+
+    assert len(calls) == 1

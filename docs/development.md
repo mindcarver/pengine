@@ -234,6 +234,24 @@ Issue / 设计说明
 - **错误信息要透传**。把底层 `ValidationError` 的字段细节吞成通用文案（如
   "未通过确定性校验"）会让运维与修复环都失去目标；`safe_message` 与日志都应携带
   `{exc}` 原文（AgentProtocolError / internal_error 均适用）。
+- **传输层隐形重试**。交互式 coding agent（Codex `stream_max_retries` 默认 5）对
+  "首 token 前死亡"的流式调用做带退避的整请求透明重发，用户只看到转圈——这是它们
+  "怎么接中转都不中断"的核心。pengine 在 `_SerialChatOpenAI._astream` 内实现了等价
+  层（`PENGINE_STREAM_MAX_RETRIES`，默认 2）：仅重试未交付任何输出的失败（stall /
+  零 chunk 干净 EOF），部分输出已到达消费者后绝不重试，业务层确定性不受影响、也不
+  占阶段尝试预算。上游侧参照：DeepSeek 官方 API 以 keep-alive 注释 + 30 分钟宽限
+  维持慢流，聚合路由器的处理窗则短得多——慢流对哑代理中转通常无害。
+- **常热前缀（Claude Code 模式）**。交互式 agent 的会话前缀永远命中缓存，因此
+  prefill 秒回、永远远离聚合路由器的 ~300 秒处理上限。批量管线在重调用（season map）
+  前显式发一个同前缀、最小输出的预热请求（`warm_prompt_cache`，
+  `PENGINE_PROMPT_CACHE_WARMUP`）复刻同一条件——注意只有具备隐式缓存亲和的上游有效
+  （DeepSeek flash slug 上实测 Alibaba/SiliconFlow 命中 12288/12547 tokens，Novita/
+  DeepInfra 不命中），供应商偏好需与之配对。
+- **续传提示（中途断杀的终点解）**。流式生成在部分输出已交付后死亡时，把已交付内容
+  作为 assistant 轮次回放、要求模型从断点逐字续写（`_PartialOutput` 按文本/工具参数
+  分片累积，`PENGINE_STREAM_CONTINUATION`，与隐形重试共享预算）。供应商不提供 resume
+  token，这是行业标准客户端解法（Atlassian Forge 等）；禁用时中途死亡直接升级到
+  worker 恢复路径。前置死亡仍走整请求隐形重发。
 - **模型档位决定 schema 纪律**。flash 档在 9 人 cast 的转录任务上反复违反唯一性约束，
   pro 档一次通过；重结构化阶段考虑用高档模型（分阶段路由），轻阶段用 flash 控制成本。
 
