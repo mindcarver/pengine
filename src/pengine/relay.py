@@ -1730,17 +1730,21 @@ def build_relay_routes(
     )
 
 
-def _openrouter_extra_body(model_id: str, settings: Settings) -> dict[str, Any] | None:
+def _openrouter_extra_body(
+    model_id: str, settings: Settings, *, with_provider: bool = False
+) -> dict[str, Any] | None:
     extra: dict[str, Any] = {}
     if model_id == "deepseek/deepseek-v4-flash":
         extra["reasoning"] = {"enabled": False}
-    if settings.openrouter_provider:
+    if with_provider and settings.openrouter_provider:
         # Prefer vetted fast upstreams without leaving the pool: unpinned routing
         # gambles large cold-prefill calls across ~15 upstreams, and some choke
         # silently on big agent histories until the router's idle ceiling kills
         # the stream (Issue #285). An ordered preference puts the fast ones
         # first; fallbacks stay enabled so tool-compatibility flaps degrade to
         # default routing instead of 404 — hard pinning proved too brittle.
+        # Generation only: some preferred upstreams answer non-streaming review
+        # calls with SSE-shaped bodies that fail the SDK's JSON parsing.
         providers = [
             item.strip() for item in settings.openrouter_provider.split(",") if item.strip()
         ]
@@ -1869,7 +1873,7 @@ def build_relay_adapter(
                 **common,
                 max_tokens=max_output_tokens,
                 stream_chunk_timeout=chunk_timeout,
-                extra_body=_openrouter_extra_body(model_id, settings),
+                extra_body=_openrouter_extra_body(model_id, settings, with_provider=True),
                 pengine_model_call_state=model_call_state,
                 pengine_stream_watchdog=stream_watchdog,
                 pengine_stream_max_retries=settings.stream_max_retries,

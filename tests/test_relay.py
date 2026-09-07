@@ -185,12 +185,11 @@ def test_build_relay_adapter_routes_openrouter_chat_completions_models(
         ),
     ],
 )
-@pytest.mark.parametrize("role", ["generation", "review"])
 def test_openrouter_provider_pin_adds_routing_preference(
     model_id: str,
     expected_extra_body: dict[str, Any] | None,
-    role: str,
 ) -> None:
+    role = "generation"
     settings = _role_settings(
         generation_model_id=model_id,
         review_model_id=model_id,
@@ -200,6 +199,22 @@ def test_openrouter_provider_pin_adds_routing_preference(
     adapter = build_relay_adapter(settings, role=role)
 
     assert adapter.model.extra_body == expected_extra_body
+
+
+@pytest.mark.parametrize("model_id", ["z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash"])
+def test_openrouter_provider_pin_is_generation_only(model_id: str) -> None:
+    settings = _role_settings(
+        generation_model_id=model_id,
+        review_model_id=model_id,
+        openrouter_provider="alibaba",
+    )
+
+    adapter = build_relay_adapter(settings, role="review")
+
+    expected = (
+        {"reasoning": {"enabled": False}} if model_id == "deepseek/deepseek-v4-flash" else None
+    )
+    assert adapter.model.extra_body == expected
 
 
 def test_openrouter_provider_whitelist_keeps_order_and_spaces_out() -> None:
