@@ -13591,3 +13591,44 @@ def test_virtual_permissions_deny_persona_writes_and_unmatched_paths() -> None:
         ("/persona", "/persona/**", "/skills", "/skills/**"),
         "deny",
     ) in skilled_rules
+
+
+@pytest.mark.asyncio
+async def test_script_group_text_doubles_budget_on_length_truncation() -> None:
+    from pengine.model_calls import ModelCallState
+
+    nonce = "b" * 32
+    plaintext = (
+        f"<<<PENGINE_EPISODE_START:{nonce}:1>>>\n第一集完整剧本\n"
+        f"<<<PENGINE_EPISODE_END:{nonce}:1>>>"
+    )
+    truncated = AIMessage(
+        content="写了一半的剧本",
+        response_metadata={"finish_reason": "length"},
+        usage_metadata={"output_tokens": 20_480, "input_tokens": 1, "total_tokens": 20_481},
+    )
+    complete = AIMessage(
+        content=plaintext,
+        response_metadata={"finish_reason": "stop"},
+        usage_metadata={"output_tokens": 900, "input_tokens": 1, "total_tokens": 901},
+    )
+    model = ToolCallingFakeModel(responses=[truncated, complete])
+    state = ModelCallState()
+    state.context.requested_output_tokens = 20_480
+
+    result = await _invoke_script_group_text(
+        model,
+        [
+            {"role": "system", "content": "Return plaintext."},
+            {"role": "user", "content": "FULL-CONTEXT-SENTINEL"},
+        ],
+        group_id="opening_unit",
+        start_episode=1,
+        end_episode=1,
+        nonce=nonce,
+        model_call_state=state,
+    )
+
+    assert [episode.content for episode in result.episodes] == ["第一集完整剧本"]
+    assert len(model.model_message_batches) == 2
+    assert state.context.requested_output_tokens == 20_480

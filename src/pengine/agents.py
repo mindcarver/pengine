@@ -2768,10 +2768,42 @@ async def _invoke_script_group_text(
     start_episode: int,
     end_episode: int,
     nonce: str,
+    model_call_state: ModelCallState | None = None,
 ) -> ScriptGenerationGroupText:
-    response = await model.ainvoke(messages)
-    if _is_thinking_only_response(response):
-        response = await model.ainvoke([*messages, _thinking_recovery_message()])
+    # Reasoning models count thinking tokens against the same output budget,
+    # so a long chain of thought can hit the per-call cap and truncate the
+    # screenplay mid-stream (finish_reason=length; Issue #285). Retry with the
+    # reservation doubled — bounded, and the observed output at the cap tells
+    # us the previous reservation — instead of failing the episode.
+    cap_override: int | None = None
+    for attempt in range(3):
+        previous_budget = None
+        if cap_override is not None and model_call_state is not None:
+            previous_budget = model_call_state.context.requested_output_tokens
+            model_call_state.context.requested_output_tokens = cap_override
+        try:
+            response = await model.ainvoke(messages)
+        finally:
+            if previous_budget is not None and model_call_state is not None:
+                model_call_state.context.requested_output_tokens = previous_budget
+        if _is_thinking_only_response(response):
+            response = await model.ainvoke([*messages, _thinking_recovery_message()])
+        metadata = getattr(response, "response_metadata", None) or {}
+        produced = (getattr(response, "usage_metadata", None) or {}).get("output_tokens")
+        if metadata.get("finish_reason") != "length" or not isinstance(produced, int):
+            break
+        if attempt >= 2:
+            break
+        cap_override = max(cap_override or 0, produced) * 2
+        logger.warning(
+            "script text truncated by output cap (finish=length, %d tokens); "
+            "retrying with doubled reservation %d for group %s episodes %d-%d",
+            produced,
+            cap_override,
+            group_id,
+            start_episode,
+            end_episode,
+        )
     return _parse_script_group_text(
         _message_plaintext(response),
         group_id=group_id,
@@ -2942,6 +2974,7 @@ async def _generate_script_group_with_sidecar(
             start_episode=start_episode,
             end_episode=end_episode,
             nonce=nonce,
+            model_call_state=model_call_state,
         )
         if window_id is not None and persist_text is not None:
             await persist_text(

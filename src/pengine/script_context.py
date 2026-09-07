@@ -18,8 +18,12 @@ from pengine.model_calls import estimate_text_tokens
 from pengine.schemas import EpisodeDraft
 
 SCRIPT_CONTEXT_SCHEMA_VERSION = 2
-SCRIPT_OUTPUT_BASE_TOKENS = 4_096
-SCRIPT_OUTPUT_TOKENS_PER_EPISODE = 8_192
+# Reasoning models spend thinking tokens from the same output budget
+# (Anthropic/OpenAI/DeepSeek all count them against max_tokens), so the
+# per-call reservation must leave room for both the chain of thought and
+# the screenplay text; a length-truncation retry doubles it as backstop.
+SCRIPT_OUTPUT_BASE_TOKENS = 8_192
+SCRIPT_OUTPUT_TOKENS_PER_EPISODE = 12_288
 
 ContextAuthority = Literal["persona", "canonical", "committed", "derived", "advisory"]
 
