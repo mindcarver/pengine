@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     # jittered exponential backoff instead of escalating to the bounded stage
     # budget. Retries never fire once partial output has reached the consumer.
     stream_max_retries: int = Field(default=2, ge=0, le=8)
+    # Claude Code-style always-warm prefix: before a heavy structured call,
+    # send a minimal-output request with the identical message prefix to seed
+    # the provider-side cache (only cache-affine upstreams benefit, e.g.
+    # Alibaba/SiliconFlow on the DeepSeek flash slug), keeping the heavy
+    # call's prefill seconds-short and far below the aggregator's ~300s
+    # processing ceiling (Issue #285).
+    prompt_cache_warmup: bool = Field(default=True)
     lease_seconds: int = Field(default=60, ge=5)
     worker_poll_seconds: float = Field(default=0.25, gt=0)
     worker_concurrency: int = Field(default=5, ge=1, le=5)

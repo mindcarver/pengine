@@ -9311,6 +9311,15 @@ class DeepAgentWorkflow:
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": compiled.model_input},
             ]
+            warm = getattr(self.generation_model, "warm_prompt_cache", None)
+            if warm is not None:
+                # Always-warm prefix (Claude Code pattern): seed the provider
+                # cache so the heavy season map prefill runs in seconds and
+                # stays clear of the aggregator's ~300s ceiling (Issue #285).
+                try:
+                    await warm(base_messages)
+                except Exception:
+                    logger.debug("season-map prompt cache warm-up failed", exc_info=True)
             # A blind requeue regenerates the same deterministic context and
             # repeats the same violation, so feed the validator's own error
             # text back to the model for a bounded targeted repair instead.

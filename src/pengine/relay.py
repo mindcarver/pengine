@@ -505,6 +505,7 @@ class _SerialChatOpenAI(ChatOpenAI):
     _pengine_model_call_state: ModelCallState | None = PrivateAttr(default=None)
     _pengine_stream_watchdog: _StreamStallWatchdog | None = PrivateAttr(default=None)
     _pengine_stream_max_retries: int = PrivateAttr(default=0)
+    _pengine_prompt_cache_warmup: bool = PrivateAttr(default=False)
 
     def __init__(
         self,
@@ -512,12 +513,14 @@ class _SerialChatOpenAI(ChatOpenAI):
         pengine_model_call_state: ModelCallState | None = None,
         pengine_stream_watchdog: _StreamStallWatchdog | None = None,
         pengine_stream_max_retries: int = 0,
+        pengine_prompt_cache_warmup: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._pengine_model_call_state = pengine_model_call_state
         self._pengine_stream_watchdog = pengine_stream_watchdog
         self._pengine_stream_max_retries = pengine_stream_max_retries
+        self._pengine_prompt_cache_warmup = pengine_prompt_cache_warmup
 
     def _with_call_output_budget(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         state = self._pengine_model_call_state
@@ -594,6 +597,30 @@ class _SerialChatOpenAI(ChatOpenAI):
                 await asyncio.sleep(delay)
                 continue
         return
+
+    async def warm_prompt_cache(self, messages: Sequence[Mapping[str, Any]]) -> str | None:
+        """Claude Code-style always-warm prefix for one heavy call (Issue #285).
+
+        A minimal-output, non-streaming request carrying the identical message
+        prefix seeds the provider-side cache — verified on cache-affine upstreams
+        (Alibaba/SiliconFlow read 12288/12547 prompt tokens from cache on the
+        immediately following call) — so the heavy call prefills in seconds
+        instead of stretching past the aggregator's ~300s processing ceiling.
+        Best-effort: failures propagate to the caller's own error handling and
+        the heavy call simply runs cold. Returns the serving provider when the
+        upstream reports one.
+        """
+        if not self._pengine_prompt_cache_warmup:
+            return None
+        response = await self.async_client.create(
+            model=self.model_name,
+            messages=[dict(item) for item in messages],
+            max_tokens=4,
+            stream=False,
+            extra_body=dict(self.extra_body) if self.extra_body else None,
+        )
+        provider = getattr(response, "provider", None)
+        return provider if isinstance(provider, str) else None
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
         tool_choice = kwargs.get("tool_choice")
@@ -1846,6 +1873,7 @@ def build_relay_adapter(
                 pengine_model_call_state=model_call_state,
                 pengine_stream_watchdog=stream_watchdog,
                 pengine_stream_max_retries=settings.stream_max_retries,
+                pengine_prompt_cache_warmup=settings.prompt_cache_warmup,
                 streaming=True,
             ),
             role=role,

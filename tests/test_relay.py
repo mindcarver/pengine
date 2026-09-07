@@ -1,5 +1,6 @@
 import asyncio
 import ssl
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -2113,3 +2114,54 @@ async def test_stream_retry_exhaustion_ends_silently_for_audit_layer(monkeypatch
 
     assert calls["n"] == 2
     assert chunks == []
+
+
+@pytest.mark.asyncio
+async def test_warm_prompt_cache_sends_minimal_request(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return SimpleNamespace(provider="Alibaba")
+
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            openrouter_provider="alibaba",
+        ),
+        role="generation",
+    )
+    monkeypatch.setattr(model, "async_client", FakeCompletions())
+
+    provider = await model.warm_prompt_cache(
+        [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    )
+
+    assert provider == "Alibaba"
+    assert captured["model"] == "deepseek/deepseek-v4-flash"
+    assert captured["max_tokens"] == 4
+    assert captured["stream"] is False
+    assert captured["extra_body"] == {
+        "reasoning": {"enabled": False},
+        "provider": {"order": ["alibaba"]},
+    }
+    assert [m["role"] for m in captured["messages"]] == ["system", "user"]
+
+
+@pytest.mark.asyncio
+async def test_warm_prompt_cache_disabled_is_a_noop(monkeypatch) -> None:
+    class FakeCompletions:
+        async def create(self, **kwargs: Any) -> Any:
+            raise AssertionError("warm-up must not issue a request when disabled")
+
+    model = build_chat_model(
+        _role_settings(
+            generation_model_id="deepseek/deepseek-v4-flash",
+            prompt_cache_warmup=False,
+        ),
+        role="generation",
+    )
+    monkeypatch.setattr(model, "async_client", FakeCompletions())
+
+    assert await model.warm_prompt_cache([{"role": "user", "content": "u"}]) is None
