@@ -247,6 +247,11 @@ Issue / 设计说明
   `PENGINE_PROMPT_CACHE_WARMUP`）复刻同一条件——注意只有具备隐式缓存亲和的上游有效
   （DeepSeek flash slug 上实测 Alibaba/SiliconFlow 命中 12288/12547 tokens，Novita/
   DeepInfra 不命中），供应商偏好需与之配对。
+- **续传提示（中途断杀的终点解）**。流式生成在部分输出已交付后死亡时，把已交付内容
+  作为 assistant 轮次回放、要求模型从断点逐字续写（`_PartialOutput` 按文本/工具参数
+  分片累积，`PENGINE_STREAM_CONTINUATION`，与隐形重试共享预算）。供应商不提供 resume
+  token，这是行业标准客户端解法（Atlassian Forge 等）；禁用时中途死亡直接升级到
+  worker 恢复路径。前置死亡仍走整请求隐形重发。
 - **模型档位决定 schema 纪律**。flash 档在 9 人 cast 的转录任务上反复违反唯一性约束，
   pro 档一次通过；重结构化阶段考虑用高档模型（分阶段路由），轻阶段用 flash 控制成本。
 

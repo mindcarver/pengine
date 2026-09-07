@@ -85,6 +85,13 @@ class Settings(BaseSettings):
     # call's prefill seconds-short and far below the aggregator's ~300s
     # processing ceiling (Issue #285).
     prompt_cache_warmup: bool = Field(default=True)
+    # Continuation prompting for mid-stream kills: when a generation stream
+    # dies after partial output was delivered (provider truncation, connection
+    # reset), replay the partial output as an assistant turn and ask the model
+    # to continue verbatim from the break point instead of discarding it —
+    # providers offer no resume token, so this client-side pattern is the
+    # standard answer (Issue #285). Shares the stream_max_retries budget.
+    stream_continuation: bool = Field(default=True)
     lease_seconds: int = Field(default=60, ge=5)
     worker_poll_seconds: float = Field(default=0.25, gt=0)
     worker_concurrency: int = Field(default=5, ge=1, le=5)

@@ -501,11 +501,114 @@ def _chunk_carries_output(chunk: Any) -> bool:
     return bool(getattr(message, "tool_calls", None))
 
 
+_CONTINUATION_INSTRUCTION = (
+    "上一次回复在输出中途被切断，上面这条 assistant 消息是已交付部分。"
+    "请从中断点逐字继续输出剩余内容：只输出尚未输出的部分，绝对不要重复已输出内容，"
+    "不要添加解释、道歉或新的开场。如果正在输出工具调用参数，就继续那个未完成的 JSON "
+    "字符串直到它合法结束。"
+)
+
+
+class _PartialOutput:
+    """Accumulates the consumer-visible output of one logical streaming call.
+
+    Continuation prompting (the standard client-side answer to mid-stream
+    kills — providers offer no resume token) needs the exact partial output to
+    replay as an assistant turn: text concatenates directly, while tool-call
+    argument fragments merge by chunk index.
+    """
+
+    def __init__(self) -> None:
+        self._text_parts: list[str] = []
+        self._tool_fragments: dict[int, dict[str, str]] = {}
+        self.saw_finish_reason = False
+
+    def add(self, chunk: Any) -> None:
+        message = getattr(chunk, "message", None)
+        if message is None:
+            return
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content:
+            self._text_parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, str) and block:
+                    self._text_parts.append(block)
+                elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                    self._text_parts.append(block["text"])
+        for fragment in getattr(message, "tool_call_chunks", None) or []:
+            if isinstance(fragment, dict):
+                name = fragment.get("name")
+                args = fragment.get("args")
+                call_id = fragment.get("id")
+                index = fragment.get("index", 0) or 0
+            else:
+                name = getattr(fragment, "name", None)
+                args = getattr(fragment, "args", None)
+                call_id = getattr(fragment, "id", None)
+                index = getattr(fragment, "index", 0) or 0
+            entry = self._tool_fragments.setdefault(index, {"name": "", "id": "", "args": ""})
+            if isinstance(name, str) and name and not entry["name"]:
+                entry["name"] = name
+            if isinstance(call_id, str) and call_id and not entry["id"]:
+                entry["id"] = call_id
+            if isinstance(args, str):
+                entry["args"] += args
+        info = getattr(chunk, "generation_info", None)
+        if isinstance(info, dict) and info.get("finish_reason"):
+            self.saw_finish_reason = True
+
+    @property
+    def has_output(self) -> bool:
+        return bool(self._text_parts) or bool(self._tool_fragments)
+
+    def assistant_payload(self) -> dict[str, Any] | None:
+        """OpenAI-style assistant message replaying the delivered partial output."""
+        if not self.has_output:
+            return None
+        payload: dict[str, Any] = {"role": "assistant", "content": "".join(self._text_parts)}
+        if self._tool_fragments:
+            tool_calls = []
+            for index in sorted(self._tool_fragments):
+                entry = self._tool_fragments[index]
+                tool_calls.append(
+                    {
+                        "id": entry["id"] or f"partial_{index}",
+                        "type": "function",
+                        "function": {
+                            "name": entry["name"] or "unknown",
+                            "arguments": entry["args"] or "",
+                        },
+                    }
+                )
+            payload["tool_calls"] = tool_calls
+        return payload
+
+    def tail_hint(self, limit: int = 80) -> str:
+        text = "".join(self._text_parts)
+        for entry in self._tool_fragments.values():
+            text += entry["args"]
+        return text[-limit:]
+
+
+def _input_messages_as_dicts(base_input: Any) -> list[dict[str, Any]] | None:
+    """Best-effort OpenAI-style dict view of a chat model input.
+
+    Continuation needs to replay the original request plus the partial output;
+    pengine's structured paths pass plain dict messages, so the common case is
+    a no-op. Other input shapes return None and fall back to a full resend.
+    """
+    if isinstance(base_input, list) and all(isinstance(item, dict) for item in base_input):
+        return list(base_input)
+    return None
+
+
 class _SerialChatOpenAI(ChatOpenAI):
     _pengine_model_call_state: ModelCallState | None = PrivateAttr(default=None)
     _pengine_stream_watchdog: _StreamStallWatchdog | None = PrivateAttr(default=None)
     _pengine_stream_max_retries: int = PrivateAttr(default=0)
     _pengine_prompt_cache_warmup: bool = PrivateAttr(default=False)
+    _pengine_stream_continuation: bool = PrivateAttr(default=True)
 
     def __init__(
         self,
@@ -514,6 +617,7 @@ class _SerialChatOpenAI(ChatOpenAI):
         pengine_stream_watchdog: _StreamStallWatchdog | None = None,
         pengine_stream_max_retries: int = 0,
         pengine_prompt_cache_warmup: bool = False,
+        pengine_stream_continuation: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -521,6 +625,7 @@ class _SerialChatOpenAI(ChatOpenAI):
         self._pengine_stream_watchdog = pengine_stream_watchdog
         self._pengine_stream_max_retries = pengine_stream_max_retries
         self._pengine_prompt_cache_warmup = pengine_prompt_cache_warmup
+        self._pengine_stream_continuation = pengine_stream_continuation
 
     def _with_call_output_budget(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         state = self._pengine_model_call_state
@@ -562,40 +667,73 @@ class _SerialChatOpenAI(ChatOpenAI):
         # a stream that dies before delivering any visible output is a transient
         # upstream roll of the provider dice, so transparently resend the whole
         # request with jittered exponential backoff instead of escalating to the
-        # workflow layer's bounded stage budget. Once any chunk has been yielded
-        # the consumer already holds partial output, so retries are off and the
-        # failure propagates unchanged — business determinism is preserved.
+        # workflow layer's bounded stage budget. Once output has been delivered
+        # the consumer already holds it, so a plain resend would duplicate
+        # content — instead continue with a continuation prompt (the standard
+        # client-side answer to mid-stream kills, since no provider offers a
+        # resume token): replay the partial output as an assistant turn and ask
+        # the model to continue verbatim from the break point. Both paths share
+        # one retry budget and stay off the stage-attempt accounting.
+        base_input = args[0]
+        partial = _PartialOutput()
+        continuation: list[Any] | None = None
         for attempt in range(self._pengine_stream_max_retries + 1):
             delivered = False
             exhausted_cleanly = False
-            retryable = False
+            action = "give_up"
             try:
-                async for chunk in self._astream_single_attempt(*args, **kwargs):
-                    delivered = delivered or _chunk_carries_output(chunk)
+                attempt_args = args if continuation is None else (continuation, *args[1:])
+                async for chunk in self._astream_single_attempt(*attempt_args, **kwargs):
+                    delivered = True
+                    if self._pengine_stream_continuation:
+                        partial.add(chunk)
                     yield chunk
                 exhausted_cleanly = True
             except (RelayStreamStalledError, APIError):
-                # APIError pre-output is a transport-level death (reset, TLS,
-                # relay 5xx with no status surfaced) — the same transient roll
-                # Codex absorbs; deterministic 4xx simply fail again and the
-                # final attempt still propagates for the workflow classifier.
-                if delivered or attempt >= self._pengine_stream_max_retries:
+                if attempt >= self._pengine_stream_max_retries:
                     raise
-                retryable = True
-            if exhausted_cleanly and delivered:
+                if delivered:
+                    # The consumer already holds partial output: a plain resend
+                    # would duplicate content. Continue when enabled; otherwise
+                    # there is no safe transport-level recovery, so escalate.
+                    if self._pengine_stream_continuation:
+                        action = "continue"
+                    else:
+                        raise
+                action = "resend" if not delivered else action
+            if exhausted_cleanly and delivered and partial.saw_finish_reason:
                 return
+            if exhausted_cleanly and delivered and not partial.saw_finish_reason:
+                # Truncated stream: content flowed but the terminal evidence
+                # never arrived. Continue from the break point when budget
+                # remains; otherwise return and let the audit layer fail the
+                # logical call as incomplete.
+                if attempt < self._pengine_stream_max_retries and self._pengine_stream_continuation:
+                    action = "continue"
+                else:
+                    return
             if exhausted_cleanly and not delivered:
                 # Zero chunks with a clean end is the silent-upstream-drop
-                # signature; a resend is the only fix (no heartbeat can resume
-                # it) and the audit callback still fails the logical call if
-                # every attempt comes back empty.
-                retryable = attempt < self._pengine_stream_max_retries
-                if not retryable:
+                # signature; a full resend is the only fix.
+                if attempt < self._pengine_stream_max_retries:
+                    action = "resend"
+                else:
                     return
-            if retryable:
-                delay = min(10.0, 2.0 * (2**attempt)) * (0.5 + random.random() / 2)
-                await asyncio.sleep(delay)
-                continue
+            if action == "give_up":
+                return
+            delay = min(10.0, 2.0 * (2**attempt)) * (0.5 + random.random() / 2)
+            await asyncio.sleep(delay)
+            if action == "continue":
+                payload = partial.assistant_payload()
+                base_dicts = _input_messages_as_dicts(base_input)
+                if payload is None or base_dicts is None:
+                    continue
+                hint = partial.tail_hint()
+                instruction = (
+                    f"{_CONTINUATION_INSTRUCTION}\n"
+                    f"已交付内容的最后几个字符是：{hint!r}。你的续写必须从这之后开始。"
+                )
+                continuation = [*base_dicts, payload, {"role": "user", "content": instruction}]
         return
 
     async def warm_prompt_cache(self, messages: Sequence[Mapping[str, Any]]) -> str | None:
@@ -1878,6 +2016,7 @@ def build_relay_adapter(
                 pengine_stream_watchdog=stream_watchdog,
                 pengine_stream_max_retries=settings.stream_max_retries,
                 pengine_prompt_cache_warmup=settings.prompt_cache_warmup,
+                pengine_stream_continuation=settings.stream_continuation,
                 streaming=True,
             ),
             role=role,
