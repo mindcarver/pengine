@@ -162,6 +162,30 @@ def estimate_messages_tokens(messages: list[Any]) -> int:
     return estimate_text_tokens(serialize_messages(messages))
 
 
+def message_size_breakdown(messages: list[Any], top: int = 5) -> str:
+    """Rank messages by serialized size for context-overflow diagnostics.
+
+    Reports only message kind, tool name, and character counts — never
+    content — so a runaway message (e.g. an exponentially duplicated history)
+    is identifiable in the blocked-call error without leaking script text.
+    """
+    ranked = sorted(
+        (
+            (
+                type(message).__name__,
+                str(getattr(message, "name", "") or getattr(message, "tool_call_id", "") or ""),
+                len(_message_text(message)),
+            )
+            for message in messages
+        ),
+        key=lambda item: item[2],
+        reverse=True,
+    )[:top]
+    total = sum(size for _, _, size in ranked)
+    head = ", ".join(f"{kind}[{name}]={chars}c" for kind, name, chars in ranked)
+    return f"{len(messages)} messages, top{top}={total}c: {head}" if ranked else "no-messages"
+
+
 def _tool_schema_text(tool: Any) -> str:
     if isinstance(tool, dict):
         return json.dumps(tool, ensure_ascii=False, sort_keys=True, default=str)

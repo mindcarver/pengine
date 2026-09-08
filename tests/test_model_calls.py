@@ -1148,3 +1148,26 @@ def test_reset_stage_budget_clears_only_the_target_stage() -> None:
     assert state.reserve_stage_call(role="generation", limit=48) == 1
     assert state.reserve_stage_call(role="review", limit=32) == 1
     assert state.stage_role_call_counts[("generating_story_outline", "generation")] == 5
+
+
+def test_message_size_breakdown_ranks_without_leaking_content() -> None:
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    from pengine.model_calls import message_size_breakdown
+
+    messages = [
+        HumanMessage(content="短消息"),
+        ToolMessage(content="剧" * 500_000, tool_call_id="t2", name="write_episodes"),
+        HumanMessage(content="中" * 200),
+        ToolMessage(content="次大" * 5_000, tool_call_id="t1", name="review"),
+    ]
+
+    breakdown = message_size_breakdown(messages, top=2)
+
+    assert "write_episodes" in breakdown
+    assert "500000c" in breakdown
+    assert breakdown.startswith("4 messages")
+    # 降序排行：最大的在前，且只保留 top N
+    assert breakdown.index("write_episodes]=500000c") < breakdown.index("review]=10000c")
+    # 不泄漏正文内容
+    assert "剧" not in breakdown
