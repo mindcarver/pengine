@@ -2446,3 +2446,70 @@ async def test_worker_rejects_results_not_derived_from_approved_checkpoints(
     assert resource is not None
     assert resource.initial.state == "failed"
     assert resource.initial.failure.code == "structured_output_invalid"
+
+
+class UpstreamToolCallVarianceOnceWorkflow(DeterministicWorkflow):
+    """A provider-order escape surfaces as an openai APIError (upstream
+    refused the forced tool_call); the episode must auto-retry in-process."""
+
+    def __init__(self) -> None:
+        super().__init__(episode_count=2)
+        self.calls = 0
+
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        self.calls += 1
+        if self.calls > 1:
+            return await super().execute(**kwargs)
+
+        before_episode = kwargs["before_episode"]
+        assert before_episode is not None
+
+        async def fail_on_second_episode(plan: EpisodePlan) -> int:
+            attempt = await before_episode(plan)
+            if plan.episode_number == 2:
+                response = httpx.Response(200, request=httpx.Request("POST", "https://x/c"))
+                raise openai.APIStatusError(
+                    "Upstream error from NextBit: upstream model did not return a valid "
+                    "tool call for the requested tool_choice",
+                    response=response,
+                    body={},
+                )
+            return attempt
+
+        return await super().execute(
+            **{
+                **kwargs,
+                "before_episode": fail_on_second_episode,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_worker_auto_retries_upstream_apierror_flake(tmp_path: Path) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "upstream-toolcall-variance",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=UpstreamToolCallVarianceOnceWorkflow(),
+        worker_id="upstream-toolcall-variance-worker",
+    )
+
+    assert await worker.run_once() is True
+    mid = await repository.get_creation(accepted.creation_id)
+    assert mid is not None
+    assert mid.initial.state == "queued"
+
+    assert await worker.run_once() is True
+    completed = await repository.get_creation(accepted.creation_id)
+    assert completed is not None
+    assert completed.initial.state == "succeeded"
