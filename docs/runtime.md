@@ -212,7 +212,7 @@ SQLite、结构化日志和 Langfuse 都保留 Relay 实际回报的原始 `resp
 
 ### Retry
 
-只适用于因操作员可修复错误终态失败的初稿 run：`relay_unavailable`（配额耗尽等外部 relay 错误）或 `stage_validation_failed`（确定性校验失败且原因已修复，如 #222 移除投影门禁）。它把 failed run 转回 `queued`，沿用原 `thread_id` 和已批准业务检查点续跑；要求对应阶段仍有尝试预算。内容性拒绝、协议错误、预算耗尽和 `ended_by_user` 保持终态；失败的修订 run 继续使用相同 feedback 重排队语义。资源中的 `progress.can_retry` 标明是否可用。
+只适用于因操作员可修复错误终态失败的初稿 run：`relay_unavailable`（配额耗尽等外部 relay 错误）、`stage_validation_failed`（确定性校验失败且原因已修复，如 #222 移除投影门禁）、`relay_rejected`（轮换池单次抽签的坏上游方差）或 `structured_output_invalid`（阶段 flake 预算耗尽于模型随机行为——如 season-map 角色重名，同阶段重试常有新抽签，2026-09-08 实测）。它把 failed run 转回 `queued`，沿用原 `thread_id` 和已批准业务检查点续跑；要求对应阶段仍有尝试预算。内容性拒绝、协议错误、预算耗尽和 `ended_by_user` 保持终态；失败的修订 run 继续使用相同 feedback 重排队语义。资源中的 `progress.can_retry` 标明是否可用。
 
 ### Authorize repair
 
