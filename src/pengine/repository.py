@@ -111,8 +111,13 @@ MAX_EPISODE_ATTEMPTS = 3
 # relay_rejected stays revivable: the rotating relay pool can reject a
 # standard request from one upstream draw while other draws accept it, so an
 # operator Retry after such a failure must never force a full restart.
+# structured_output_invalid stays revivable too: it is the stage flake
+# budget exhausting on stochastic model behavior (e.g. duplicate season-map
+# character names, production 2026-09-08) — the identical stage often
+# passes on a fresh retry, so an operator Retry must not force a full
+# restart either.
 RETRYABLE_FAILURE_CODES = frozenset(
-    {"relay_unavailable", "relay_rejected", "stage_validation_failed"}
+    {"relay_unavailable", "relay_rejected", "stage_validation_failed", "structured_output_invalid"}
 )
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
 

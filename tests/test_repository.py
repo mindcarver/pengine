@@ -4388,3 +4388,37 @@ async def test_run_progress_reports_outline_group_coverage(
         "current_start_episode": 4,
         "current_end_episode": 5,
     }
+
+
+async def test_retry_run_revives_structured_output_invalid_after_flake_budget(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    """A structured_output_invalid terminal failure (stage flake budget
+    exhausted on stochastic model behavior, e.g. duplicate season-map
+    character names) must stay operator-retryable: the identical stage
+    often passes on a fresh retry (production 2026-09-08)."""
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.fail_run(
+        lease.run_id,
+        RunFailure(
+            code="structured_output_invalid",
+            message="分集大纲分组上下文或生成结果未通过确定性校验。",
+            failed_stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            attempt_count=3,
+        ),
+        now=NOW,
+    )
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.state == "failed"
+    assert failed.initial.progress.can_retry is True
+
+    revived = await repository.retry_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-structured-output-invalid",
+        now=NOW + timedelta(seconds=10),
+    )
+    assert revived.run_state == "queued"
