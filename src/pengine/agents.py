@@ -67,7 +67,12 @@ from pengine.language import (
     infer_output_language,
     language_instruction,
 )
-from pengine.model_calls import ModelCallState, estimate_text_tokens, new_operation_id
+from pengine.model_calls import (
+    ModelCallState,
+    estimate_text_tokens,
+    message_serialized_chars,
+    new_operation_id,
+)
 from pengine.observability import content_fingerprint, record_langfuse_event
 from pengine.outline_context import (
     CompiledOutlineContext,
@@ -182,6 +187,11 @@ _BILINGUAL_GLOSS_SUFFIX = re.compile(r"\s*[（(][^()（）]*[A-Za-z][^()（）]*
 _INFER_OUTPUT_LANGUAGE = object()
 _TRANSLATABLE_LANGUAGE_VALUE = object()
 _REGISTERED_PROFILE_KEYS: set[str] = set()
+# A well-formed structured output stays well under the reserved output tokens
+# (~50k chars); anything past this bound is an upstream echo, not model text.
+_SIDECAR_RAW_MAX_CHARS = 200_000
+
+
 _REQUIRED_READ_PATHS_OPEN = "<pengine-required-read-paths>"
 _REQUIRED_READ_PATHS_CLOSE = "</pengine-required-read-paths>"
 _REQUIRED_READ_PATHS_BLOCK = re.compile(
@@ -2259,7 +2269,14 @@ async def _invoke_direct_structured_with_retry(
         ),
         None,
     )
-    if isinstance(raw, AIMessage) and matching_call is not None:
+    # A misbehaving upstream can echo megabytes into the raw assistant message
+    # (production 2026-09-08: a 19.9M-char AIMessage poisoned the retry context
+    # and preflight-blocked the follow-up at ~8M tokens). Never replay an
+    # oversized raw message: feed the correction back as plain text instead.
+    raw_oversized = (
+        isinstance(raw, AIMessage) and message_serialized_chars(raw) > _SIDECAR_RAW_MAX_CHARS
+    )
+    if isinstance(raw, AIMessage) and matching_call is not None and not raw_oversized:
         retry_messages.extend(
             [
                 raw,

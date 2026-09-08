@@ -13632,3 +13632,33 @@ async def test_script_group_text_doubles_budget_on_length_truncation() -> None:
     assert [episode.content for episode in result.episodes] == ["第一集完整剧本"]
     assert len(model.model_message_batches) == 2
     assert state.context.requested_output_tokens == 20_480
+
+
+@pytest.mark.asyncio
+async def test_direct_structured_retry_drops_oversized_raw_message() -> None:
+    """A misbehaving upstream echoing megabytes into the raw assistant message
+    must not poison the retry context (production 2026-09-08: a 19.9M-char
+    AIMessage preflight-blocked the follow-up call at ~8M tokens)."""
+
+    class Result(BaseModel):
+        value: str
+
+    poisoned = _tool_call("Result", {}, 1)  # empty args -> parse failure
+    poisoned.content = "echo" * 100_000  # 400k chars, over the raw guard bound
+    model = ToolCallingFakeModel(
+        responses=[
+            poisoned,
+            _tool_call("Result", {"value": "corrected"}, 2),
+        ]
+    )
+
+    result = await _invoke_direct_structured_with_retry(
+        model,
+        Result,
+        [{"role": "user", "content": "Produce the value."}],
+    )
+
+    assert result == Result(value="corrected")
+    retry_batch = model.model_message_batches[1]
+    assert not any(isinstance(message, AIMessage) for message in retry_batch)
+    assert any(isinstance(message, HumanMessage) for message in retry_batch)

@@ -162,6 +162,11 @@ def estimate_messages_tokens(messages: list[Any]) -> int:
     return estimate_text_tokens(serialize_messages(messages))
 
 
+def message_serialized_chars(message: Any) -> int:
+    """Serialized character count of a single message (content + tool calls)."""
+    return len(serialize_messages([message]))
+
+
 def message_size_breakdown(messages: list[Any], top: int = 5) -> str:
     """Rank messages by serialized size for context-overflow diagnostics.
 
