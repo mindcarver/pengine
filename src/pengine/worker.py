@@ -1654,6 +1654,17 @@ class Worker:
                         _exception_type_chain(exc),
                     )
                     return
+                # A fresh writer entry (e.g. lease-expiry resume after a
+                # service restart) on an episode whose attempt cycle is
+                # exhausted raises attempts_exhausted from the writer hook
+                # itself — outside the flake handlers. Roll a fresh cycle and
+                # requeue instead of terminal-failing the run (#290 spirit).
+                if (
+                    isinstance(exc, DomainError)
+                    and exc.code == "attempts_exhausted"
+                    and await self._roll_exhausted_episode(work)
+                ):
+                    return
                 # Known stochastic flake families raised outside the
                 # structured-output path (sidecar pydantic ValidationErrors,
                 # writer-tool ValueErrors, upstream tool-call variance surfaced
@@ -1778,6 +1789,36 @@ class Worker:
             episode_number,
             attempt_count + 1,
             str(exc)[:200],
+        )
+        return True
+
+    async def _roll_exhausted_episode(self, work: RunWorkItem) -> bool:
+        """Roll a fresh attempt cycle when a writer entry hits a full one.
+
+        The writer hook's record_episode_attempt raises attempts_exhausted
+        whenever a fresh entry (lease-expiry resume, post-restart requeue)
+        meets an exhausted cycle; pausing handlers never ran, so this helper
+        performs the roll the flake path would have done. Returns True when
+        the run was requeued on a fresh cycle.
+        """
+        refreshed = await self.repository.get_run_work_item(work.run_id)
+        if not refreshed.episode_drafts:
+            return False
+        episode_number = len(refreshed.episode_drafts) + 1
+        if episode_number > len(refreshed.episode_plans):
+            return False
+        attempts = await self.repository.get_episode_attempt_counts(work.run_id)
+        if attempts.get(episode_number, 0) < 3:
+            return False
+        await self.repository.roll_episode_attempt_cycle(work.run_id, episode_number)
+        await self.repository.requeue_stage_flake_retry(
+            work.run_id, stage=InternalStage.GENERATING_EPISODE_SCRIPTS
+        )
+        logger.warning(
+            "episode attempt cycle rolled on writer entry run_id=%s creation_id=%s episode=%s",
+            work.run_id,
+            work.creation_id,
+            episode_number,
         )
         return True
 
