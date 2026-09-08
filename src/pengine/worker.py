@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 import aiosqlite
+import openai
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 from pydantic import ValidationError
@@ -1655,10 +1656,12 @@ class Worker:
                     return
                 # Known stochastic flake families raised outside the
                 # structured-output path (sidecar pydantic ValidationErrors,
-                # writer-tool ValueErrors) auto-retry the current episode
-                # within its attempt budget before any pause; unknown
+                # writer-tool ValueErrors, upstream tool-call variance surfaced
+                # as openai APIError — e.g. provider-order escapes to upstreams
+                # that choke on forced tool_choice) auto-retry the current
+                # episode within its attempt budget before any pause; unknown
                 # exception types keep the conservative pause/fail paths.
-                if isinstance(exc, (ValidationError, ValueError)) and (
+                if isinstance(exc, (ValidationError, ValueError, openai.APIError)) and (
                     await self._retry_episode_flake(work, exc)
                 ):
                     return
