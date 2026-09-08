@@ -189,7 +189,7 @@ SQLite、结构化日志和 Langfuse 都保留 Relay 实际回报的原始 `resp
 | 协议错误 | OpenAI/Anthropic tool 协议不匹配、结构化输出无效 | 终止为安全错误 | 检查 relay adapter 和响应合同 |
 | 上下文预算 | 未设置可信上限，或序列化请求 + 保留输出超出上限 | 请求前阻断，0 outbound call，运行暂停为 `context_budget` | 增加已验证上限、缩小上下文或结束任务 |
 | 阶段结构化抖动（模型返回非结构化/错误 stage 等协议错误） | 模型行为随机抖动（如 end_turn 散文代替结构化工具调用） | 未批准阶段自动重掷 ≤2 次后从已批准检查点续跑；仍失败或已批准阶段的确定性错误则终态 |
-| 单集执行 flake（`episode_error`） | 写作/装配当前集时的可恢复错误（sidecar 结构缺字段、上游 tool 协议方差等） | 暂停当前集（已完成分集不受影响），`Continue` 只重试当前集；当前尝试周期三次耗尽时自动滚动新尝试周期（`roll_episode_attempt_cycle`）再暂停——有成稿的 run 永不因此终态，零成稿 run 保持 fail-closed | `Continue` 恢复；重复同错的确定性死点修复根因后继续 |
+| 单集执行 flake（`episode_error`） | 写作/装配当前集时的可恢复错误（sidecar 结构缺字段、上游 tool 协议方差、writer 工具 flake 等） | **进程内自动重试**：有成稿的 run 在当前尝试周期预算内自动重排队重写当前集（无人介入）；预算三次耗尽时自动滚动新尝试周期（`roll_episode_attempt_cycle`）并暂停——真死点等人工，有成稿的 run 永不终态 | 自动重试消化随机抖动；同错复现的确定性死点修复根因后 `Continue` |
 | 大纲组结构化装配/引用校验耗尽 | 组内两轮协议修复后仍不通过 → 携带证据自动重掷整组，最多 3 次组尝试 | 3 次后暂停为 `content_rejected`（证据按组持久化），"继续"带反馈重写该组；随机抖动在自动层自愈，操作员无感知 |
 | 内容审查不通过 | 合同、单集连续性、结构性里程碑失败 | 只做有界内容修复；预算耗尽后 `paused` | 需要 `authorize-repair` 才能消费一次授权周期，或保留并结束 |
 | L0/L4 最终拒绝 | 质量闸门返回 rejected | `quality_rejected`，不重跑前面内容 | `retry-final-review` 只重跑同一最终审核，或结束 |

@@ -1268,7 +1268,7 @@ async def test_worker_resumes_the_first_unfinished_episode_after_a_relay_interru
 
 
 @pytest.mark.asyncio
-async def test_worker_pauses_arithmetic_error_and_resumes_only_failed_episode(
+async def test_worker_auto_retries_episode_flake_within_attempt_budget(
     tmp_path: Path,
 ) -> None:
     settings, catalog, repository, snapshot = await _services(tmp_path)
@@ -1290,20 +1290,14 @@ async def test_worker_pauses_arithmetic_error_and_resumes_only_failed_episode(
         worker_id="episode-arithmetic-recovery-worker",
     )
 
+    # The first pass commits episode 1, then flakes on episode 2: the flake
+    # is auto-requeued inside the episode attempt budget (no pause, no
+    # operator Continue) and the next pass succeeds.
     assert await worker.run_once() is True
-    paused = await repository.get_creation(accepted.creation_id)
-    assert paused is not None
-    assert paused.initial.state == "paused"
-    assert paused.initial.pause.code == "episode_error"
-    assert paused.initial.pause.episode_number == 2
-    assert "非十进制参数" in paused.initial.pause.message
-    assert [draft.episode_number for draft in paused.initial.drafts.episodes] == [1]
+    mid = await repository.get_creation(accepted.creation_id)
+    assert mid is not None
+    assert mid.initial.state == "queued"
 
-    await repository.continue_run(
-        creation_id=accepted.creation_id,
-        run_kind="initial",
-        idempotency_key="continue-arithmetic-episode",
-    )
     assert await worker.run_once() is True
     completed = await repository.get_creation(accepted.creation_id)
     assert completed is not None
@@ -1321,7 +1315,7 @@ async def test_worker_pauses_arithmetic_error_and_resumes_only_failed_episode(
 
 
 @pytest.mark.asyncio
-async def test_worker_rolls_attempt_cycle_instead_of_failing_mid_season_run(
+async def test_worker_rolls_attempt_cycle_after_auto_retries_are_exhausted(
     tmp_path: Path,
 ) -> None:
     settings, catalog, repository, snapshot = await _services(tmp_path)
@@ -1355,26 +1349,32 @@ async def test_worker_rolls_attempt_cycle_instead_of_failing_mid_season_run(
             )["id"]
         )
 
-    for round_no in range(1, 4):
+    # Flakes one and two auto-requeue inside the attempt budget: the run is
+    # requeued (not paused) and needs no Continue.
+    for round_no in (1, 2):
         assert await worker.run_once() is True
-        paused = await repository.get_creation(accepted.creation_id)
-        assert paused is not None, f"round {round_no}: creation missing"
-        assert paused.initial.state == "paused", (
-            f"round {round_no}: expected paused, got {paused.initial.state}"
-        )
-        assert paused.initial.pause is not None
-        assert paused.initial.pause.code == "episode_error"
-        assert paused.initial.pause.episode_number == 2
-        await repository.continue_run(
-            creation_id=accepted.creation_id,
-            run_kind="initial",
-            idempotency_key=f"continue-roll-cycle-{round_no}",
+        mid = await repository.get_creation(accepted.creation_id)
+        assert mid is not None, f"round {round_no}: creation missing"
+        assert mid.initial.state == "queued", (
+            f"round {round_no}: expected queued (auto-retry), got {mid.initial.state}"
         )
 
-    # The third flake rolled a fresh attempt cycle for episode 2 instead of
-    # terminal-failing a run that already holds a committed episode.
+    # The third flake exhausts the cycle budget: the run pauses (rolling a
+    # fresh attempt cycle) instead of terminal-failing.
+    assert await worker.run_once() is True
+    paused = await repository.get_creation(accepted.creation_id)
+    assert paused is not None
+    assert paused.initial.state == "paused"
+    assert paused.initial.pause is not None
+    assert paused.initial.pause.code == "episode_error"
+    assert paused.initial.pause.episode_number == 2
     assert await repository.get_episode_attempt_cycles(run_id) == {1: 0, 2: 1}
 
+    await repository.continue_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="continue-roll-cycle",
+    )
     assert await worker.run_once() is True
     completed = await repository.get_creation(accepted.creation_id)
     assert completed is not None
@@ -1383,7 +1383,7 @@ async def test_worker_rolls_attempt_cycle_instead_of_failing_mid_season_run(
 
 
 @pytest.mark.asyncio
-async def test_worker_pauses_routing_flake_declaring_approved_stage_after_episodes(
+async def test_worker_auto_retries_routing_flake_after_committed_episodes(
     tmp_path: Path,
 ) -> None:
     settings, catalog, repository, snapshot = await _services(tmp_path)
@@ -1405,21 +1405,14 @@ async def test_worker_pauses_routing_flake_declaring_approved_stage_after_episod
         worker_id="approved-stage-routing-flake-worker",
     )
 
+    # A supervisor routing slip after episode 1 is committed is auto-requeued
+    # within the episode attempt budget; the retry pass succeeds without an
+    # operator Continue.
     assert await worker.run_once() is True
-    paused = await repository.get_creation(accepted.creation_id)
-    assert paused is not None
-    assert paused.initial.state == "paused"
-    assert paused.initial.pause.code == "episode_error"
-    assert paused.initial.pause.episode_number == 2
-    assert "无效的结构化结果" in paused.initial.pause.message
-    assert paused.initial.progress.can_continue is True
-    assert [draft.episode_number for draft in paused.initial.drafts.episodes] == [1]
+    mid = await repository.get_creation(accepted.creation_id)
+    assert mid is not None
+    assert mid.initial.state == "queued"
 
-    await repository.continue_run(
-        creation_id=accepted.creation_id,
-        run_kind="initial",
-        idempotency_key="continue-approved-stage-routing-flake",
-    )
     assert await worker.run_once() is True
     completed = await repository.get_creation(accepted.creation_id)
     assert completed is not None
