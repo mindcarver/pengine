@@ -738,7 +738,7 @@ async def _creation_checkpoints(
     repository: Repository,
     creation_id: UUID,
 ) -> dict[InternalStage, Any]:
-    async with repository._connection() as connection:
+    async with repository._transaction() as connection:
         row = await (
             await connection.execute(
                 "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
@@ -2508,6 +2508,88 @@ async def test_worker_auto_retries_upstream_apierror_flake(tmp_path: Path) -> No
     mid = await repository.get_creation(accepted.creation_id)
     assert mid is not None
     assert mid.initial.state == "queued"
+
+    assert await worker.run_once() is True
+    completed = await repository.get_creation(accepted.creation_id)
+    assert completed is not None
+    assert completed.initial.state == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_worker_rolls_cycle_when_writer_entry_hits_exhausted_budget(
+    tmp_path: Path,
+) -> None:
+    """A lease-expiry resume (service restart requeue) entering the writer
+    with an exhausted attempt cycle must roll a fresh cycle and requeue —
+    not terminal-fail the run (production 2026-09-08 ep45)."""
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "writer-entry-exhausted-budget",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = EpisodeArithmeticErrorOnceWorkflow()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="writer-entry-exhausted-budget-worker",
+    )
+
+    async with repository._connection() as connection:
+        run_id = UUID(
+            (
+                await (
+                    await connection.execute(
+                        "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+                        (str(accepted.creation_id),),
+                    )
+                ).fetchone()
+            )["id"]
+        )
+
+    # First pass commits episode 1 and flakes episode 2 (auto-requeued).
+    assert await worker.run_once() is True
+    mid = await repository.get_creation(accepted.creation_id)
+    assert mid is not None
+    assert [draft.episode_number for draft in mid.initial.drafts.episodes] == [1]
+
+    # Simulate the interrupted-resume state: episode 2's cycle budget is
+    # exhausted (three recorded attempts) and the job is requeued without the
+    # flake handlers having rolled the cycle.
+    async with repository._connection() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT COUNT(*) FROM episode_attempts "
+                "WHERE run_id=? AND episode_number=2 AND attempt_cycle=0",
+                (str(run_id),),
+            )
+        ).fetchone()
+        for _ in range(3 - int(row[0])):
+            await connection.execute(
+                "INSERT INTO episode_attempts"
+                "(run_id, episode_number, attempt_cycle, attempt_number, recorded_at) "
+                "VALUES (?, 2, 0, (SELECT COALESCE(MAX(attempt_number),0)+1 FROM "
+                "episode_attempts WHERE run_id=? AND episode_number=2 AND attempt_cycle=0), ?)",
+                (str(run_id), str(run_id), "2026-09-08T10:00:00+00:00"),
+            )
+        await connection.execute(
+            "UPDATE jobs SET state='queued', lease_owner=NULL, lease_expires_at=NULL "
+            "WHERE run_id=?",
+            (str(run_id),),
+        )
+        await connection.commit()
+
+    assert await worker.run_once() is True
+    rolled = await repository.get_creation(accepted.creation_id)
+    assert rolled is not None
+    assert rolled.initial.state == "queued"
+    assert await repository.get_episode_attempt_cycles(run_id) == {1: 0, 2: 1}
 
     assert await worker.run_once() is True
     completed = await repository.get_creation(accepted.creation_id)
