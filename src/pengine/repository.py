@@ -4818,6 +4818,84 @@ class Repository:
         async with self._connection() as connection:
             return await self._episode_drafts(connection, run_id)
 
+    async def roll_episode_attempt_cycle(
+        self, run_id: UUID, episode_number: int, *, now: datetime | None = None
+    ) -> None:
+        """Open a fresh attempt cycle for an episode whose budget is exhausted.
+
+        Keeps mid-season runs (with committed episodes) continuable: continue
+        budgets reset per cycle, and history in prior cycles stays auditable.
+        The new cycle number is run-wide MAX+1 and its boundary row must be
+        inserted into episode_attempt_cycles before episode_attempt_current
+        can reference it (enforced foreign key).
+        """
+        timestamp = _timestamp(now or _utc_now())
+        async with self._transaction() as connection:
+            current = await self._fetchone(
+                connection,
+                """
+                SELECT attempt_cycle FROM episode_attempt_current
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (str(run_id), episode_number),
+            )
+            if current is None:
+                raise DomainError(
+                    "episode_not_planned",
+                    "The episode is not in the approved outline.",
+                    409,
+                )
+            cycle_row = await self._fetchone(
+                connection,
+                """
+                SELECT MAX(attempt_cycle) AS attempt_cycle
+                FROM episode_attempt_cycles
+                WHERE run_id = ?
+                """,
+                (str(run_id),),
+            )
+            new_cycle = (
+                int(cycle_row["attempt_cycle"]) + 1
+                if cycle_row is not None and cycle_row["attempt_cycle"] is not None
+                else 1
+            )
+            boundary = await self._fetchone(
+                connection,
+                """
+                SELECT MIN(episode_number) AS from_episode,
+                       MAX(episode_number) AS to_episode
+                FROM episode_plans
+                WHERE run_id = ?
+                """,
+                (str(run_id),),
+            )
+            from_episode = (
+                int(boundary["from_episode"])
+                if boundary is not None and boundary["from_episode"] is not None
+                else episode_number
+            )
+            to_episode = (
+                max(int(boundary["to_episode"]), episode_number)
+                if boundary is not None and boundary["to_episode"] is not None
+                else episode_number
+            )
+            await connection.execute(
+                """
+                INSERT OR IGNORE INTO episode_attempt_cycles(
+                    run_id, attempt_cycle, from_episode, to_episode, started_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (str(run_id), new_cycle, from_episode, to_episode, timestamp),
+            )
+            await connection.execute(
+                """
+                UPDATE episode_attempt_current
+                SET attempt_cycle = ?
+                WHERE run_id = ? AND episode_number = ?
+                """,
+                (new_cycle, str(run_id), episode_number),
+            )
+
     async def get_episode_attempt_counts(self, run_id: UUID) -> dict[int, int]:
         async with self._connection() as connection:
             cursor = await connection.execute(

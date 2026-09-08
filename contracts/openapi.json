@@ -3118,7 +3118,8 @@
             "type": "string",
             "minLength": 1,
             "pattern": "\\S",
-            "title": "Handoff"
+            "title": "Handoff",
+            "description": "Required for EVERY episode including the last of the group. 1-3 Chinese sentences describing the exact ending state this episode hands to the next episode: character positions, revealed facts, open tensions. Never omit this field."
           }
         },
         "additionalProperties": false,

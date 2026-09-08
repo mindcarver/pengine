@@ -457,6 +457,39 @@ class EpisodeArithmeticErrorOnceWorkflow(DeterministicWorkflow):
         )
 
 
+class EpisodeArithmeticErrorThriceWorkflow(DeterministicWorkflow):
+    """Episode 2 flakes three times in a row; a run that already committed
+    episode 1 must stay paused across attempt cycles and never terminal-fail
+    (the "restart-only" incident class of 2026-09-08)."""
+
+    def __init__(self) -> None:
+        super().__init__(episode_count=2)
+        self.calls = 0
+        self.retry_drafts: list[int] = []
+
+    async def execute(self, **kwargs: Any) -> WorkflowResult:
+        self.calls += 1
+        if self.calls > 3:
+            self.retry_drafts = [draft.episode_number for draft in kwargs["episode_drafts"]]
+            return await super().execute(**kwargs)
+
+        before_episode = kwargs["before_episode"]
+        assert before_episode is not None
+
+        async def fail_on_second_episode(plan: EpisodePlan) -> int:
+            attempt = await before_episode(plan)
+            if plan.episode_number == 2:
+                raise ValueError("Operands must be decimal numbers")
+            return attempt
+
+        return await super().execute(
+            **{
+                **kwargs,
+                "before_episode": fail_on_second_episode,
+            }
+        )
+
+
 class ApprovedStageRoutingErrorOnceWorkflow(DeterministicWorkflow):
     """A supervisor routing slip that declares an already-approved stage
     after one episode is committed must pause continuably, not fail."""
@@ -1285,6 +1318,68 @@ async def test_worker_pauses_arithmetic_error_and_resumes_only_failed_episode(
         ).fetchone()
     assert row is not None
     assert await repository.get_episode_attempt_counts(UUID(row["id"])) == {1: 1, 2: 2}
+
+
+@pytest.mark.asyncio
+async def test_worker_rolls_attempt_cycle_instead_of_failing_mid_season_run(
+    tmp_path: Path,
+) -> None:
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "roll-attempt-cycle",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = EpisodeArithmeticErrorThriceWorkflow()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="roll-attempt-cycle-worker",
+    )
+
+    async with repository._connection() as connection:
+        run_id = UUID(
+            (
+                await (
+                    await connection.execute(
+                        "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+                        (str(accepted.creation_id),),
+                    )
+                ).fetchone()
+            )["id"]
+        )
+
+    for round_no in range(1, 4):
+        assert await worker.run_once() is True
+        paused = await repository.get_creation(accepted.creation_id)
+        assert paused is not None, f"round {round_no}: creation missing"
+        assert paused.initial.state == "paused", (
+            f"round {round_no}: expected paused, got {paused.initial.state}"
+        )
+        assert paused.initial.pause is not None
+        assert paused.initial.pause.code == "episode_error"
+        assert paused.initial.pause.episode_number == 2
+        await repository.continue_run(
+            creation_id=accepted.creation_id,
+            run_kind="initial",
+            idempotency_key=f"continue-roll-cycle-{round_no}",
+        )
+
+    # The third flake rolled a fresh attempt cycle for episode 2 instead of
+    # terminal-failing a run that already holds a committed episode.
+    assert await repository.get_episode_attempt_cycles(run_id) == {1: 0, 2: 1}
+
+    assert await worker.run_once() is True
+    completed = await repository.get_creation(accepted.creation_id)
+    assert completed is not None
+    assert completed.initial.state == "succeeded"
+    assert workflow.retry_drafts == [1]
 
 
 @pytest.mark.asyncio

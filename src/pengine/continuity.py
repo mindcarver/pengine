@@ -409,7 +409,14 @@ class EpisodeStateDelta(ContinuityModel):
             "target_id values must be unique within this list."
         ),
     )
-    handoff: NonEmptyText
+    handoff: NonEmptyText = Field(
+        description=(
+            "Required for EVERY episode including the last of the group. 1-3 "
+            "Chinese sentences describing the exact ending state this episode hands "
+            "to the next episode: character positions, revealed facts, open tensions. "
+            "Never omit this field."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_unique_evidence_targets(self) -> EpisodeStateDelta:

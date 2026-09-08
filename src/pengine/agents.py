@@ -2866,7 +2866,10 @@ async def _invoke_script_group_sidecar(
         "Do not rewrite, summarize, or repeat screenplay content. Return exactly one "
         "ScriptGenerationGroupSidecar. Copy every supplied screenplay SHA-256 exactly. "
         "Each state_delta must contain only that episode's changes and must bind the supplied "
-        "contract hash. Evidence excerpts must occur verbatim in the matching screenplay.\n\n"
+        "contract hash. Evidence excerpts must occur verbatim in the matching screenplay. "
+        "Every episode's state_delta MUST include a non-empty handoff field describing the "
+        "ending state handed to the next episode; for the last episode of the group, "
+        "summarize the ending state the next episode will inherit.\n\n"
         f"SIDE_CAR_CONTEXT={json.dumps(sidecar_context, ensure_ascii=False, sort_keys=True)}\n\n"
         f"{screenplays}"
     )

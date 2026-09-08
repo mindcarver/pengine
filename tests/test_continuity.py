@@ -1376,3 +1376,15 @@ def test_build_episode_lock_enforce_continuity_flag_gates_advisory_mode() -> Non
     assert lock.episode_number == 1
     assert lock.series_state.locked_through_episode == 1
     assert lock.series_state_sha256
+
+
+def test_episode_state_delta_handoff_carries_schema_description() -> None:
+    """The handoff field must explain itself in the JSON schema: model-side
+    structured output (function calling) reads these descriptions, and a bare
+    field was systematically omitted by the writer sidecar in production
+    (2026-09-08: episodes[0]/[1] of ScriptGenerationGroupSidecar)."""
+
+    properties = EpisodeStateDelta.model_json_schema()["properties"]
+    description = properties["handoff"].get("description", "")
+    assert description
+    assert "EVERY episode" in description

@@ -1166,6 +1166,34 @@ async def test_schema_v18_migrates_episode_attempts_to_cycle_zero(
     assert "attempt_cycle" in {row["name"] for row in columns}
 
 
+async def test_roll_episode_attempt_cycle_resets_current_cycle_budget(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    _, lease = await create_and_lease_initial(repository, persona, creation_request)
+    _, outline = locked_outline_payload()
+    review_call_id = persist_succeeded_outline_review(repository, lease.run_id)
+    await repository.approve_business_checkpoint(
+        lease.run_id,
+        InternalStage.GENERATING_EPISODE_OUTLINE,
+        outline,
+        review_call_id=review_call_id,
+        now=NOW,
+    )
+    for _ in range(3):
+        await repository.record_episode_attempt(lease.run_id, 1, now=NOW)
+    assert await repository.get_episode_attempt_counts(lease.run_id) == {1: 3}
+
+    await repository.roll_episode_attempt_cycle(lease.run_id, 1)
+
+    assert await repository.get_episode_attempt_counts(lease.run_id) == {}
+    assert await repository.get_episode_attempt_cycles(lease.run_id) == {1: 1}
+
+    with pytest.raises(DomainError, match="not in the approved outline"):
+        await repository.roll_episode_attempt_cycle(lease.run_id, 99)
+
+
 async def test_schema_v19_to_v20_adds_identity_evidence_and_pause_reason(
     repository,
     persona,

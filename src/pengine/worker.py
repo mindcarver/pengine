@@ -1763,7 +1763,17 @@ class Worker:
             except DomainError:
                 return False
         if attempt_count >= 3:
-            return False
+            # Mid-season runs with committed episodes stay continuable forever:
+            # roll a fresh attempt cycle instead of terminal-failing on the
+            # third flake. The fail-closed budget only applies to zero-progress
+            # runs (no committed episodes), gated above. This flake consumes
+            # the first attempt of the new cycle so the pause below passes the
+            # recorded-writer-attempt invariant.
+            await self.repository.roll_episode_attempt_cycle(work.run_id, episode_number)
+            try:
+                await self.repository.record_episode_attempt(work.run_id, episode_number)
+            except DomainError:
+                return False
         safe_message = _episode_error_message(exc)
         await self.repository.pause_episode_error(
             work.run_id,
