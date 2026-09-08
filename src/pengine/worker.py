@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
+from pydantic import ValidationError
 
 from pengine.agents import (
     L0_GATE_EVIDENCE_LABELS,
@@ -1451,41 +1452,45 @@ class Worker:
                 return
             except (AgentProtocolError, StageValidationError) as exc:
                 # Structured-output flakes are stochastic model behavior, not
-                # terminal defects: consume the existing stage attempt budget
-                # (already recorded by before_stage) and auto-retry the stage
-                # from its approved checkpoints before ever failing the run.
+                # terminal defects: auto-retry from approved checkpoints before
+                # ever pausing or failing the run.
                 failure_stage = self._failure_stage(exc, current_stage, approved)
-                # Only retry stages that a resume will actually re-enter (not yet
-                # approved, so before_stage re-fires and the budget advances);
-                # approved-stage sync errors are deterministic and stay terminal.
-                # The script stage budgets per episode instead of stage_attempts
-                # and keeps its existing recoverable-episode pause path.
-                retryable_flake = (
-                    failure_stage is not InternalStage.GENERATING_EPISODE_SCRIPTS
-                    and failure_stage not in approved
-                )
-                requeues = self._flake_requeues.get(work.run_id, 0)
-                if retryable_flake and requeues < 2:
-                    self._flake_requeues[work.run_id] = requeues + 1
-                    await self.repository.requeue_stage_flake_retry(
-                        work.run_id,
-                        stage=failure_stage,
-                    )
-                    logger.warning(
-                        "structured flake retried run_id=%s creation_id=%s stage=%s "
-                        "requeue=%d error=%s",
-                        work.run_id,
-                        work.creation_id,
-                        failure_stage.value,
-                        requeues + 1,
-                        str(exc)[:200],
-                    )
+                if failure_stage is not InternalStage.GENERATING_EPISODE_SCRIPTS:
+                    # Only retry stages that a resume will actually re-enter
+                    # (not yet approved, so before_stage re-fires and the
+                    # budget advances); approved-stage sync errors are
+                    # deterministic and stay terminal.
+                    requeues = self._flake_requeues.get(work.run_id, 0)
+                    if failure_stage not in approved and requeues < 2:
+                        self._flake_requeues[work.run_id] = requeues + 1
+                        await self.repository.requeue_stage_flake_retry(
+                            work.run_id,
+                            stage=failure_stage,
+                        )
+                        logger.warning(
+                            "structured flake retried run_id=%s creation_id=%s stage=%s "
+                            "requeue=%d error=%s",
+                            work.run_id,
+                            work.creation_id,
+                            failure_stage.value,
+                            requeues + 1,
+                            str(exc)[:200],
+                        )
+                        return
+                # Episode-level auto-retry: script-stage flakes (and
+                # approved-stage routing flakes surfaced by a mid-season run)
+                # budget per episode — single-episode sidecar/protocol flakes
+                # clear on retry with near certainty (production 2026-09-08),
+                # so a run with committed episodes retries the current episode
+                # in-process instead of pausing for an operator. A pause (with
+                # a rolled attempt cycle) is only for a genuinely stuck
+                # episode; zero-progress runs keep the fail-closed budget.
+                if await self._retry_episode_flake(work, exc):
                     return
-                # Preserve the pre-existing recoverable-episode pause path. A
-                # protocol flake raised while replaying an already-approved
-                # stage (e.g. a supervisor routing slip after Continue) must
-                # not terminal-kill a run that already holds committed
-                # episodes; the helper pauses the current episode instead.
+                # Preserve the pre-existing recoverable-episode pause path: a
+                # budget-exhausted flake pauses the current episode (rolling a
+                # fresh cycle) instead of terminal-killing a run that already
+                # holds committed episodes.
                 if await self._pause_recoverable_episode_error(work, failure_stage, exc):
                     return
                 failure = await self._safe_failure(work.run_id, failure_stage, exc)
@@ -1648,6 +1653,15 @@ class Worker:
                         _exception_type_chain(exc),
                     )
                     return
+                # Known stochastic flake families raised outside the
+                # structured-output path (sidecar pydantic ValidationErrors,
+                # writer-tool ValueErrors) auto-retry the current episode
+                # within its attempt budget before any pause; unknown
+                # exception types keep the conservative pause/fail paths.
+                if isinstance(exc, (ValidationError, ValueError)) and (
+                    await self._retry_episode_flake(work, exc)
+                ):
+                    return
                 if await self._pause_recoverable_episode_error(work, failure_stage, exc):
                     return
                 failure = await self._safe_failure(work.run_id, failure_stage, exc)
@@ -1718,6 +1732,51 @@ class Worker:
                 stage=stage,
             )
         return durable_call_id
+
+    async def _retry_episode_flake(
+        self,
+        work: RunWorkItem,
+        exc: Exception,
+    ) -> bool:
+        """Requeue a single-episode script flake for an in-process retry.
+
+        The durable per-episode attempt budget (episode_attempts within the
+        current cycle) bounds the auto-spend; a flake before the writer's
+        first recorded attempt is charged one attempt here, mirroring the
+        pause path's accounting. The requeue anchors on the script stage —
+        the run's durable progress — even when the flake declared an
+        already-approved stage. Returns True when the run was requeued.
+        """
+        refreshed = await self.repository.get_run_work_item(work.run_id)
+        if not refreshed.episode_drafts:
+            return False
+        episode_number = len(refreshed.episode_drafts) + 1
+        if episode_number > len(refreshed.episode_plans):
+            return False
+        attempts = await self.repository.get_episode_attempt_counts(work.run_id)
+        attempt_count = attempts.get(episode_number, 0)
+        if attempt_count == 0:
+            try:
+                await self.repository.record_episode_attempt(work.run_id, episode_number)
+            except DomainError:
+                return False
+            attempt_count = 1
+        if attempt_count >= 3:
+            return False
+        await self.repository.requeue_stage_flake_retry(
+            work.run_id, stage=InternalStage.GENERATING_EPISODE_SCRIPTS
+        )
+        logger.warning(
+            "episode flake auto-retried run_id=%s creation_id=%s stage=%s episode=%s "
+            "attempt=%d/3 error=%s",
+            work.run_id,
+            work.creation_id,
+            InternalStage.GENERATING_EPISODE_SCRIPTS.value,
+            episode_number,
+            attempt_count + 1,
+            str(exc)[:200],
+        )
+        return True
 
     async def _pause_recoverable_episode_error(
         self,
