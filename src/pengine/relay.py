@@ -53,6 +53,7 @@ from pengine.model_calls import (
     estimate_messages_tokens,
     estimate_tools_tokens,
     extract_provider_usage,
+    message_size_breakdown,
     usage_status_from,
 )
 from pengine.observability import record_model_call_event
@@ -943,7 +944,9 @@ class _ModelCallAuditHandler(BaseCallbackHandler):
                 episode_number=context.episode_number,
                 required_tokens=estimated_total,
                 verified_limit_tokens=self.context_limit_tokens,
-                context_breakdown=_compiled_context_breakdown(context),
+                context_breakdown=(
+                    _compiled_context_breakdown(context) or message_size_breakdown(message_batch)
+                ),
             )
             record.preflight = "blocked"
             record.status = "preflight_blocked"
