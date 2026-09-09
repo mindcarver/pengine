@@ -90,6 +90,7 @@ from pengine.outline_context import (
     drop_identical_group_registrations,
     normalize_outline_group_markdown,
     parse_outline_group_markdown,
+    sanitize_season_map_payload,
     validate_outline_group_references,
 )
 from pengine.relay import is_relay_exception, retryable_relay_interruption
@@ -9398,7 +9399,18 @@ class DeepAgentWorkflow:
                     ]
                 try:
                     response = await structured.ainvoke(messages)
-                    return OutlineSeasonMap.model_validate(response).model_dump(mode="json")
+                    sanitized = sanitize_season_map_payload(response)
+                    if sanitized != response:
+                        logger.warning(
+                            "season-map payload sanitized before validation "
+                            "(duplicate characters dropped: %d -> %d, "
+                            "relationships: %d -> %d)",
+                            len(response.get("characters") or []),
+                            len(sanitized.get("characters") or []),
+                            len(response.get("relationships") or []),
+                            len(sanitized.get("relationships") or []),
+                        )
+                    return OutlineSeasonMap.model_validate(sanitized).model_dump(mode="json")
                 except ValidationError as exc:
                     validation_error = exc
             raise cast(Exception, validation_error)

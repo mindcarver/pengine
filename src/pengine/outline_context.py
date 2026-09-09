@@ -327,6 +327,76 @@ def assemble_outline_group_result(
         raise OutlineGroupAssemblyError(evidence, sidecar=sidecar) from error
 
 
+def sanitize_season_map_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Deterministically repair cross-field violations before validation.
+
+    Models repeatedly violate the two cross-field constraints a schema cannot
+    enforce (deepseek-v4-flash, production 2026-09-08/09: three of four
+    creations died here): duplicate character ids/names, and relationship
+    references to unknown character ids. Mirroring
+    drop_identical_group_registrations, pure duplicates are dropped with the
+    first occurrence winning; a relationship reference that exactly matches a
+    character *name* (the model filling the name into the id field) is
+    rewritten to that character's id; a reference to a wholly unknown id
+    drops that one relationship rather than failing the whole season map.
+    Malformed shapes fall through untouched so the validator still names
+    them.
+    """
+    data = dict(payload)
+    characters = data.get("characters")
+    if not isinstance(characters, list) or not characters:
+        return data
+
+    kept_characters: list[Mapping[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    name_to_id: dict[str, str] = {}
+    for character in characters:
+        if not isinstance(character, Mapping):
+            return data
+        character_id = character.get("character_id")
+        name = character.get("name")
+        if not isinstance(character_id, str) or not isinstance(name, str):
+            return data
+        normalized_name = name.strip()
+        if not character_id.strip() or not normalized_name:
+            return data
+        if character_id in seen_ids or normalized_name in seen_names:
+            continue
+        seen_ids.add(character_id)
+        seen_names.add(normalized_name)
+        name_to_id[normalized_name] = character_id
+        kept_characters.append(character)
+    data["characters"] = kept_characters
+
+    relationships = data.get("relationships")
+    if not isinstance(relationships, list):
+        return data
+    kept_relationships: list[Mapping[str, Any]] = []
+    for relationship in relationships:
+        if not isinstance(relationship, Mapping):
+            kept_relationships.append(relationship)
+            continue
+        candidate = dict(relationship)
+        resolved = True
+        for field in ("source_character_id", "target_character_id"):
+            reference = candidate.get(field)
+            if isinstance(reference, str) and reference in seen_ids:
+                continue
+            if (
+                isinstance(reference, str)
+                and reference.strip() in name_to_id
+                and reference not in seen_ids
+            ):
+                candidate[field] = name_to_id[reference.strip()]
+                continue
+            resolved = False
+        if resolved:
+            kept_relationships.append(candidate)
+    data["relationships"] = kept_relationships
+    return data
+
+
 def drop_identical_group_registrations(
     prior_groups: Sequence[EpisodeOutlineGroupResult],
     candidate: EpisodeOutlineGroupResult,

@@ -626,3 +626,83 @@ def test_drop_identical_group_registrations_keeps_conflicting_redeclaration() ->
     assert [fact.fact_id for fact in untouched.facts] == [fact.fact_id for fact in candidate.facts]
     with pytest.raises(OutlineContextError, match="duplicate fact ID"):
         validate_outline_group_references(season_map, prior, untouched)
+
+
+def test_sanitize_season_map_payload_repairs_cross_field_violations() -> None:
+    """deepseek-v4-flash repeatedly violates the two cross-field constraints
+    a schema cannot enforce (production 2026-09-08/09: three of four
+    creations died at the season map). Deterministic repair: duplicate
+    characters drop (first wins), a name filled into an id field maps back,
+    and a wholly unknown reference drops that relationship only."""
+    from pengine.outline_context import OutlineSeasonMap, sanitize_season_map_payload
+
+    payload = {
+        "episode_count": 4,
+        "characters": [
+            {"character_id": "chen_chong", "name": "陈冲", "role": "骑手"},
+            {"character_id": "chen_chong", "name": "陈冲", "role": "骑手"},
+            {"character_id": "granny", "name": "老太太", "role": "长者"},
+            {"character_id": "granny_dup", "name": "老太太", "role": "长者"},
+        ],
+        "relationships": [
+            # Name mistakenly used as an id -> rewritten to the real id.
+            {"source_character_id": "陈冲", "target_character_id": "granny", "relation": "送餐"},
+            # Wholly unknown id -> the relationship itself is dropped.
+            {
+                "source_character_id": "chen_chong",
+                "target_character_id": "ghost_id",
+                "relation": "旧识",
+            },
+        ],
+        "prohibitions": ["不得穿越"],
+        "review_milestones": [4],
+        "script_generation_groups": [
+            {
+                "group_id": "g1",
+                "start_episode": 1,
+                "end_episode": 4,
+                "dramatic_unit": "相遇与信物",
+                "boundary_reason": "悬念收束",
+            },
+        ],
+    }
+
+    sanitized = sanitize_season_map_payload(payload)
+
+    assert [c["character_id"] for c in sanitized["characters"]] == ["chen_chong", "granny"]
+    assert sanitized["relationships"] == [
+        {"source_character_id": "chen_chong", "target_character_id": "granny", "relation": "送餐"},
+    ]
+    # The repaired payload now passes the strict validator unchanged.
+    season_map = OutlineSeasonMap.model_validate(sanitized)
+    assert season_map.episode_count == 4
+
+
+def test_sanitize_season_map_payload_passes_clean_input_through() -> None:
+    from pengine.outline_context import sanitize_season_map_payload
+
+    payload = {
+        "episode_count": 2,
+        "characters": [{"character_id": "a", "name": "甲", "role": "r"}],
+        "relationships": [],
+        "prohibitions": [],
+        "review_milestones": [],
+        "script_generation_groups": [
+            {
+                "group_id": "g",
+                "start_episode": 1,
+                "end_episode": 2,
+                "dramatic_unit": "单元",
+                "boundary_reason": "收束",
+            },
+        ],
+    }
+
+    assert sanitize_season_map_payload(payload) == payload
+
+
+def test_sanitize_season_map_payload_leaves_malformed_shapes_to_validator() -> None:
+    from pengine.outline_context import sanitize_season_map_payload
+
+    malformed = {"episode_count": 2, "characters": [{"character_id": 7, "name": "甲"}]}
+    assert sanitize_season_map_payload(malformed) == malformed
