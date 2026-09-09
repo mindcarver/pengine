@@ -9360,6 +9360,7 @@ class DeepAgentWorkflow:
             structured = self.generation_model.with_structured_output(
                 OutlineSeasonMap,
                 method="function_calling",
+                include_raw=True,
             )
             base_messages = [
                 {"role": "system", "content": prompt},
@@ -9398,7 +9399,42 @@ class DeepAgentWorkflow:
                         },
                     ]
                 try:
-                    response = await structured.ainvoke(messages)
+                    wrapper = await structured.ainvoke(messages)
+                    response: Mapping[str, Any] | None = (
+                        wrapper.get("parsed") if isinstance(wrapper, Mapping) else None
+                    )
+                    if response is None:
+                        # The parser's own pydantic construction rejected the
+                        # payload — usually a cross-field violation a schema
+                        # cannot enforce. Recover the raw tool arguments and
+                        # sanitize them deterministically before deciding this
+                        # attempt failed.
+                        raw = wrapper.get("raw") if isinstance(wrapper, Mapping) else None
+                        raw_args: Mapping[str, Any] | None = None
+                        for call in getattr(raw, "tool_calls", None) or []:
+                            args = call.get("args") if isinstance(call, Mapping) else None
+                            if isinstance(args, Mapping):
+                                raw_args = args
+                                break
+                            if isinstance(args, str):
+                                try:
+                                    decoded = json.loads(args)
+                                except ValueError:
+                                    continue
+                                if isinstance(decoded, Mapping):
+                                    raw_args = decoded
+                                    break
+                        if raw_args is not None:
+                            sanitized = sanitize_season_map_payload(raw_args)
+                            return OutlineSeasonMap.model_validate(sanitized).model_dump(
+                                mode="json"
+                            )
+                        parsing_error = (
+                            wrapper.get("parsing_error") if isinstance(wrapper, Mapping) else None
+                        )
+                        if parsing_error is not None:
+                            raise cast(Exception, parsing_error)
+                        raise AgentProtocolError("Season-map structured output missing")
                     sanitized = sanitize_season_map_payload(response)
                     if sanitized != response:
                         logger.warning(
