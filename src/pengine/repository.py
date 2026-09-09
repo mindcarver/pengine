@@ -116,8 +116,18 @@ MAX_EPISODE_ATTEMPTS = 3
 # character names, production 2026-09-08) — the identical stage often
 # passes on a fresh retry, so an operator Retry must not force a full
 # restart either.
+# attempts_exhausted joins for the same reason: the stage flake budget
+# burning on mixed relay/model stochasticity (a stream stall plus grouped
+# outline validation misses, production 2026-09-08) — retry re-enters the
+# stage with a fresh budget instead of abandoning the creation.
 RETRYABLE_FAILURE_CODES = frozenset(
-    {"relay_unavailable", "relay_rejected", "stage_validation_failed", "structured_output_invalid"}
+    {
+        "relay_unavailable",
+        "relay_rejected",
+        "stage_validation_failed",
+        "structured_output_invalid",
+        "attempts_exhausted",
+    }
 )
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
 

@@ -2021,7 +2021,7 @@ async def test_retry_run_rejects_running_and_non_external_failures(
     assert running_reject.value.code == "run_not_controllable"
 
     for index, code in enumerate(
-        ("ended_by_user", "attempts_exhausted", "content_review_rejected")
+        ("ended_by_user", "content_review_rejected", "quality_gate_rejected")
     ):
         accepted = await repository.create_creation(
             idempotency_key=f"create-retry-code-{index}",
@@ -4419,6 +4419,37 @@ async def test_retry_run_revives_structured_output_invalid_after_flake_budget(
         creation_id=accepted.creation_id,
         run_kind="initial",
         idempotency_key="retry-structured-output-invalid",
+        now=NOW + timedelta(seconds=10),
+    )
+    assert revived.run_state == "queued"
+
+
+async def test_retry_run_revives_attempts_exhausted_after_mixed_flakes(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    """An attempts_exhausted terminal failure (stage flake budget burned on
+    mixed relay/model stochasticity) must stay operator-retryable."""
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.fail_run(
+        lease.run_id,
+        RunFailure(
+            code="attempts_exhausted",
+            message="The stage attempt limit was exhausted.",
+            failed_stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            attempt_count=3,
+        ),
+        now=NOW,
+    )
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.progress.can_retry is True
+
+    revived = await repository.retry_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-attempts-exhausted",
         now=NOW + timedelta(seconds=10),
     )
     assert revived.run_state == "queued"
