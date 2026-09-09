@@ -8947,9 +8947,6 @@ class StageGuardMiddleware(AgentMiddleware):
 class DeepAgentWorkflow:
     generation_model: BaseChatModel
     review_model: BaseChatModel
-    # Stronger model for the outline pipeline when configured; falls back to
-    # the generation route (mixed routing, production 2026-09-09).
-    outline_model: BaseChatModel | None = None
     checkpointer: BaseCheckpointSaver
     recursion_limit: int = 80
     generation_provider_profile_key: str = "anthropic"
@@ -8960,6 +8957,9 @@ class DeepAgentWorkflow:
     review_context_limit_tokens: int | None = None
     grouped_outline_enabled: bool = True
     content_review_tier: str = "standard"
+    # Stronger model for the outline pipeline when configured; falls back to
+    # the generation route (mixed routing, production 2026-09-09).
+    outline_model: BaseChatModel | None = None
 
     def __post_init__(self) -> None:
         register_pengine_harness_profile(self.generation_provider_profile_key)
