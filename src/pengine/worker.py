@@ -370,6 +370,13 @@ class WorkflowExecutor(Protocol):
     ) -> WorkflowResult: ...
 
 
+# Failure codes whose zero-progress terminal deaths auto-requeue (bounded
+# twice per run) instead of waiting for an operator Retry — stochastic
+# model/relay behavior that a fresh attempt often clears (production
+# 2026-09-09: pro sidecar field omission burned a 10-episode creation).
+_AUTO_RETRYABLE_FAILURE_CODES = frozenset({"structured_output_invalid", "attempts_exhausted"})
+
+
 class Worker:
     def __init__(
         self,
@@ -381,6 +388,10 @@ class Worker:
         worker_id: str | None = None,
     ) -> None:
         self._flake_requeues: dict[UUID, int] = {}
+        # Bounded auto-retry allowance for zero-progress runs that die on
+        # operator-revivable codes (per worker process; restart grants a
+        # fresh, still-bounded allowance).
+        self._auto_retries: dict[UUID, int] = {}
         self.settings = settings
         self.repository = repository
         self.catalog = catalog
@@ -1497,6 +1508,8 @@ class Worker:
                     return
                 failure = await self._safe_failure(work.run_id, failure_stage, exc)
                 await self.repository.fail_run(work.run_id, failure)
+                if await self._auto_retry_revivable_failure(work, failure):
+                    return
                 logger.warning(
                     "workflow run failed run_id=%s creation_id=%s stage=%s code=%s "
                     "(stage flake budget exhausted or terminal sync error)",
@@ -1681,6 +1694,8 @@ class Worker:
                     return
                 failure = await self._safe_failure(work.run_id, failure_stage, exc)
                 await self.repository.fail_run(work.run_id, failure)
+                if await self._auto_retry_revivable_failure(work, failure):
+                    return
                 logger.warning(
                     "workflow run failed run_id=%s creation_id=%s stage=%s code=%s error_types=%s",
                     work.run_id,
@@ -1790,6 +1805,41 @@ class Worker:
             episode_number,
             attempt_count + 1,
             str(exc)[:200],
+        )
+        return True
+
+    async def _auto_retry_revivable_failure(
+        self,
+        work: RunWorkItem,
+        failure: RunFailure,
+    ) -> bool:
+        """Zero-progress runs dying on retryable codes requeue automatically.
+
+        Operator Retry exists for exactly these codes (#296/#297/#298), but an
+        unattended run still stops until a human clicks; a bounded in-process
+        auto-retry (twice per run) closes that loop. Mid-season runs keep the
+        fail-closed semantics — their pause/roll paths never reach here.
+        """
+        if failure.code not in _AUTO_RETRYABLE_FAILURE_CODES:
+            return False
+        refreshed = await self.repository.get_run_work_item(work.run_id)
+        if refreshed.episode_drafts:
+            return False
+        retries = self._auto_retries.get(work.run_id, 0)
+        if retries >= 2:
+            return False
+        self._auto_retries[work.run_id] = retries + 1
+        await self.repository.retry_run(
+            creation_id=work.creation_id,
+            run_kind=work.run_kind,
+            idempotency_key=f"auto-retry-{work.run_id}-{retries + 1}",
+        )
+        logger.warning(
+            "zero-progress run auto-retried run_id=%s creation_id=%s code=%s auto_retry=%d/2",
+            work.run_id,
+            work.creation_id,
+            failure.code,
+            retries + 1,
         )
         return True
 
