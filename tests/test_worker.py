@@ -986,6 +986,7 @@ async def test_worker_start_injects_distinct_generation_and_review_routes(
                 model=review_model,
                 provider_profile_key="deepseek-review",
             ),
+            outline=None,
         )
 
     class FakeDeepAgentWorkflow:

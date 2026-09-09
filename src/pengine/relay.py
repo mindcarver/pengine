@@ -1607,6 +1607,9 @@ class RelayAdapter:
 class RelayRoutes:
     generation: RelayAdapter
     review: RelayAdapter
+    # Optional stronger model for the outline pipeline (season map, outline
+    # groups, outline repair patches); None follows the generation route.
+    outline: RelayAdapter | None = None
     model_call_state: ModelCallState | None = None
 
 
@@ -1856,6 +1859,16 @@ def build_relay_routes(
         )
     if model_call_state is None:
         model_call_state = ModelCallState()
+    outline_adapter = (
+        build_relay_adapter(
+            settings,
+            role="generation",
+            model_call_state=model_call_state,
+            model_id_override=settings.outline_model_id,
+        )
+        if settings.outline_model_id
+        else None
+    )
     return RelayRoutes(
         generation=build_relay_adapter(
             settings,
@@ -1867,6 +1880,7 @@ def build_relay_routes(
             role="review",
             model_call_state=model_call_state,
         ),
+        outline=outline_adapter,
         model_call_state=model_call_state,
     )
 
@@ -1898,6 +1912,7 @@ def build_relay_adapter(
     *,
     role: ModelRole,
     model_call_state: ModelCallState | None = None,
+    model_id_override: str | None = None,
 ) -> RelayAdapter:
     if role == "generation":
         model_id = settings.generation_model_id
@@ -1907,6 +1922,8 @@ def build_relay_adapter(
         model_id = settings.review_model_id
         max_output_tokens = settings.review_max_output_tokens
         context_limit_tokens = settings.review_context_limit_tokens
+    if model_id_override:
+        model_id = model_id_override
     provider_profile_key = (
         "anthropic"
         if model_id in _ANTHROPIC_ROUTE_MODEL_IDS
