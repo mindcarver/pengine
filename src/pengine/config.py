@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     generation_model_id: str | None = None
     generation_max_output_tokens: int = Field(default=128_000, ge=1, le=128_000)
     generation_context_limit_tokens: int | None = Field(default=None, ge=1)
+    # Optional stronger model for the outline pipeline only (season map,
+    # outline groups, outline repair patches) while script writing keeps the
+    # generation route: mixed routing trades a few slow calls for structural
+    # quality where weaker models repeatedly violate cross-field constraints
+    # (production 2026-09-09: clue/fact group ownership). Empty follows the
+    # generation route.
+    outline_model_id: str = ""
     review_model_id: str | None = None
     review_max_output_tokens: int | None = Field(default=None, ge=1)
     review_context_limit_tokens: int | None = Field(default=None, ge=1)

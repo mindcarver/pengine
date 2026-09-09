@@ -44,6 +44,7 @@ def _role_settings(
     generation_max_output_tokens: int = 128_000,
     review_model_id: str = "deepseek-v4-flash",
     review_max_output_tokens: int | None = None,
+    outline_model_id: str = "",
     **stream_watchdog_overrides: Any,
 ) -> Settings:
     return Settings(
@@ -54,6 +55,7 @@ def _role_settings(
         generation_max_output_tokens=generation_max_output_tokens,
         review_model_id=review_model_id,
         review_max_output_tokens=review_max_output_tokens,
+        outline_model_id=outline_model_id,
         **stream_watchdog_overrides,
     )
 
@@ -2266,3 +2268,19 @@ async def test_stream_continuation_disabled_reraises_mid_output_death(monkeypatc
         await _collect(model._astream([{"role": "user", "content": "写"}]))
 
     assert len(calls) == 1
+
+
+def test_build_relay_routes_outline_follows_generation_when_unset() -> None:
+    from pengine.relay import build_relay_routes
+
+    routes = build_relay_routes(_role_settings())
+    assert routes.outline is None
+
+
+def test_build_relay_routes_outline_override_builds_third_route() -> None:
+    from pengine.relay import build_relay_routes
+
+    routes = build_relay_routes(_role_settings(outline_model_id="deepseek/deepseek-v4-pro"))
+    assert routes.outline is not None
+    assert routes.outline.model_id == "deepseek/deepseek-v4-pro"
+    assert routes.generation.model_id == "claude-opus-5"

@@ -424,6 +424,7 @@ class Worker:
                 self.workflow = DeepAgentWorkflow(
                     generation_model=routes.generation.model,
                     review_model=routes.review.model,
+                    outline_model=routes.outline.model if routes.outline is not None else None,
                     checkpointer=self._saver,
                     recursion_limit=self.settings.agent_recursion_limit,
                     generation_provider_profile_key=routes.generation.provider_profile_key,

@@ -8947,6 +8947,9 @@ class StageGuardMiddleware(AgentMiddleware):
 class DeepAgentWorkflow:
     generation_model: BaseChatModel
     review_model: BaseChatModel
+    # Stronger model for the outline pipeline when configured; falls back to
+    # the generation route (mixed routing, production 2026-09-09).
+    outline_model: BaseChatModel | None = None
     checkpointer: BaseCheckpointSaver
     recursion_limit: int = 80
     generation_provider_profile_key: str = "anthropic"
@@ -8961,6 +8964,8 @@ class DeepAgentWorkflow:
     def __post_init__(self) -> None:
         register_pengine_harness_profile(self.generation_provider_profile_key)
         register_pengine_harness_profile(self.review_provider_profile_key)
+        if self.outline_model is None:
+            self.outline_model = self.generation_model
 
     async def has_checkpoint(self, thread_id: str) -> bool:
         checkpoint = await self.checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
@@ -9357,7 +9362,7 @@ class DeepAgentWorkflow:
             )
             if output_language_contract:
                 prompt = f"{prompt}\n{output_language_contract}"
-            structured = self.generation_model.with_structured_output(
+            structured = self.outline_model.with_structured_output(
                 OutlineSeasonMap,
                 method="function_calling",
                 include_raw=True,
@@ -9366,7 +9371,7 @@ class DeepAgentWorkflow:
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": compiled.model_input},
             ]
-            warm = getattr(self.generation_model, "warm_prompt_cache", None)
+            warm = getattr(self.outline_model, "warm_prompt_cache", None)
             if warm is not None:
                 # Always-warm prefix (Claude Code pattern): seed the provider
                 # cache so the heavy season map prefill runs in seconds and
@@ -9472,7 +9477,7 @@ class DeepAgentWorkflow:
                     )
 
             return await _generate_outline_group_with_sidecar(
-                self.generation_model,
+                self.outline_model,
                 compiled=compiled,
                 group=group,
                 operation_id=operation_id,
@@ -9613,7 +9618,7 @@ class DeepAgentWorkflow:
                 instruction = f"{instruction}\n{output_language_contract}"
             if correction:
                 instruction = f"{instruction}\n{correction}"
-            structured_model = self.generation_model.with_structured_output(
+            structured_model = self.outline_model.with_structured_output(
                 OutlineRepairPatch,
                 method="function_calling",
                 include_raw=True,
