@@ -8965,7 +8965,7 @@ class DeepAgentWorkflow:
         register_pengine_harness_profile(self.generation_provider_profile_key)
         register_pengine_harness_profile(self.review_provider_profile_key)
         if self.outline_model is None:
-            self.outline_model = self.generation_model
+            object.__setattr__(self, "outline_model", self.generation_model)
 
     async def has_checkpoint(self, thread_id: str) -> bool:
         checkpoint = await self.checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
