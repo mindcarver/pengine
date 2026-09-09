@@ -44,6 +44,7 @@ from pengine.schemas import (
     QualityRepairIssue,
     QualityRepairPlan,
     RevisionRequest,
+    RunFailure,
     WorkflowResult,
 )
 from pengine.worker import (
@@ -913,6 +914,13 @@ async def test_worker_rejects_undeclared_l0_variant_before_checkpoint(tmp_path: 
 
     resource = await repository.get_creation(accepted.creation_id)
     assert resource is not None
+    # Zero-progress retryable deaths now auto-retry (bounded twice per run)
+    # instead of waiting for an operator; this deterministic protocol error
+    # exhausts that allowance on the following passes.
+    assert resource.initial.state == "queued"
+    assert await worker.run_once() is True
+    assert await worker.run_once() is True
+    resource = await repository.get_creation(accepted.creation_id)
     assert resource.initial.state == "failed"
     assert resource.initial.failure.code == "structured_output_invalid"
     assert resource.initial.failure.failed_stage == InternalStage.SELECTING_L0_VARIANT
@@ -1447,6 +1455,12 @@ async def test_worker_fails_closed_when_episode_error_precedes_writer_attempt(
     failed = await repository.get_creation(accepted.creation_id)
 
     assert failed is not None
+    # Zero-progress retryable deaths auto-retry (bounded twice per run).
+    assert failed.initial.state == "queued"
+    assert await worker.run_once() is True
+    assert await worker.run_once() is True
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
     assert failed.initial.state == "failed"
     assert failed.initial.failure.code == "structured_output_invalid"
     assert failed.initial.failure.message == "模型未返回有效的结构化结果。"
@@ -1486,6 +1500,9 @@ async def test_worker_handles_stage_less_protocol_error_without_abandoning_job(
     assert second_retry is not None
     assert second_retry.initial.state == "queued"
 
+    assert await worker.run_once() is True
+    # Zero-progress retryable deaths auto-retry twice before staying failed.
+    assert await worker.run_once() is True
     assert await worker.run_once() is True
     failed = await repository.get_creation(accepted.creation_id)
     assert failed is not None
@@ -2438,10 +2455,14 @@ async def test_worker_rejects_results_not_derived_from_approved_checkpoints(
         worker_id="checkpoint-truth-test-worker",
     )
 
-    assert await worker.run_once() is True
-    # Flake retry budget (2 requeues) must drain before the terminal failure.
-    assert await worker.run_once() is True
-    assert await worker.run_once() is True
+    # Flake retry budget (2 requeues) drains, then the zero-progress death
+    # auto-retries twice before the run finally stays failed.
+    for _ in range(8):
+        if not await worker.run_once():
+            break
+        resource = await repository.get_creation(accepted.creation_id)
+        if resource is not None and resource.initial.state == "failed":
+            break
     resource = await repository.get_creation(accepted.creation_id)
 
     assert resource is not None
@@ -2596,3 +2617,81 @@ async def test_worker_rolls_cycle_when_writer_entry_hits_exhausted_budget(
     completed = await repository.get_creation(accepted.creation_id)
     assert completed is not None
     assert completed.initial.state == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_worker_auto_retries_zero_progress_retryable_death(tmp_path: Path) -> None:
+    """A zero-progress run dying on a retryable code requeues automatically
+    (bounded twice) instead of waiting for an operator Retry; mid-season
+    runs keep fail-closed semantics."""
+    settings, catalog, repository, snapshot = await _services(tmp_path)
+    accepted = await repository.create_creation(
+        "auto-retry-revivable",
+        CreateCreationRequest(
+            persona_id="test-persona",
+            story="一个人回乡。",
+            requirements="生成完整短剧。",
+        ),
+        snapshot.summary,
+    )
+    workflow = EpisodeArithmeticErrorThriceWorkflow()
+    worker = Worker(
+        settings=settings,
+        repository=repository,
+        catalog=catalog,
+        workflow=workflow,
+        worker_id="auto-retry-worker",
+    )
+    async with repository._connection() as connection:
+        run_id = UUID(
+            (
+                await (
+                    await connection.execute(
+                        "SELECT id FROM runs WHERE creation_id = ? AND kind = 'initial'",
+                        (str(accepted.creation_id),),
+                    )
+                ).fetchone()
+            )["id"]
+        )
+    async with repository._connection() as connection:
+        await connection.execute(
+            "UPDATE jobs SET state='queued', lease_owner=NULL, lease_expires_at=NULL "
+            "WHERE run_id=?",
+            (str(run_id),),
+        )
+        await connection.commit()
+    await repository.fail_run(
+        run_id,
+        RunFailure(
+            code="structured_output_invalid",
+            message="确定性校验未通过。",
+            failed_stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            attempt_count=3,
+        ),
+    )
+    work = await repository.get_run_work_item(run_id)
+    failure = RunFailure(
+        code="structured_output_invalid",
+        message="确定性校验未通过。",
+        failed_stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+        attempt_count=3,
+    )
+
+    assert await worker._auto_retry_revivable_failure(work, failure) is True
+    revived = await repository.get_creation(accepted.creation_id)
+    assert revived is not None
+    assert revived.initial.state == "queued"
+    assert worker._auto_retries[run_id] == 1
+
+    # Bound: the third attempt falls back to terminal failure.
+    await repository.fail_run(
+        run_id,
+        RunFailure(
+            code="structured_output_invalid",
+            message="确定性校验未通过。",
+            failed_stage=InternalStage.GENERATING_EPISODE_OUTLINE,
+            attempt_count=3,
+        ),
+    )
+    worker._auto_retries[run_id] = 2
+    assert await worker._auto_retry_revivable_failure(work, failure) is False

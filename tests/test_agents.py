@@ -2281,6 +2281,7 @@ async def test_script_group_sidecar_resume_reuses_persisted_plaintext() -> None:
             ),
             _tool_call("ScriptGenerationGroupSidecar", invalid_sidecar, 1),
             _tool_call("ScriptGenerationGroupSidecar", invalid_sidecar, 2),
+            _tool_call("ScriptGenerationGroupSidecar", invalid_sidecar, 3),
         ]
     )
 
@@ -13662,3 +13663,30 @@ async def test_direct_structured_retry_drops_oversized_raw_message() -> None:
     retry_batch = model.model_message_batches[1]
     assert not any(isinstance(message, AIMessage) for message in retry_batch)
     assert any(isinstance(message, HumanMessage) for message in retry_batch)
+
+
+@pytest.mark.asyncio
+async def test_direct_structured_retry_uses_second_repair_round() -> None:
+    """Two invalid attempts followed by a valid third must succeed through
+    the expanded repair loop (production 2026-09-09: one repair round let
+    occasional sidecar omissions burn the whole stage budget)."""
+
+    class Result(BaseModel):
+        value: str
+
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call("Result", {}, 1),  # empty args -> parse failure
+            _tool_call("Result", {}, 2),  # still invalid after first feedback
+            _tool_call("Result", {"value": "third-time"}, 3),
+        ]
+    )
+
+    result = await _invoke_direct_structured_with_retry(
+        model,
+        Result,
+        [{"role": "user", "content": "Produce the value."}],
+    )
+
+    assert result == Result(value="third-time")
+    assert len(model.model_message_batches) == 3

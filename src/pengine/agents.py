@@ -2236,68 +2236,75 @@ async def _invoke_direct_structured_with_retry(
     model: BaseChatModel,
     schema: type[Any],
     messages: list[dict[str, str]],
+    *,
+    max_repair_rounds: int = 2,
 ) -> Any:
-    """Retry one invalid direct structured call with bounded protocol feedback."""
+    """Retry invalid direct structured calls with bounded protocol feedback.
+
+    One initial attempt plus up to ``max_repair_rounds`` feedback repairs
+    (production 2026-09-09: a single repair round let occasional sidecar
+    field omissions — pro and flash alike — burn the whole stage budget)."""
 
     structured_model = model.with_structured_output(
         schema,
         method="function_calling",
         include_raw=True,
     )
-    response = await structured_model.ainvoke(messages)
-    parsed = response.get("parsed") if isinstance(response, Mapping) else None
-    if parsed is not None:
-        return parsed
-
-    parsing_error = response.get("parsing_error") if isinstance(response, Mapping) else None
-    error = (
-        parsing_error
-        if isinstance(parsing_error, Exception)
-        else ValueError("structured_result_missing")
-    )
-    correction = (
-        f"{_structured_output_retry_message(error)} Pass every schema field directly as a "
-        "tool argument. Do not wrap the result in $PARAMETER_NAME and do not encode the "
-        "result object as a JSON string."
-    )
-    raw = response.get("raw") if isinstance(response, Mapping) else None
     retry_messages: list[Any] = list(messages)
-    matching_call = next(
-        (
-            call
-            for call in getattr(raw, "tool_calls", [])
-            if call.get("name") == schema.__name__ and call.get("id")
-        ),
-        None,
-    )
-    # A misbehaving upstream can echo megabytes into the raw assistant message
-    # (production 2026-09-08: a 19.9M-char AIMessage poisoned the retry context
-    # and preflight-blocked the follow-up at ~8M tokens). Never replay an
-    # oversized raw message: feed the correction back as plain text instead.
-    raw_oversized = (
-        isinstance(raw, AIMessage) and message_serialized_chars(raw) > _SIDECAR_RAW_MAX_CHARS
-    )
-    if isinstance(raw, AIMessage) and matching_call is not None and not raw_oversized:
-        retry_messages.extend(
-            [
-                raw,
-                ToolMessage(
-                    content=correction,
-                    tool_call_id=matching_call["id"],
-                    name=schema.__name__,
-                ),
-            ]
-        )
-    else:
-        retry_messages.append(HumanMessage(content=correction))
+    last_error: Exception | None = None
+    for round_no in range(max_repair_rounds + 1):
+        response = await structured_model.ainvoke(retry_messages)
+        parsed = response.get("parsed") if isinstance(response, Mapping) else None
+        if parsed is not None:
+            return parsed
 
-    corrected = await structured_model.ainvoke(retry_messages)
-    corrected_parsed = corrected.get("parsed") if isinstance(corrected, Mapping) else None
-    if corrected_parsed is not None:
-        return corrected_parsed
-    corrected_error = corrected.get("parsing_error") if isinstance(corrected, Mapping) else None
-    if isinstance(corrected_error, Exception):
-        raise corrected_error
+        parsing_error = response.get("parsing_error") if isinstance(response, Mapping) else None
+        error = (
+            parsing_error
+            if isinstance(parsing_error, Exception)
+            else ValueError("structured_result_missing")
+        )
+        last_error = error
+        if round_no == max_repair_rounds:
+            break
+        correction = (
+            f"{_structured_output_retry_message(error)} Pass every schema field directly as a "
+            "tool argument. Do not wrap the result in $PARAMETER_NAME and do not encode the "
+            "result object as a JSON string."
+        )
+        raw = response.get("raw") if isinstance(response, Mapping) else None
+        matching_call = next(
+            (
+                call
+                for call in getattr(raw, "tool_calls", [])
+                if call.get("name") == schema.__name__ and call.get("id")
+            ),
+            None,
+        )
+        # A misbehaving upstream can echo megabytes into the raw assistant
+        # message (production 2026-09-08: a 19.9M-char AIMessage poisoned the
+        # retry context and preflight-blocked the follow-up at ~8M tokens).
+        # Never replay an oversized raw message: feed the correction back as
+        # plain text instead.
+        raw_oversized = (
+            isinstance(raw, AIMessage) and message_serialized_chars(raw) > _SIDECAR_RAW_MAX_CHARS
+        )
+        if isinstance(raw, AIMessage) and matching_call is not None and not raw_oversized:
+            retry_messages.extend(
+                [
+                    raw,
+                    ToolMessage(
+                        content=correction,
+                        tool_call_id=matching_call["id"],
+                        name=schema.__name__,
+                    ),
+                ]
+            )
+        else:
+            retry_messages.append(HumanMessage(content=correction))
+
+    if isinstance(last_error, Exception):
+        raise last_error
     raise AgentProtocolError("Subagent returned invalid structured output")
 
 
