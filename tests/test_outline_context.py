@@ -706,3 +706,33 @@ def test_sanitize_season_map_payload_leaves_malformed_shapes_to_validator() -> N
 
     malformed = {"episode_count": 2, "characters": [{"character_id": 7, "name": "甲"}]}
     assert sanitize_season_map_payload(malformed) == malformed
+
+
+def test_sanitize_season_map_payload_dedupes_prohibitions() -> None:
+    """Flash re-emits identical prohibition lines; the season-map validator
+    does not check them but the StoryContract constructor does, and a
+    committed map with a duplicate cannot be repaired by regenerating
+    outline groups (production 2026-09-09: four identical group retries
+    burned the budget)."""
+    from pengine.outline_context import sanitize_season_map_payload
+
+    payload = {
+        "episode_count": 2,
+        "characters": [{"character_id": "a", "name": "甲", "role": "r"}],
+        "relationships": [],
+        "prohibitions": ["不得穿越", "不得穿越", "不得换角"],
+        "review_milestones": [],
+        "script_generation_groups": [
+            {
+                "group_id": "g",
+                "start_episode": 1,
+                "end_episode": 2,
+                "dramatic_unit": "单元",
+                "boundary_reason": "收束",
+            },
+        ],
+    }
+
+    sanitized = sanitize_season_map_payload(payload)
+
+    assert sanitized["prohibitions"] == ["不得穿越", "不得换角"]

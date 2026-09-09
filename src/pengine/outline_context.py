@@ -369,6 +369,13 @@ def sanitize_season_map_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         kept_characters.append(character)
     data["characters"] = kept_characters
 
+    prohibitions = data.get("prohibitions")
+    if isinstance(prohibitions, list):
+        # Flash re-emits identical prohibition lines; the StoryContract
+        # constructor rejects duplicates, and a committed season map with a
+        # duplicate cannot be repaired by regenerating outline groups.
+        data["prohibitions"] = list(dict.fromkeys(prohibitions))
+
     relationships = data.get("relationships")
     if not isinstance(relationships, list):
         return data
@@ -931,7 +938,7 @@ def assemble_episode_outline(
         timeline=timeline,
         knowledge_states=knowledge_states,
         clues=[item for group in groups for item in group.clues],
-        prohibitions=season_map.prohibitions,
+        prohibitions=list(dict.fromkeys(season_map.prohibitions)),
         episode_obligations=[item for group in groups for item in group.episode_obligations],
     )
     return {
