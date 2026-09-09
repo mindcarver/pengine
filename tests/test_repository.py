@@ -2058,7 +2058,7 @@ async def test_retry_run_rejects_running_and_non_external_failures(
         assert code_reject.value.code == "run_not_controllable"
 
 
-async def test_retry_run_rejects_revision_kind_and_exhausted_attempts(
+async def test_retry_run_rejects_revision_kind_and_resets_exhausted_budget(
     repository,
     persona,
     creation_request,
@@ -2129,15 +2129,17 @@ async def test_retry_run_rejects_revision_kind_and_exhausted_attempts(
     )
     failed = await repository.get_creation(accepted.creation_id)
     assert failed is not None
-    assert failed.initial.progress.can_retry is False
-    with pytest.raises(DomainError) as exhausted_reject:
-        await repository.retry_run(
-            creation_id=accepted.creation_id,
-            run_kind="initial",
-            idempotency_key="retry-exhausted",
-        )
-    assert exhausted_reject.value.code == "run_not_controllable"
-    assert "attempt limit" in exhausted_reject.value.message
+    assert failed.initial.progress.can_retry is True
+    # Retry re-enters with a fresh stage budget (the exhausted one made the
+    # revivable whitelist unreachable, production 2026-09-08).
+    revived = await repository.retry_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-exhausted",
+        now=NOW + timedelta(seconds=40),
+    )
+    assert revived.run_state == "queued"
+    assert await repository.get_stage_attempt_counts(lease.run_id) == {}
 
 
 async def test_relay_interruption_is_delayed_and_shares_the_stage_recovery_budget(
@@ -4453,3 +4455,38 @@ async def test_retry_run_revives_attempts_exhausted_after_mixed_flakes(
         now=NOW + timedelta(seconds=10),
     )
     assert revived.run_state == "queued"
+
+
+async def test_retry_run_resets_exhausted_stage_budget(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    """A revivable terminal failure with an exhausted stage budget must reset
+    the budget on Retry — the gate rejecting the revive would make the
+    revivable whitelist unreachable (production 2026-09-08)."""
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    for _ in range(3):
+        await repository.record_stage_attempt(lease.run_id, InternalStage.GENERATING_STORY_OUTLINE)
+    await repository.fail_run(
+        lease.run_id,
+        RunFailure(
+            code="attempts_exhausted",
+            message="The stage attempt limit was exhausted.",
+            failed_stage=InternalStage.GENERATING_STORY_OUTLINE,
+            attempt_count=3,
+        ),
+        now=NOW,
+    )
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.state == "failed"
+
+    revived = await repository.retry_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-budget-reset",
+        now=NOW + timedelta(seconds=10),
+    )
+    assert revived.run_state == "queued"
+    assert await repository.get_stage_attempt_counts(lease.run_id) == {}
