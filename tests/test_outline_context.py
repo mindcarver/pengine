@@ -736,3 +736,36 @@ def test_sanitize_season_map_payload_dedupes_prohibitions() -> None:
     sanitized = sanitize_season_map_payload(payload)
 
     assert sanitized["prohibitions"] == ["不得穿越", "不得换角"]
+
+
+def test_sanitize_accepts_parsed_model_instance_payload() -> None:
+    """with_structured_output(include_raw=True) hands back a model instance,
+    not a dict (production 2026-09-09: AttributeError mid-pipeline); the
+    sanitize pipeline must tolerate it via model_dump normalization."""
+    from pengine.outline_context import OutlineSeasonMap, sanitize_season_map_payload
+
+    season_map = OutlineSeasonMap.model_validate(
+        {
+            "episode_count": 2,
+            "characters": [
+                {"character_id": "hero_lin", "name": "甲", "role": "r"},
+                {"character_id": "granny_su", "name": "乙", "role": "r"},
+            ],
+            "relationships": [],
+            "prohibitions": ["不得穿越"],
+            "review_milestones": [],
+            "script_generation_groups": [
+                {
+                    "group_id": "gg_intro",
+                    "start_episode": 1,
+                    "end_episode": 2,
+                    "dramatic_unit": "单元",
+                    "boundary_reason": "收束",
+                },
+            ],
+        }
+    )
+
+    sanitized = sanitize_season_map_payload(season_map.model_dump(mode="json"))
+    assert len(sanitized["characters"]) == 2
+    assert OutlineSeasonMap.model_validate(sanitized).episode_count == 2

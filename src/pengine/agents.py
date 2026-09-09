@@ -9440,6 +9440,10 @@ class DeepAgentWorkflow:
                         if parsing_error is not None:
                             raise cast(Exception, parsing_error)
                         raise AgentProtocolError("Season-map structured output missing")
+                    # include_raw=True returns the parsed value as a model
+                    # instance, not a dict: normalize before sanitizing.
+                    if isinstance(response, BaseModel):
+                        response = response.model_dump(mode="json")
                     sanitized = sanitize_season_map_payload(response)
                     if sanitized != response:
                         logger.warning(
