@@ -6766,7 +6766,7 @@ class StageGuardMiddleware(AgentMiddleware):
                                     repair_mode=repair_mode,
                                 )
                         except OutlineGroupAssemblyError as error:
-                            if protocol_repair_rounds >= 2:
+                            if protocol_repair_rounds >= 3:
                                 # Protocol exhaustion degrades to the same continuable
                                 # pause as a semantic rejection: one flaky group must
                                 # never terminal-kill a long season. Continuing reuses
@@ -6806,7 +6806,7 @@ class StageGuardMiddleware(AgentMiddleware):
                             parsed = drop_identical_group_registrations(committed, parsed)
                             validate_outline_group_references(season_map, committed, parsed)
                         except OutlineContextError as error:
-                            if protocol_repair_rounds >= 2:
+                            if protocol_repair_rounds >= 3:
                                 raise ContentReviewRejectedError(
                                     stage=InternalStage.GENERATING_EPISODE_OUTLINE,
                                     evidence=(
@@ -6851,7 +6851,7 @@ class StageGuardMiddleware(AgentMiddleware):
                             group_review = await review_group(compiled, parsed)
                         if group_review.passed:
                             break
-                        if review_repair_rounds >= 2:
+                        if review_repair_rounds >= 3:
                             raise ContentReviewRejectedError(
                                 stage=InternalStage.GENERATING_EPISODE_OUTLINE,
                                 evidence=group_review.evidence,
@@ -7060,7 +7060,10 @@ class StageGuardMiddleware(AgentMiddleware):
                     evidence=review.evidence,
                     repair_rounds=repair_rounds,
                 )
-            if repair_rounds >= 2:
+            if repair_rounds >= 3:
+                # Three paid repair rounds before pausing (production
+                # 2026-09-10: the third round cleared a 20-obligation episode
+                # that two could not; the DB CHECK allows 2-6).
                 raise ContentReviewRejectedError(
                     stage=InternalStage.GENERATING_EPISODE_OUTLINE,
                     evidence=review.evidence,
@@ -8701,7 +8704,10 @@ class StageGuardMiddleware(AgentMiddleware):
                             handler=handler,
                         )
                     break
-                if repair_rounds >= 2:
+                if repair_rounds >= 3:
+                    # Three paid repair rounds before pausing (production
+                    # 2026-09-10: high-obligation closing episodes often
+                    # clear on the third round; the DB CHECK allows 2-6).
                     raise ContentReviewRejectedError(
                         stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
                         evidence=review.evidence,

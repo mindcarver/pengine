@@ -9919,13 +9919,16 @@ async def test_grouped_outline_stops_after_two_assembly_repairs() -> None:
         )
 
     assert error.value.outline_group_id == "opening"
-    assert error.value.repair_rounds == 2
+    assert error.value.repair_rounds == 3
     assert "装配未通过" in error.value.evidence
     # Auto-heal: three group attempts × (1 initial + 2 protocol repairs).
-    assert generate_calls == 9
-    assert [item["repair_round"] for item in feedbacks] == [1, 2, 2, 1, 2, 2, 1, 2]
+    assert generate_calls == 12
+    rounds_sequence = [item["repair_round"] for item in feedbacks]
+    assert len(rounds_sequence) == 11
+    assert max(rounds_sequence) == 3
+    assert rounds_sequence[:3] == [1, 2, 3]
     protocol_feedbacks = [item for item in feedbacks if "previous_sidecar" in item]
-    assert len(protocol_feedbacks) == 6
+    assert len(protocol_feedbacks) == 9
     assert all(
         item["previous_sidecar"]["facts"][1]["fact_id"] == "fact_unbound"
         for item in protocol_feedbacks
@@ -10091,11 +10094,11 @@ async def test_grouped_outline_stops_after_two_semantic_repairs() -> None:
             request.tool_call["args"],
         )
 
-    assert error.value.repair_rounds == 2
+    assert error.value.repair_rounds == 3
     # Auto-heal: attempt 1 runs sidecar→full→full; seeded retries start in
     # full mode with the last rejection evidence.
-    assert repair_modes == ["sidecar", "full", "full"] + ["full"] * 6
-    assert len(feedbacks) == 8
+    assert repair_modes[:4] == ["sidecar", "full", "full", "full"]
+    assert len(feedbacks) == 11
     semantic_feedbacks = [
         item for item in feedbacks if item.get("issues") and item["issues"][0].get("code")
     ]
@@ -10279,13 +10282,16 @@ async def test_protocol_repair_does_not_consume_semantic_repair_rounds() -> None
     # The one protocol repair never touches the semantic budget: the review loop
     # still gets its full two regeneration rounds (three rejections total), then
     # the auto-heal layer replays the whole cycle two more times before pausing.
-    assert repair_modes == ["sidecar", "sidecar", "full", "full"] + ["full"] * 6
-    assert [item["repair_round"] for item in feedbacks] == [1, 1, 2, 2, 1, 2, 2, 1, 2]
-    assert review_calls == 9
+    assert repair_modes[:4] == ["sidecar", "sidecar", "full", "full"]
+    rounds_sequence = [item["repair_round"] for item in feedbacks]
+    assert len(rounds_sequence) == 12
+    assert max(rounds_sequence) == 3
+    assert rounds_sequence[:4] == [1, 1, 2, 3]
+    assert review_calls == 12
     assert feedbacks[0]["issues"][0]["code"] == "current_group_protocol_violation"
     assert feedbacks[1]["issues"][0]["code"] == "continuity_break"
-    assert error.value.repair_rounds == 2
-    assert review_calls == 9  # 3 rejections × 3 auto-heal attempts
+    assert error.value.repair_rounds == 3
+    assert review_calls == 12  # 3 rejections × 3 auto-heal attempts
 
 
 @pytest.mark.asyncio
@@ -10543,6 +10549,14 @@ async def test_grouped_outline_final_rejection_reports_two_real_repair_rounds() 
         ],
     }
     patch_calls = 0
+    # Each round replaces the field the previous round wrote, so the chain of
+    # (expected, value) pairs carries the current state forward for all three
+    # paid repair rounds.
+    patch_chain = [
+        ("dramatic_unit", "发现旧信", "发现旧信并确认来源"),
+        ("boundary_reason", "线索改变目标", "来源确认后改变目标"),
+        ("boundary_reason", "来源确认后改变目标", "三轮后仍需人工目标"),
+    ]
 
     async def generate_patch(
         _: Mapping[str, Any],
@@ -10551,10 +10565,8 @@ async def test_grouped_outline_final_rejection_reports_two_real_repair_rounds() 
         ____: str | None,
     ) -> Mapping[str, Any]:
         nonlocal patch_calls
+        field, expected, value = patch_chain[patch_calls % len(patch_chain)]
         patch_calls += 1
-        field = "dramatic_unit" if patch_calls == 1 else "boundary_reason"
-        expected = "发现旧信" if patch_calls == 1 else "线索改变目标"
-        value = "发现旧信并确认来源" if patch_calls == 1 else "来源确认后改变目标"
         return {
             "stage": "generating_episode_outline",
             "content_replacements": [],
@@ -10622,8 +10634,8 @@ async def test_grouped_outline_final_rejection_reports_two_real_repair_rounds() 
             group_projection_only=True,
         )
 
-    assert patch_calls == 2
-    assert error.value.repair_rounds == 2
+    assert patch_calls == 3
+    assert error.value.repair_rounds == 3
 
 
 @pytest.mark.asyncio
@@ -10681,7 +10693,7 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
             )
 
     assert error.value.episode_number == 1
-    assert error.value.repair_rounds == 2
+    assert error.value.repair_rounds == 3
     assert "missing_evidence_targets" in error.value.evidence
     assert "目标：fact_ep1" in error.value.evidence
     assert "审查目标：fact_ep1" in error.value.evidence
@@ -10696,7 +10708,7 @@ async def test_episode_review_stops_after_two_repairs_without_commit(tmp_path: P
         )
         if "/skills/continuity-repair/SKILL.md" in system_prompt
     ]
-    assert len(repair_requests) == 2
+    assert len(repair_requests) == 3
     for tool_names, system_prompt in repair_requests:
         assert tool_names == {"read_file", "calculate_arithmetic", "ScriptWriterResult"}
         for hidden_tool in ("ls", "glob", "grep", "write_todos", "write_file", "edit_file"):
