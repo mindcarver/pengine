@@ -740,6 +740,29 @@ def outline_group_output_tokens(
     return min(maximum_output_tokens, requested)
 
 
+# A closing group's continuity sidecar must resolve or re-register the whole
+# season's accumulated registries (facts, clues, obligations, timeline).
+# A flat per-episode budget truncated every attempt at the cap (production
+# 2026-09-10: finish_reason=length six times in a row on a single-episode
+# closing group, leaving facts/timeline/obligations entirely missing), so the
+# sidecar budget scales with the cumulative entry count too.
+OUTLINE_SIDECAR_RESERVED_TOKENS_PER_ENTRY = 128
+
+
+def outline_group_sidecar_output_tokens(
+    *,
+    episode_count: int,
+    committed_entry_count: int,
+) -> int:
+    """Output budget for an outline group's continuity sidecar."""
+
+    return max(
+        4_096,
+        episode_count * OUTLINE_GROUP_OUTPUT_TOKENS_PER_EPISODE,
+        OUTLINE_SIDECAR_RESERVED_TOKENS_PER_ENTRY * committed_entry_count,
+    )
+
+
 def compile_outline_group_context(
     *,
     creation_request: str,

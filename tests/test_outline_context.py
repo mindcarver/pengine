@@ -769,3 +769,16 @@ def test_sanitize_accepts_parsed_model_instance_payload() -> None:
     sanitized = sanitize_season_map_payload(season_map.model_dump(mode="json"))
     assert len(sanitized["characters"]) == 2
     assert OutlineSeasonMap.model_validate(sanitized).episode_count == 2
+
+
+def test_outline_group_sidecar_output_budget_scales_with_committed_entries() -> None:
+    """A single-episode closing group must escape the flat 4,096 budget: its
+    sidecar resolves the whole season's registries and truncated at the cap
+    six attempts in a row (production 2026-09-10)."""
+    from pengine.outline_context import outline_group_sidecar_output_tokens
+
+    # Plain early group: per-episode budget dominates.
+    assert outline_group_sidecar_output_tokens(episode_count=1, committed_entry_count=2) == 4_096
+    assert outline_group_sidecar_output_tokens(episode_count=3, committed_entry_count=4) == 12_288
+    # Closing group with a full season to resolve: cumulative budget dominates.
+    assert outline_group_sidecar_output_tokens(episode_count=1, committed_entry_count=80) == 10_240

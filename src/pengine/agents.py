@@ -89,6 +89,7 @@ from pengine.outline_context import (
     compile_season_map_context,
     drop_identical_group_registrations,
     normalize_outline_group_markdown,
+    outline_group_sidecar_output_tokens,
     parse_outline_group_markdown,
     sanitize_season_map_payload,
     validate_outline_group_references,
@@ -2613,9 +2614,17 @@ async def _invoke_outline_group_sidecar(
             context.context_bundle_sha256,
             context.context_manifest_json,
         )
-        context.requested_output_tokens = max(
-            4_096,
-            len(markdown.episodes) * 4_096,
+        context.requested_output_tokens = outline_group_sidecar_output_tokens(
+            episode_count=len(markdown.episodes),
+            committed_entry_count=sum(
+                len(sidecar_context.get(key) or [])
+                for key in (
+                    "committed_facts",
+                    "committed_clues",
+                    "committed_obligation_ids",
+                    "committed_timeline_event_ids",
+                )
+            ),
         )
         context.context_bundle_sha256 = content_fingerprint(sidecar_input)
         context.context_manifest_json = json.dumps(manifest, separators=(",", ":"), sort_keys=True)
