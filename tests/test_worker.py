@@ -1558,6 +1558,17 @@ async def test_episode_connection_error_auto_resumes_once_then_pauses_safely(
     )
     assert resumed is not None
     assert str(resumed.run_id) == run["id"]
+    # The auto-resume window is four: fast-forward the per-episode durable
+    # counter (episode_timeouts) to the window edge so the second observable
+    # interruption pauses instead of auto-resuming again.
+    async with repository._connection() as connection:
+        await connection.execute(
+            "INSERT INTO episode_timeouts(run_id, episode_number, timeout_count, updated_at) "
+            "VALUES (?, 2, 4, '2026-07-28T12:00:00+00:00') "
+            "ON CONFLICT(run_id, episode_number) DO UPDATE SET timeout_count = 4",
+            (str(resumed.run_id),),
+        )
+        await connection.commit()
     await worker._process_job(resumed)
     paused = await repository.get_creation(accepted.creation_id)
 

@@ -354,6 +354,15 @@ async def test_paused_run_continue_and_end_commands_are_idempotent(tmp_path: Pat
             resumed.run_id,
             InternalStage.GENERATING_STORY_OUTLINE,
         )
+        # The auto-resume window is four: fast-forward the durable counter so
+        # this occurrence lands at the window edge and pauses.
+        async with repository._connection() as connection:
+            await connection.execute(
+                "UPDATE run_progress SET timeout_count = 4, "
+                "timeout_stage = 'generating_story_outline' WHERE run_id = ?",
+                (str(resumed.run_id),),
+            )
+            await connection.commit()
         assert (
             await repository.handle_run_timeout(
                 resumed.run_id,
@@ -522,6 +531,15 @@ async def test_paused_run_end_command_is_idempotent(tmp_path: Path) -> None:
             resumed.run_id,
             InternalStage.GENERATING_STORY_OUTLINE,
         )
+        # The auto-resume window is four: fast-forward the durable counter so
+        # this occurrence lands at the window edge and pauses.
+        async with repository._connection() as connection:
+            await connection.execute(
+                "UPDATE run_progress SET timeout_count = 4, "
+                "timeout_stage = 'generating_story_outline' WHERE run_id = ?",
+                (str(resumed.run_id),),
+            )
+            await connection.commit()
         assert (
             await repository.handle_run_timeout(
                 resumed.run_id,
@@ -669,6 +687,16 @@ async def test_episode_progress_and_committed_drafts_remain_readable_after_end(
         resumed = await repository.lease_next_job("episode-progress-worker-2", 30)
         assert resumed is not None
         await repository.record_episode_attempt(resumed.run_id, 2)
+        # The auto-resume window is four: fast-forward the per-episode durable
+        # counter (episode_timeouts) to the window edge.
+        async with repository._connection() as connection:
+            await connection.execute(
+                "INSERT INTO episode_timeouts(run_id, episode_number, timeout_count, updated_at) "
+                "VALUES (?, 2, 4, '2026-07-28T12:00:00+00:00') "
+                "ON CONFLICT(run_id, episode_number) DO UPDATE SET timeout_count = 4",
+                (str(resumed.run_id),),
+            )
+            await connection.commit()
         assert await repository.handle_episode_timeout(resumed.run_id, 2) == "paused"
         paused = await client.get(f"/creations/{creation_id}")
         assert paused.json()["initial"]["pause"]["episode_number"] == 2

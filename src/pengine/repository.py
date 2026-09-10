@@ -105,6 +105,11 @@ from pengine.series_review import (
 SCHEMA_VERSION = 33
 MAX_STAGE_ATTEMPTS = 3
 MAX_EPISODE_ATTEMPTS = 3
+# A relay interruption (stream stall/reset) auto-resumes while its per-stage
+# counter stays within this window; beyond it the run pauses for an operator.
+# Four absorbs a degrading-relay window (production 2026-09-10/11) without
+# unbounded spend: attempt budgets and rolled cycles still bound everything.
+RELAY_AUTO_RESUME_WINDOW = 4
 # Failure codes an operator can resolve before reviving a terminally failed
 # initial run: relay quota/availability, or a deterministic stage failure whose
 # cause was fixed (the run re-enters through its approved checkpoints).
@@ -4746,7 +4751,7 @@ class Repository:
                 "failed"
                 if attempt_count >= MAX_EPISODE_ATTEMPTS
                 else "auto_resuming"
-                if timeout_count == 1
+                if timeout_count <= RELAY_AUTO_RESUME_WINDOW
                 else "paused"
             )
             await connection.execute(
@@ -8347,7 +8352,7 @@ class Repository:
                 "failed"
                 if attempt_count >= MAX_STAGE_ATTEMPTS and not grouped_outline_resume
                 else "auto_resuming"
-                if timeout_count == 1
+                if timeout_count <= RELAY_AUTO_RESUME_WINDOW
                 else "paused"
             )
             elapsed_seconds = self._elapsed_seconds(progress, current)
