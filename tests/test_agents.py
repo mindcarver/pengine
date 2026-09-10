@@ -13690,3 +13690,30 @@ async def test_direct_structured_retry_uses_second_repair_round() -> None:
 
     assert result == Result(value="third-time")
     assert len(model.model_message_batches) == 3
+
+
+@pytest.mark.asyncio
+async def test_direct_structured_retry_raises_protocol_error_when_parsed_missing() -> None:
+    """Responses with neither a parsed value nor a parsing error (the
+    synthesized structured_result_missing case) must surface as
+    AgentProtocolError so stage flake handlers requeue them — not as a bare
+    ValueError that terminal-fails as internal_error (production
+    2026-09-09 blind test)."""
+
+    class Result(BaseModel):
+        value: str
+
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(content="no tool call"),
+            AIMessage(content="again"),
+            AIMessage(content="once more"),
+        ]
+    )
+
+    with pytest.raises(AgentProtocolError):
+        await _invoke_direct_structured_with_retry(
+            model,
+            Result,
+            [{"role": "user", "content": "Produce the value."}],
+        )

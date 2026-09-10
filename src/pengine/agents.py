@@ -2303,9 +2303,12 @@ async def _invoke_direct_structured_with_retry(
         else:
             retry_messages.append(HumanMessage(content=correction))
 
-    if isinstance(last_error, Exception):
+    if isinstance(last_error, ValidationError):
         raise last_error
-    raise AgentProtocolError("Subagent returned invalid structured output")
+    # Everything else (including the synthesized structured_result_missing)
+    # keeps the protocol-error semantics so the stage flake paths classify
+    # and requeue it instead of terminal-failing as internal_error.
+    raise AgentProtocolError("Subagent returned invalid structured output") from last_error
 
 
 async def _invoke_outline_group_review(
