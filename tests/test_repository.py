@@ -1085,6 +1085,14 @@ async def test_grouped_outline_recovery_does_not_exhaust_whole_stage_attempts(
         )
         == 3
     )
+    # The auto-resume window is four: fast-forward the durable counter so this
+    # occurrence lands at the window edge and pauses.
+    async with repository._connection() as connection:
+        await connection.execute(
+            "UPDATE run_progress SET timeout_count = 4, timeout_stage = ? WHERE run_id = ?",
+            ("generating_episode_outline", str(lease.run_id)),
+        )
+        await connection.commit()
     assert (
         await repository.handle_run_timeout(
             lease.run_id,
@@ -1780,6 +1788,16 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
         InternalStage.GENERATING_STORY_OUTLINE,
         now=NOW + timedelta(seconds=41),
     )
+    # The relay/timeout auto-resume window is four (RELAY_AUTO_RESUME_WINDOW):
+    # occurrences 2-4 keep auto-resuming; the fifth pauses for an operator.
+    # Fast-forward the durable counter to the window edge, then time out once.
+    async with repository._connection() as connection:
+        await connection.execute(
+            "UPDATE run_progress SET timeout_count = 4, "
+            "timeout_stage = 'generating_story_outline' WHERE run_id = ?",
+            (str(resumed.run_id),),
+        )
+        await connection.commit()
     second_timeout = await repository.handle_run_timeout(
         resumed.run_id,
         InternalStage.GENERATING_STORY_OUTLINE,
@@ -1791,7 +1809,7 @@ async def test_progress_timeout_pause_continue_and_end_are_durable_and_idempoten
     assert paused is not None
     assert paused.initial.state == "paused"
     assert paused.initial.pause.code == "run_timeout"
-    assert paused.initial.pause.timeout_count == 2
+    assert paused.initial.pause.timeout_count == 5
     assert paused.initial.progress.can_continue is True
     assert paused.initial.progress.can_end is True
     assert paused.initial.drafts == running.initial.drafts
@@ -2198,6 +2216,15 @@ async def test_relay_interruption_is_delayed_and_shares_the_stage_recovery_budge
         InternalStage.GENERATING_STORY_OUTLINE,
         now=NOW + timedelta(seconds=21),
     )
+    # The auto-resume window is four: fast-forward the durable counter so this
+    # second observable occurrence lands at the window edge and pauses.
+    async with restarted._connection() as connection:
+        await connection.execute(
+            "UPDATE run_progress SET timeout_count = 4, "
+            "timeout_stage = 'generating_story_outline' WHERE run_id = ?",
+            (str(resumed.run_id),),
+        )
+        await connection.commit()
     assert (
         await restarted.handle_run_timeout(
             resumed.run_id,
@@ -2209,7 +2236,7 @@ async def test_relay_interruption_is_delayed_and_shares_the_stage_recovery_budge
     paused = await restarted.get_creation(accepted.creation_id, now=NOW + timedelta(seconds=23))
     assert paused is not None
     assert paused.initial.pause.code == "run_timeout"
-    assert paused.initial.pause.timeout_count == 2
+    assert paused.initial.pause.timeout_count == 5
     assert paused.initial.progress.recovery_reason == "run_timeout"
     assert paused.initial.progress.can_continue is True
     assert paused.initial.progress.can_end is True
@@ -2809,6 +2836,16 @@ async def test_episode_timeout_recovers_first_unfinished_and_ended_run_keeps_dra
         )
         == 2
     )
+    # The auto-resume window is four: fast-forward the durable per-episode
+    # counter (episode_timeouts) so this occurrence lands at the edge.
+    async with repository._connection() as connection:
+        await connection.execute(
+            "INSERT INTO episode_timeouts(run_id, episode_number, timeout_count, updated_at) "
+            "VALUES (?, 2, 4, ?) ON CONFLICT(run_id, episode_number) DO UPDATE SET "
+            "timeout_count = 4",
+            (str(resumed.run_id), "2026-07-28T12:00:00+00:00"),
+        )
+        await connection.commit()
     assert (
         await repository.handle_episode_timeout(
             resumed.run_id,
@@ -2822,7 +2859,7 @@ async def test_episode_timeout_recovers_first_unfinished_and_ended_run_keeps_dra
     assert paused is not None
     assert paused.initial.state == "paused"
     assert paused.initial.pause.episode_number == 2
-    assert paused.initial.pause.timeout_count == 2
+    assert paused.initial.pause.timeout_count == 5
     assert paused.initial.pause.code == "run_timeout"
     assert paused.initial.drafts.episodes == [first]
     await repository.end_run(
