@@ -1892,7 +1892,11 @@ def _openrouter_extra_body(
     model_id: str, settings: Settings, *, with_provider: bool = False
 ) -> dict[str, Any] | None:
     extra: dict[str, Any] = {}
-    if model_id == "deepseek/deepseek-v4-flash":
+    if model_id in {"deepseek/deepseek-v4-flash", "deepseek/deepseek-v4.1-flash"}:
+        # Reasoning burn: the creation pipeline needs schema-bound tool calls,
+        # not chain-of-thought. Left enabled, V4.1 emitted ~10k reasoning
+        # tokens before a ~900-token character-relationships call (production
+        # 2026-09-11: 660s vs 8s, ~20x slower, output budget squeezed).
         extra["reasoning"] = {"enabled": False}
     if with_provider and settings.openrouter_provider:
         # Prefer vetted fast upstreams without leaving the pool: unpinned routing
