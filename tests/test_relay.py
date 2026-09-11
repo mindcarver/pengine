@@ -2284,3 +2284,28 @@ def test_build_relay_routes_outline_override_builds_third_route() -> None:
     assert routes.outline is not None
     assert routes.outline.model_id == "deepseek/deepseek-v4-pro"
     assert routes.generation.model_id == "claude-opus-5"
+
+
+def test_v4_1_flash_model_route_is_allowed_and_aliased() -> None:
+    """deepseek/deepseek-v4.1-flash rides the OpenRouter chat-completions
+    route and its identity audit accepts the dated -20260910 snapshot the
+    upstream providers echo (verified 2026-09-11)."""
+    from pengine.config import Settings
+    from pengine.relay import (
+        _RESPONSE_MODEL_ID_EQUIVALENTS,
+        _openrouter_extra_body,
+    )
+
+    settings = Settings(
+        _env_file=None,
+        relay_base_url="https://openrouter.ai/api/v1",
+        relay_api_key="secret-value",
+        generation_model_id="deepseek/deepseek-v4.1-flash",
+        review_model_id="deepseek/deepseek-v4.1-flash",
+    )
+    assert settings.generation_model_id == "deepseek/deepseek-v4.1-flash"
+
+    assert "deepseek-v4.1-flash-20260910" in _RESPONSE_MODEL_ID_EQUIVALENTS["deepseek-v4.1-flash"]
+
+    extra = _openrouter_extra_body("deepseek/deepseek-v4.1-flash", settings, with_provider=True)
+    assert extra is None or "reasoning" not in extra

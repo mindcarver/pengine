@@ -81,6 +81,9 @@ _RESPONSE_MODEL_ID_EQUIVALENTS = MappingProxyType(
         # (verified 2026-08-21: /models advertises deepseek-v4-flash only and
         # requesting -0731 directly returns model-not-found).
         "deepseek-v4-flash": frozenset({"deepseek-v4-flash", "deepseek-v4-flash-0731"}),
+        # Upstream providers answer with the dated snapshot slug (verified
+        # 2026-09-11: -20260910 across DeepInfra/Fireworks/Parasail et al.).
+        "deepseek-v4.1-flash": frozenset({"deepseek-v4.1-flash", "deepseek-v4.1-flash-20260910"}),
         # OpenRouter echoes the provider-prefixed slug on its Anthropic-compat
         # route; the bare slug covers relays that strip the prefix. Populated
         # from live-call evidence (Issue #271).

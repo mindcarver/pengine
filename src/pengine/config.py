@@ -15,7 +15,12 @@ OPENROUTER_ANTHROPIC_MODEL_IDS = frozenset(
     f"anthropic/{model_id}" for model_id in ANTHROPIC_MODEL_IDS
 )
 OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS = frozenset(
-    {"z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"}
+    {
+        "z-ai/glm-5.3-flash",
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4.1-flash",
+    }
 )
 _ALLOWED_GENERATION_MODELS = (
     ANTHROPIC_MODEL_IDS | OPENROUTER_ANTHROPIC_MODEL_IDS | OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS
