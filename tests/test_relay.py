@@ -2308,4 +2308,7 @@ def test_v4_1_flash_model_route_is_allowed_and_aliased() -> None:
     assert "deepseek-v4.1-flash-20260910" in _RESPONSE_MODEL_ID_EQUIVALENTS["deepseek-v4.1-flash"]
 
     extra = _openrouter_extra_body("deepseek/deepseek-v4.1-flash", settings, with_provider=True)
-    assert extra is None or "reasoning" not in extra
+    # Reasoning must be disabled: the creation pipeline needs schema-bound
+    # tool calls, not chain-of-thought (660s vs 8s when left enabled).
+    assert extra is not None
+    assert extra.get("reasoning") == {"enabled": False}
