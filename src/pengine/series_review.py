@@ -67,6 +67,13 @@ def active_prefix_hash(episodes: Sequence[Mapping[str, str]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# A rejection that would trigger a paid suffix rewrite must carry real evidence:
+# schema-level NonEmptyText only blocks empty strings, and a transport-truncated
+# single-character verdict slipped through and rewound a 40-episode production
+# run (2026-09-12: evidence='L', earliest_affected=1, whole-season redo).
+REJECTION_EVIDENCE_MIN_CHARS = 50
+
+
 class StructuralReviewResult(ContinuityModel):
     """The structured review decision for one milestone or final prefix."""
 
@@ -98,6 +105,25 @@ class StructuralReviewResult(ContinuityModel):
             "format, style, or a prior superseded prefix."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_rejection_evidence(self) -> StructuralReviewResult:
+        if not self.passed and self.category in {"design_defect", "script_defect"}:
+            # Rejections drive paid suffix rewrites and design rebuilds; a
+            # truncated or placeholder verdict is an invalid review, not a
+            # decision. The episode number must also be cited somewhere so the
+            # earliest-affected claim is auditable.
+            if len(self.evidence.strip()) < REJECTION_EVIDENCE_MIN_CHARS:
+                raise ValueError(
+                    "A rejecting structural review needs substantive evidence "
+                    f"(>= {REJECTION_EVIDENCE_MIN_CHARS} chars)"
+                )
+            if self.earliest_affected_episode is not None:
+                marker = str(self.earliest_affected_episode)
+                has_marker = marker in self.evidence or "第" in self.evidence
+                if not has_marker:
+                    raise ValueError("Rejecting evidence must cite the affected episode number")
+        return self
 
     @model_validator(mode="after")
     def validate_decision(self) -> StructuralReviewResult:

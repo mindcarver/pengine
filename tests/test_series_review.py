@@ -1199,3 +1199,54 @@ def test_effective_milestones_always_include_the_final_episode() -> None:
         effective_milestones([0], 3)
     with _pytest.raises(ValueError):
         effective_milestones([4], 3)
+
+
+def test_truncated_rejection_evidence_is_invalid() -> None:
+    """A transport-truncated verdict ('L') must not count as a rejecting
+    review: it rewound a 40-episode production run (2026-09-12)."""
+    from pydantic import ValidationError as VE
+
+    from pengine.series_review import StructuralReviewResult
+
+    with pytest.raises(VE, match="substantive evidence"):
+        StructuralReviewResult.model_validate(
+            {
+                "passed": False,
+                "category": "script_defect",
+                "evidence": "L",
+                "earliest_affected_episode": 1,
+            }
+        )
+
+
+def test_rejection_without_episode_marker_is_invalid() -> None:
+    from pydantic import ValidationError as VE
+
+    from pengine.series_review import StructuralReviewResult
+
+    with pytest.raises(VE, match="cite the affected episode"):
+        StructuralReviewResult.model_validate(
+            {
+                "passed": False,
+                "category": "script_defect",
+                "evidence": "存在贯穿性的重大结构冲突：剧本正文与事实清单多处严重不一致，且长期未得到任何修复处理，广泛影响故事整体走向。",
+                "earliest_affected_episode": 1,
+            }
+        )
+
+
+def test_substantive_rejection_with_episode_citation_passes() -> None:
+    from pengine.series_review import StructuralReviewResult
+
+    result = StructuralReviewResult.model_validate(
+        {
+            "passed": False,
+            "category": "script_defect",
+            "evidence": (
+                "第1集违反锁定事实：剧本正文与第1集事实清单直接冲突，"
+                "且第1集结尾状态与后续剧情不衔接，缺陷自第1集贯穿整个当前前缀。"
+            ),
+            "earliest_affected_episode": 1,
+        }
+    )
+    assert result.earliest_affected_episode == 1
