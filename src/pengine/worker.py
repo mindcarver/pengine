@@ -2516,9 +2516,17 @@ class Worker:
             latest_review_id = (
                 unresolved_reviews[-1].review_id if unresolved_reviews else exc.review_id
             )
+            # A whole-season rewrite (from_episode within the first 10% of the
+            # season) is too expensive to execute on a single model verdict:
+            # pause for human confirmation instead (production 2026-09-12: a
+            # 40-episode run was rewound to ep1 automatically).
+            whole_season_rewrite = effective_earliest is not None and effective_earliest <= max(
+                1, len(work.episode_plans) // 10
+            )
             if (
                 batch is not None
                 and effective_earliest is not None
+                and not whole_season_rewrite
                 and await self.repository.has_automatic_suffix_budget(
                     work.run_id,
                     batch.batch_id,

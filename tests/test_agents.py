@@ -2737,7 +2737,8 @@ async def test_valid_structural_milestone_rejection_is_not_skipped() -> None:
             passed=False,
             category="script_defect",
             evidence=(
-                "L4硬规则：第一集违反锁定事实。\nL4价值观：未发现阻断。\nL4创作建议：未发现阻断。"
+                "L4硬规则：第1集违反锁定事实：与第1集事实清单直接冲突，缺陷自第1集贯穿当前前缀。"
+                "\nL4价值观：未发现阻断。\nL4创作建议：未发现阻断。"
             ),
             earliest_affected_episode=1,
         )
