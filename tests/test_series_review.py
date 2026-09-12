@@ -1229,7 +1229,10 @@ def test_rejection_without_episode_marker_is_invalid() -> None:
             {
                 "passed": False,
                 "category": "script_defect",
-                "evidence": "存在贯穿性的重大结构冲突：剧本正文与事实清单多处严重不一致，且长期未得到任何修复处理，广泛影响故事整体走向。",
+                "evidence": (
+                    "存在贯穿性的重大结构冲突：剧本正文与事实清单多处严重不一致，"
+                    "且长期未得到任何修复处理，广泛影响故事整体走向。"
+                ),
                 "earliest_affected_episode": 1,
             }
         )
