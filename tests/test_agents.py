@@ -13706,6 +13706,57 @@ async def test_direct_structured_retry_uses_second_repair_round() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_structured_retry_perturbs_first_user_message() -> None:
+    """Repair rounds must inject a fresh nonce into the first user message
+    itself, while the first attempt replays the original input verbatim.
+
+    Production 2026-09-13 (run 30268bc4, ep31): a temperature-0 upstream
+    returned one byte-identical invalid sidecar 21 times in a row, ignoring
+    every appended correction. The decoder fixates on the large first user
+    message, so only changing that message per round guarantees the next
+    attempt decodes from an input that has never been seen before."""
+
+    class Result(BaseModel):
+        value: str
+
+    model = ToolCallingFakeModel(
+        responses=[
+            _tool_call("Result", {}, 1),  # empty args -> parse failure
+            _tool_call("Result", {}, 2),  # still invalid after first feedback
+            _tool_call("Result", {"value": "third-time"}, 3),
+        ]
+    )
+
+    result = await _invoke_direct_structured_with_retry(
+        model,
+        Result,
+        [{"role": "user", "content": "Produce the value."}],
+    )
+
+    assert result == Result(value="third-time")
+    assert len(model.model_message_batches) == 3
+
+    def first_user_content(batch: list[Any]) -> str:
+        message = next(item for item in batch if isinstance(item, HumanMessage))
+        return str(message.content)
+
+    nonces: list[str] = []
+    for attempt, batch in enumerate(model.model_message_batches):
+        content = first_user_content(batch)
+        if attempt == 0:
+            # The first attempt stays byte-identical so provider-side prompt
+            # cache stays warm for the healthy path.
+            assert content == "Produce the value."
+            continue
+        match = re.search(r"^\[repair attempt (\d+); retry nonce ([0-9a-f]{8})\]\n", content)
+        assert match is not None
+        assert match.group(1) == str(attempt)
+        assert content.endswith("Produce the value.")
+        nonces.append(match.group(2))
+    assert len(set(nonces)) == len(nonces)
+
+
+@pytest.mark.asyncio
 async def test_direct_structured_retry_raises_protocol_error_when_parsed_missing() -> None:
     """Responses with neither a parsed value nor a parsing error (the
     synthesized structured_result_missing case) must surface as

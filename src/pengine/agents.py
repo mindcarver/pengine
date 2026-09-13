@@ -2233,6 +2233,25 @@ def _structured_output_retry_message(error: Exception) -> str:
     return f"{instruction} Correct these validation errors: {'; '.join(details)}."
 
 
+def _perturbed_structured_retry_messages(
+    messages: list[dict[str, str]], round_no: int
+) -> list[dict[str, str]]:
+    # Deterministic-replay guard (production 2026-09-13, run 30268bc4 ep31):
+    # a temperature-0 upstream returned one byte-identical invalid sidecar 21
+    # times in a row while ignoring every appended correction — the decoder
+    # fixates on the large first user message, so appended feedback alone
+    # never changes the output. Each repair round prefixes that message with
+    # a fresh random nonce: the next attempt then decodes from an input that
+    # has never been seen before, whatever the upstream fixates on.
+    prefix = f"[repair attempt {round_no}; retry nonce {secrets.token_hex(4)}]\n"
+    perturbed = list(messages)
+    for index, message in enumerate(perturbed):
+        if isinstance(message, Mapping) and message.get("role") == "user":
+            perturbed[index] = {**message, "content": f"{prefix}{message.get('content') or ''}"}
+            break
+    return perturbed
+
+
 async def _invoke_direct_structured_with_retry(
     model: BaseChatModel,
     schema: type[Any],
@@ -2244,17 +2263,25 @@ async def _invoke_direct_structured_with_retry(
 
     One initial attempt plus up to ``max_repair_rounds`` feedback repairs
     (production 2026-09-09: a single repair round let occasional sidecar
-    field omissions — pro and flash alike — burn the whole stage budget)."""
+    field omissions — pro and flash alike — burn the whole stage budget).
+    The first attempt replays the original messages verbatim so provider-side
+    prompt cache stays warm; every repair round perturbs the first user
+    message with a fresh nonce (see ``_perturbed_structured_retry_messages``)."""
 
     structured_model = model.with_structured_output(
         schema,
         method="function_calling",
         include_raw=True,
     )
-    retry_messages: list[Any] = list(messages)
+    feedback_tail: list[Any] = []
     last_error: Exception | None = None
     for round_no in range(max_repair_rounds + 1):
-        response = await structured_model.ainvoke(retry_messages)
+        attempt_messages = (
+            list(messages)
+            if round_no == 0
+            else [*_perturbed_structured_retry_messages(messages, round_no), *feedback_tail]
+        )
+        response = await structured_model.ainvoke(attempt_messages)
         parsed = response.get("parsed") if isinstance(response, Mapping) else None
         if parsed is not None:
             return parsed
@@ -2291,7 +2318,7 @@ async def _invoke_direct_structured_with_retry(
             isinstance(raw, AIMessage) and message_serialized_chars(raw) > _SIDECAR_RAW_MAX_CHARS
         )
         if isinstance(raw, AIMessage) and matching_call is not None and not raw_oversized:
-            retry_messages.extend(
+            feedback_tail.extend(
                 [
                     raw,
                     ToolMessage(
@@ -2302,7 +2329,7 @@ async def _invoke_direct_structured_with_retry(
                 ]
             )
         else:
-            retry_messages.append(HumanMessage(content=correction))
+            feedback_tail.append(HumanMessage(content=correction))
 
     if isinstance(last_error, ValidationError):
         raise last_error
