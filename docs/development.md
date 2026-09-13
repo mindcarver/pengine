@@ -227,6 +227,14 @@ Issue / 设计说明
   会复现同一个错误（实测 flash 同错三连败）；把校验器的逐字错误（含字段名）附进重试
   请求，模型一修即过。season map（`generate_outline_season_map`）与大纲组 sidecar
   （`bounded_current_group_repair`）都走这条路径。
+- **回喂不够时必须扰动原始输入**（2026-09-13，run 30268bc4 ep31）。温度 0 下，某上游
+  对剧本文本组的状态提取调用（`_invoke_direct_structured_with_retry`）21 次返回逐字节
+  相同的坏 sidecar——回喂的纠错消息（每次 +309 token）被完全无视：解码器只"盯"第一条
+  大 user 消息，追加的反馈改变不了它。解法：首轮消息原样保留（prompt cache 保持命中），
+  每个修复轮给第一条 user 消息加前缀 `[repair attempt N; retry nonce <random>]`
+  （`_perturbed_structured_retry_messages`），保证下一轮解码的输入前所未见。同类前科
+  （裁缝铺 run ep20、顾长风 run ep13/17 靠重试运气过关）说明这是概率性模型行为，温度 0
+  一旦落进死点即永久复读，普通重试架构（flake retry / 用户手动 continue）永远救不回。
 - **纯重复先确定性去重**。同 ID 且全量内容一致的重复条目（如同一 fact 在组内列了两
   次）是语义空操作，用 `drop_identical_group_registrations` 直接丢弃（并只在 fact
   完全无剩余拷贝时才清理义务引用），不要浪费有界修复轮次。同 ID 不同内容是真冲突，
