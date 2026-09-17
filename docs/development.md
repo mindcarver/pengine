@@ -239,6 +239,11 @@ Issue / 设计说明
   次）是语义空操作，用 `drop_identical_group_registrations` 直接丢弃（并只在 fact
   完全无剩余拷贝时才清理义务引用），不要浪费有界修复轮次。同 ID 不同内容是真冲突，
   保留给错误回喂环处理。
+- **"改动量小于整体"类预算对退化候选不可满足**（2026-09-18，run 8dda33f3）。故事大纲
+  修复补丁要求 `change_budget < len(content)`；当候选本身只有 1 个字符（`NonEmptyText`
+  的下限放行了退化输出）时，任何补丁都 ≥ 整个候选，三轮修复必然全拒、终态判死。解法：
+  小于 `_STORY_REPAIR_DEGENERATE_CANDIDATE_CHARS`（200 字符）的候选豁免最小性检查——
+  整体替换退化候选本身就是最小修复。设计"相对量"约束时要先问分母是否会退化。
 - **错误信息要透传**。把底层 `ValidationError` 的字段细节吞成通用文案（如
   "未通过确定性校验"）会让运维与修复环都失去目标；`safe_message` 与日志都应携带
   `{exc}` 原文（AgentProtocolError / internal_error 均适用）。

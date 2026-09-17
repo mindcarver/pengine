@@ -3551,7 +3551,10 @@ def test_story_artifact_patch_discards_harmless_no_op_alongside_real_repairs() -
 
 
 def test_story_artifact_patch_enforces_total_old_or_new_line_change_budget() -> None:
-    content = "第一行。\n第二行。\n第三行。\n第四行。"
+    content = "\n".join(
+        f"第{index}行：这座老照相馆在拆迁前的最后一个秋天里，仍然亮着那盏暗红色的灯。"
+        for index in range(1, 9)
+    )
     patch = StoryArtifactRepairPatch.model_validate(
         {
             "stage": "generating_story_outline",
@@ -3559,7 +3562,9 @@ def test_story_artifact_patch_enforces_total_old_or_new_line_change_budget() -> 
                 {
                     "start_line": 2,
                     "end_line": 2,
-                    "replacement": "这是一个长度接近完整候选的新事实插入，不能绕过预算。",
+                    "replacement": (
+                        content.replace("\n", "") + "新增的整段事实插入，长度超过完整候选。"
+                    ),
                 }
             ],
         }
@@ -3571,6 +3576,41 @@ def test_story_artifact_patch_enforces_total_old_or_new_line_change_budget() -> 
             content=content,
             patch=patch,
         )
+
+
+def test_story_artifact_patch_allows_full_replacement_of_degenerate_candidate() -> None:
+    # A degenerate candidate (an essentially empty outline that slipped through
+    # the NonEmptyText floor) can never satisfy a "smaller than the whole"
+    # change budget: every patch is at least as large. Replacing it entirely IS
+    # the minimal repair, so the budget must not reject it (production
+    # 2026-09-18, run 8dda33f3: three repair attempts all rejected with
+    # story_repair_patch_not_minimal on a 1-char candidate, terminal failure).
+    content = "。"
+    patch = StoryArtifactRepairPatch.model_validate(
+        {
+            "stage": "generating_story_outline",
+            "line_replacements": [
+                {
+                    "start_line": 1,
+                    "end_line": 1,
+                    "replacement": (
+                        "开局：程显影守着老街照相馆，铁皮柜里攒下五十张没人来取的全家福。\n"
+                        "中段：孙子程一寸回城学摄影，逐张送出照片，揭开半条老街五十年的旧事。\n"
+                        "结尾：第五十一张照片拍下全街人到齐的一幕，谜底揭开。"
+                    ),
+                }
+            ],
+        }
+    )
+
+    repaired = _apply_story_artifact_repair_patch(
+        stage=InternalStage.GENERATING_STORY_OUTLINE,
+        content=content,
+        patch=patch,
+    )
+
+    assert repaired.content.startswith("开局：程显影")
+    assert "第五十一张照片" in repaired.content
 
 
 def test_story_artifact_patch_allows_in_scope_multi_line_outline_repair() -> None:

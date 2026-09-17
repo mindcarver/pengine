@@ -216,6 +216,12 @@ _STORY_OUTLINE_EPISODE_SECTION = re.compile(
 _MAX_OUTLINE_REPAIR_ROUNDS = 2
 _PRIMARY_STORY_ARTIFACT_REPAIR_ROUNDS = 4
 _MAX_STORY_ARTIFACT_REPAIR_ROUNDS = 4
+# Below this size a story candidate carries no meaningful structure, so a repair
+# patch that replaces all of it is by definition minimal (production
+# 2026-09-18, run 8dda33f3: a 1-char outline candidate made the change-budget
+# floor unsatisfiable — every patch is at least as large as the whole
+# candidate — and burned the repair attempts into a terminal failure).
+_STORY_REPAIR_DEGENERATE_CANDIDATE_CHARS = 200
 _SPECIALIST_SKILL_SOURCES = {
     "canon_reviewer": ["/skills/canon-review"],
     "episode_repair": ["/skills/continuity-repair"],
@@ -4710,14 +4716,15 @@ def _apply_story_artifact_repair_patch(
         for left, right in zip(meaningful, meaningful[1:], strict=False)
     ):
         raise ValueError("overlapping_story_line_replacement")
+    degenerate_candidate = len(content) < _STORY_REPAIR_DEGENERATE_CANDIDATE_CHARS
     change_budget = 0
     for replacement in meaningful:
         old_span = "\n".join(lines[replacement.start_line - 1 : replacement.end_line])
         replacement_budget = max(len(old_span), len(replacement.replacement))
-        if replacement_budget >= len(content):
+        if not degenerate_candidate and replacement_budget >= len(content):
             raise ValueError("story_repair_patch_not_minimal")
         change_budget += replacement_budget
-    if change_budget >= len(content):
+    if not degenerate_candidate and change_budget >= len(content):
         raise ValueError("story_repair_patch_not_minimal")
     repaired_lines = lines.copy()
     for replacement in reversed(meaningful):
