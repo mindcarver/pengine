@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from pengine.outline_context import (
     EpisodeOutlineGroupResult,
@@ -113,6 +114,40 @@ def test_season_map_accepts_natural_variable_groups_for_thirty_episodes() -> Non
     } > {2}
     assert season_map.script_generation_groups[0].start_episode == 1
     assert season_map.script_generation_groups[-1].end_episode == 30
+
+
+def test_season_map_rejects_runaway_list_inflation() -> None:
+    # Runaway list inflation must fail validation with a feedable entry-cap
+    # error instead of pinning every retry at the output-token ceiling on a
+    # truncated payload (production 2026-09-18, run fdc48e03: a deterministic
+    # 15,833-entry prohibitions list burned the stage at temperature 0).
+    season_map = make_season_map()
+
+    with pytest.raises(ValidationError, match="prohibitions"):
+        OutlineSeasonMap.model_validate(
+            {
+                **season_map.model_dump(mode="json"),
+                "prohibitions": [f"禁止事项{index}" for index in range(513)],
+            }
+        )
+
+    with pytest.raises(ValidationError, match="characters"):
+        OutlineSeasonMap.model_validate(
+            {
+                **season_map.model_dump(mode="json"),
+                "characters": [
+                    *season_map.model_dump(mode="json")["characters"],
+                    *[
+                        {
+                            "character_id": f"extra_{index}",
+                            "name": f"额外人物{index}",
+                            "role": "配角",
+                        }
+                        for index in range(64)
+                    ],
+                ],
+            }
+        )
 
 
 @pytest.mark.parametrize(
