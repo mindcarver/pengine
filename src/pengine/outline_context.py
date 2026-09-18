@@ -42,9 +42,14 @@ class OutlineSeasonMap(ContinuityModel):
     """Small whole-season design that decides natural generation boundaries."""
 
     episode_count: int = Field(ge=1)
-    characters: list[CharacterSpec] = Field(min_length=1)
-    relationships: list[RelationshipSpec] = Field(default_factory=list)
-    prohibitions: list[NonEmptyText] = Field(default_factory=list)
+    # Entry caps convert runaway list inflation into an immediate, feedable
+    # validation error instead of a truncated multi-cap output that neither
+    # parses nor explains itself (production 2026-09-18, run fdc48e03: a
+    # deterministic 15,833-entry prohibitions list at temperature 0 pinned
+    # every retry at the 49,152-token output ceiling until the stage died).
+    characters: list[CharacterSpec] = Field(min_length=1, max_length=64)
+    relationships: list[RelationshipSpec] = Field(default_factory=list, max_length=256)
+    prohibitions: list[NonEmptyText] = Field(default_factory=list, max_length=512)
     review_milestones: list[int] = Field(default_factory=list)
     script_generation_groups: list[ScriptGenerationGroup] = Field(min_length=1)
 
