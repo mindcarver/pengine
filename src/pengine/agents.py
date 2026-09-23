@@ -2924,32 +2924,19 @@ async def _invoke_script_group_sidecar(
     sidecar_context: Mapping[str, Any],
     model_call_state: ModelCallState | None = None,
 ) -> ScriptGenerationGroupResult:
-    screenplays = "\n\n".join(
-        (
-            f"<episode number={episode.episode_number} "
-            f"sha256={episode.screenplay_sha256}>\n{episode.content}\n</episode>"
-        )
-        for episode in text.episodes
-    )
-    sidecar_input = (
-        "Extract only the compact machine state for the immutable screenplay group below. "
-        "Do not rewrite, summarize, or repeat screenplay content. Return exactly one "
-        "ScriptGenerationGroupSidecar. Copy every supplied screenplay SHA-256 exactly. "
-        "Each state_delta must contain only that episode's changes and must bind the supplied "
-        "contract hash. Evidence excerpts must occur verbatim in the matching screenplay. "
-        "Every episode's state_delta MUST include a non-empty handoff field describing the "
-        "ending state handed to the next episode; for the last episode of the group, "
-        "summarize the ending state the next episode will inherit.\n\n"
-        f"SIDE_CAR_CONTEXT={json.dumps(sidecar_context, ensure_ascii=False, sort_keys=True)}\n\n"
-        f"{screenplays}"
-    )
+    # One extraction call per episode. A whole-group call lets a lazy
+    # temperature-0 upstream return only the first episode's sidecar every
+    # time — across repair nonces and provider rotations (production
+    # 2026-09-13 run 30268bc4 ep31, 2026-09-23 run d52cb948 ep4) — because
+    # "stop after episode one" survives every perturbation. A single-episode
+    # request has no episode to skip, so the failure class cannot form; the
+    # smaller inputs are also cheaper to prefill.
     manifest = {
         "mode": "script_state_sidecar",
         "group_id": text.group_id,
         "start_episode": text.start_episode,
         "end_episode": text.end_episode,
-        "input_characters": len(sidecar_input),
-        "input_estimated_tokens": estimate_text_tokens(sidecar_input),
+        "per_episode": True,
         "screenplay_sha256": [
             {
                 "episode_number": episode.episode_number,
@@ -2958,49 +2945,98 @@ async def _invoke_script_group_sidecar(
             for episode in text.episodes
         ],
     }
-    previous_context: tuple[int | None, str | None, str | None] | None = None
-    if model_call_state is not None:
-        context = model_call_state.context
-        previous_context = (
-            context.requested_output_tokens,
-            context.context_bundle_sha256,
-            context.context_manifest_json,
-        )
-        context.requested_output_tokens = max(4_096, len(text.episodes) * 4_096)
-        context.context_bundle_sha256 = content_fingerprint(sidecar_input)
-        context.context_manifest_json = json.dumps(manifest, separators=(",", ":"), sort_keys=True)
     record_langfuse_event(
         "pengine.script_state_sidecar.started",
         input=manifest,
         metadata={"trace_version": "pengine-1"},
     )
-    try:
-        sidecar = await _invoke_direct_structured_with_retry(
-            model,
-            ScriptGenerationGroupSidecar,
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You extract continuity state from immutable screenplay text. Return "
-                        "only the requested compact structured sidecar and never rewrite the "
-                        "screenplay."
-                    ),
-                },
-                {"role": "user", "content": sidecar_input},
-            ],
+    episode_sidecars: list[ScriptEpisodeSidecar] = []
+    for position, episode in enumerate(text.episodes):
+        is_last = position == len(text.episodes) - 1
+        screenplay = (
+            f"<episode number={episode.episode_number} "
+            f"sha256={episode.screenplay_sha256}>\n{episode.content}\n</episode>"
         )
-    finally:
-        if model_call_state is not None and previous_context is not None:
-            (
-                model_call_state.context.requested_output_tokens,
-                model_call_state.context.context_bundle_sha256,
-                model_call_state.context.context_manifest_json,
-            ) = previous_context
-    result = _assemble_script_group_result(text, sidecar)
+        sidecar_input = (
+            "Extract only the compact machine state for the single immutable screenplay "
+            "below. Do not rewrite, summarize, or repeat screenplay content. Return exactly "
+            "one ScriptGenerationGroupSidecar whose start_episode and end_episode both equal "
+            f"{episode.episode_number} and whose episodes list contains exactly that one "
+            "episode. Copy the supplied screenplay SHA-256 exactly. The state_delta must "
+            "contain only this episode's changes and must bind the supplied contract hash. "
+            "Evidence excerpts must occur verbatim in this screenplay. The state_delta MUST "
+            "include a non-empty handoff field describing the ending state handed to the "
+            "next episode"
+            + (
+                "; this is the last episode of its group, so summarize the ending state the "
+                "next episode will inherit."
+                if is_last
+                else "."
+            )
+            + "\n\nSIDE_CAR_CONTEXT="
+            + json.dumps(sidecar_context, ensure_ascii=False, sort_keys=True)
+            + "\n\n"
+            + screenplay
+        )
+        call_manifest = {
+            **manifest,
+            "input_characters": len(sidecar_input),
+            "input_estimated_tokens": estimate_text_tokens(sidecar_input),
+            "screenplay_sha256": [
+                {"episode_number": episode.episode_number, "sha256": episode.screenplay_sha256}
+            ],
+        }
+        previous_context: tuple[int | None, str | None, str | None] | None = None
+        if model_call_state is not None:
+            context = model_call_state.context
+            previous_context = (
+                context.requested_output_tokens,
+                context.context_bundle_sha256,
+                context.context_manifest_json,
+            )
+            context.requested_output_tokens = 4_096
+            context.context_bundle_sha256 = content_fingerprint(sidecar_input)
+            context.context_manifest_json = json.dumps(
+                call_manifest, separators=(",", ":"), sort_keys=True
+            )
+        try:
+            sidecar = await _invoke_direct_structured_with_retry(
+                model,
+                ScriptGenerationGroupSidecar,
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You extract continuity state from immutable screenplay text. "
+                            "Return only the requested compact structured sidecar and never "
+                            "rewrite the screenplay."
+                        ),
+                    },
+                    {"role": "user", "content": sidecar_input},
+                ],
+            )
+        finally:
+            if model_call_state is not None and previous_context is not None:
+                (
+                    model_call_state.context.requested_output_tokens,
+                    model_call_state.context.context_bundle_sha256,
+                    model_call_state.context.context_manifest_json,
+                ) = previous_context
+        episode_sidecars.append(sidecar.episodes[0])
+    group_sidecar = ScriptGenerationGroupSidecar(
+        stage="generating_episode_scripts",
+        group_id=text.group_id,
+        start_episode=text.start_episode,
+        end_episode=text.end_episode,
+        episodes=episode_sidecars,
+    )
+    result = _assemble_script_group_result(text, group_sidecar)
     record_langfuse_event(
         "pengine.script_state_sidecar.completed",
-        input={**manifest, "sidecar_sha256": content_fingerprint(sidecar.model_dump_json())},
+        input={
+            **manifest,
+            "sidecar_sha256": content_fingerprint(group_sidecar.model_dump_json()),
+        },
         metadata={"trace_version": "pengine-1"},
     )
     return result

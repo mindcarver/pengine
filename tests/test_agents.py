@@ -2185,6 +2185,72 @@ async def test_script_group_sidecar_binds_hash_without_repeating_screenplay_json
 
 
 @pytest.mark.asyncio
+async def test_script_group_sidecar_extracts_each_episode_in_its_own_call() -> None:
+    """Whole-group extraction let a lazy temperature-0 upstream return only the
+    first episode's sidecar on every attempt — across repair nonces and
+    provider rotations (production 2026-09-13 run 30268bc4 ep31; 2026-09-23
+    run d52cb948 ep4). Extraction must run one call per episode so an episode
+    cannot be skipped."""
+    contract = _story_contract()
+    nonce = "e" * 32
+    contents = {number: f"第{number}集事实\n钩子{number}" for number in (1, 2)}
+    plaintext = "\n".join(
+        f"<<<PENGINE_EPISODE_START:{nonce}:{number}>>>\n{contents[number]}\n"
+        f"<<<PENGINE_EPISODE_END:{nonce}:{number}>>>"
+        for number in (1, 2)
+    )
+    text_model = ToolCallingFakeModel(responses=[AIMessage(content=plaintext)])
+    text = await _invoke_script_group_text(
+        text_model,
+        [{"role": "user", "content": "write"}],
+        group_id="opening_unit",
+        start_episode=1,
+        end_episode=2,
+        nonce=nonce,
+    )
+    responses = [
+        _tool_call(
+            "ScriptGenerationGroupSidecar",
+            {
+                "stage": "generating_episode_scripts",
+                "group_id": "opening_unit",
+                "start_episode": number,
+                "end_episode": number,
+                "episodes": [
+                    {
+                        "episode_number": number,
+                        "screenplay_sha256": hashlib.sha256(contents[number].encode()).hexdigest(),
+                        "state_delta": _state_delta(contract, number),
+                    }
+                ],
+            },
+            number,
+        )
+        for number in (1, 2)
+    ]
+    model = ToolCallingFakeModel(responses=responses)
+
+    result = await _invoke_script_group_sidecar(
+        model,
+        text,
+        sidecar_context={"contract_sha256": "locked"},
+    )
+
+    assert [episode.episode_number for episode in result.episodes] == [1, 2]
+    assert result.episodes[0].content == contents[1]
+    assert result.episodes[1].content == contents[2]
+    # One call per episode, each seeing only that episode's screenplay.
+    assert len(model.model_message_batches) == 2
+    for attempt, number in enumerate((1, 2)):
+        call_input = "\n".join(
+            str(message.content) for message in model.model_message_batches[attempt]
+        )
+        other = 2 if number == 1 else 1
+        assert f"第{number}集事实" in call_input
+        assert f"第{other}集事实" not in call_input
+
+
+@pytest.mark.asyncio
 async def test_script_group_sidecar_rejects_screenplay_hash_mismatch() -> None:
     contract = _story_contract()
     nonce = "d" * 32
