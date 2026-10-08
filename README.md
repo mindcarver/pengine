@@ -246,12 +246,28 @@ API 只允许绑定回环地址。Relay URL 必须使用 HTTPS；只有 `localho
 `127.0.0.1` 和 `::1` 可使用 HTTP。`PENGINE_RELAY_BASE_URL` 与
 `PENGINE_RELAY_API_KEY` 同时交给两个客户端；该地址必须接受所选模型对应的协议。默认
 OpenRouter 组合是单一模型 `deepseek/deepseek-v4-flash` 同时承担 generation 与
-review。全部 OpenRouter slug（GLM flash、DeepSeek flash/pro）都可用于任一角色。可选 `PENGINE_OPENROUTER_PROVIDER`
+review。全部 OpenRouter slug（GLM flash、DeepSeek flash/pro、Kimi K3）都可用于任一角色。可选 `PENGINE_OPENROUTER_PROVIDER`
 （逗号分隔的供应商列表）通过 provider.order 让大冷 prefill 调用优先走实测快的上游、
 避免撞路由器空闲上限（Issue #285）；回退保持开启，兼容性抖动时退回默认路由而非
 404；留空保持默认负载均衡。兼容模型仍包括
 Claude、GPT 和原生 DeepSeek 的既有白名单。URL、密钥或任一模型 ID 缺失时，工作流会
 fail closed，不会降级成单模型，也不会跨角色回退。
+
+Kimi K3 的 OpenRouter 模型 ID 是 `moonshotai/kimi-k3`。生成、审核和大纲可以分别选用
+K3 或 DeepSeek；大纲的 `PENGINE_OUTLINE_MODEL_ID` 留空时跟随生成模型。全部切换到 K3：
+
+```dotenv
+PENGINE_GENERATION_MODEL_ID=moonshotai/kimi-k3
+PENGINE_REVIEW_MODEL_ID=moonshotai/kimi-k3
+PENGINE_OUTLINE_MODEL_ID=moonshotai/kimi-k3
+PENGINE_OPENROUTER_PROVIDER=
+```
+
+URL 与密钥沿用现有 OpenRouter 配置；清空 DeepSeek 专用供应商偏好后，由 OpenRouter
+选择可用的 K3 上游。K3 始终开启推理，本项目使用 `low` 推理强度，省略固定采样参数，
+并保留推理字段供下一轮工具调用回传。输出预算包含推理和最终输出。K3 使用自动缓存，
+不执行 4-token 预热；流式中断交给现有有界恢复处理，不构造缺少完整推理历史的续写消息。
+切回 DeepSeek 时，只需将对应角色的模型 ID 改回 `deepseek/deepseek-v4-flash`。
 
 ### 私有服务器入口与账户迁移
 
