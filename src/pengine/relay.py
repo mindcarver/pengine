@@ -21,7 +21,7 @@ import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage
 from langchain_core.outputs import LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover - exercised only without langfuse instal
 
 from pengine.config import (
     ANTHROPIC_MODEL_IDS,
+    KIMI_MODEL_ID,
     OPENROUTER_ANTHROPIC_MODEL_IDS,
     OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS,
     Settings,
@@ -71,8 +72,10 @@ _PROMPT_CACHE_MIN_SYSTEM_CHARS = 4_000
 # Bare and OpenRouter-prefixed Claude slugs share one Anthropic route: the
 # OpenRouter Anthropic-compatible endpoint speaks the native Messages protocol.
 _ANTHROPIC_ROUTE_MODEL_IDS = ANTHROPIC_MODEL_IDS | OPENROUTER_ANTHROPIC_MODEL_IDS
-# Sonnet 5 rejects non-default sampling parameters on both spellings.
-_TEMPERATURE_OMITTED_MODEL_IDS = frozenset({"claude-sonnet-5", "anthropic/claude-sonnet-5"})
+# Sonnet 5 and K3 require their fixed default sampling parameters.
+_TEMPERATURE_OMITTED_MODEL_IDS = frozenset(
+    {"claude-sonnet-5", "anthropic/claude-sonnet-5", KIMI_MODEL_ID}
+)
 _RESPONSE_MODEL_ID_EQUIVALENTS = MappingProxyType(
     {
         "gpt-5.5": frozenset({"gpt-5.5", "gpt-5.5-2026-04-23"}),
@@ -775,6 +778,43 @@ class _SerialChatOpenAI(ChatOpenAI):
             kwargs["tool_choice"] = "auto"
         kwargs["parallel_tool_calls"] = False
         return super().bind_tools(tools, **kwargs)
+
+
+class _SerialChatKimi(_SerialChatOpenAI):
+    """Preserve K3 reasoning while keeping the audited Chat Completions transport."""
+
+    def _get_request_payload(self, input_: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = super()._get_request_payload(input_, **kwargs)
+        messages = self._convert_input(input_).to_messages()
+        for source, target in zip(messages, payload["messages"], strict=True):
+            if isinstance(source, AIMessage):
+                for key in ("reasoning_content", "reasoning", "reasoning_details"):
+                    if source.additional_kwargs.get(key) is not None:
+                        target[key] = source.additional_kwargs[key]
+        return payload
+
+    def _create_chat_result(self, response: Any, generation_info: Any = None) -> Any:
+        result = super()._create_chat_result(response, generation_info)
+        data = response if isinstance(response, dict) else response.model_dump()
+        for generation, choice in zip(result.generations, data["choices"], strict=True):
+            for key in ("reasoning_content", "reasoning", "reasoning_details"):
+                if choice["message"].get(key) is not None:
+                    generation.message.additional_kwargs[key] = choice["message"][key]
+        return result
+
+    def _convert_chunk_to_generation_chunk(
+        self, chunk: dict, default_chunk_class: type, base_generation_info: dict | None
+    ) -> Any:
+        result = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if result is not None and isinstance(result.message, AIMessageChunk):
+            choices = chunk.get("choices") or []
+            delta = (choices[0].get("delta") or {}) if choices else {}
+            for key in ("reasoning_content", "reasoning", "reasoning_details"):
+                if delta.get(key) is not None:
+                    result.message.additional_kwargs[key] = delta[key]
+        return result
 
 
 def _build_langfuse_handler(settings: Settings) -> BaseCallbackHandler | None:
@@ -1892,6 +1932,9 @@ def _openrouter_extra_body(
     model_id: str, settings: Settings, *, with_provider: bool = False
 ) -> dict[str, Any] | None:
     extra: dict[str, Any] = {}
+    if model_id == KIMI_MODEL_ID:
+        # K3 always thinks; low effort bounds latency and leaves room for result tools.
+        extra["reasoning"] = {"effort": "low"}
     if model_id in {"deepseek/deepseek-v4-flash", "deepseek/deepseek-v4.1-flash"}:
         # Reasoning burn: the creation pipeline needs schema-bound tool calls,
         # not chain-of-thought. Left enabled, V4.1 emitted ~10k reasoning
@@ -1975,9 +2018,7 @@ def build_relay_adapter(
             *([handler] if (handler := _build_langfuse_handler(settings)) is not None else []),
         ],
     }
-    # Sonnet 5 rejects non-default sampling parameters. Omitting temperature lets
-    # Anthropic apply the model default while preserving deterministic overrides for
-    # the existing routes.
+    # Models with fixed sampling parameters must apply their own defaults.
     if model_id not in _TEMPERATURE_OMITTED_MODEL_IDS:
         common["temperature"] = 0
     # langchain-openai's per-chunk timer defaults to 120s and does not count
@@ -1985,14 +2026,16 @@ def build_relay_adapter(
     # default is killed mid-stream. Keep this ceiling at or above both the
     # request timeout and the stall watchdog so those bounds always bind first.
     chunk_timeout = max(settings.model_timeout_seconds, settings.stream_stall_seconds)
+    chat_completions_client = _SerialChatKimi if model_id == KIMI_MODEL_ID else _SerialChatOpenAI
     if role == "review":
         if model_id in {"gpt-5.5", "gpt-5.6-terra"} | OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS:
             return RelayAdapter(
-                model=_SerialChatOpenAI(
+                model=chat_completions_client(
                     **common,
                     max_tokens=max_output_tokens,
                     stream_chunk_timeout=chunk_timeout,
                     extra_body=_openrouter_extra_body(model_id, settings),
+                    pengine_stream_continuation=model_id != KIMI_MODEL_ID,
                 ),
                 role=role,
                 model_id=model_id,
@@ -2034,7 +2077,7 @@ def build_relay_adapter(
     )
     if model_id in OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS:
         return RelayAdapter(
-            model=_SerialChatOpenAI(
+            model=chat_completions_client(
                 **common,
                 max_tokens=max_output_tokens,
                 stream_chunk_timeout=chunk_timeout,
@@ -2042,8 +2085,12 @@ def build_relay_adapter(
                 pengine_model_call_state=model_call_state,
                 pengine_stream_watchdog=stream_watchdog,
                 pengine_stream_max_retries=settings.stream_max_retries,
-                pengine_prompt_cache_warmup=settings.prompt_cache_warmup,
-                pengine_stream_continuation=settings.stream_continuation,
+                # K3 caches automatically. Tiny warmups spend the cap on reasoning;
+                # partial-output replay cannot provide a complete reasoning history.
+                pengine_prompt_cache_warmup=settings.prompt_cache_warmup
+                and model_id != KIMI_MODEL_ID,
+                pengine_stream_continuation=settings.stream_continuation
+                and model_id != KIMI_MODEL_ID,
                 streaming=True,
             ),
             role=role,

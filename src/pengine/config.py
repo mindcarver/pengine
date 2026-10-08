@@ -14,9 +14,11 @@ ANTHROPIC_MODEL_IDS = frozenset({"claude-opus-5", "claude-sonnet-5"})
 OPENROUTER_ANTHROPIC_MODEL_IDS = frozenset(
     f"anthropic/{model_id}" for model_id in ANTHROPIC_MODEL_IDS
 )
+KIMI_MODEL_ID = "moonshotai/kimi-k3"
 OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS = frozenset(
     {
         "z-ai/glm-5.3-flash",
+        KIMI_MODEL_ID,
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4.1-flash",

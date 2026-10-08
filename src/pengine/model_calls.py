@@ -154,6 +154,13 @@ def serialize_messages(messages: list[Any]) -> str:
                 "tool_calls: "
                 + json.dumps(list(tool_calls), ensure_ascii=False, sort_keys=True, default=str)
             )
+        additional = getattr(message, "additional_kwargs", {})
+        for key in ("reasoning_content", "reasoning", "reasoning_details"):
+            if additional.get(key) is not None:
+                parts.append(
+                    f"{key}: "
+                    + json.dumps(additional[key], ensure_ascii=False, sort_keys=True, default=str)
+                )
         lines.append("\n".join(parts))
     return "\n".join(lines)
 
