@@ -250,6 +250,14 @@ Issue / 设计说明
   逐集调用（start=end=n，episodes 恰含一集），漏集在结构上不可能发生，输入还小了
   2/3。凡是"一次生成 N 个条目"的调用，都要先问：模型偷懒少写条目时，校验失败可修吗？
   不可修就拆单。
+- **聚合上游的输出钳检测**（2026-10-09，run 0c4574f2，Issue #318）。聚合路由器池内
+  部分上游对单次补全有远低于申请额度的硬钳（K3 池某上游把 12.8 万额度钳到 2048，
+  `finish_reason=length`），截断的结构化 JSON 在解析层表现成 `structured_output_invalid`，
+  重试还可能再抽中同类上游。解法：非流式响应在交付消费者之前完整可见，`_SerialChatOpenAI._agenerate`
+  检测 `length` 且 completion×4 < 申请 max_tokens 时整请求透明重发（重发即重掷上游
+  骰子），共享 `stream_max_retries` 预算；流式路径内容已交付不可安全重发，由结构化
+  修复环 + nonce 扰动兜住。判别要点：真预算截断落在申请额度附近，钳制截断落在上游
+  自己的机器上限。
 - **错误信息要透传**。把底层 `ValidationError` 的字段细节吞成通用文案（如
   "未通过确定性校验"）会让运维与修复环都失去目标；`safe_message` 与日志都应携带
   `{exc}` 原文（AgentProtocolError / internal_error 均适用）。

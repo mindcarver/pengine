@@ -12,7 +12,12 @@ from anthropic.types import RawMessageDeltaEvent
 from langchain_anthropic import ChatAnthropic
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
+from langchain_core.outputs import (
+    ChatGeneration,
+    ChatGenerationChunk,
+    ChatResult,
+    LLMResult,
+)
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 from openai import APIError
@@ -364,6 +369,91 @@ async def test_openrouter_stream_deduplicates_repeated_finish_identity(monkeypat
 
     assert combined.generation_info["model_name"] == "z-ai/glm-5.3-flash"
     assert combined.generation_info["finish_reason"] == "tool_calls"
+
+
+def _clamped_review_result(completion_tokens: int, *, finish_reason: str) -> ChatResult:
+    return ChatResult(
+        generations=[
+            ChatGeneration(
+                message=AIMessage(
+                    content="被截断的结构化结果" if finish_reason == "length" else "完整结果",
+                    response_metadata={
+                        "finish_reason": finish_reason,
+                        "token_usage": {"completion_tokens": completion_tokens},
+                    },
+                )
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_upstream_output_clamp_resends_until_uncapped(monkeypatch) -> None:
+    """两次 2048/length 钳制 + 第三次正常:整请求重发,最终返回正常结果(Issue #318)。"""
+    calls: list[int] = []
+
+    async def fake_agenerate(*args: Any, **kwargs: Any) -> ChatResult:
+        calls.append(len(calls) + 1)
+        if len(calls) <= 2:
+            return _clamped_review_result(2048, finish_reason="length")
+        return _clamped_review_result(902, finish_reason="tool_calls")
+
+    async def fast_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(ChatOpenAI, "_agenerate", fake_agenerate)
+    monkeypatch.setattr(relay_module.asyncio, "sleep", fast_sleep)
+    model = build_chat_model(
+        _role_settings(
+            review_model_id="z-ai/glm-5.3-flash",
+            review_max_output_tokens=128_000,
+            stream_max_retries=2,
+        ),
+        role="review",
+    )
+
+    result = await model._agenerate([{"role": "user", "content": "审校"}])
+
+    assert len(calls) == 3
+    assert result.generations[0].message.content == "完整结果"
+
+
+@pytest.mark.asyncio
+async def test_genuine_budget_length_is_not_resent(monkeypatch) -> None:
+    """finish=length 但 completion 接近申请额度(100000/128000)是真预算截断,不重发。"""
+    calls: list[int] = []
+
+    async def fake_agenerate(*args: Any, **kwargs: Any) -> ChatResult:
+        calls.append(len(calls) + 1)
+        return _clamped_review_result(100_000, finish_reason="length")
+
+    monkeypatch.setattr(ChatOpenAI, "_agenerate", fake_agenerate)
+    model = build_chat_model(
+        _role_settings(
+            review_model_id="z-ai/glm-5.3-flash",
+            review_max_output_tokens=128_000,
+            stream_max_retries=2,
+        ),
+        role="review",
+    )
+
+    result = await model._agenerate([{"role": "user", "content": "审校"}])
+
+    assert len(calls) == 1
+    assert result.generations[0].message.response_metadata["finish_reason"] == "length"
+
+
+def test_review_chat_completions_adapter_carries_resend_budget() -> None:
+    """review 角色的 chat-completions 适配器必须携带非零重发预算(Issue #318)。"""
+    model = build_chat_model(
+        _role_settings(
+            review_model_id="z-ai/glm-5.3-flash",
+            stream_max_retries=2,
+        ),
+        role="review",
+    )
+
+    assert getattr(model, "_pengine_stream_max_retries", 0) == 2
 
 
 def test_stream_watchdog_waits_for_measurable_output_before_crawl() -> None:
