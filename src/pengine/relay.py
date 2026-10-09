@@ -22,7 +22,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage
-from langchain_core.outputs import LLMResult
+from langchain_core.outputs import ChatResult, LLMResult
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 from openai import APIError
@@ -99,6 +99,8 @@ _RESPONSE_MODEL_ID_EQUIVALENTS = MappingProxyType(
 _MODEL_CALL_LOGGER = logging.getLogger("uvicorn.error.pengine.model_calls")
 # Durable structured record lines that carry estimate/actual/duration/finish/outcome.
 _MODEL_CALL_RECORD_LOGGER = logging.getLogger("uvicorn.error.pengine.model_call_records")
+# Transport-layer recovery events (invisible resends, clamp re-rolls).
+_RELAY_LOGGER = logging.getLogger("uvicorn.error.pengine.relay")
 ModelRole = Literal["generation", "review"]
 
 # The audit handler runs on the event-loop thread (the model is invoked with
@@ -610,6 +612,58 @@ def _input_messages_as_dicts(base_input: Any) -> list[dict[str, Any]] | None:
     return None
 
 
+def _clamped_completion_tokens(message: Any) -> int | None:
+    """Completion tokens of a finished generation from either usage source."""
+    for source in (
+        getattr(message, "usage_metadata", None),
+        (getattr(message, "response_metadata", None) or {}).get("token_usage")
+        if isinstance(getattr(message, "response_metadata", None), dict)
+        else None,
+    ):
+        if not isinstance(source, dict):
+            continue
+        for key in ("output_tokens", "completion_tokens"):
+            value = source.get(key)
+            if isinstance(value, int) and value >= 0:
+                return value
+    return None
+
+
+def _upstream_output_clamped(result: ChatResult, requested_max_tokens: Any) -> bool:
+    """Whether a non-streaming result was cut by an aggregating upstream's own
+    output cap rather than by the requested budget.
+
+    The signature is finish_reason="length" together with a completion count
+    far below the max_tokens this request actually asked for (a genuine budget
+    cut lands at or near the request ceiling; a clamping upstream cuts at its
+    own machine limit, e.g. 2048 of 128000). Usage is read from both the
+    standardized ``usage_metadata`` and the OpenAI-style
+    ``response_metadata.token_usage``; without a usable count the result is
+    conservatively treated as not clamped.
+    """
+    if not isinstance(requested_max_tokens, int) or requested_max_tokens <= 0:
+        return False
+    for generation in result.generations:
+        message = getattr(generation, "message", None)
+        metadata = getattr(message, "response_metadata", None)
+        if not isinstance(metadata, dict) or metadata.get("finish_reason") != "length":
+            continue
+        completion = _clamped_completion_tokens(message)
+        if completion is not None and completion * 4 < requested_max_tokens:
+            return True
+    return False
+
+
+def _clamp_completion_hint(result: ChatResult) -> int | None:
+    """Completion count of the first length-finish generation, for logs."""
+    for generation in result.generations:
+        message = getattr(generation, "message", None)
+        metadata = getattr(message, "response_metadata", None)
+        if isinstance(metadata, dict) and metadata.get("finish_reason") == "length":
+            return _clamped_completion_tokens(message)
+    return None
+
+
 class _SerialChatOpenAI(ChatOpenAI):
     _pengine_model_call_state: ModelCallState | None = PrivateAttr(default=None)
     _pengine_stream_watchdog: _StreamStallWatchdog | None = PrivateAttr(default=None)
@@ -633,6 +687,32 @@ class _SerialChatOpenAI(ChatOpenAI):
         self._pengine_stream_max_retries = pengine_stream_max_retries
         self._pengine_prompt_cache_warmup = pengine_prompt_cache_warmup
         self._pengine_stream_continuation = pengine_stream_continuation
+
+    async def _agenerate(self, *args: Any, run_manager: Any = None, **kwargs: Any) -> ChatResult:
+        # Upstream output clamp (Issue #318): some aggregating upstreams
+        # silently cap one completion far below the requested max_tokens and
+        # still report finish_reason="length" (production 2026-10-09, run
+        # 0c4574f2: a K3-pool upstream capped a whole-season final review at
+        # 2048 of 128000 requested tokens; the truncated JSON then failed
+        # parsing and terminal-failed a 40/40 run). A non-streaming response
+        # exists fully before anything is handed to the consumer, so a whole
+        # resend — which re-rolls the upstream dice — is safe and stays off
+        # the stage-attempt accounting. A genuine budget cut (completion at
+        # or near what we asked for) must NOT resend.
+        result = await super()._agenerate(*args, run_manager=run_manager, **kwargs)
+        for attempt in range(self._pengine_stream_max_retries):
+            if not _upstream_output_clamped(result, self.max_tokens):
+                return result
+            _RELAY_LOGGER.info(
+                "upstream output clamp detected, resending request "
+                "attempt=%s completion_cap_hint=%s requested_max_tokens=%s",
+                attempt + 1,
+                _clamp_completion_hint(result),
+                self.max_tokens,
+            )
+            await asyncio.sleep(min(10.0, 2.0 * (2**attempt)) * (0.5 + random.random() / 2))
+            result = await super()._agenerate(*args, run_manager=run_manager, **kwargs)
+        return result
 
     def _with_call_output_budget(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         state = self._pengine_model_call_state
@@ -2036,6 +2116,10 @@ def build_relay_adapter(
                     stream_chunk_timeout=chunk_timeout,
                     extra_body=_openrouter_extra_body(model_id, settings),
                     pengine_stream_continuation=model_id != KIMI_MODEL_ID,
+                    # Non-streaming reviews are exactly where the aggregating-
+                    # upstream output clamp bites (Issue #318): whole-response
+                    # resend is safe there and re-rolls the upstream dice.
+                    pengine_stream_max_retries=settings.stream_max_retries,
                 ),
                 role=role,
                 model_id=model_id,
