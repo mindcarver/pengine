@@ -40,9 +40,10 @@ except ImportError:  # pragma: no cover - exercised only without langfuse instal
 
 from pengine.config import (
     ANTHROPIC_MODEL_IDS,
-    KIMI_MODEL_ID,
+    KIMI_MODEL_IDS,
     OPENROUTER_ANTHROPIC_MODEL_IDS,
     OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS,
+    TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS,
     Settings,
 )
 from pengine.model_calls import (
@@ -63,6 +64,8 @@ _AUTO_TOOL_CHOICE_MODELS = frozenset(
     {
         "deepseek-v4-flash",
         "deepseek-v4-pro",
+        # TokenHub's dated snapshot of the same model keeps its auto choice.
+        "deepseek-v4-flash-0731",
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro",
     }
@@ -72,9 +75,14 @@ _PROMPT_CACHE_MIN_SYSTEM_CHARS = 4_000
 # Bare and OpenRouter-prefixed Claude slugs share one Anthropic route: the
 # OpenRouter Anthropic-compatible endpoint speaks the native Messages protocol.
 _ANTHROPIC_ROUTE_MODEL_IDS = ANTHROPIC_MODEL_IDS | OPENROUTER_ANTHROPIC_MODEL_IDS
+# Both gateways' chat-completions slugs ride the same _SerialChatOpenAI/_SerialChatKimi
+# transport; the slug picks the gateway credentials, not the client (Issue #320).
+_CHAT_COMPLETIONS_ROUTE_MODEL_IDS = (
+    OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS | TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS
+)
 # Sonnet 5 and K3 require their fixed default sampling parameters.
 _TEMPERATURE_OMITTED_MODEL_IDS = frozenset(
-    {"claude-sonnet-5", "anthropic/claude-sonnet-5", KIMI_MODEL_ID}
+    {"claude-sonnet-5", "anthropic/claude-sonnet-5", *KIMI_MODEL_IDS}
 )
 _RESPONSE_MODEL_ID_EQUIVALENTS = MappingProxyType(
     {
@@ -2012,16 +2020,27 @@ def _openrouter_extra_body(
     model_id: str, settings: Settings, *, with_provider: bool = False
 ) -> dict[str, Any] | None:
     extra: dict[str, Any] = {}
-    if model_id == KIMI_MODEL_ID:
+    if model_id in KIMI_MODEL_IDS:
         # K3 always thinks; low effort bounds latency and leaves room for result tools.
         extra["reasoning"] = {"effort": "low"}
-    if model_id in {"deepseek/deepseek-v4-flash", "deepseek/deepseek-v4.1-flash"}:
+    if model_id in {
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4.1-flash",
+        # TokenHub's bare snapshots of the same models; the gateway ignores
+        # unrecognized fields, so the reasoning-disable stays harmless there.
+        "deepseek-v4.1-flash",
+        "deepseek-v4-flash-0731",
+    }:
         # Reasoning burn: the creation pipeline needs schema-bound tool calls,
         # not chain-of-thought. Left enabled, V4.1 emitted ~10k reasoning
         # tokens before a ~900-token character-relationships call (production
         # 2026-09-11: 660s vs 8s, ~20x slower, output budget squeezed).
         extra["reasoning"] = {"enabled": False}
-    if with_provider and settings.openrouter_provider:
+    if (
+        with_provider
+        and settings.openrouter_provider
+        and model_id in OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS
+    ):
         # Prefer vetted fast upstreams without leaving the pool: unpinned routing
         # gambles large cold-prefill calls across ~15 upstreams, and some choke
         # silently on big agent histories until the router's idle ceiling kills
@@ -2055,7 +2074,9 @@ def build_relay_adapter(
     if model_id_override:
         model_id = model_id_override
     provider_profile_key = (
-        "anthropic"
+        "tokenhub"
+        if model_id in TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS
+        else "anthropic"
         if model_id in _ANTHROPIC_ROUTE_MODEL_IDS
         else "openrouter"
         if model_id in OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS
@@ -2063,7 +2084,17 @@ def build_relay_adapter(
         if model_id in {"gpt-5.5", "gpt-5.6-terra"}
         else "deepseek"
     )
-    if not settings.relay_base_url or not settings.relay_api_key or not model_id:
+    # Gateway credentials ride the model slug (Issue #320): TokenHub bare slugs
+    # answer at tokenhub_base_url, everything else at relay_base_url. A missing
+    # credential fails closed for that route; there is never a cross-gateway
+    # fallback.
+    if model_id in TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS:
+        gateway_base_url = settings.tokenhub_base_url
+        gateway_api_key = settings.tokenhub_api_key
+    else:
+        gateway_base_url = settings.relay_base_url
+        gateway_api_key = settings.relay_api_key
+    if not gateway_base_url or not gateway_api_key or not model_id:
         raise RelayError(
             code="relay_unavailable",
             safe_message=f"The {role} model route is not configured.",
@@ -2071,14 +2102,15 @@ def build_relay_adapter(
     if model_call_state is None:
         model_call_state = ModelCallState()
     reserved_output_tokens = max_output_tokens or 0
-    # The operator's relay key is an exact credential that must never survive in
-    # durable provider-error evidence, even if the relay echoes it in an error body.
+    # The operator's relay keys are exact credentials that must never survive in
+    # durable provider-error evidence, even if a relay echoes them in an error body.
     register_redaction_secret(settings.relay_api_key)
+    register_redaction_secret(settings.tokenhub_api_key)
 
     common = {
         "model": model_id,
-        "base_url": settings.relay_base_url,
-        "api_key": settings.relay_api_key,
+        "base_url": gateway_base_url,
+        "api_key": gateway_api_key,
         "max_retries": 0,
         "timeout": settings.model_timeout_seconds,
         "callbacks": [
@@ -2106,16 +2138,16 @@ def build_relay_adapter(
     # default is killed mid-stream. Keep this ceiling at or above both the
     # request timeout and the stall watchdog so those bounds always bind first.
     chunk_timeout = max(settings.model_timeout_seconds, settings.stream_stall_seconds)
-    chat_completions_client = _SerialChatKimi if model_id == KIMI_MODEL_ID else _SerialChatOpenAI
+    chat_completions_client = _SerialChatKimi if model_id in KIMI_MODEL_IDS else _SerialChatOpenAI
     if role == "review":
-        if model_id in {"gpt-5.5", "gpt-5.6-terra"} | OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS:
+        if model_id in {"gpt-5.5", "gpt-5.6-terra"} | _CHAT_COMPLETIONS_ROUTE_MODEL_IDS:
             return RelayAdapter(
                 model=chat_completions_client(
                     **common,
                     max_tokens=max_output_tokens,
                     stream_chunk_timeout=chunk_timeout,
                     extra_body=_openrouter_extra_body(model_id, settings),
-                    pengine_stream_continuation=model_id != KIMI_MODEL_ID,
+                    pengine_stream_continuation=model_id not in KIMI_MODEL_IDS,
                     # Non-streaming reviews are exactly where the aggregating-
                     # upstream output clamp bites (Issue #318): whole-response
                     # resend is safe there and re-rolls the upstream dice.
@@ -2159,7 +2191,7 @@ def build_relay_adapter(
         if settings.stream_watchdog_enabled
         else None
     )
-    if model_id in OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS:
+    if model_id in _CHAT_COMPLETIONS_ROUTE_MODEL_IDS:
         return RelayAdapter(
             model=chat_completions_client(
                 **common,
@@ -2172,9 +2204,9 @@ def build_relay_adapter(
                 # K3 caches automatically. Tiny warmups spend the cap on reasoning;
                 # partial-output replay cannot provide a complete reasoning history.
                 pengine_prompt_cache_warmup=settings.prompt_cache_warmup
-                and model_id != KIMI_MODEL_ID,
+                and model_id not in KIMI_MODEL_IDS,
                 pengine_stream_continuation=settings.stream_continuation
-                and model_id != KIMI_MODEL_ID,
+                and model_id not in KIMI_MODEL_IDS,
                 streaming=True,
             ),
             role=role,

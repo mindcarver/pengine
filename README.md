@@ -254,7 +254,15 @@ Claude、GPT 和原生 DeepSeek 的既有白名单。URL、密钥或任一模型
 fail closed，不会降级成单模型，也不会跨角色回退。
 
 Kimi K3 的 OpenRouter 模型 ID 是 `moonshotai/kimi-k3`。生成、审核和大纲可以分别选用
-K3 或 DeepSeek；大纲的 `PENGINE_OUTLINE_MODEL_ID` 留空时跟随生成模型。全部切换到 K3：
+K3 或 DeepSeek；大纲的 `PENGINE_OUTLINE_MODEL_ID` 留空时跟随生成模型。
+
+双网关并存（Issue #320）：江苏电信智云 TokenHub（`https://aigw.telecomjs.com/v1`）的
+裸 slug（`kimi-k3`、`deepseek-v4.1-flash`、`deepseek-v4-flash-0731`、`glm-5.3-flash`）
+按模型 ID 自动路由到 `PENGINE_TOKENHUB_BASE_URL`/`PENGINE_TOKENHUB_API_KEY`
+（base_url 缺省即该地址），带前缀的 OpenRouter slug 仍走 `PENGINE_RELAY_BASE_URL`。
+两网关可混搭（例如 generation 用 TokenHub、review 用 OpenRouter）；任一被选用网关
+缺少凭据时按 `relay_unavailable` fail closed，不做跨网关回退；`provider.order` 偏好
+只注入 OpenRouter 路由。全部切换到 K3：
 
 ```dotenv
 PENGINE_GENERATION_MODEL_ID=moonshotai/kimi-k3
