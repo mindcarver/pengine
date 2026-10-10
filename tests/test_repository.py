@@ -2023,6 +2023,43 @@ async def test_retry_run_revives_stage_validation_failure_with_durable_outline(
     assert checkpoints[InternalStage.SELECTING_L0_VARIANT]["selected_l0_variant"] == "主动选择"
 
 
+async def test_retry_run_revives_agent_execution_limit_after_budget_raise(
+    repository,
+    persona,
+    creation_request,
+) -> None:
+    """An agent_execution_limit failure is an operator-parameter failure: the
+    per-stage call budget was sized below the fleet's repair-loop reality, and
+    the operator revives the run after raising the limit (production
+    2026-10-10: episode 22 burned the default 48 on TokenHub)."""
+    accepted, lease = await create_and_lease_initial(repository, persona, creation_request)
+    await repository.fail_run(
+        lease.run_id,
+        RunFailure(
+            code="agent_execution_limit",
+            message=(
+                "The generating_episode_scripts episode 22 reached its "
+                "generation model-call budget (48)."
+            ),
+            failed_stage=InternalStage.GENERATING_EPISODE_SCRIPTS,
+            attempt_count=1,
+        ),
+        now=NOW,
+    )
+    failed = await repository.get_creation(accepted.creation_id)
+    assert failed is not None
+    assert failed.initial.state == "failed"
+    assert failed.initial.progress.can_retry is True
+
+    revived = await repository.retry_run(
+        creation_id=accepted.creation_id,
+        run_kind="initial",
+        idempotency_key="retry-agent-execution-limit",
+        now=NOW + timedelta(seconds=10),
+    )
+    assert revived.run_state == "queued"
+
+
 async def test_retry_run_rejects_running_and_non_external_failures(
     repository,
     persona,
