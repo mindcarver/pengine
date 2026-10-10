@@ -187,7 +187,13 @@ def test_generation_output_cannot_exceed_opus_5_maximum() -> None:
 
 @pytest.mark.parametrize(
     "model_id",
-    ["kimi-k3", "deepseek-v4.1-flash", "deepseek-v4-flash-0731", "glm-5.3-flash"],
+    [
+        "kimi-k3",
+        "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-new",
+        "deepseek-v4-flash-0731",
+        "glm-5.3-flash",
+    ],
 )
 def test_tokenhub_models_are_accepted_for_both_roles(model_id: str) -> None:
     settings = Settings(_env_file=None, generation_model_id=model_id, review_model_id=model_id)

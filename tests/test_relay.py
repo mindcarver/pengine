@@ -2413,7 +2413,14 @@ def _tokenhub_settings(**model_ids: str) -> Settings:
 
 
 @pytest.mark.parametrize(
-    "model_id", ["kimi-k3", "deepseek-v4.1-flash", "deepseek-v4-flash-0731", "glm-5.3-flash"]
+    "model_id",
+    [
+        "kimi-k3",
+        "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-new",
+        "deepseek-v4-flash-0731",
+        "glm-5.3-flash",
+    ],
 )
 def test_tokenhub_slugs_route_to_the_tokenhub_gateway(model_id: str) -> None:
     settings = _tokenhub_settings(generation_model_id=model_id, review_model_id=model_id)
@@ -2460,7 +2467,10 @@ def test_tokenhub_routes_never_receive_openrouter_provider_pins() -> None:
     deepseek_adapter = build_relay_adapter(settings, role="review")
 
     assert kimi_adapter.model.extra_body == {"reasoning": {"effort": "low"}}
-    assert deepseek_adapter.model.extra_body == {"reasoning": {"enabled": False}}
+    assert deepseek_adapter.model.extra_body == {
+        "reasoning": {"enabled": False},
+        "thinking": {"type": "disabled"},
+    }
 
 
 def test_tokenhub_route_registers_both_gateway_keys_for_redaction() -> None:
