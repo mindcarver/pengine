@@ -2029,6 +2029,7 @@ def _openrouter_extra_body(
         # TokenHub's bare snapshots of the same models; the gateway ignores
         # unrecognized fields, so the reasoning-disable stays harmless there.
         "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-new",
         "deepseek-v4-flash-0731",
     }:
         # Reasoning burn: the creation pipeline needs schema-bound tool calls,
@@ -2036,6 +2037,12 @@ def _openrouter_extra_body(
         # tokens before a ~900-token character-relationships call (production
         # 2026-09-11: 660s vs 8s, ~20x slower, output budget squeezed).
         extra["reasoning"] = {"enabled": False}
+        if model_id in TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS:
+            # TokenHub's refreshed V4.1 variant ignores the OpenRouter-style
+            # reasoning flag and burns ~500 thinking tokens into a
+            # length-truncated empty body; DeepSeek's native field is the one
+            # it honors (probed 2026-10-10, both fields together are accepted).
+            extra["thinking"] = {"type": "disabled"}
     if (
         with_provider
         and settings.openrouter_provider

@@ -33,6 +33,8 @@ TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS = frozenset(
     {
         TOKENHUB_KIMI_MODEL_ID,
         "deepseek-v4.1-flash",
+        # TokenHub's refreshed variant of the same V4.1 flash route.
+        "deepseek-v4.1-flash-new",
         "deepseek-v4-flash-0731",
         "glm-5.3-flash",
     }
