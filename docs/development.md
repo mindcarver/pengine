@@ -54,7 +54,13 @@ PENGINE_SCRIPT_STAGE_REVIEW_CALL_TOTAL_LIMIT=128
 - `.env.example` 默认使用 OpenRouter 的单一模型 `deepseek/deepseek-v4-flash`
   同时承担生成与审核；两个完整 slug（含 `z-ai/glm-5.3-flash`）都允许用于任一角色
   并走 OpenAI-compatible Chat Completions；GLM 保留强制推理，DeepSeek 关闭推理；
-- 可选 `PENGINE_OPENROUTER_PROVIDER`（逗号分隔供应商列表）通过 provider.order 让 OpenRouter 大冷 prefill 调用优先走实测快的上游（Issue #285）；回退保持开启，工具兼容性抖动时退回默认路由而非 404；留空保持默认负载均衡；
+- 可选 `PENGINE_OPENROUTER_PROVIDER`（逗号分隔供应商列表）通过 provider.order 让 OpenRouter 大冷 prefill 调用优先走实测快的上游（Issue #285）；回退保持开启，工具兼容性抖动时退回默认路由而非 404；留空保持默认负载均衡；该偏好只注入 OpenRouter 路由；
+- 双网关并存（Issue #320）：TokenHub 裸 slug（`kimi-k3`、`deepseek-v4.1-flash`、
+  `deepseek-v4-flash-0731`、`glm-5.3-flash`，江苏电信智云 TokenHub
+  `https://aigw.telecomjs.com/v1`，2026-10-10 实测）按模型 ID 自动路由到
+  `PENGINE_TOKENHUB_BASE_URL`（缺省即该地址）/`PENGINE_TOKENHUB_API_KEY`，与
+  `PENGINE_RELAY_BASE_URL` 的 OpenRouter slug 可按角色混搭；被选用的网关缺凭据时
+  `relay_unavailable` fail closed，无跨网关回退；
 - 兼容白名单仍保留 `deepseek-v4-flash`、`gpt-5.5`、`gpt-5.6-terra`、
   `claude-opus-5`、`claude-sonnet-5` 及既有 OpenRouter Claude slug；不能仅凭配置通过
   就声称 provider 能力已验证；

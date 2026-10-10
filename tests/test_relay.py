@@ -2402,3 +2402,85 @@ def test_v4_1_flash_model_route_is_allowed_and_aliased() -> None:
     # tool calls, not chain-of-thought (660s vs 8s when left enabled).
     assert extra is not None
     assert extra.get("reasoning") == {"enabled": False}
+
+
+def _tokenhub_settings(**model_ids: str) -> Settings:
+    return _role_settings(
+        tokenhub_base_url="https://tokenhub.example/v1",
+        tokenhub_api_key="tokenhub-secret",
+        **model_ids,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_id", ["kimi-k3", "deepseek-v4.1-flash", "deepseek-v4-flash-0731", "glm-5.3-flash"]
+)
+def test_tokenhub_slugs_route_to_the_tokenhub_gateway(model_id: str) -> None:
+    settings = _tokenhub_settings(generation_model_id=model_id, review_model_id=model_id)
+
+    adapter = build_relay_adapter(settings, role="generation")
+
+    assert isinstance(adapter.model, ChatOpenAI)
+    assert not isinstance(adapter.model, ChatDeepSeek)
+    assert adapter.model_id == model_id
+    assert adapter.provider_profile_key == "tokenhub"
+    assert adapter.model.model_name == model_id
+    assert adapter.model.openai_api_base == "https://tokenhub.example/v1"
+    assert adapter.model.openai_api_key.get_secret_value() == "tokenhub-secret"
+
+
+def test_tokenhub_route_requires_its_own_api_key() -> None:
+    settings = _role_settings(generation_model_id="kimi-k3", review_model_id="kimi-k3")
+
+    for role in ("generation", "review"):
+        with pytest.raises(RelayError) as excinfo:
+            build_relay_adapter(settings, role=role)
+        assert excinfo.value.code == "relay_unavailable"
+
+
+def test_tokenhub_kimi_reuses_the_serial_kimi_transport() -> None:
+    settings = _tokenhub_settings(generation_model_id="kimi-k3", review_model_id="kimi-k3")
+
+    adapter = build_relay_adapter(settings, role="generation")
+
+    assert isinstance(adapter.model, relay_module._SerialChatKimi)
+    request_payload = adapter.model._get_request_payload([HumanMessage(content="ping")])
+    # K3 keeps its fixed default sampling parameters on either gateway.
+    assert "temperature" not in request_payload
+
+
+def test_tokenhub_routes_never_receive_openrouter_provider_pins() -> None:
+    settings = _tokenhub_settings(
+        generation_model_id="kimi-k3",
+        review_model_id="deepseek-v4.1-flash",
+        openrouter_provider="deepinfra",
+    )
+
+    kimi_adapter = build_relay_adapter(settings, role="generation")
+    deepseek_adapter = build_relay_adapter(settings, role="review")
+
+    assert kimi_adapter.model.extra_body == {"reasoning": {"effort": "low"}}
+    assert deepseek_adapter.model.extra_body == {"reasoning": {"enabled": False}}
+
+
+def test_tokenhub_route_registers_both_gateway_keys_for_redaction() -> None:
+    settings = _tokenhub_settings(generation_model_id="kimi-k3", review_model_id="glm-5.3-flash")
+
+    build_relay_adapter(settings, role="generation")
+
+    assert "secret-value" in relay_module._REDACTION_SECRETS
+    assert "tokenhub-secret" in relay_module._REDACTION_SECRETS
+
+
+def test_mixed_fleet_builds_routes_on_both_gateways() -> None:
+    settings = _tokenhub_settings(
+        generation_model_id="kimi-k3",
+        review_model_id="deepseek/deepseek-v4-flash",
+        outline_model_id="deepseek-v4.1-flash",
+    )
+
+    routes = build_relay_routes(settings)
+
+    assert routes.generation.model.openai_api_base == "https://tokenhub.example/v1"
+    assert routes.review.model.openai_api_base == "https://relay.example/v1"
+    assert routes.outline.model.openai_api_base == "https://tokenhub.example/v1"

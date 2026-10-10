@@ -24,13 +24,33 @@ OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS = frozenset(
         "deepseek/deepseek-v4.1-flash",
     }
 )
+# Jiangsu Telecom 智云 TokenHub (https://aigw.telecomjs.com/v1) uses bare slugs
+# without vendor prefixes, so its namespace is disjoint from OpenRouter's prefixed
+# slugs and the model id alone selects the gateway (Issue #320). The dated
+# deepseek-v4-flash-0731 snapshot is the same model as deepseek-v4-flash.
+TOKENHUB_KIMI_MODEL_ID = "kimi-k3"
+TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS = frozenset(
+    {
+        TOKENHUB_KIMI_MODEL_ID,
+        "deepseek-v4.1-flash",
+        "deepseek-v4-flash-0731",
+        "glm-5.3-flash",
+    }
+)
+# Both Kimi K3 slugs share the _SerialChatKimi transport and fixed sampling
+# parameters; the slug only picks the gateway.
+KIMI_MODEL_IDS = frozenset({KIMI_MODEL_ID, TOKENHUB_KIMI_MODEL_ID})
 _ALLOWED_GENERATION_MODELS = (
-    ANTHROPIC_MODEL_IDS | OPENROUTER_ANTHROPIC_MODEL_IDS | OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS
+    ANTHROPIC_MODEL_IDS
+    | OPENROUTER_ANTHROPIC_MODEL_IDS
+    | OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS
+    | TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS
 )
 _ALLOWED_REVIEW_MODELS = (
     frozenset({"deepseek-v4-flash", "gpt-5.5", "gpt-5.6-terra", *ANTHROPIC_MODEL_IDS})
     | OPENROUTER_ANTHROPIC_MODEL_IDS
     | OPENROUTER_CHAT_COMPLETIONS_MODEL_IDS
+    | TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS
 )
 
 
@@ -47,6 +67,12 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, ge=1, le=65535)
     relay_base_url: str | None = None
     relay_api_key: SecretStr | None = None
+    # Second gateway for TokenHub-owned bare slugs (Issue #320). Model ids in
+    # TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS route here; everything else keeps the
+    # relay_base_url gateway. Absent key/tokenhub leaves those routes
+    # unconfigured (relay_unavailable), never falling back across gateways.
+    tokenhub_base_url: str = "https://aigw.telecomjs.com/v1"
+    tokenhub_api_key: SecretStr | None = None
     generation_model_id: str | None = None
     generation_max_output_tokens: int = Field(default=128_000, ge=1, le=128_000)
     generation_context_limit_tokens: int | None = Field(default=None, ge=1)
@@ -144,11 +170,18 @@ class Settings(BaseSettings):
 
     @property
     def relay_configured(self) -> bool:
-        return bool(
-            self.relay_base_url
-            and self.relay_api_key
-            and self.generation_model_id
-            and self.review_model_id
+        if not (self.generation_model_id and self.review_model_id):
+            return False
+        selected = {self.generation_model_id, self.review_model_id}
+        if self.outline_model_id:
+            selected.add(self.outline_model_id)
+        # Each selected model's gateway must carry its own credentials; one
+        # configured gateway never covers the other's slugs (Issue #320).
+        tokenhub_selected = any(slug in TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS for slug in selected)
+        relay_selected = any(slug not in TOKENHUB_CHAT_COMPLETIONS_MODEL_IDS for slug in selected)
+        return not (
+            (tokenhub_selected and not (self.tokenhub_base_url and self.tokenhub_api_key))
+            or (relay_selected and not (self.relay_base_url and self.relay_api_key))
         )
 
     @property
@@ -191,7 +224,7 @@ class Settings(BaseSettings):
             pass
         raise ValueError("Pengine V1 may bind only to a loopback address")
 
-    @field_validator("relay_base_url")
+    @field_validator("relay_base_url", "tokenhub_base_url")
     @classmethod
     def relay_base_url_must_be_safe(cls, value: str | None) -> str | None:
         if value is None:

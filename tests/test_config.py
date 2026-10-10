@@ -117,7 +117,7 @@ def test_both_model_roles_are_required(
     ("field", "value"),
     [
         ("generation_model_id", "deepseek-v4-pro"),
-        ("generation_model_id", "glm-5.3-flash"),
+        ("generation_model_id", "glm-5.3-flashx"),
         ("generation_model_id", "z-ai/glm-5.3"),
         ("generation_model_id", "claude-haiku-4-5"),
         ("generation_model_id", "anthropic/claude-haiku-4-5"),
@@ -183,3 +183,78 @@ def test_invalid_relay_adapter_settings_are_rejected(field: str, value: object) 
 def test_generation_output_cannot_exceed_opus_5_maximum() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, generation_max_output_tokens=128_001)
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ["kimi-k3", "deepseek-v4.1-flash", "deepseek-v4-flash-0731", "glm-5.3-flash"],
+)
+def test_tokenhub_models_are_accepted_for_both_roles(model_id: str) -> None:
+    settings = Settings(_env_file=None, generation_model_id=model_id, review_model_id=model_id)
+    assert settings.generation_model_id == model_id
+    assert settings.review_model_id == model_id
+    assert settings.tokenhub_base_url == "https://aigw.telecomjs.com/v1"
+
+
+def test_unsafe_tokenhub_base_urls_are_rejected() -> None:
+    with pytest.raises(ValidationError, match="tokenhub_base_url"):
+        Settings(_env_file=None, tokenhub_base_url="http://aigw.telecomjs.com/v1")
+
+
+def test_relay_configured_keeps_gateways_separate() -> None:
+    # OpenRouter-only fleet needs only the shared relay credentials.
+    assert (
+        Settings(
+            _env_file=None,
+            relay_base_url="https://openrouter.example/v1",
+            relay_api_key="openrouter-secret",
+            generation_model_id="deepseek/deepseek-v4-flash",
+            review_model_id="deepseek/deepseek-v4-flash",
+        ).relay_configured
+        is True
+    )
+    # A TokenHub slug selected without its key stays unconfigured.
+    assert (
+        Settings(
+            _env_file=None,
+            relay_base_url="https://openrouter.example/v1",
+            relay_api_key="openrouter-secret",
+            generation_model_id="kimi-k3",
+            review_model_id="deepseek/deepseek-v4-flash",
+        ).relay_configured
+        is False
+    )
+    # Mixed fleets need both gateways' credentials.
+    assert (
+        Settings(
+            _env_file=None,
+            relay_base_url="https://openrouter.example/v1",
+            relay_api_key="openrouter-secret",
+            tokenhub_api_key="tokenhub-secret",
+            generation_model_id="kimi-k3",
+            review_model_id="deepseek/deepseek-v4-flash",
+        ).relay_configured
+        is True
+    )
+    # A pure TokenHub deployment runs without any relay_base_url.
+    assert (
+        Settings(
+            _env_file=None,
+            tokenhub_api_key="tokenhub-secret",
+            generation_model_id="kimi-k3",
+            review_model_id="glm-5.3-flash",
+        ).relay_configured
+        is True
+    )
+    # The outline route participates in gateway selection too.
+    assert (
+        Settings(
+            _env_file=None,
+            relay_base_url="https://openrouter.example/v1",
+            relay_api_key="openrouter-secret",
+            generation_model_id="deepseek/deepseek-v4-flash",
+            review_model_id="deepseek/deepseek-v4-flash",
+            outline_model_id="deepseek-v4.1-flash",
+        ).relay_configured
+        is False
+    )
