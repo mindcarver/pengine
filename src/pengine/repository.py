@@ -125,6 +125,12 @@ RELAY_AUTO_RESUME_WINDOW = 4
 # burning on mixed relay/model stochasticity (a stream stall plus grouped
 # outline validation misses, production 2026-09-08) — retry re-enters the
 # stage with a fresh budget instead of abandoning the creation.
+# agent_execution_limit joins as an operator-parameter failure in the same
+# spirit: a per-stage model-call budget sized too small for the fleet's
+# repair-loop reality (production 2026-10-10: episode 22 burned the default
+# 48 on TokenHub; the same run runs green after the operator raises
+# PENGINE_STAGE_MODEL_CALL_LIMIT) — the failed stage re-enters with the
+# raised budget and rolled episode cycle, keeping all approved episodes.
 RETRYABLE_FAILURE_CODES = frozenset(
     {
         "relay_unavailable",
@@ -132,6 +138,7 @@ RETRYABLE_FAILURE_CODES = frozenset(
         "stage_validation_failed",
         "structured_output_invalid",
         "attempts_exhausted",
+        "agent_execution_limit",
     }
 )
 _MIN_RELAY_RETRY_DELAY_SECONDS = 10
